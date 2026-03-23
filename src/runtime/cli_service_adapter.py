@@ -1018,31 +1018,49 @@ def run_http_service(
         request_positive_int=request_positive_int,
         current_context=current_context,
     )
-    bind_host = host
-    server_class = ThreadingHTTPServer
-    if host == "0.0.0.0" and getattr(socket, "has_dualstack_ipv6", lambda: False)():
-        class DualStackThreadingHTTPServer(ThreadingHTTPServer):
-            address_family = socket.AF_INET6
+    servers: list[ThreadingHTTPServer] = []
+    server_threads: list[threading.Thread] = []
+
+    def _build_server(bind_host: str, *, family: int) -> ThreadingHTTPServer:
+        class FamilyThreadingHTTPServer(ThreadingHTTPServer):
+            address_family = family
 
             def server_bind(self) -> None:
-                try:
-                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-                except OSError:
-                    pass
+                if family == socket.AF_INET6:
+                    try:
+                        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except OSError:
+                        pass
                 super().server_bind()
 
-        server_class = DualStackThreadingHTTPServer
-        bind_host = "::"
-    server = server_class((bind_host, port), Handler)
+        return FamilyThreadingHTTPServer((bind_host, port), Handler)
+
+    bind_hosts: list[str] = []
+    if host == "0.0.0.0":
+        servers.append(_build_server("0.0.0.0", family=socket.AF_INET))
+        bind_hosts.append("0.0.0.0")
+        try:
+            servers.append(_build_server("::", family=socket.AF_INET6))
+            bind_hosts.append("::")
+        except OSError:
+            pass
+    else:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        servers.append(_build_server(host, family=family))
+        bind_hosts.append(host)
+
     if tls_enabled:
         if not tls_cert.exists() or not tls_key.exists():
             from tls.gen_self_signed_cert import generate_self_signed_cert
             generate_self_signed_cert(tls_cert, tls_key)
         tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_ctx.load_cert_chain(certfile=str(tls_cert), keyfile=str(tls_key))
-        server.socket = tls_ctx.wrap_socket(server.socket, server_side=True)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
+        for server in servers:
+            server.socket = tls_ctx.wrap_socket(server.socket, server_side=True)
+    for server in servers:
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        server_threads.append(server_thread)
 
     # Start outbound WS peer client connections (config from runtime/ws_peer_clients.json)
     start_ws_peer_clients(
@@ -1065,7 +1083,7 @@ def run_http_service(
             "service_id": self_service["service_id"],
             "process_id": process_id,
             "host": host,
-            "bind_host": bind_host,
+            "bind_hosts": bind_hosts,
             "port": port,
             "tls": tls_enabled,
             "default_target": default_target,
@@ -1230,8 +1248,9 @@ def run_http_service(
                     },
                 )
     finally:
-        server.shutdown()
-        server.server_close()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
         router_conn.close()
     return 0
 
