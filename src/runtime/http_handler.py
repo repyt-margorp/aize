@@ -1050,11 +1050,22 @@ def make_handler(
                 session_scope=initial_session_scope,
             )
             sidebar_system_html = (
-                "<div class='stack'>"
-                "<p><strong>Superuser</strong></p>"
-                "<p>To register users, run <code>./scripts/register_user.sh</code> from the repo root.</p>"
-                "</div>"
-                if role_name == "superuser"
+                "".join(
+                    [
+                        "<div class='stack'>",
+                        "<p><strong>Superuser</strong></p>",
+                        "<p>Create additional UI users directly from HTTPBridge. Passwords stay in runtime state and are not tracked in Git.</p>",
+                        "<form id='register-user-form' class='stack' method='post' action='/register'>",
+                        "<input id='register-user-username' name='username' placeholder='new username' autocomplete='off'>",
+                        "<input id='register-user-password' name='password' type='password' placeholder='new password (8+ chars)' autocomplete='new-password'>",
+                        "<input id='register-user-password-confirm' type='password' placeholder='confirm password' autocomplete='new-password'>",
+                        "<button class='ghost' type='submit'>Create User</button>",
+                        "<div id='register-user-status' class='context-action-status'>Creates a standard user account.</div>",
+                        "</form>",
+                        "</div>",
+                    ]
+                )
+                if is_superuser
                 else ""
             )
             items = _render_initial_history_html(initial_history_for_http, render_entry_html)
@@ -1516,7 +1527,7 @@ def make_handler(
                 self._json(400, {"error": "bootstrap_required"})
                 return
             context = current_context(self, payload=payload)
-            if not context or context.get("role") != "superuser":
+            if not context or not bool(context.get("is_superuser")):
                 self._json(403, {"error": "superuser_required"})
                 return
             username = str(payload.get("username", "")).strip()
