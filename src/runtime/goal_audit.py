@@ -20,7 +20,7 @@ from runtime.persistent_state import (
 from wire.protocol import message_meta_get
 
 GOAL_AUDIT_BUNDLE_DIRNAME = "goal-audit"
-DEFAULT_CODEX_MODEL = str(os.environ.get("AIZE_CODEX_MODEL", "gpt-5.3-codex-spark")).strip() or "gpt-5.3-codex-spark"
+DEFAULT_CODEX_MODEL = str(os.environ.get("AIZE_CODEX_MODEL", "gpt-5.4")).strip() or "gpt-5.4"
 
 
 def history_excerpt(entries: list[dict[str, Any]], *, limit: int = 24) -> str:
@@ -406,6 +406,7 @@ def build_goal_audit_prompt(
             "Line 1 is always the goal_state record:",
             '  {"kind": "goal_state", "progress_state": "complete" | "in_progress", "goal_satisfied": true | false, "summary": "..."}',
             "Lines 2+ are agent_directive records, one per agent that should receive a follow-up (only when in_progress):",
+            "These follow-up records are the agent_directives for the session.",
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}',
             "Optional additional lines are child_goal_request records:",
             '  {"kind": "child_goal_request", "service_id": "...", "goal_text": "...", "label": ""}',
@@ -525,6 +526,36 @@ def run_goal_audit(
 ) -> dict[str, Any]:
     from runtime import cli_service_adapter as _runtime_cli_service_adapter
 
+    def _run_codex_goal_audit(
+        request_prompt: str,
+        *,
+        request_session_id: str | None,
+    ) -> tuple[str, list[dict[str, Any]], str | None]:
+        try:
+            return _runtime_cli_service_adapter.run_codex(
+                request_prompt,
+                session_id=request_session_id,
+                response_schema_id="goal_audit_v1",
+                on_event=on_event,
+            )
+        except RuntimeError as exc:
+            error_text = str(exc)
+            if "invalid_json_schema" not in error_text:
+                raise
+            if on_event:
+                on_event(
+                    {
+                        "type": "service.goal_audit_schema_fallback",
+                        "error": error_text,
+                    }
+                )
+            return _runtime_cli_service_adapter.run_codex(
+                request_prompt,
+                session_id=request_session_id,
+                response_schema_id=None,
+                on_event=on_event,
+            )
+
     session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
     contacted_agents = list_session_agent_contacts(runtime_root, username=username, session_id=session_id)
     last_reviewed_turn_completed_at = str(
@@ -566,11 +597,9 @@ def run_goal_audit(
             on_event=on_event,
         )
     else:
-        final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_codex(
+        final_text, _events, audit_session_id = _run_codex_goal_audit(
             prompt,
-            session_id=None,
-            response_schema_id=None,
-            on_event=on_event,
+            request_session_id=None,
         )
     max_parse_retries = 2
     retry_final_text = final_text
@@ -628,11 +657,9 @@ def run_goal_audit(
                 on_event=on_event,
             )
         else:
-            retry_final_text, _, retry_session_id = _runtime_cli_service_adapter.run_codex(
+            retry_final_text, _, retry_session_id = _run_codex_goal_audit(
                 retry_prompt,
-                session_id=retry_session_id,
-                response_schema_id=None,
-                on_event=on_event,
+                request_session_id=retry_session_id,
             )
     if parsed_records is None and parsed_legacy is None:
         raise RuntimeError(f"goal_audit_invalid_payload_after_retries: {parse_error_detail}")

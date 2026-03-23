@@ -58,6 +58,8 @@ from runtime.persistent_state import (
     drain_service_pending_inputs,
     get_history as get_user_history,
     get_session_settings,
+    active_agent_priority,
+    lease_session_service,
     load_agent_audit_state,
     load_codex_session,
     load_claude_session,
@@ -65,6 +67,7 @@ from runtime.persistent_state import (
     load_service_pending_inputs,
     list_session_agent_contacts,
     record_session_agent_contact,
+    release_session_service,
     resolve_session_agent_id,
     read_json_file,
     schedule_session_auto_resume,
@@ -122,6 +125,45 @@ def build_panic_recovery_parent_return_xml(
             f"<panic_service_id>{html.escape(panic_service_id)}</panic_service_id>",
             "<instruction>Resume parent session from panic recovery completion.</instruction>",
             "</aize_panic_recovery_parent_resume>",
+        ]
+    )
+
+
+def _parent_resume_validated_for_recovery_completion(
+    *,
+    runtime_root: Path,
+    username: str,
+    recovery_session_settings: dict[str, Any],
+) -> tuple[bool, str]:
+    if str(recovery_session_settings.get("session_group") or "").strip().lower() != "error":
+        return True, ""
+    parent_session_id = str(recovery_session_settings.get("parent_session_id") or "").strip()
+    if not parent_session_id:
+        return True, ""
+    recovery_created_at = str(recovery_session_settings.get("created_at") or "").strip()
+    parent_history = get_user_history(runtime_root, username=username, session_id=parent_session_id)
+    for entry in parent_history:
+        ts = str(entry.get("ts") or "")
+        if recovery_created_at and ts <= recovery_created_at:
+            continue
+        direction = str(entry.get("direction") or "")
+        event_type = str(entry.get("event_type") or "")
+        if direction == "in":
+            return True, ""
+        if event_type in {"agent.turn_started", "turn.completed"}:
+            return True, ""
+    return False, "parent_session_not_resumed_after_recovery"
+
+
+def _session_completion_override_xml(*, reason: str, session_dir_path: str, timeline_path: str) -> str:
+    return "\n".join(
+        [
+            "<aize_completion_override>",
+            f"  <reason>{html.escape(reason)}</reason>",
+            "  <instruction>Do not treat this session as completed yet. The completion validator rejected the completed state. Continue only the work required to satisfy the validator, then verify again.</instruction>",
+            f"  <session_dir>{html.escape(session_dir_path)}</session_dir>",
+            f"  <timeline_path>{html.escape(timeline_path)}</timeline_path>",
+            "</aize_completion_override>",
         ]
     )
 
@@ -243,33 +285,31 @@ def run_agent_service(
     self_service: dict[str, Any],
     process_id: str,
     log_path: Path,
-    rx_port: Path,
-    tx_port: Path,
+    router_conn: Any = None,
 ) -> int:
+    from kernel.ipc import connect_to_router, RouterConnection
     service_id = self_service["service_id"]
+    if router_conn is None:
+        router_conn = connect_to_router(runtime_root, service_id)
     config = dict(self_service.get("config", {}))
     history_limit = int(config.get("history_limit", 500))
     reply_count = 0
     reply_count_lock = threading.Lock()
-    tx_lock = threading.Lock()
     done_sent = threading.Event()
     scope_locks: dict[str, threading.Lock] = {}
     scope_locks_guard = threading.Lock()
     workers: list[threading.Thread] = []
 
     def send_tx(message_obj: dict[str, Any]) -> None:
-        with tx_lock:
-            tx_handle.write(encode_line(message_obj))
-            tx_handle.flush()
+        router_conn.write(encode_line(message_obj))
 
     class LockedTxHandle:
         def write(self, data: str) -> int:
-            with tx_lock:
-                return tx_handle.write(data)
+            router_conn.write(data)
+            return len(data)
 
         def flush(self) -> None:
-            with tx_lock:
-                tx_handle.flush()
+            pass
 
     def scope_lock_for(username: str | None, session_id: str | None) -> threading.Lock:
         key = f"{username}::{session_id}" if username and session_id else "__global__"
@@ -354,6 +394,14 @@ def run_agent_service(
         send_tx(dispatch_message)
         return recovery_session
 
+    def _pool_for_kind_from_manifest(kind: str) -> list[str]:
+        """Derive service pool for a provider kind from the manifest."""
+        return [
+            s["service_id"]
+            for s in manifest.get("services", [])
+            if isinstance(s.get("service_id"), str) and s.get("kind") == kind
+        ]
+
     def maybe_spawn_failure_recovery(
         *,
         username: str | None,
@@ -369,7 +417,21 @@ def run_agent_service(
             or failure_event.get("text")
             or ""
         ).strip()
+
+        # Determine provider kind of the failed service
+        session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+        agent_priority = active_agent_priority(session_settings.get("agent_priority"))
+
+        # Determine which kind the failed service is
+        failed_kind = str(
+            next(
+                (s.get("kind") for s in manifest.get("services", []) if s.get("service_id") == failure_service_id),
+                "codex" if "codex" in failure_service_id.lower() else "claude",
+            )
+        )
+
         if _is_usage_limit_error_text(error_text):
+            # Mark the failed service as panic
             save_agent_audit_state(
                 runtime_root,
                 service_id=failure_service_id,
@@ -377,6 +439,77 @@ def run_agent_service(
                 session_id=session_id,
                 audit_state="panic",
             )
+
+            # Try next providers in agent_priority order before creating a recovery session.
+            # Recovery sessions should only be spawned when ALL providers are exhausted.
+            tried_kinds = {failed_kind}
+            for provider in agent_priority:
+                if provider in tried_kinds:
+                    continue
+                tried_kinds.add(provider)
+                fallback_pool = _pool_for_kind_from_manifest(provider)
+                if not fallback_pool:
+                    continue
+                # Release current service binding and try next pool
+                release_session_service(runtime_root, username=username, session_id=session_id)
+                next_svc = lease_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    pool_service_ids=fallback_pool,
+                )
+                if not next_svc:
+                    continue
+                # Fallback available: re-enqueue goal and dispatch to new provider
+                goal_text = str(session_settings.get("goal_text") or "").strip()
+                active_goal_id = str(session_settings.get("active_goal_id") or session_settings.get("goal_id") or "").strip()
+                if goal_text:
+                    append_pending_input(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        entry=make_aize_pending_input(
+                            kind="goal_update",
+                            role="system",
+                            text=_goal_update_xml(goal_id=active_goal_id, goal_text=goal_text),
+                        ),
+                    )
+                fallback_dispatch = make_dispatch_pending_message(
+                    manifest=manifest,
+                    from_service_id=service_id,
+                    to_service_id=next_svc,
+                    process_id=process_id,
+                    run_id=f"provider-fallback-{uuid.uuid4().hex[:8]}",
+                    username=username,
+                    session_id=session_id,
+                    auth_context=None,
+                    reason="provider_fallback",
+                )
+                send_tx(fallback_dispatch)
+                append_user_history(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    entry={
+                        "direction": "event",
+                        "ts": utc_ts(),
+                        "service_id": failure_service_id,
+                        "event_type": "service.provider_fallback",
+                        "text": f"Rate limit: {failed_kind} exhausted, switched to {provider} ({next_svc})",
+                        "event": {
+                            "type": "service.provider_fallback",
+                            "from_service_id": failure_service_id,
+                            "to_service_id": next_svc,
+                            "from_provider": failed_kind,
+                            "to_provider": provider,
+                            "reason": "rate_limit",
+                        },
+                    },
+                    limit=GOAL_AUDIT_HISTORY_LIMIT,
+                )
+                return None  # No recovery session needed; dispatched to fallback
+
+            # All providers in agent_priority exhausted — fall back to recovery session
             update_session_goal_flags(
                 runtime_root,
                 username=username,
@@ -402,7 +535,7 @@ def run_agent_service(
                     "ts": utc_ts(),
                     "service_id": failure_service_id,
                     "event_type": "service.auto_resume_scheduled",
-                    "text": "Auto resume scheduled after rate limit",
+                    "text": "All providers rate-limited; auto resume scheduled",
                     "event": {
                         "type": "service.auto_resume_scheduled",
                         "reason": "rate_limit",
@@ -425,6 +558,7 @@ def run_agent_service(
                 },
                 panic_service_id=failure_service_id,
             )
+        # Non-rate-limit failure: mark panic and create recovery session
         save_agent_audit_state(
             runtime_root,
             service_id=failure_service_id,
@@ -976,6 +1110,38 @@ def run_agent_service(
                                 "scope": {"username": scope_username, "session_id": scope_session_id},
                             },
                         )
+                        current_audit_state = load_agent_audit_state(
+                            runtime_root,
+                            service_id=service_id,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                        )
+                        if current_audit_state == "panic":
+                            save_agent_audit_state(
+                                runtime_root,
+                                service_id=service_id,
+                                username=scope_username,
+                                session_id=scope_session_id,
+                                audit_state="all_clear",
+                            )
+                            append_user_history(
+                                runtime_root,
+                                username=scope_username,
+                                session_id=scope_session_id,
+                                entry={
+                                    "direction": "event",
+                                    "ts": utc_ts(),
+                                    "service_id": service_id,
+                                    "event_type": "service.panic_cleared_after_successful_turn",
+                                    "text": "Panic state cleared after a successful worker turn.",
+                                    "event": {
+                                        "type": "service.panic_cleared_after_successful_turn",
+                                        "previous_audit_state": "panic",
+                                        "new_audit_state": "all_clear",
+                                    },
+                                },
+                                limit=GOAL_AUDIT_HISTORY_LIMIT,
+                            )
                         session_settings = (
                             get_session_settings(runtime_root, username=scope_username, session_id=scope_session_id) or {}
                         )
@@ -1399,6 +1565,81 @@ def run_agent_service(
                                             session_id=scope_session_id,
                                             audit_state=resolved_audit_state,
                                         )
+                                        completion_ok, completion_reason = _parent_resume_validated_for_recovery_completion(
+                                            runtime_root=runtime_root,
+                                            username=scope_username,
+                                            recovery_session_settings=session_settings,
+                                        )
+                                        if not completion_ok:
+                                            update_session_goal_flags(
+                                                runtime_root,
+                                                username=scope_username,
+                                                session_id=scope_session_id,
+                                                goal_id=goal_id,
+                                                goal_completed=False,
+                                                goal_progress_state="in_progress",
+                                            )
+                                            scope_session_dir = session_dir(
+                                                runtime_root,
+                                                username=scope_username,
+                                                session_id=scope_session_id,
+                                            )
+                                            scope_timeline = session_timeline_path(
+                                                runtime_root,
+                                                username=scope_username,
+                                                session_id=scope_session_id,
+                                            )
+                                            append_pending_input(
+                                                runtime_root,
+                                                username=scope_username,
+                                                session_id=scope_session_id,
+                                                entry=make_aize_pending_input(
+                                                    kind="completion_override",
+                                                    role="system",
+                                                    text=_session_completion_override_xml(
+                                                        reason=completion_reason,
+                                                        session_dir_path=str(scope_session_dir),
+                                                        timeline_path=str(scope_timeline),
+                                                    ),
+                                                ),
+                                            )
+                                            append_user_history(
+                                                runtime_root,
+                                                username=scope_username,
+                                                session_id=scope_session_id,
+                                                entry={
+                                                    "direction": "event",
+                                                    "ts": utc_ts(),
+                                                    "service_id": service_id,
+                                                    "event_type": "service.session_completion_overridden",
+                                                    "text": f"Session completion overridden: {completion_reason}",
+                                                    "event": {
+                                                        "type": "service.session_completion_overridden",
+                                                        "reason": completion_reason,
+                                                    },
+                                                },
+                                                limit=GOAL_AUDIT_HISTORY_LIMIT,
+                                            )
+                                            send_tx(
+                                                make_dispatch_pending_message(
+                                                    manifest=manifest,
+                                                    from_service_id=service_id,
+                                                    to_service_id=service_id,
+                                                    process_id=process_id,
+                                                    run_id=f"completion-override-{uuid.uuid4().hex[:8]}",
+                                                    username=scope_username,
+                                                    session_id=scope_session_id,
+                                                    auth_context=None,
+                                                    reason="session_completion_overridden",
+                                                    session_agent_id=resolve_session_agent_id(
+                                                        runtime_root,
+                                                        username=scope_username,
+                                                        session_id=scope_session_id,
+                                                        service_id=service_id,
+                                                    ),
+                                                )
+                                            )
+                                            return
                                         update_session_goal_flags(
                                             runtime_root,
                                             username=scope_username,
@@ -1987,8 +2228,8 @@ def run_agent_service(
                 },
             )
 
-    with rx_port.open("r", encoding="utf-8") as rx_handle, tx_port.open("w", encoding="utf-8") as tx_handle:
-        for raw in rx_handle:
+    with router_conn:
+        for raw in router_conn:
             line = raw.strip()
             if not line:
                 continue

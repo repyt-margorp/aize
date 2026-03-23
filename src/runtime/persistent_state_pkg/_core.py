@@ -20,6 +20,8 @@ DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT = 30
 DEFAULT_PENDING_INPUT_LIMIT = 100
 DEFAULT_SESSION_GROUP = "user"
 DEFAULT_AUTO_RESUME_INTERVAL_SECONDS = 6 * 60 * 60
+AGENT_PRIORITY_BORDER = "border"
+DEFAULT_AGENT_PRIORITY = ["codex", "claude", AGENT_PRIORITY_BORDER]
 SESSION_GROUP_DEFAULT_PERMISSIONS = {
     "user": {
         "create_child_session": True,
@@ -29,7 +31,7 @@ SESSION_GROUP_DEFAULT_PERMISSIONS = {
     "error": {
         "create_child_session": False,
         "auto_spawn_recovery": False,
-        "auto_resume": False,
+        "auto_resume": True,
     },
 }
 
@@ -41,6 +43,36 @@ def normalize_auto_compact_threshold_left_percent(value: Any) -> int:
         threshold = DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT
     threshold = max(5, min(95, threshold))
     return threshold - (threshold % 5)
+
+
+def normalize_agent_priority(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return list(DEFAULT_AGENT_PRIORITY)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in value:
+        item = str(raw_item or "").strip().lower()
+        if not item:
+            continue
+        if item == "boarder":
+            item = AGENT_PRIORITY_BORDER
+        if item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized or list(DEFAULT_AGENT_PRIORITY)
+
+
+def active_agent_priority(value: Any, *, available_kinds: set[str] | None = None) -> list[str]:
+    available = available_kinds or {"codex", "claude"}
+    active: list[str] = []
+    for item in normalize_agent_priority(value):
+        if item == AGENT_PRIORITY_BORDER:
+            break
+        if item in available and item not in active:
+            active.append(item)
+    fallback = [kind for kind in DEFAULT_AGENT_PRIORITY if kind in available]
+    return active or fallback
 
 
 def normalize_username(username: str) -> str:
@@ -116,6 +148,18 @@ def session_dag_dir(runtime_root: Path, *, username: str, session_id: str) -> Pa
     return session_dir(runtime_root, username=username, session_id=session_id) / "dag"
 
 
+def session_goals_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "goals"
+
+
+def session_goal_dir(runtime_root: Path, *, username: str, session_id: str, goal_id: str) -> Path:
+    return session_goals_dir(runtime_root, username=username, session_id=session_id) / goal_id
+
+
+def session_goal_attachments_dir(runtime_root: Path, *, username: str, session_id: str, goal_id: str) -> Path:
+    return session_goal_dir(runtime_root, username=username, session_id=session_id, goal_id=goal_id) / "attachments"
+
+
 def session_metadata_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
     return session_dir(runtime_root, username=username, session_id=session_id) / "session.json"
 
@@ -186,6 +230,56 @@ def session_agent_state_path(
     service_id: str,
 ) -> Path:
     return session_services_dir(runtime_root, username=username, session_id=session_id) / f"{service_id}.audit.json"
+
+
+def safe_agent_id_for_path(agent_id: str) -> str:
+    """Return a filesystem-safe version of agent_id (replaces @@ with __ and strips unsafe chars)."""
+    return str(agent_id or "").replace("@@", "__").replace("/", "_").replace("\\", "_").replace("..", "_")
+
+
+def session_agent_files_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "agent_files"
+
+
+def session_agent_entry_files_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_agent_files_dir(runtime_root, username=username, session_id=session_id) / safe_agent_id_for_path(agent_id)
+
+
+def session_agent_inbox_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_agent_entry_files_dir(runtime_root, username=username, session_id=session_id, agent_id=agent_id) / "inbox"
+
+
+def session_agent_outbox_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_agent_entry_files_dir(runtime_root, username=username, session_id=session_id, agent_id=agent_id) / "outbox"
+
+
+def session_agent_acl_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    """Path to the ACL metadata file for a specific agent file directory."""
+    return session_agent_entry_files_dir(runtime_root, username=username, session_id=session_id, agent_id=agent_id) / ".acl.json"
 
 
 def state_path(runtime_root: Path) -> Path:
@@ -543,6 +637,13 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("goal_auto_compact_enabled", True)
     session.setdefault("agent_welcome_enabled", False)
     session.setdefault("preferred_provider", "codex")
+    # agent_priority: ordered list with an optional border marker that disables entries below it
+    session["agent_priority"] = normalize_agent_priority(session.get("agent_priority"))
+    # session_priority: 0–100, higher means more important (default 50)
+    try:
+        session["session_priority"] = max(0, min(100, int(session.get("session_priority", 50))))
+    except (TypeError, ValueError):
+        session["session_priority"] = 50
     session.setdefault("goal_updated_at", session.get("updated_at", utc_ts()))
     session.setdefault("last_context_status", None)
     session.setdefault("last_context_status_updated_at", session.get("updated_at", utc_ts()))
@@ -644,6 +745,82 @@ def _load_state_unlocked(runtime_root: Path) -> dict[str, Any]:
     state.pop("agent_states", None)
     state["_runtime_root"] = runtime_root
     return state
+
+
+def _guess_attachment_content_type(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+        "svg": "image/svg+xml",
+        "pdf": "application/pdf",
+    }.get(ext, "application/octet-stream")
+
+
+def write_goal_dir(runtime_root: Path, *, username: str, session_id: str, revision: dict[str, Any]) -> None:
+    """Write goal directory structure (meta.json + goal.md) for a goal revision."""
+    goal_id = str(revision.get("goal_id") or "").strip()
+    if not goal_id:
+        return
+    normalized = normalize_username(username)
+    goal_dir = session_goal_dir(runtime_root, username=normalized, session_id=session_id, goal_id=goal_id)
+    goal_dir.mkdir(parents=True, exist_ok=True)
+    meta = {k: v for k, v in revision.items() if k != "goal_text"}
+    write_json_file(goal_dir / "meta.json", meta)
+    goal_text = str(revision.get("goal_text", "") or "")
+    (goal_dir / "goal.md").write_text(goal_text, encoding="utf-8")
+
+
+def list_goal_attachments(runtime_root: Path, *, username: str, session_id: str, goal_id: str) -> list[dict[str, Any]]:
+    """List attachment metadata for a goal directory."""
+    normalized = normalize_username(username)
+    attachments_dir = session_goal_attachments_dir(
+        runtime_root, username=normalized, session_id=session_id, goal_id=goal_id
+    )
+    if not attachments_dir.exists():
+        return []
+    files: list[dict[str, Any]] = []
+    for f in sorted(attachments_dir.iterdir()):
+        if f.is_file() and not f.name.startswith("."):
+            files.append({
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "content_type": _guess_attachment_content_type(f.name),
+            })
+    return files
+
+
+def save_goal_attachment(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    goal_id: str,
+    filename: str,
+    data: bytes,
+) -> str:
+    """Save an attachment file to the goal directory. Returns the stored filename."""
+    import re
+    normalized = normalize_username(username)
+    attachments_dir = session_goal_attachments_dir(
+        runtime_root, username=normalized, session_id=session_id, goal_id=goal_id
+    )
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^\w.\-]", "_", filename)[:120] or "attachment"
+    target = attachments_dir / safe_name
+    # Avoid overwrite collision
+    if target.exists():
+        stem = safe_name.rsplit(".", 1)
+        counter = 1
+        while target.exists():
+            candidate = f"{stem[0]}_{counter}.{stem[1]}" if len(stem) == 2 else f"{safe_name}_{counter}"
+            target = attachments_dir / candidate
+            counter += 1
+    target.write_bytes(data)
+    return target.name
 
 
 def ensure_state(runtime_root: Path) -> dict[str, Any]:

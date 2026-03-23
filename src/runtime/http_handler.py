@@ -24,6 +24,7 @@ from runtime.message_builder import (
 )
 from runtime.persistent_state import (
     append_pending_input,
+    clear_session_service_runtime,
     create_conversation_session,
     create_session,
     delete_session,
@@ -38,6 +39,7 @@ from runtime.persistent_state import (
     list_sessions,
     load_agent_audit_state,
     normalize_auto_compact_threshold_left_percent,
+    normalize_agent_priority,
     register_history_subscriber,
     record_session_agent_contact,
     rename_session,
@@ -49,6 +51,15 @@ from runtime.persistent_state import (
     update_session_goal_flags,
     update_session_peer_joinable,
     update_session_selected_agents,
+    write_agent_file,
+    read_agent_file,
+    list_agent_files,
+    delete_agent_file,
+    get_agent_file_dir_acl,
+    set_agent_file_dir_acl,
+    check_agent_file_acl,
+    list_goal_attachments,
+    save_goal_attachment,
 )
 from runtime.session_view import (
     build_worker_count_summary,
@@ -66,6 +77,42 @@ DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 HTTP_EVENT_TEXT_LIMIT = 4000
 INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT = 40
+
+
+def _parse_multipart_bytes(raw: bytes, boundary: str) -> list[dict]:
+    """Minimal multipart/form-data parser. Returns list of dicts with name, filename, data."""
+    sep = ("--" + boundary).encode("utf-8")
+    end = ("--" + boundary + "--").encode("utf-8")
+    parts: list[dict] = []
+    chunks = raw.split(sep)
+    for chunk in chunks[1:]:
+        if chunk.lstrip(b"\r\n").startswith(b"--"):
+            break
+        if chunk.startswith(b"\r\n"):
+            chunk = chunk[2:]
+        if chunk.endswith(b"\r\n"):
+            chunk = chunk[:-2]
+        header_end = chunk.find(b"\r\n\r\n")
+        if header_end == -1:
+            continue
+        header_bytes = chunk[:header_end]
+        body = chunk[header_end + 4:]
+        headers: dict[str, str] = {}
+        for line in header_bytes.split(b"\r\n"):
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower().decode("utf-8", errors="replace")] = v.strip().decode("utf-8", errors="replace")
+        disposition = headers.get("content-disposition", "")
+        name = ""
+        filename = ""
+        for token in disposition.split(";"):
+            token = token.strip()
+            if token.startswith("name="):
+                name = token[5:].strip().strip('"')
+            elif token.startswith("filename="):
+                filename = token[9:].strip().strip('"')
+        parts.append({"name": name, "filename": filename, "data": body})
+    return parts
 
 
 def _truncate_http_text(value: Any, *, limit: int = HTTP_EVENT_TEXT_LIMIT) -> str:
@@ -531,7 +578,6 @@ def make_handler(
     subscribers, subscribers_lock, stopped,
     _active_goal_audits, _active_goal_audits_lock,
     _active_agent_turns, _active_agent_turns_lock,
-    control_port,
     # Nested functions from run_http_service
     release_stale_session_bindings, subscriber_key, append_history,
     send_router_control, enqueue_service_control,
@@ -605,6 +651,7 @@ def make_handler(
                 "agent_running": _agent_turn is not None,
                 "goal_manager_state": "running" if _goal_audit else "idle",
                 "goal_manager_worker": _gm_worker,
+                "parent_session_id": str(_talk.get("parent_session_id") or "").strip(),
             })
         _wc = build_worker_count_summary(service_snapshots=_snaps, session_summaries=_summaries)
         return {
@@ -705,6 +752,7 @@ def make_handler(
                     "agent_running": False,
                     "goal_manager_state": str(goal_manager_runtime.get("goal_manager_state") or "idle"),
                     "goal_manager_worker": goal_manager_runtime.get("goal_manager_worker"),
+                    "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
                 }
             )
         return summaries
@@ -874,6 +922,16 @@ def make_handler(
                 return self._do_GET_services(path, query)
             if path == "/overview":
                 return self._do_GET_overview(path, query)
+            if path == "/session/agent-file/list":
+                return self._do_GET_agent_file_list(path, query)
+            if path == "/session/agent-file/read":
+                return self._do_GET_agent_file_read(path, query)
+            if path == "/session/agent-file/acl":
+                return self._do_GET_agent_file_acl(path, query)
+            if path == "/session/goal/attachments":
+                return self._do_GET_goal_attachments(path, query)
+            if path == "/session/goal/attachment":
+                return self._do_GET_goal_attachment(path, query)
             self._json(404, {"error": "not_found"})
 
         def _do_GET_root(self, path: str, query: dict) -> None:
@@ -917,6 +975,7 @@ def make_handler(
             session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
             initial_session_label = str(session_settings.get("label", session_id))
             initial_goal_text = str(session_settings.get("goal_text", ""))
+            initial_active_goal_id = str(session_settings.get("active_goal_id", "") or "")
             initial_goal_active = bool(session_settings.get("goal_active", bool(initial_goal_text)))
             initial_goal_completed = bool(session_settings.get("goal_completed", False))
             initial_goal_progress_state = str(
@@ -945,6 +1004,11 @@ def make_handler(
             initial_auto_resume_reason = str(session_settings.get("auto_resume_reason", "") or "")
             initial_session_group = str(session_settings.get("session_group", "user") or "user")
             initial_preferred_provider = str(session_settings.get("preferred_provider", default_provider))
+            initial_agent_priority = normalize_agent_priority(session_settings.get("agent_priority"))
+            try:
+                initial_session_priority: int = max(0, min(100, int(session_settings.get("session_priority", 50))))
+            except (TypeError, ValueError):
+                initial_session_priority = 50
             initial_agent_welcome_enabled = bool(session_settings.get("agent_welcome_enabled", False))
             initial_welcomed_agents = list_session_agent_contacts(runtime_root, username=username, session_id=session_id)
             initial_selected_agents = list(session_settings.get("selected_agents", [])) if isinstance(session_settings.get("selected_agents"), list) else []
@@ -1012,6 +1076,7 @@ def make_handler(
                     initial_auto_compact_threshold=initial_auto_compact_threshold,
                     initial_session_label=initial_session_label,
                     initial_goal_text=initial_goal_text,
+                    initial_active_goal_id=initial_active_goal_id,
                     initial_goal_active=initial_goal_active,
                     initial_goal_completed=initial_goal_completed,
                     initial_goal_progress_state=initial_goal_progress_state,
@@ -1026,6 +1091,8 @@ def make_handler(
                     initial_auto_resume_reason=initial_auto_resume_reason,
                     initial_session_group=initial_session_group,
                     initial_preferred_provider=initial_preferred_provider,
+                    initial_agent_priority=initial_agent_priority,
+                    initial_session_priority=initial_session_priority,
                     initial_goal_manager_state=str(initial_goal_manager_state),
                     initial_agent_welcome_enabled=initial_agent_welcome_enabled,
                     initial_welcomed_agents=initial_welcomed_agents,
@@ -1264,6 +1331,10 @@ def make_handler(
         def do_POST(self) -> None:
             content_type = self.headers.get("Content-Type", "")
             length = int(self.headers.get("Content-Length", "0"))
+            # Multipart file uploads are handled separately (binary safe)
+            if "multipart/form-data" in content_type and self.path == "/session/goal/attach":
+                raw_bytes = self.rfile.read(length) if length else b""
+                return self._do_POST_goal_attach_multipart(raw_bytes, content_type)
             raw = self.rfile.read(length).decode("utf-8") if length else ""
             payload: dict[str, Any]
             if "application/json" in content_type:
@@ -1307,6 +1378,10 @@ def make_handler(
                 return self._do_POST_session_goal(payload)
             if self.path == "/session/goal/state":
                 return self._do_POST_session_goal_state(payload)
+            if self.path == "/session/goal/attach":
+                # Reached here only if not multipart (fallback error)
+                self._json(400, {"error": "multipart_form_data_required"})
+                return
             if self.path == "/service/control":
                 return self._do_POST_service_control(payload)
             if self.path == "/session/agent/welcome":
@@ -1315,6 +1390,12 @@ def make_handler(
                 return self._do_POST_session_peer_joinable(payload)
             if self.path == "/session/selected-agents":
                 return self._do_POST_session_selected_agents(payload)
+            if self.path == "/session/agent-file/write":
+                return self._do_POST_agent_file_write(payload)
+            if self.path == "/session/agent-file/delete":
+                return self._do_POST_agent_file_delete(payload)
+            if self.path == "/session/agent-file/acl":
+                return self._do_POST_agent_file_acl(payload)
             if self.path != "/message":
                 self._json(404, {"error": "not_found"})
                 return
@@ -1747,6 +1828,8 @@ def make_handler(
                     if "auto_resume_interval_seconds" in payload
                     else None
                 ),
+                agent_priority=payload.get("agent_priority") if "agent_priority" in payload else None,
+                session_priority=payload.get("session_priority") if "session_priority" in payload else None,
             )
             if not talk:
                 self._json(404, {"error": "session_not_found"})
@@ -1765,12 +1848,37 @@ def make_handler(
                         username=context["username"],
                         session_id=context["session_id"],
                     )
+                    clear_session_service_runtime(
+                        runtime_root,
+                        username=context["username"],
+                        session_id=context["session_id"],
+                        service_id=previous_bound_service_id,
+                    )
             released_service_id = maybe_release_session_provider(
                 runtime_root,
                 username=context["username"],
                 session_id=context["session_id"],
                 talk=talk,
             )
+            runnable_goal = bool(talk.get("goal_active", False)) and not bool(talk.get("goal_completed", False)) and (
+                str(talk.get("goal_progress_state", "in_progress")).strip().lower() == "in_progress"
+            )
+            if requested_provider in {"codex", "claude"} and runnable_goal:
+                provider_pool = codex_service_pool if requested_provider == "codex" else claude_service_pool
+                leased_service_id = lease_session_service(
+                    runtime_root,
+                    username=context["username"],
+                    session_id=context["session_id"],
+                    pool_service_ids=provider_pool,
+                )
+                if leased_service_id:
+                    record_session_agent_contact(
+                        runtime_root,
+                        username=context["username"],
+                        session_id=context["session_id"],
+                        service_id=leased_service_id,
+                        provider=requested_provider,
+                    )
             dispatched_to, dispatch_error = enqueue_goal_dispatch(
                 username=context["username"],
                 session_id=context["session_id"],
@@ -1800,6 +1908,110 @@ def make_handler(
                 },
             )
             return
+
+        def _do_POST_goal_attach_multipart(self, raw_bytes: bytes, content_type: str) -> None:
+            context = self._require_user()
+            if not context:
+                return
+            # Parse boundary from Content-Type header
+            boundary = ""
+            for part in content_type.split(";"):
+                part = part.strip()
+                if part.startswith("boundary="):
+                    boundary = part[len("boundary="):].strip().strip('"')
+                    break
+            if not boundary:
+                self._json(400, {"error": "missing_multipart_boundary"})
+                return
+            # Parse multipart parts
+            parts = _parse_multipart_bytes(raw_bytes, boundary)
+            talk = get_session_settings(
+                runtime_root, username=context["username"], session_id=context["session_id"]
+            )
+            if not talk:
+                self._json(404, {"error": "session_not_found"})
+                return
+            goal_id = str(talk.get("active_goal_id") or talk.get("goal_id") or "").strip()
+            if not goal_id:
+                self._json(400, {"error": "no_active_goal"})
+                return
+            saved: list[dict[str, Any]] = []
+            for part in parts:
+                name = part.get("name", "")
+                if name != "file":
+                    continue
+                filename = part.get("filename") or "attachment"
+                data = part.get("data", b"")
+                if not data:
+                    continue
+                stored_name = save_goal_attachment(
+                    runtime_root,
+                    username=context["username"],
+                    session_id=context["session_id"],
+                    goal_id=goal_id,
+                    filename=filename,
+                    data=data,
+                )
+                saved.append({"filename": stored_name, "size": len(data)})
+            attachments = list_goal_attachments(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                goal_id=goal_id,
+            )
+            self._json(200, {"ok": True, "saved": saved, "attachments": attachments, "goal_id": goal_id})
+
+        def _do_GET_goal_attachments(self, _path: str, query: dict) -> None:
+            context = self._require_user(query=query)
+            if not context:
+                return
+            talk = get_session_settings(
+                runtime_root, username=context["username"], session_id=context["session_id"]
+            )
+            if not talk:
+                self._json(404, {"error": "session_not_found"})
+                return
+            goal_id = str(query.get("goal_id") or talk.get("active_goal_id") or talk.get("goal_id") or "").strip()
+            if not goal_id:
+                self._json(200, {"ok": True, "attachments": [], "goal_id": ""})
+                return
+            attachments = list_goal_attachments(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                goal_id=goal_id,
+            )
+            self._json(200, {"ok": True, "attachments": attachments, "goal_id": goal_id})
+
+        def _do_GET_goal_attachment(self, _path: str, query: dict) -> None:
+            from runtime.persistent_state_pkg import session_goal_attachments_dir, normalize_username
+            context = self._require_user(query=query)
+            if not context:
+                return
+            goal_id = str(query.get("goal_id") or "").strip()
+            filename = str(query.get("filename") or "").strip()
+            if not goal_id or not filename or "/" in filename or "\\" in filename or filename.startswith("."):
+                self._json(400, {"error": "invalid_params"})
+                return
+            attachments_dir = session_goal_attachments_dir(
+                runtime_root,
+                username=normalize_username(context["username"]),
+                session_id=context["session_id"],
+                goal_id=goal_id,
+            )
+            file_path = attachments_dir / filename
+            if not file_path.exists() or not file_path.is_file():
+                self._json(404, {"error": "not_found"})
+                return
+            data = file_path.read_bytes()
+            from runtime.persistent_state_pkg._core import _guess_attachment_content_type
+            ct = _guess_attachment_content_type(filename)
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
 
         def _do_POST_service_control(self, payload: dict) -> None:
             context = self._require_user()
@@ -1906,6 +2118,236 @@ def make_handler(
                 self._json(404, {"error": "session_not_found"})
                 return
             self._json(200, {"ok": True, "session_id": session_id, "selected_agents": result.get("selected_agents", [])})
+
+        # ------------------------------------------------------------------ agent file endpoints
+
+        def _agent_file_acl_check(
+            self,
+            context: dict,
+            agent_id: str,
+            permission: str,
+        ) -> bool:
+            """Return True if the HTTP caller may perform ``permission`` on ``agent_id``'s directory.
+
+            HTTP callers that do NOT supply a ``caller_agent_id`` are treated as
+            session admin (the session owner) and always allowed.  If the session
+            has the superuser role the check is also bypassed.
+            The ``caller_agent_id`` key in the context dict is populated by the
+            handlers that extract it from the request payload / query.
+            """
+            is_superuser = bool(context.get("is_superuser"))
+            caller_agent_id = str(context.get("caller_agent_id") or "").strip()
+            if is_superuser or not caller_agent_id:
+                return True
+            return check_agent_file_acl(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                dir_agent_id=agent_id,
+                caller_agent_id=caller_agent_id,
+                permission=permission,
+            )
+
+        def _do_POST_agent_file_write(self, payload: dict) -> None:
+            """Write a file to an agent's inbox or outbox.
+
+            Body (JSON):
+              agent_id         – target directory's agent_id
+              filename         – target filename (basename only; path traversal is rejected)
+              box              – "inbox" or "outbox"
+              content_b64      – base64-encoded file content
+              caller_agent_id  – (optional) identity of the writing agent; enforces ACL when set
+            """
+            import base64
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            agent_id = str(payload.get("agent_id", "")).strip()
+            filename = str(payload.get("filename", "")).strip()
+            box = str(payload.get("box", "")).strip().lower()
+            content_b64 = str(payload.get("content_b64", "")).strip()
+            context["caller_agent_id"] = str(payload.get("caller_agent_id", "")).strip()
+            if not agent_id:
+                self._json(400, {"error": "agent_id_required"})
+                return
+            if not filename:
+                self._json(400, {"error": "filename_required"})
+                return
+            if box not in {"inbox", "outbox"}:
+                self._json(400, {"error": "box_must_be_inbox_or_outbox"})
+                return
+            if not content_b64:
+                self._json(400, {"error": "content_b64_required"})
+                return
+            if not self._agent_file_acl_check(context, agent_id, "write"):
+                self._json(403, {"error": "access_denied"})
+                return
+            try:
+                content = base64.b64decode(content_b64)
+            except Exception:
+                self._json(400, {"error": "invalid_base64"})
+                return
+            ok = write_agent_file(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                agent_id=agent_id,
+                box=box,
+                filename=filename,
+                content=content,
+            )
+            if not ok:
+                self._json(400, {"error": "write_failed"})
+                return
+            self._json(200, {"ok": True, "agent_id": agent_id, "box": box, "filename": filename, "size": len(content)})
+
+        def _do_POST_agent_file_delete(self, payload: dict) -> None:
+            """Delete a file from an agent's inbox or outbox.
+
+            Body (JSON): agent_id, filename, box, caller_agent_id (optional)
+            """
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            agent_id = str(payload.get("agent_id", "")).strip()
+            filename = str(payload.get("filename", "")).strip()
+            box = str(payload.get("box", "")).strip().lower()
+            context["caller_agent_id"] = str(payload.get("caller_agent_id", "")).strip()
+            if not agent_id or not filename or box not in {"inbox", "outbox"}:
+                self._json(400, {"error": "agent_id_filename_and_box_required"})
+                return
+            if not self._agent_file_acl_check(context, agent_id, "write"):
+                self._json(403, {"error": "access_denied"})
+                return
+            deleted = delete_agent_file(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                agent_id=agent_id,
+                box=box,
+                filename=filename,
+            )
+            self._json(200, {"ok": True, "deleted": deleted})
+
+        def _do_GET_agent_file_list(self, _path: str, query: dict) -> None:
+            """List files in an agent's inbox or outbox.
+
+            Query params: agent_id, box (inbox|outbox), caller_agent_id (optional)
+            """
+            context = self._require_user(query=query)
+            if not context:
+                return
+            agent_id = (query.get("agent_id") or [""])[0].strip()
+            box = (query.get("box") or [""])[0].strip().lower()
+            context["caller_agent_id"] = (query.get("caller_agent_id") or [""])[0].strip()
+            if not agent_id or box not in {"inbox", "outbox"}:
+                self._json(400, {"error": "agent_id_and_box_required"})
+                return
+            if not self._agent_file_acl_check(context, agent_id, "read"):
+                self._json(403, {"error": "access_denied"})
+                return
+            files = list_agent_files(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                agent_id=agent_id,
+                box=box,
+            )
+            self._json(200, {"ok": True, "agent_id": agent_id, "box": box, "files": files})
+
+        def _do_GET_agent_file_read(self, _path: str, query: dict) -> None:
+            """Read (download) a file from an agent's inbox or outbox.
+
+            Query params: agent_id, box (inbox|outbox), filename, caller_agent_id (optional)
+            Returns JSON: {ok, agent_id, box, filename, size, content_b64}
+            """
+            import base64
+            context = self._require_user(query=query)
+            if not context:
+                return
+            agent_id = (query.get("agent_id") or [""])[0].strip()
+            box = (query.get("box") or [""])[0].strip().lower()
+            filename = (query.get("filename") or [""])[0].strip()
+            context["caller_agent_id"] = (query.get("caller_agent_id") or [""])[0].strip()
+            if not agent_id or box not in {"inbox", "outbox"} or not filename:
+                self._json(400, {"error": "agent_id_box_and_filename_required"})
+                return
+            if not self._agent_file_acl_check(context, agent_id, "read"):
+                self._json(403, {"error": "access_denied"})
+                return
+            content = read_agent_file(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                agent_id=agent_id,
+                box=box,
+                filename=filename,
+            )
+            if content is None:
+                self._json(404, {"error": "file_not_found"})
+                return
+            self._json(200, {
+                "ok": True,
+                "agent_id": agent_id,
+                "box": box,
+                "filename": filename,
+                "size": len(content),
+                "content_b64": base64.b64encode(content).decode("ascii"),
+            })
+
+        def _do_GET_agent_file_acl(self, _path: str, query: dict) -> None:
+            """Get the ACL for an agent file directory.
+
+            Query params: agent_id
+            """
+            context = self._require_user(query=query)
+            if not context:
+                return
+            agent_id = (query.get("agent_id") or [""])[0].strip()
+            if not agent_id:
+                self._json(400, {"error": "agent_id_required"})
+                return
+            acl = get_agent_file_dir_acl(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                agent_id=agent_id,
+            )
+            self._json(200, {"ok": True, "agent_id": agent_id, "acl": acl})
+
+        def _do_POST_agent_file_acl(self, payload: dict) -> None:
+            """Set (update) the ACL for an agent file directory.
+
+            Body (JSON):
+              agent_id – the target directory's agent_id (required)
+              owner    – new owner agent_id (optional)
+              grants   – list of {agent_id, permissions:[\"read\",\"write\"]} (optional)
+
+            Only the session owner (HTTP user) or a superuser may modify the ACL.
+            """
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            agent_id = str(payload.get("agent_id", "")).strip()
+            if not agent_id:
+                self._json(400, {"error": "agent_id_required"})
+                return
+            owner = payload.get("owner")
+            grants = payload.get("grants")
+            if owner is not None:
+                owner = str(owner).strip()
+            if grants is not None and not isinstance(grants, list):
+                self._json(400, {"error": "grants_must_be_list"})
+                return
+            acl = set_agent_file_dir_acl(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+                agent_id=agent_id,
+                owner=owner,
+                grants=grants,
+            )
+            self._json(200, {"ok": True, "agent_id": agent_id, "acl": acl})
 
         def _do_POST_message(self, payload: dict, content_type: str) -> None:
             context = self._require_user(payload=payload)
@@ -2061,19 +2503,26 @@ def make_handler(
                         or default_provider
                     )
                     # selected_agents overrides provider routing when present.
-                    # If the list contains only WS-peer service_ids (no pool token)
-                    # we skip the local LLM entirely — the subscribed WS peer will
-                    # receive the session_event and respond via its event pump.
+                    # If the list contains only WS-peer service_ids (no pool token and
+                    # no individual local service_id) we skip the local LLM entirely.
                     selected_agents_cfg = list(session_settings.get("selected_agents", []))
-                    ws_only_mode = bool(selected_agents_cfg) and not any(
-                        a in {"codex_pool", "claude_pool"} for a in selected_agents_cfg
+                    all_local_service_ids = set(codex_service_pool) | set(claude_service_pool)
+                    has_local = any(
+                        a in {"codex_pool", "claude_pool"} or a in all_local_service_ids
+                        for a in selected_agents_cfg
                     )
+                    ws_only_mode = bool(selected_agents_cfg) and not has_local
                     provider_pool = codex_service_pool if preferred_provider == "codex" else claude_service_pool
                     # When codex_pool or claude_pool is explicitly selected, prefer that pool.
                     if "codex_pool" in selected_agents_cfg:
                         provider_pool = codex_service_pool
                     elif "claude_pool" in selected_agents_cfg:
                         provider_pool = claude_service_pool
+                    else:
+                        # When individual local service_ids are selected, restrict pool to those.
+                        selected_local = [a for a in selected_agents_cfg if a in all_local_service_ids]
+                        if selected_local:
+                            provider_pool = selected_local
                     leased_service_id = get_session_service(
                         runtime_root,
                         username=username,

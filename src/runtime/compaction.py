@@ -140,7 +140,7 @@ def maybe_resume_after_restart(
     process_id: str,
     log_path: Path,
     service_id: str,
-    tx_port: Path,
+    router_conn: Any,
     service_kind: str = "codex",
 ) -> None:
     restart_resume = dict(self_service.get("config", {})).get("restart_resume")
@@ -152,6 +152,21 @@ def maybe_resume_after_restart(
         session_entries = list_claude_sessions(runtime_root, service_id=service_id)
     else:
         session_entries = list_codex_sessions(runtime_root, service_id=service_id)
+    filtered_session_entries: list[dict[str, str | None]] = []
+    for entry in session_entries:
+        username = entry.get("username")
+        session_id = entry.get("conversation_session_id") or entry.get("session_id")
+        if not isinstance(username, str) or not isinstance(session_id, str):
+            continue
+        talk = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+        preferred_provider = str(talk.get("preferred_provider") or service_kind).strip().lower() or service_kind
+        bound_service_id = str(talk.get("service_id") or "").strip()
+        if preferred_provider and preferred_provider != service_kind:
+            continue
+        if bound_service_id and bound_service_id != service_id:
+            continue
+        filtered_session_entries.append(entry)
+    session_entries = filtered_session_entries
     session_entry_map: dict[tuple[str, str], dict[str, str | None]] = {}
     for entry in session_entries:
         username = entry.get("username")
@@ -180,13 +195,30 @@ def maybe_resume_after_restart(
 
     def has_unfinished_turn(username: str, session_id: str) -> bool:
         history = get_user_history(runtime_root, username=username, session_id=session_id)
-        last_user_out_ts = None
-        last_turn_completed_ts = None
+        last_user_out_ts = ""
+        last_turn_completed_ts = ""
+        last_turn_activity_ts = ""
         for entry in history:
-            if str(entry.get("direction")) == "out":
-                last_user_out_ts = str(entry.get("ts") or "")
-            if str(entry.get("event_type")) == "turn.completed":
-                last_turn_completed_ts = str(entry.get("ts") or "")
+            ts = str(entry.get("ts") or "")
+            direction = str(entry.get("direction") or "")
+            event_type = str(entry.get("event_type") or "")
+            if direction == "out":
+                last_user_out_ts = ts
+            if event_type in {
+                "agent.turn_started",
+                "thread.started",
+                "turn.started",
+                "item.started",
+            }:
+                if ts >= last_turn_activity_ts:
+                    last_turn_activity_ts = ts
+            if direction == "in":
+                if ts >= last_turn_activity_ts:
+                    last_turn_activity_ts = ts
+            if event_type == "turn.completed":
+                last_turn_completed_ts = ts
+        if last_turn_activity_ts and last_turn_activity_ts > last_turn_completed_ts:
+            return True
         if not last_user_out_ts:
             return False
         if not last_turn_completed_ts:
@@ -355,8 +387,24 @@ def maybe_resume_after_restart(
         dangling_goal_audit = should_standard_goal_route and has_dangling_goal_audit(scope_username, scope_session_id)
         should_resume_unfinished = (
             not goal_completed
-            and (unfinished_turn or has_actionable_pending or dangling_goal_audit or has_unreviewed_turn_completed or isinstance(due_auto_resume, dict))
+            and (
+                unfinished_turn
+                or has_actionable_pending
+                or dangling_goal_audit
+                or has_unreviewed_turn_completed
+                or isinstance(due_auto_resume, dict)
+            )
         )
+        # If the provider session itself is gone after restart, an active in-progress talk still
+        # needs a reconstructive restart turn even when no pending queue entry survived.
+        if (
+            not should_resume_unfinished
+            and recovery_mode == "reconstruct_without_session"
+            and goal_active
+            and not goal_completed
+            and goal_progress_state == "in_progress"
+        ):
+            should_resume_unfinished = True
         if (
             not should_resume_unfinished
             and goal_active
@@ -438,9 +486,7 @@ def maybe_resume_after_restart(
                             service_id=service_id,
                         ),
                     )
-                    with tx_port.open("w", encoding="utf-8") as tx_handle:
-                        tx_handle.write(encode_line(dispatch_message))
-                        tx_handle.flush()
+                    router_conn.write(encode_line(dispatch_message))
                     write_jsonl(
                         log_path,
                         {
@@ -483,7 +529,13 @@ def maybe_resume_after_restart(
             )
             continue
         run_id = f"system-restart-{int(time.time())}"
-        if unfinished_turn or has_actionable_pending or dangling_goal_audit or isinstance(due_auto_resume, dict):
+        if (
+            unfinished_turn
+            or has_actionable_pending
+            or dangling_goal_audit
+            or isinstance(due_auto_resume, dict)
+            or recovery_mode == "reconstruct_without_session"
+        ):
             scope_session_dir = session_dir(
                 runtime_root,
                 username=scope_username,
@@ -549,9 +601,7 @@ def maybe_resume_after_restart(
                 service_id=service_id,
             ),
         )
-        with tx_port.open("w", encoding="utf-8") as tx_handle:
-            tx_handle.write(encode_line(dispatch_message))
-            tx_handle.flush()
+        router_conn.write(encode_line(dispatch_message))
         restart_resume_event = {
             "type": "service.restart_resume_enqueued",
             "ts": utc_ts(),

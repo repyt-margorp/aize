@@ -1,0 +1,14 @@
+{
+  "kind": "codex",
+  "id_prefix": "service-codex",
+  "pool_size_env": "AIZE_CODEX_POOL_SIZE",
+  "pool_size_default": 5,
+  "display_name_template": "CodexFox {index}",
+  "persona": "You are Codex running inside the Aize HTTP mesh. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
+  "max_turns": 100,
+  "response_schema_id": "service_control_v1",
+  "config_env": {
+    "model": {"env": "AIZE_CODEX_MODEL", "default": "gpt-5.4"}
+  },
+  "enabled": true
+}

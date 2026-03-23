@@ -3,7 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ._core import normalize_username, read_json_file, sessions_dir, session_metadata_path, session_service_state_path, state_lock, write_json_file
+from ._core import (
+    normalize_username,
+    read_json_file,
+    sessions_dir,
+    session_metadata_path,
+    session_service_pending_path,
+    session_service_state_path,
+    state_lock,
+    write_json_file,
+)
 
 
 def load_claude_session(
@@ -52,6 +61,38 @@ def save_claude_session(
             else:
                 service_state.pop("claude_session_id", None)
             write_json_file(service_state_path, service_state)
+
+
+def clear_session_service_runtime(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+) -> None:
+    normalized = normalize_username(username)
+    normalized_service_id = str(service_id or "").strip()
+    if not normalized_service_id:
+        return
+    with state_lock(runtime_root):
+        service_state_path = session_service_state_path(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+            service_id=normalized_service_id,
+        )
+        audit_state_path = service_state_path.with_suffix(".audit.json")
+        pending_path = session_service_pending_path(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+            service_id=normalized_service_id,
+        )
+        for path in (service_state_path, audit_state_path, pending_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
 
 
 def load_codex_session(
