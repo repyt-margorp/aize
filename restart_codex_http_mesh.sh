@@ -2,18 +2,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${ROOT:-$SCRIPT_DIR}"
-RUNTIME_ROOT="${AIZE_RUNTIME_ROOT:-$ROOT/.agent-mesh-runtime}"
-HTTP_HOST="${AIZE_HTTP_HOST:-0.0.0.0}"
-HTTP_PORT="${AIZE_HTTP_PORT:-4123}"
-LOG_PATH="${LOG_PATH:-$ROOT/.temp/restart-debug/launcher.log}"
-SUPERVISOR_LOG_PATH="${SUPERVISOR_LOG_PATH:-$ROOT/.temp/restart-debug/restart-supervisor.log}"
-RESTART_LOCK_PATH="${RESTART_LOCK_PATH:-$ROOT/.temp/restart-debug/restart.lock}"
+ROOT="$SCRIPT_DIR"
+RUNTIME_ROOT="$ROOT/.agent-mesh-runtime"
+HTTP_HOST="0.0.0.0"
+HTTP_PORT="4123"
+LOG_PATH="$ROOT/.temp/restart-debug/launcher.log"
+SUPERVISOR_LOG_PATH="$ROOT/.temp/restart-debug/restart-supervisor.log"
+RESTART_LOCK_PATH="$ROOT/.temp/restart-debug/restart.lock"
 PYTHON="${PYTHON:-/usr/bin/python3}"
-HEALTH_URL="${HEALTH_URL:-https://$HTTP_HOST:$HTTP_PORT/health}"
-START_TIMEOUT_SECONDS="${START_TIMEOUT_SECONDS:-20}"
+HEALTH_URL="https://$HTTP_HOST:$HTTP_PORT/health"
+START_TIMEOUT_SECONDS="20"
 
-parent_pattern='cli.run_codex_http_mesh'
+parent_pattern="cli.run_codex_http_mesh --runtime-root $RUNTIME_ROOT"
 router_pattern="python3 -m kernel.router --manifest $RUNTIME_ROOT/manifest.json"
 adapter_pattern="python3 -m runtime.cli_service_adapter --manifest $RUNTIME_ROOT/manifest.json"
 
@@ -115,9 +115,9 @@ log "adapter processes terminated"
 
 cd "$ROOT"
 if command -v setsid >/dev/null 2>&1; then
-  nohup setsid /bin/bash -lc "exec 9>&-; cd '$ROOT' && env PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' '$PYTHON' -m cli.run_codex_http_mesh" >"$LOG_PATH" 2>&1 </dev/null &
+  nohup setsid /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
 else
-  nohup /bin/bash -lc "exec 9>&-; cd '$ROOT' && env PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' '$PYTHON' -m cli.run_codex_http_mesh" >"$LOG_PATH" 2>&1 </dev/null &
+  nohup /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
 fi
 new_pid=$!
 log "launched new parent pid=$new_pid"

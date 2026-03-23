@@ -159,6 +159,7 @@ from runtime.panic_recovery import (
     panic_recovery_bootstrap_xml,
 )
 from runtime.agent_service import run_agent_service
+from runtime.ws_peer_client import start_ws_peer_clients
 
 DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
@@ -1006,6 +1007,20 @@ def run_http_service(
         server.socket = tls_ctx.wrap_socket(server.socket, server_side=True)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+
+    # Start outbound WS peer client connections (config from runtime/ws_peer_clients.json)
+    start_ws_peer_clients(
+        runtime_root,
+        manifest=manifest,
+        self_service=self_service,
+        process_id=process_id,
+        log_path=log_path,
+        codex_service_pool=codex_service_pool,
+        claude_service_pool=claude_service_pool,
+        append_history=append_history,
+        stopped=stopped,
+    )
+
     write_jsonl(
         log_path,
         {

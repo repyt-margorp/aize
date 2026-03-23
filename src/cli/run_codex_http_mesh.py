@@ -13,16 +13,38 @@ import re
 from collections import defaultdict
 
 
+# Accept --runtime-root as a CLI arg so the runtime root appears in the process
+# command line, enabling per-instance pgrep matching in restart scripts.
+_cli_runtime_root: str | None = None
+for _i, _arg in enumerate(sys.argv[1:], 1):
+    if _arg == "--runtime-root" and _i < len(sys.argv):
+        _cli_runtime_root = sys.argv[_i + 1]
+        break
+    if _arg.startswith("--runtime-root="):
+        _cli_runtime_root = _arg.split("=", 1)[1]
+        break
+
 ROOT = Path(os.environ.get("AIZE_ROOT", Path(__file__).resolve().parents[2]))
-RUNTIME_ROOT = Path(os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".agent-mesh-runtime")))
+RUNTIME_ROOT = Path(
+    _cli_runtime_root
+    or os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".agent-mesh-runtime"))
+)
 PORTS = RUNTIME_ROOT / "ports"
 LOGS = RUNTIME_ROOT / "logs"
 OBJECTS = RUNTIME_ROOT / "objects"
 STATE = RUNTIME_ROOT / "state"
 MANIFEST = RUNTIME_ROOT / "manifest.json"
 NODE_ID = os.environ.get("AIZE_NODE_ID") or f"node-{re.sub(r'[^a-z0-9]+', '-', ROOT.name.lower()).strip('-') or 'local'}"
-HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))
+PRIMARY_RUNTIME_ROOT = (ROOT / ".agent-mesh-runtime").resolve()
+ALLOW_PRIMARY_HTTP_OVERRIDE = os.environ.get("AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}
+if RUNTIME_ROOT.resolve() == PRIMARY_RUNTIME_ROOT and not ALLOW_PRIMARY_HTTP_OVERRIDE:
+    HTTP_HOST = "0.0.0.0"
+    HTTP_PORT = 4123
+    HTTP_TLS = True
+else:
+    HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
+    HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))
+    HTTP_TLS = os.environ.get("AIZE_TLS", "true").strip().lower() not in {"false", "0", "no", "off"}
 CODEX_MODEL = str(os.environ.get("AIZE_CODEX_MODEL", "gpt-5.3-codex-spark")).strip() or "gpt-5.3-codex-spark"
 CODEX_POOL_SIZE = int(os.environ.get("AIZE_CODEX_POOL_SIZE", "5"))
 CLAUDE_POOL_SIZE = int(os.environ.get("AIZE_CLAUDE_POOL_SIZE", "5"))
@@ -73,7 +95,7 @@ def build_core_manifest() -> dict:
             "config": {
                 "host": HTTP_HOST,
                 "port": HTTP_PORT,
-                "tls_enabled": True,
+                "tls_enabled": HTTP_TLS,
                 "default_target": CODEX_POOL_SERVICE_IDS[0],
                 "default_provider": "codex",
                 "history_limit": 100,
@@ -240,9 +262,15 @@ def bootstrap_runtime() -> dict:
             for f in tls_dir.iterdir():
                 if f.is_file():
                     saved_tls[f.name] = f.read_bytes()
+        # Preserve ws_peer_clients.json (outbound peer client config).
+        ws_peer_clients_path = RUNTIME_ROOT / "ws_peer_clients.json"
+        saved_ws_peer_clients: bytes | None = (
+            ws_peer_clients_path.read_bytes() if ws_peer_clients_path.exists() else None
+        )
         shutil.rmtree(RUNTIME_ROOT)
     else:
         saved_tls = {}
+        saved_ws_peer_clients = None
     PORTS.mkdir(parents=True)
     LOGS.mkdir(parents=True)
     OBJECTS.mkdir(parents=True)
@@ -255,6 +283,8 @@ def bootstrap_runtime() -> dict:
             dest = tls_restore / name
             dest.write_bytes(data)
             dest.chmod(0o600 if name.endswith(".key") else 0o644)
+    if saved_ws_peer_clients is not None:
+        (RUNTIME_ROOT / "ws_peer_clients.json").write_bytes(saved_ws_peer_clients)
     manifest = write_manifest(extra_services=extra_services, extra_routes=extra_routes, restart_resume=restart_resume)
     for service in manifest["services"]:
         service_id = service["service_id"]
@@ -266,6 +296,7 @@ def bootstrap_runtime() -> dict:
 def spawn_logged(name: str, *argv: str) -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
+    env["AIZE_TLS"] = "true" if HTTP_TLS else "false"
     LOGS.mkdir(parents=True, exist_ok=True)
     stdout_handle = (LOGS / f"{name}.stdout.log").open("a", encoding="utf-8")
     stderr_handle = (LOGS / f"{name}.stderr.log").open("a", encoding="utf-8")

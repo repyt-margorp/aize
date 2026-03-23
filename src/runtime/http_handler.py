@@ -2117,17 +2117,47 @@ def make_handler(
                             username=username,
                             session_id=session_id,
                         )
+                    # Determine display target for history entry
+                    if ws_only_mode:
+                        display_to = "pending:ws_peer"
+                    elif to_service:
+                        display_to = to_service
+                    else:
+                        display_to = f"pending:{preferred_provider}"
                     append_history(
                         username,
                         session_id,
                         {
                             "direction": "out",
                             "ts": utc_ts(),
-                            "to": to_service or f"pending:{preferred_provider}",
+                            "to": display_to,
                             "session_id": session_id,
                             "text": prompt_text,
                         },
                     )
+                    # When WS-only, write a degraded-state event if no WS peer is
+                    # actively subscribed (no live connection joined the session).
+                    if ws_only_mode:
+                        from runtime.persistent_state_pkg import list_session_agent_contacts
+                        _ws_agents = [
+                            a for a in list_session_agent_contacts(
+                                runtime_root, username=username, session_id=session_id
+                            )
+                            if str(a.get("provider", "")) == "ws_peer"
+                        ]
+                        if not _ws_agents:
+                            append_history(
+                                username,
+                                session_id,
+                                {
+                                    "direction": "event",
+                                    "ts": utc_ts(),
+                                    "session_id": session_id,
+                                    "event_type": "ws_peer.no_agent",
+                                    "text": "No WS peer agent is registered for this session. Prompt queued — will be processed on next connection.",
+                                    "event": {"type": "ws_peer.no_agent"},
+                                },
+                            )
                     append_pending_input(
                         runtime_root,
                         username=username,

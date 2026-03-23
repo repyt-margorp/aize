@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import struct
 from typing import IO
 
@@ -82,6 +83,28 @@ def write_close_frame(wfile: IO[bytes], code: int = 1000) -> None:
 def write_pong_frame(wfile: IO[bytes], payload: bytes = b"") -> None:
     """Write a WebSocket pong frame (echo of ping payload)."""
     _write_frame(wfile, OP_PONG, payload)
+
+
+def write_masked_text_frame(wfile: IO[bytes], text: str) -> None:
+    """Write a masked WebSocket text frame (RFC 6455 client→server requirement)."""
+    payload = text.encode("utf-8")
+    mask_key = os.urandom(4)
+    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    b0 = 0x80 | OP_TEXT
+    length = len(masked)
+    header = bytearray([b0])
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", length))
+    header.extend(mask_key)
+    wfile.write(bytes(header))
+    wfile.write(masked)
+    wfile.flush()
 
 
 def _write_frame(wfile: IO[bytes], opcode: int, payload: bytes) -> None:
