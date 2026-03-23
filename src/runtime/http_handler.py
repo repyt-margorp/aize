@@ -1408,9 +1408,6 @@ def make_handler(
 
         def _do_POST_bootstrap(self, payload: dict, content_type: str) -> None:
             password = str(payload.get("password", ""))
-            if len(password) < 8:
-                self._json(400, {"error": "password_too_short"})
-                return
             ok, result = bootstrap_root_user(runtime_root, password=password)
             if not ok:
                 self._json(400, {"error": result})
@@ -1526,9 +1523,6 @@ def make_handler(
                 return
             username = str(payload.get("username", "")).strip()
             password = str(payload.get("password", ""))
-            if len(password) < 8:
-                self._json(400, {"error": "password_too_short"})
-                return
             ok, result = create_user(runtime_root, username=username, password=password)
             if not ok:
                 self._json(400, {"error": result})
