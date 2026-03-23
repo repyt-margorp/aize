@@ -20,6 +20,9 @@ from runtime.persistent_state import (
 from runtime.service_control import parse_service_response
 
 
+TEST_USERNAME = "test-user"
+
+
 class ServiceControlParserTests(unittest.TestCase):
     def test_parse_service_response_rejects_missing_comma_with_json_decode_shape(self) -> None:
         malformed = '{"assistant_text":"ok" "spawn_requests":[]}'
@@ -41,7 +44,7 @@ class PanicRecoveryReturnPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.runtime_root = Path(self.tempdir.name)
-        self.username = "repyt"
+        self.username = TEST_USERNAME
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -103,7 +106,7 @@ class PanicRecoveryDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.runtime_root = Path(self.tempdir.name)
-        self.username = "repyt"
+        self.username = TEST_USERNAME
         self.manifest = {"node_id": "node-aize"}
 
     def tearDown(self) -> None:

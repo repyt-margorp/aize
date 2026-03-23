@@ -71,13 +71,16 @@ from runtime.persistent_state import (  # noqa: E402
 )
 
 
+TEST_USERNAME = "test-user"
+
+
 class GoalManagerCompactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.runtime_root = Path(self.tempdir.name)
         ensure_state(self.runtime_root)
         (self.runtime_root / "logs").mkdir(parents=True, exist_ok=True)
-        talk = create_conversation_session(self.runtime_root, username="repyt", label="Goal Talk")
+        talk = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Goal Talk")
         self.session_id = str(talk["session_id"])
 
     def tearDown(self) -> None:
@@ -100,7 +103,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             {
                 "ts": "2026-03-19T09:00:00Z",
                 "type": "service.goal_audit_started",
-                "scope": {"username": "repyt", "session_id": self.session_id},
+                "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
                 "run_id": "run-1",
             },
             {
@@ -121,7 +124,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         bundle_path, count = build_goal_audit_log_bundle(
             runtime_root=self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
         )
 
@@ -208,7 +211,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         ):
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -224,21 +227,21 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_record_session_agent_contact_preserves_fifo_order(self) -> None:
         record_session_agent_contact(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             service_id="service-codex-001",
             provider="codex",
         )
         record_session_agent_contact(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             service_id="service-claude-001",
             provider="claude",
         )
         record_session_agent_contact(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             service_id="service-codex-001",
             provider="codex",
@@ -247,7 +250,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         contacts = list_session_agent_contacts(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
         )
 
@@ -257,13 +260,13 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_session_history_is_written_to_timeline_jsonl(self) -> None:
         append_history(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             entry={"direction": "in", "ts": "2026-03-22T19:00:00Z", "text": "hello"},
             limit=20,
         )
 
-        timeline_path = self.runtime_root.parent / ".aize-state" / "sessions" / "repyt" / self.session_id / "timeline.jsonl"
+        timeline_path = self.runtime_root.parent / ".aize-state" / "sessions" / TEST_USERNAME / self.session_id / "timeline.jsonl"
         self.assertTrue(timeline_path.exists())
         lines = timeline_path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 1)
@@ -272,7 +275,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_goal_manager_fifo_is_session_scoped(self) -> None:
         pending = append_goal_manager_pending_input(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             entry={"kind": "turn_completed", "ts": "2026-03-22T19:00:01Z", "service_id": "service-codex-001"},
         )
@@ -281,7 +284,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             self.runtime_root.parent
             / ".aize-state"
             / "sessions"
-            / "repyt"
+            / TEST_USERNAME
             / self.session_id
             / "pending"
             / "goal_manager.jsonl"
@@ -290,7 +293,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         loaded = load_goal_manager_pending_inputs(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
         )
         self.assertEqual(loaded[0]["kind"], "turn_completed")
@@ -298,7 +301,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_session_storage_bootstraps_goal_manager_and_dag_files(self) -> None:
         goal_manager_state_path = session_goal_manager_state_path(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
         )
         self.assertTrue(goal_manager_state_path.exists())
@@ -306,7 +309,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(
             session_goal_manager_reviews_path(
                 self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
             ).exists()
         )
@@ -314,7 +317,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             json.loads(
                 session_dag_parents_path(
                     self.runtime_root,
-                    username="repyt",
+                    username=TEST_USERNAME,
                     session_id=self.session_id,
                 ).read_text(encoding="utf-8")
             )["parents"],
@@ -324,7 +327,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             json.loads(
                 session_dag_children_path(
                     self.runtime_root,
-                    username="repyt",
+                    username=TEST_USERNAME,
                     session_id=self.session_id,
                 ).read_text(encoding="utf-8")
             )["children"],
@@ -336,7 +339,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             self.runtime_root,
             service_id="service-codex-001",
             provider_session_id="thread-123",
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
         )
 
@@ -344,7 +347,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             self.runtime_root.parent
             / ".aize-state"
             / "sessions"
-            / "repyt"
+            / TEST_USERNAME
             / self.session_id
             / "services"
             / "service-codex-001.json"
@@ -356,7 +359,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_goal_state_response_payload_includes_agent_welcome_toggle(self) -> None:
         talk = update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             agent_welcome_enabled=True,
         )
@@ -412,7 +415,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         append_pending_input(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             entry={
                 "kind": "turn_completed",
@@ -434,7 +437,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         verified = collect_and_verify_turn_completed_artifacts(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             last_reviewed_turn_completed_at="",
         )
@@ -466,7 +469,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_completed_goal_releases_session_provider(self) -> None:
         released = maybe_release_session_provider(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             talk={
                 "goal_active": True,
@@ -510,7 +513,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             service_id="service-codex-001",
             process_id="proc-1",
             goal_audit_job_id="job-1",
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             audit=audit,
         )
@@ -521,24 +524,24 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(written[0]["audit_state"], "needs_compact")
         self.assertTrue(written[0]["request_compact"])
         self.assertEqual(written[0]["request_compact_reason"], "Repeatedly ignored guidance")
-        history = get_history(self.runtime_root, username="repyt", session_id=self.session_id)
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertEqual(history[0]["event"]["audit_state"], "needs_compact")
         self.assertEqual(history[0]["event"]["request_compact_reason"], "Repeatedly ignored guidance")
 
     def test_goal_auto_compact_state_round_trip_payload(self) -> None:
         from runtime.persistent_state import update_session_goal
 
-        update_session_goal(self.runtime_root, username="repyt", session_id=self.session_id, goal_text="Ship it")
+        update_session_goal(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id, goal_text="Ship it")
         talk = update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_auto_compact_enabled=True,
             goal_reset_completed_on_prompt=False,
         )
         assert talk is not None
 
-        stored = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
         payload = goal_state_response_payload(stored, session_id=self.session_id, default_provider="codex")
 
@@ -554,14 +557,14 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         first = update_session_goal(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_text="First goal",
         )
         assert first is not None
         second = update_session_goal(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_text="Second goal",
         )
@@ -579,14 +582,14 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         first = update_session_goal(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_text="First goal",
         )
         assert first is not None
         second = update_session_goal(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_text="Second goal",
         )
@@ -594,7 +597,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         talk = update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_id=first["goal_id"],
             goal_progress_state="complete",
@@ -613,10 +616,10 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_no_goal_mode_forces_inactive_state(self) -> None:
         from runtime.persistent_state import update_session_goal
 
-        update_session_goal(self.runtime_root, username="repyt", session_id=self.session_id, goal_text="")
+        update_session_goal(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id, goal_text="")
         talk = update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_active=True,
             goal_progress_state="complete",
@@ -678,7 +681,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(summary["goal_manager_worker"]["slot"], 2)
 
     def test_talk_records_are_normalized_to_session_ids(self) -> None:
-        stored = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
         self.assertEqual(stored["session_id"], self.session_id)
         self.assertEqual(stored["session_id"], self.session_id)
@@ -688,7 +691,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             self.runtime_root,
             service_id="service-codex-001",
             provider_session_id="provider-session-1",
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
         )
         sessions = list_codex_sessions(self.runtime_root, service_id="service-codex-001")
@@ -699,32 +702,32 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_create_child_conversation_session_persists_dag_edges(self) -> None:
         child = create_child_conversation_session(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             parent_session_id=self.session_id,
             label="Subgoal",
             goal_text="Do child work",
         )
         assert child is not None
         child_id = str(child["session_id"])
-        self.assertEqual(list_session_children(self.runtime_root, username="repyt", session_id=self.session_id), [child_id])
-        self.assertEqual(list_session_parents(self.runtime_root, username="repyt", session_id=child_id), [self.session_id])
-        stored_parent = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        self.assertEqual(list_session_children(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id), [child_id])
+        self.assertEqual(list_session_parents(self.runtime_root, username=TEST_USERNAME, session_id=child_id), [self.session_id])
+        stored_parent = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored_parent is not None
         self.assertTrue(stored_parent["waiting_on_children"])
 
     def test_add_session_child_rejects_cycle(self) -> None:
-        child = create_conversation_session(self.runtime_root, username="repyt", label="Child")
+        child = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Child")
         child_id = str(child["session_id"])
         add_session_child(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             parent_session_id=self.session_id,
             child_session_id=child_id,
         )
         with self.assertRaisesRegex(ValueError, "session_dag_cycle"):
             add_session_child(
                 self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 parent_session_id=child_id,
                 child_session_id=self.session_id,
             )
@@ -732,7 +735,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_complete_session_child_clears_waiting_on_children(self) -> None:
         child = create_child_conversation_session(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             parent_session_id=self.session_id,
             label="Subgoal",
             goal_text="Do child work",
@@ -741,7 +744,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         child_id = str(child["session_id"])
         update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=child_id,
             goal_completed=True,
             goal_progress_state="complete",
@@ -749,14 +752,14 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         progress = complete_session_child(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             parent_session_id=self.session_id,
             child_session_id=child_id,
         )
 
         assert progress is not None
         self.assertFalse(progress["waiting_on_children"])
-        stored_parent = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        stored_parent = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored_parent is not None
         self.assertFalse(stored_parent["waiting_on_children"])
 
@@ -766,9 +769,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         legacy_state_path.write_text(
             json.dumps(
                 {
-                    "users": {"repyt": {"username": "repyt"}},
-                    "sessions": {"token-hash": {"username": "repyt", "active_session_id": self.session_id}},
-                    "talks": {"repyt": [{"session_id": self.session_id, "label": "Legacy Talk"}]},
+                    "users": {TEST_USERNAME: {"username": TEST_USERNAME}},
+                    "sessions": {"token-hash": {"username": TEST_USERNAME, "active_session_id": self.session_id}},
+                    "talks": {TEST_USERNAME: [{"session_id": self.session_id, "label": "Legacy Talk"}]},
                 }
             ),
             encoding="utf-8",
@@ -843,16 +846,16 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         talk = update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             preferred_provider="claude",
         )
         assert talk is not None
         talk["service_id"] = "service-claude-001"
-        session = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        session = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert session is not None
         session["service_id"] = "service-claude-001"
-        write_json_file(session_metadata_path(self.runtime_root, username="repyt", session_id=self.session_id), session)
+        write_json_file(session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id), session)
 
         released = release_nonrunnable_session_services(self.runtime_root)
 
@@ -862,7 +865,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         ]
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0]["reason"], "service_status:stopped")
-        stored = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
         self.assertIsNone(stored.get("service_id"))
 
@@ -898,7 +901,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             process_id="proc-service-claude-001",
             status="running",
         )
-        session = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        session = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert session is not None
         session["service_id"] = "service-claude-001"
         session["preferred_provider"] = "claude"
@@ -906,12 +909,12 @@ class GoalManagerCompactTests(unittest.TestCase):
         session["goal_active"] = True
         session["goal_progress_state"] = "in_progress"
         session["goal_completed"] = False
-        write_json_file(session_metadata_path(self.runtime_root, username="repyt", session_id=self.session_id), session)
+        write_json_file(session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id), session)
 
         released = release_nonrunnable_session_services(self.runtime_root)
 
         self.assertEqual(released, [])
-        stored = get_session_settings(self.runtime_root, username="repyt", session_id=self.session_id)
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
         self.assertEqual(stored.get("service_id"), "service-claude-001")
 
@@ -935,7 +938,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         ):
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -949,7 +952,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_run_goal_audit_parses_agent_directives(self) -> None:
         record_session_agent_contact(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             service_id="service-codex-001",
             provider="codex",
@@ -982,7 +985,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         ):
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -1021,7 +1024,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         ):
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -1056,7 +1059,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch("runtime.cli_service_adapter.run_codex", side_effect=fake_run_codex):
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -1090,7 +1093,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch("runtime.cli_service_adapter.run_codex", side_effect=fake_run_codex):
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -1123,7 +1126,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         ) as claude_mock, patch("runtime.cli_service_adapter.run_codex") as codex_mock:
             audit = run_goal_audit(
                 runtime_root=self.runtime_root,
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 goal_text="Ship it",
                 history_entries=[],
@@ -1175,7 +1178,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_handle_goal_manager_compact_request_is_suppressed_when_toggle_off(self) -> None:
         update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_auto_compact_enabled=False,
         )
@@ -1192,7 +1195,7 @@ class GoalManagerCompactTests(unittest.TestCase):
                 service_id="service-codex-001",
                 process_id="proc-1",
                 goal_audit_job_id="job-1",
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 audit=audit,
             )
@@ -1201,14 +1204,14 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["type"], "service.goal_manager_compact_checked")
         self.assertEqual(event["compaction"], "suppressed_by_session_setting")
-        history = get_history(self.runtime_root, username="repyt", session_id=self.session_id)
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertEqual(history[0]["event_type"], "service.goal_manager_compact_checked")
         self.assertIn("No implementation progress", history[0]["text"])
 
     def test_handle_goal_manager_compact_request_calls_compactor_when_toggle_on(self) -> None:
         update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_auto_compact_enabled=True,
         )
@@ -1238,7 +1241,7 @@ class GoalManagerCompactTests(unittest.TestCase):
                 service_id="service-codex-001",
                 process_id="proc-1",
                 goal_audit_job_id="job-1",
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 audit=audit,
             )
@@ -1247,7 +1250,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["compaction"], "triggered")
         self.assertEqual(event["reason"], "Repeated sabotage")
-        history = get_history(self.runtime_root, username="repyt", session_id=self.session_id)
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         event_types = [str(entry.get("event_type")) for entry in history[:2]]
         self.assertIn("service.goal_manager_compact_started", event_types)
         self.assertIn("service.goal_manager_compact_checked", event_types)
@@ -1356,7 +1359,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_goal_audit_then_compact_event_sequence_is_logged(self) -> None:
         update_session_goal_flags(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             goal_auto_compact_enabled=True,
         )
@@ -1377,7 +1380,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             service_id="service-codex-001",
             process_id="proc-1",
             goal_audit_job_id="job-1",
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             audit=audit,
         )
@@ -1402,7 +1405,7 @@ class GoalManagerCompactTests(unittest.TestCase):
                 service_id="service-codex-001",
                 process_id="proc-1",
                 goal_audit_job_id="job-1",
-                username="repyt",
+                username=TEST_USERNAME,
                 session_id=self.session_id,
                 audit=audit,
             )
@@ -1488,7 +1491,7 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_maybe_enqueue_mid_turn_progress_inquiry_records_fallback(self) -> None:
         append_history(
             self.runtime_root,
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             entry={
                 "direction": "event",
@@ -1505,7 +1508,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             log_path=self.runtime_root / "logs" / "service-http-001.jsonl",
             http_service_id="service-http-001",
             process_id="proc-http-1",
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             source_kind="user_message",
             source_text="Where are you now?",
@@ -1513,11 +1516,11 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
 
         self.assertTrue(enqueued)
-        pending = load_pending_inputs(self.runtime_root, username="repyt", session_id=self.session_id)
+        pending = load_pending_inputs(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertEqual([item["kind"] for item in pending], ["progress_inquiry"])
         self.assertIn("Where are you now?", pending[0]["text"])
 
-        history = get_history(self.runtime_root, username="repyt", session_id=self.session_id)
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         event_types = [str(entry.get("event_type")) for entry in history]
         self.assertIn("service.progress_inquiry_requested", event_types)
         self.assertIn("service.progress_inquiry_deferred", event_types)
@@ -1528,7 +1531,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             log_path=self.runtime_root / "logs" / "service-http-001.jsonl",
             http_service_id="service-http-001",
             process_id="proc-http-1",
-            username="repyt",
+            username=TEST_USERNAME,
             session_id=self.session_id,
             source_kind="user_message",
             source_text="And now?",
