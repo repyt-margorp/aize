@@ -1,0 +1,98 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "progress_state",
+    "audit_state",
+    "goal_satisfied",
+    "summary",
+    "continue_xml",
+    "request_compact",
+    "request_compact_reason",
+    "agent_directives",
+    "child_goal_requests"
+  ],
+  "properties": {
+    "progress_state": {
+      "type": "string",
+      "enum": ["complete", "in_progress"]
+    },
+    "audit_state": {
+      "type": "string",
+      "enum": ["all_clear", "needs_compact", "panic"]
+    },
+    "goal_satisfied": {
+      "type": "boolean"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "continue_xml": {
+      "type": "string"
+    },
+    "request_compact": {
+      "type": "boolean"
+    },
+    "request_compact_reason": {
+      "type": "string"
+    },
+    "agent_directives": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "service_id",
+          "audit_state",
+          "continue_xml",
+          "request_compact",
+          "request_compact_reason",
+          "summary"
+        ],
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "audit_state": {
+            "type": "string",
+            "enum": ["all_clear", "needs_compact", "panic"]
+          },
+          "continue_xml": {
+            "type": "string"
+          },
+          "request_compact": {
+            "type": "boolean"
+          },
+          "request_compact_reason": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "child_goal_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "service_id",
+          "goal_text"
+        ],
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "goal_text": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

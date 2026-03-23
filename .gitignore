@@ -1,0 +1,32 @@
+# Runtime state — never commit
+.aize-state/
+.agent-mesh-runtime/
+.temp/
+temp/
+.tmp-agent-test/
+.tmux-agent-chat/
+.tmux-agent-chat-loop/
+.tmux-agent-mesh/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# TLS keys (extra safety)
+*.key
+*.pem
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
