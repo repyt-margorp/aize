@@ -122,22 +122,15 @@ def _ws_upgrade(host: str, port: int, path: str, use_tls: bool) -> tuple[socket.
     return sock, rfile, wfile
 
 
-def _send_router_control(runtime_root: Path, message: dict[str, Any]) -> bool:
-    control_port = runtime_root / "ports" / "router.control"
-    payload = encode_line(message).encode("utf-8")
-    fd: int | None = None
+def _send_router_control(runtime_root: Path, message: dict[str, Any], sender_id: str = "user.local") -> bool:
+    from kernel.ipc import connect_to_router
     try:
-        fd = os.open(str(control_port), os.O_RDWR | os.O_NONBLOCK)
-        os.write(fd, payload)
+        conn = connect_to_router(runtime_root, sender_id)
+        conn.write(encode_line(message))
+        conn.close()
         return True
     except OSError:
         return False
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 
 def _dispatch_to_local_llm(
@@ -374,6 +367,7 @@ def run_ws_peer_client(
                 "type": "auth",
                 "username": auth_username,
                 "password": auth_password,
+                "node_id": str(manifest.get("node_id") or ""),
             }, write_lock)
 
             # Wait for auth_ok (drain until we get it or error)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -12,20 +13,6 @@ from kernel.registry import add_allowed_peer, get_service_record, list_service_r
 from wire.protocol import message_meta_get, utc_ts
 
 
-def open_fifo_read(path: Path) -> int:
-    return os.open(path, os.O_RDWR | os.O_NONBLOCK)
-
-
-def open_fifo_write(path: Path) -> int:
-    return os.open(path, os.O_RDWR | os.O_NONBLOCK)
-
-
-def make_fifo(path: Path) -> None:
-    if path.exists():
-        path.unlink()
-    os.mkfifo(path)
-
-
 class SpawnManager:
     def __init__(
         self,
@@ -33,34 +20,42 @@ class SpawnManager:
         runtime_root: Path,
         manifest_path: Path,
         root_dir: Path,
-        read_fds: dict[int, tuple[str, Path]],
-        write_fds: dict[str, int],
-        buffers: dict[int, str],
+        write_socks: dict[str, "socket.socket"],
     ) -> None:
         self.runtime_root = runtime_root
         self.manifest_path = manifest_path
         self.root_dir = root_dir
-        self.read_fds = read_fds
-        self.write_fds = write_fds
-        self.buffers = buffers
+        self.write_socks = write_socks
         self.child_processes: list[subprocess.Popen] = []
 
     def attach_existing_services(self) -> None:
-        for record in list_service_records(self.runtime_root):
-            self._attach_service_ports(record)
+        # Services connect to router.sock dynamically on spawn; no-op here.
+        pass
 
     def spawn_from_message(self, message: dict) -> dict:
         sender = str(message.get("from", ""))
         incoming_auth = message_meta_get(message, "auth")
         auth = incoming_auth if isinstance(incoming_auth, dict) else {}
         if sender not in ("user.local", "kernel.local") and not auth_context_allows(auth, "spawn_service"):
-            return {
-                "type": "spawn_manager.spawn_rejected",
-                "ts": utc_ts(),
-                "service_id": message.get("payload", {}).get("service", {}).get("service_id"),
-                "spawned_by": sender,
-                "reason": "spawn_service_capability_required",
-            }
+            # Allow if the sender's registered service record grants spawn_service
+            try:
+                sender_record = get_service_record(self.runtime_root, sender)
+                if "spawn_service" not in sender_record.get("owner_capabilities", []):
+                    return {
+                        "type": "spawn_manager.spawn_rejected",
+                        "ts": utc_ts(),
+                        "service_id": message.get("payload", {}).get("service", {}).get("service_id"),
+                        "spawned_by": sender,
+                        "reason": "spawn_service_capability_required",
+                    }
+            except KeyError:
+                return {
+                    "type": "spawn_manager.spawn_rejected",
+                    "ts": utc_ts(),
+                    "service_id": message.get("payload", {}).get("service", {}).get("service_id"),
+                    "spawned_by": sender,
+                    "reason": "spawn_service_capability_required",
+                }
         payload = message.get("payload", {})
         service_spec = dict(payload["service"])
         allowed_peers = list(payload.get("allowed_peers") or [])
@@ -134,9 +129,8 @@ class SpawnManager:
         return self._reload_service(service_id)
 
     def _create_service_ports(self, service_record: dict) -> None:
-        ports_dir = self.runtime_root / "ports"
-        make_fifo(ports_dir / f"{service_record['service_id']}.rx")
-        make_fifo(ports_dir / f"{service_record['service_id']}.tx")
+        # No FIFO creation needed; services connect via UNIX socket.
+        pass
 
     def _add_reverse_routes(self, service_id: str, allowed_peers: list[str]) -> None:
         for peer_service_id in allowed_peers:
@@ -178,13 +172,8 @@ class SpawnManager:
         self.child_processes.append(child)
 
     def _attach_service_ports(self, service_record: dict) -> None:
-        record = get_service_record(self.runtime_root, service_record["service_id"])
-        tx_port = self.runtime_root / record["ports"]["tx"]
-        rx_port = self.runtime_root / record["ports"]["rx"]
-        fd = open_fifo_read(tx_port)
-        self.read_fds[fd] = (record["service_id"], tx_port)
-        self.buffers[fd] = ""
-        self.write_fds[record["service_id"]] = open_fifo_write(rx_port)
+        # Services connect to router.sock dynamically; no FIFO attachment needed.
+        pass
 
     def _current_process_record(self, service_record: dict) -> dict | None:
         process_id = service_record.get("current_process_id")

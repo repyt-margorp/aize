@@ -79,6 +79,7 @@
         "additionalProperties": false,
         "required": [
           "service_id",
+          "label",
           "goal_text"
         ],
         "properties": {

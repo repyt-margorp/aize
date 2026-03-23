@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 from collections import defaultdict
 
+from services.svcmgr.loader import build_service_plan, list_service_descriptors
 
 # Accept --runtime-root as a CLI arg so the runtime root appears in the process
 # command line, enabling per-instance pgrep matching in restart scripts.
@@ -45,80 +46,29 @@ else:
     HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
     HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))
     HTTP_TLS = os.environ.get("AIZE_TLS", "true").strip().lower() not in {"false", "0", "no", "off"}
-CODEX_MODEL = str(os.environ.get("AIZE_CODEX_MODEL", "gpt-5.3-codex-spark")).strip() or "gpt-5.3-codex-spark"
-CODEX_POOL_SIZE = int(os.environ.get("AIZE_CODEX_POOL_SIZE", "5"))
-CLAUDE_POOL_SIZE = int(os.environ.get("AIZE_CLAUDE_POOL_SIZE", "5"))
-CODEX_POOL_SERVICE_IDS = [f"service-codex-{index:03d}" for index in range(1, CODEX_POOL_SIZE + 1)]
-CLAUDE_POOL_SERVICE_IDS = [f"service-claude-{index:03d}" for index in range(1, CLAUDE_POOL_SIZE + 1)]
-CORE_SERVICE_IDS = set(CODEX_POOL_SERVICE_IDS) | set(CLAUDE_POOL_SERVICE_IDS) | {"service-http-001"}
-
-
-def make_fifo(path: Path) -> None:
-    if path.exists():
-        path.unlink()
-    os.mkfifo(path)
+CORE_SERVICE_IDS = {"service-http-001", "service-svcmgr-001"} | {
+    f"service-codex-{index:03d}" for index in range(1, int(os.environ.get("AIZE_CODEX_POOL_SIZE", "5")) + 1)
+} | {
+    f"service-claude-{index:03d}" for index in range(1, int(os.environ.get("AIZE_CLAUDE_POOL_SIZE", "5")) + 1)
+}
 
 
 def build_core_manifest() -> dict:
-    services = [
-        {
-            "service_id": service_id,
-            "kind": "codex",
-            "display_name": f"CodexFox {index}",
-            "persona": "You are Codex running inside the Aize HTTP mesh. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
-            "max_turns": 100,
-            "response_schema_id": "service_control_v1",
-            "config": {
-                "model": CODEX_MODEL,
-            },
-        }
-        for index, service_id in enumerate(CODEX_POOL_SERVICE_IDS, start=1)
-    ]
-    services.extend(
-        {
-            "service_id": service_id,
-            "kind": "claude",
-            "display_name": f"ClaudeCode {index}",
-            "persona": "You are ClaudeCode running inside the Aize HTTP mesh. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
-            "max_turns": 100,
-            "response_schema_id": "service_control_v1",
-        }
-        for index, service_id in enumerate(CLAUDE_POOL_SERVICE_IDS, start=1)
-    )
-    services.append(
-        {
-            "service_id": "service-http-001",
-            "kind": "http",
-            "display_name": "HttpBridge",
-            "persona": "Bridge HTTP requests into the local service mesh.",
-            "max_turns": 1000000,
-            "config": {
-                "host": HTTP_HOST,
-                "port": HTTP_PORT,
-                "tls_enabled": HTTP_TLS,
-                "default_target": CODEX_POOL_SERVICE_IDS[0],
-                "default_provider": "codex",
-                "history_limit": 100,
-                "restart_resume": None,
-            },
-        }
-    )
-    routes = []
-    for service_id in [*CODEX_POOL_SERVICE_IDS, *CLAUDE_POOL_SERVICE_IDS]:
-        routes.append(
-            {
-                "sender_id": "service-http-001",
-                "recipient_id": service_id,
-                "enabled": True,
-            }
-        )
-        routes.append(
-            {
-                "sender_id": service_id,
-                "recipient_id": "service-http-001",
-                "enabled": True,
-            }
-        )
+    descriptors = list_service_descriptors(exclude_kinds={"svcmgr"})
+    services = build_service_plan(descriptors)
+    routes: list[dict] = []
+    service_ids = [str(service["service_id"]) for service in services]
+    for sender_id in service_ids:
+        for recipient_id in service_ids:
+            if sender_id == recipient_id:
+                continue
+            routes.append(
+                {
+                    "sender_id": sender_id,
+                    "recipient_id": recipient_id,
+                    "enabled": True,
+                }
+            )
     return {
         "node_id": NODE_ID,
         "run_id": f"run-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}",
@@ -132,6 +82,24 @@ def build_core_manifest() -> dict:
         "services": services,
         "routes": routes,
     }
+
+
+def apply_restart_resume_to_manifest_services(manifest: dict, restart_resume: dict[str, dict]) -> dict:
+    services = []
+    for service in manifest.get("services", []):
+        if not isinstance(service, dict):
+            continue
+        service_id = str(service.get("service_id", "")).strip()
+        config = dict(service.get("config", {}))
+        if service_id:
+            config["restart_resume"] = restart_resume.get(service_id)
+        merged = dict(service)
+        if config:
+            merged["config"] = config
+        services.append(merged)
+    merged_manifest = dict(manifest)
+    merged_manifest["services"] = services
+    return merged_manifest
 
 
 def load_restart_resume_map() -> dict[str, dict]:
@@ -235,19 +203,16 @@ def write_manifest(
     restart_resume: dict[str, dict] | None = None,
 ) -> dict:
     manifest = build_core_manifest()
-    restart_resume = restart_resume or {}
-    for service in manifest["services"]:
-        service.setdefault("config", {})
-        service["config"]["restart_resume"] = restart_resume.get(service["service_id"])
-    for service in extra_services or []:
-        manifest["services"].append(service)
-    existing_routes = {(route["sender_id"], route["recipient_id"]) for route in manifest["routes"]}
-    for route in extra_routes or []:
-        key = (route["sender_id"], route["recipient_id"])
-        if key in existing_routes:
+    if restart_resume:
+        manifest = apply_restart_resume_to_manifest_services(manifest, restart_resume)
+    manifest_services = list(manifest.get("services", []))
+    existing_ids = {str(service.get("service_id")) for service in manifest_services}
+    for extra in extra_services or []:
+        if str(extra.get("service_id")) in existing_ids:
             continue
-        existing_routes.add(key)
-        manifest["routes"].append(route)
+        manifest_services.append(extra)
+    manifest["services"] = manifest_services
+    manifest["routes"] = list(manifest.get("routes", [])) + list(extra_routes or [])
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest
 
@@ -275,7 +240,6 @@ def bootstrap_runtime() -> dict:
     LOGS.mkdir(parents=True)
     OBJECTS.mkdir(parents=True)
     STATE.mkdir(parents=True)
-    make_fifo(PORTS / "router.control")
     if saved_tls:
         tls_restore = RUNTIME_ROOT / "tls"
         tls_restore.mkdir(parents=True, exist_ok=True)
@@ -285,17 +249,28 @@ def bootstrap_runtime() -> dict:
             dest.chmod(0o600 if name.endswith(".key") else 0o644)
     if saved_ws_peer_clients is not None:
         (RUNTIME_ROOT / "ws_peer_clients.json").write_bytes(saved_ws_peer_clients)
-    manifest = write_manifest(extra_services=extra_services, extra_routes=extra_routes, restart_resume=restart_resume)
-    for service in manifest["services"]:
-        service_id = service["service_id"]
-        make_fifo(PORTS / f"{service_id}.rx")
-        make_fifo(PORTS / f"{service_id}.tx")
+    for service in extra_services:
+        if not isinstance(service, dict):
+            continue
+        config = dict(service.get("config", {}))
+        service["config"] = {
+            **config,
+            "restart_resume": restart_resume.get(str(service.get("service_id"))),
+        }
+    manifest = write_manifest(
+        extra_services=extra_services,
+        extra_routes=extra_routes,
+        restart_resume=restart_resume,
+    )
     return manifest
 
 
 def spawn_logged(name: str, *argv: str) -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
+    # Propagate HTTP config as env vars so service.json config_env picks them up
+    env["AIZE_HTTP_HOST"] = HTTP_HOST
+    env["AIZE_HTTP_PORT"] = str(HTTP_PORT)
     env["AIZE_TLS"] = "true" if HTTP_TLS else "false"
     LOGS.mkdir(parents=True, exist_ok=True)
     stdout_handle = (LOGS / f"{name}.stdout.log").open("a", encoding="utf-8")
@@ -345,8 +320,11 @@ def spawn_service_process(service_id: str) -> subprocess.Popen:
 def main() -> int:
     manifest = bootstrap_runtime()
     procs: dict[str, subprocess.Popen] = {"kernel.router": spawn_router_process()}
-    for service in manifest["services"]:
-        procs[str(service["service_id"])] = spawn_service_process(str(service["service_id"]))
+    for service in manifest.get("services", []):
+        service_id = str(service.get("service_id", "")).strip()
+        if not service_id:
+            continue
+        procs[service_id] = spawn_service_process(service_id)
     restart_window_seconds = 10.0
     restart_limit = 3
     restart_history: dict[str, list[float]] = defaultdict(list)

@@ -4,24 +4,20 @@ import argparse
 import json
 import os
 import select
+import socket
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from kernel.ipc import HANDSHAKE_TYPE, SYSTEM_SENDERS, create_router_socket, router_socket_path
 from kernel.lifecycle import init_lifecycle_state
 from kernel.peers import get_peer
 from kernel.registry import get_service_record, init_registry, list_service_records, load_manifest, update_service_process
 from kernel.spawn import SpawnManager
 from wire.protocol import decode_line, encode_line, message_meta_get, utc_ts, write_jsonl
 
-
-def open_fifo_read(path: Path) -> int:
-    return os.open(path, os.O_RDWR | os.O_NONBLOCK)
-
-
-def open_fifo_write(path: Path) -> int:
-    return os.open(path, os.O_RDWR | os.O_NONBLOCK)
 
 def record_payload_mode(message: dict) -> str:
     return "ref" if message.get("payload_ref") else "inline"
@@ -181,13 +177,13 @@ def forward_remote_message(runtime_root: Path, message: dict) -> tuple[bool, str
 def deliver_local_message(
     *,
     router_log: Path,
-    write_fds: dict[str, int],
+    write_socks: dict[str, socket.socket],
     recipient_id: str,
     message: dict,
     manifest: dict,
 ) -> bool:
-    fd = write_fds.get(recipient_id)
-    if fd is None:
+    sock = write_socks.get(recipient_id)
+    if sock is None:
         write_jsonl(
             router_log,
             {
@@ -200,7 +196,7 @@ def deliver_local_message(
         )
         return False
     try:
-        os.write(fd, encode_line(message).encode("utf-8"))
+        sock.sendall(encode_line(message).encode("utf-8"))
         return True
     except OSError as exc:
         write_jsonl(
@@ -217,6 +213,17 @@ def deliver_local_message(
         return False
 
 
+@dataclass
+class _Conn:
+    sock: socket.socket
+    sender_id: str | None = None  # None until handshake
+    buf: str = ""
+
+    @property
+    def is_system(self) -> bool:
+        return self.sender_id in SYSTEM_SENDERS
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local mesh router")
     parser.add_argument("--manifest", required=True)
@@ -228,9 +235,8 @@ def main() -> int:
     init_registry(runtime_root, manifest)
     init_lifecycle_state(runtime_root, node_id=manifest["node_id"], run_id=manifest["run_id"])
     logs_dir = runtime_root / "logs"
-    ports_dir = runtime_root / "ports"
     router_log = logs_dir / "router.jsonl"
-    control_port = ports_dir / "router.control"
+    sock_path = router_socket_path(runtime_root)
 
     write_jsonl(
         router_log,
@@ -243,17 +249,18 @@ def main() -> int:
         },
     )
 
-    control_fd = open_fifo_read(control_port)
-    read_fds: dict[int, tuple[str, Path]] = {control_fd: ("control", control_port)}
-    write_fds: dict[str, int] = {}
-    buffers: dict[int, str] = {}
+    listen_sock = create_router_socket(sock_path)
+
+    # Map from socket fd -> _Conn for all active connections
+    conns: dict[int, _Conn] = {}
+    # Map from service_id -> socket for delivery
+    write_socks: dict[str, socket.socket] = {}
+
     spawn_manager = SpawnManager(
         runtime_root=runtime_root,
         manifest_path=Path(args.manifest),
         root_dir=Path(args.manifest).resolve().parent.parent,
-        read_fds=read_fds,
-        write_fds=write_fds,
-        buffers=buffers,
+        write_socks=write_socks,
     )
     spawn_manager.attach_existing_services()
 
@@ -264,23 +271,65 @@ def main() -> int:
     }
 
     while True:
-        ready, _, _ = select.select(list(read_fds.keys()), [], [], 1.0)
+        read_fds = [listen_sock.fileno()] + list(conns.keys())
+        ready, _, _ = select.select(read_fds, [], [], 1.0)
+
         for fd in ready:
+            # Accept new connection
+            if fd == listen_sock.fileno():
+                try:
+                    client_sock, _ = listen_sock.accept()
+                    client_sock.setblocking(True)
+                    conns[client_sock.fileno()] = _Conn(sock=client_sock)
+                except OSError:
+                    pass
+                continue
+
+            conn = conns.get(fd)
+            if conn is None:
+                continue
+
             try:
-                chunk = os.read(fd, 65536).decode("utf-8")
-            except BlockingIOError:
-                continue
+                chunk = conn.sock.recv(65536).decode("utf-8")
+            except OSError:
+                chunk = ""
+
             if not chunk:
+                # Connection closed
+                if conn.sender_id and conn.sender_id in write_socks:
+                    del write_socks[conn.sender_id]
+                try:
+                    conn.sock.close()
+                except OSError:
+                    pass
+                del conns[fd]
                 continue
-            buffers[fd] = buffers.get(fd, "") + chunk
-            while "\n" in buffers[fd]:
-                line, buffers[fd] = buffers[fd].split("\n", 1)
+
+            conn.buf += chunk
+            while "\n" in conn.buf:
+                line, conn.buf = conn.buf.split("\n", 1)
                 if not line.strip():
                     continue
-                message = decode_line(line)
-                source_kind, _ = read_fds[fd]
 
-                if source_kind == "control":
+                # Handle handshake
+                if conn.sender_id is None:
+                    try:
+                        handshake = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if handshake.get("type") == HANDSHAKE_TYPE:
+                        sender_id = str(handshake.get("service_id", ""))
+                        if sender_id:
+                            conn.sender_id = sender_id
+                            # Register socket for delivery (not for system senders)
+                            if sender_id not in SYSTEM_SENDERS:
+                                write_socks[sender_id] = conn.sock
+                    continue
+
+                message = decode_line(line)
+
+                if conn.is_system:
+                    # System sender path (user.local, kernel.local)
                     allowed, detail = authorize_control_injection(
                         runtime_root=runtime_root,
                         manifest=manifest,
@@ -331,7 +380,7 @@ def main() -> int:
                     recipient_id = message["to"]
                     deliver_local_message(
                         router_log=router_log,
-                        write_fds=write_fds,
+                        write_socks=write_socks,
                         recipient_id=recipient_id,
                         message=message,
                         manifest=manifest,
@@ -348,6 +397,7 @@ def main() -> int:
                     )
                     continue
 
+                # Service sender path
                 if message.get("type") == "service.done":
                     service_id, process_id = parse_service_done(message)
                     if not service_id:
@@ -432,7 +482,7 @@ def main() -> int:
                     continue
                 deliver_local_message(
                     router_log=router_log,
-                    write_fds=write_fds,
+                    write_socks=write_socks,
                     recipient_id=recipient_id,
                     message=message,
                     manifest=manifest,

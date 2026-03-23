@@ -1,0 +1,13 @@
+{
+  "kind": "http",
+  "id": "service-http-001",
+  "display_name": "HttpBridge",
+  "persona": "Bridge HTTP requests into the local service mesh.",
+  "max_turns": 1000000,
+  "spawn_order": 10,
+  "config_env": {
+    "host": {"env": "AIZE_HTTP_HOST", "default": "0.0.0.0"},
+    "port": {"env": "AIZE_HTTP_PORT", "type": "int", "default": 4123}
+  },
+  "enabled": true
+}

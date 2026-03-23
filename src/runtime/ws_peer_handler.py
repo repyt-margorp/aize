@@ -4,12 +4,21 @@ Protocol (JSON over WebSocket text frames):
 
   Client → Server
   ---------------
-  {"type": "auth", "username": "...", "password": "..."}
+  {"type": "auth", "username": "...", "password": "...", "node_id": "..."}
   {"type": "list_open_sessions"}
   {"type": "join_session",  "username": "...", "session_id": "..."}
   {"type": "leave_session", "username": "...", "session_id": "..."}
   {"type": "message",       "username": "...", "session_id": "...", "text": "..."}
   {"type": "ping"}
+
+  File protocol (requires prior join_session):
+  {"type": "file_write",  "username": "...", "session_id": "...", "box": "inbox|outbox",
+                          "filename": "...", "content_b64": "..."}
+  {"type": "file_read",   "username": "...", "session_id": "...", "box": "inbox|outbox",
+                          "filename": "..."}
+  {"type": "file_list",   "username": "...", "session_id": "...", "box": "inbox|outbox"}
+  {"type": "file_delete", "username": "...", "session_id": "...", "box": "inbox|outbox",
+                          "filename": "..."}
 
   Server → Client
   ---------------
@@ -22,15 +31,33 @@ Protocol (JSON over WebSocket text frames):
   {"type": "message_accepted","username": "...", "session_id": "..."}
   {"type": "pong"}
   {"type": "error",          "message": "..."}
+
+  File protocol responses:
+  {"type": "file_write_ok",  "username": "...", "session_id": "...", "box": "...",
+                             "filename": "...", "size": N}
+  {"type": "file_read_result","username": "...", "session_id": "...", "box": "...",
+                             "filename": "...", "size": N, "content_b64": "..."}
+  {"type": "file_list_result","username": "...", "session_id": "...", "box": "...",
+                             "files": [{"filename": "...", "size": N, "modified_at": "..."}]}
+  {"type": "file_delete_ok", "username": "...", "session_id": "...", "box": "...",
+                             "filename": "...", "deleted": true|false}
 """
 from __future__ import annotations
 
+import base64
 import json
 import queue
 import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from runtime.persistent_state import (
+    write_agent_file,
+    read_agent_file,
+    list_agent_files,
+    delete_agent_file,
+    check_agent_file_acl,
+)
 from runtime.ws_bridge import (
     OP_CLOSE,
     OP_PING,
@@ -137,7 +164,10 @@ def handle_peer_connection(
         if not ok:
             _send({"type": "auth_error", "message": "invalid_credentials"})
             return
-        _auth_context = {"username": username}
+        _auth_context = {
+            "username": username,
+            "node_id": str(msg.get("node_id", "")).strip(),
+        }
         peer_meta = manifest.get("peer") or {}
         write_jsonl(log_path, {
             "type": "ws_peer.auth_ok",
@@ -181,7 +211,8 @@ def handle_peer_connection(
 
         # Register the external AIze peer as a welcomed agent in this session
         peer_username = str(_auth_context.get("username", "peer")).strip()
-        peer_node_id = str(manifest.get("node_id") or "").strip()
+        # Use the node_id the peer advertised in its auth message; fall back to username.
+        peer_node_id = str(_auth_context.get("node_id") or "").strip()
         # Derive a stable virtual service_id for this peer based on its node
         peer_service_id = f"ws-peer-{peer_node_id or peer_username}"
         record_session_agent_contact(
@@ -246,7 +277,7 @@ def handle_peer_connection(
                 return
 
         peer_label = str(_auth_context.get("username", "peer")).strip()
-        peer_node_id = str(manifest.get("node_id") or "").strip()
+        peer_node_id = str(_auth_context.get("node_id") or "").strip()
         peer_service_id = f"ws-peer-{peer_node_id or peer_label}"
         now = utc_ts()
 
@@ -310,6 +341,195 @@ def handle_peer_connection(
         })
         _send({"type": "message_accepted", "username": username, "session_id": session_id})
 
+    # ----------------------------------------------------------------- file handlers
+
+    def _peer_service_id_for_file(msg: dict[str, Any]) -> str | None:
+        """Return the peer's virtual service_id, or None if not authenticated."""
+        if _auth_context is None:
+            return None
+        peer_node_id = str(_auth_context.get("node_id") or "").strip()
+        peer_label = str(_auth_context.get("username", "peer")).strip()
+        return f"ws-peer-{peer_node_id or peer_label}"
+
+    def _require_joined_session(msg: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        """Validate auth + session membership.
+
+        Returns (username, session_id, caller_agent_id, dir_agent_id) or None.
+        ``caller_agent_id`` is the peer's own identity.
+        ``dir_agent_id`` is the target directory: the message's ``dir_agent_id``
+        field if provided, otherwise the caller's own agent_id.
+        """
+        if _auth_context is None:
+            _send({"type": "error", "message": "not_authenticated"})
+            return None
+        username = str(msg.get("username", "")).strip()
+        session_id = str(msg.get("session_id", "")).strip()
+        if not username or not session_id:
+            _send({"type": "error", "message": "username_and_session_id_required"})
+            return None
+        key = f"{username}::{session_id}"
+        with _lock:
+            if key not in _subscriptions:
+                _send({"type": "error", "message": "not_joined_to_session"})
+                return None
+        peer_service_id = _peer_service_id_for_file(msg)
+        caller_agent_id = f"{peer_service_id}@@{session_id}"
+        dir_agent_id_override = str(msg.get("dir_agent_id") or "").strip()
+        dir_agent_id = dir_agent_id_override if dir_agent_id_override else caller_agent_id
+        return username, session_id, caller_agent_id, dir_agent_id
+
+    def _handle_file_write(msg: dict[str, Any]) -> None:
+        result = _require_joined_session(msg)
+        if result is None:
+            return
+        username, session_id, caller_agent_id, dir_agent_id = result
+        box = str(msg.get("box", "")).strip().lower()
+        filename = str(msg.get("filename", "")).strip()
+        content_b64 = str(msg.get("content_b64", "")).strip()
+        if box not in {"inbox", "outbox"}:
+            _send({"type": "error", "message": "box_must_be_inbox_or_outbox"})
+            return
+        if not filename:
+            _send({"type": "error", "message": "filename_required"})
+            return
+        if not content_b64:
+            _send({"type": "error", "message": "content_b64_required"})
+            return
+        if not check_agent_file_acl(runtime_root, username=username, session_id=session_id,
+                                     dir_agent_id=dir_agent_id, caller_agent_id=caller_agent_id,
+                                     permission="write"):
+            _send({"type": "error", "message": "access_denied"})
+            return
+        try:
+            content = base64.b64decode(content_b64)
+        except Exception:
+            _send({"type": "error", "message": "invalid_base64"})
+            return
+        ok = write_agent_file(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            agent_id=dir_agent_id,
+            box=box,
+            filename=filename,
+            content=content,
+        )
+        if not ok:
+            _send({"type": "error", "message": "file_write_failed"})
+            return
+        _send({
+            "type": "file_write_ok",
+            "username": username,
+            "session_id": session_id,
+            "dir_agent_id": dir_agent_id,
+            "box": box,
+            "filename": filename,
+            "size": len(content),
+        })
+
+    def _handle_file_read(msg: dict[str, Any]) -> None:
+        result = _require_joined_session(msg)
+        if result is None:
+            return
+        username, session_id, caller_agent_id, dir_agent_id = result
+        box = str(msg.get("box", "")).strip().lower()
+        filename = str(msg.get("filename", "")).strip()
+        if box not in {"inbox", "outbox"}:
+            _send({"type": "error", "message": "box_must_be_inbox_or_outbox"})
+            return
+        if not filename:
+            _send({"type": "error", "message": "filename_required"})
+            return
+        if not check_agent_file_acl(runtime_root, username=username, session_id=session_id,
+                                     dir_agent_id=dir_agent_id, caller_agent_id=caller_agent_id,
+                                     permission="read"):
+            _send({"type": "error", "message": "access_denied"})
+            return
+        content = read_agent_file(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            agent_id=dir_agent_id,
+            box=box,
+            filename=filename,
+        )
+        if content is None:
+            _send({"type": "error", "message": "file_not_found"})
+            return
+        _send({
+            "type": "file_read_result",
+            "username": username,
+            "session_id": session_id,
+            "dir_agent_id": dir_agent_id,
+            "box": box,
+            "filename": filename,
+            "size": len(content),
+            "content_b64": base64.b64encode(content).decode("ascii"),
+        })
+
+    def _handle_file_list(msg: dict[str, Any]) -> None:
+        result = _require_joined_session(msg)
+        if result is None:
+            return
+        username, session_id, caller_agent_id, dir_agent_id = result
+        box = str(msg.get("box", "")).strip().lower()
+        if box not in {"inbox", "outbox"}:
+            _send({"type": "error", "message": "box_must_be_inbox_or_outbox"})
+            return
+        if not check_agent_file_acl(runtime_root, username=username, session_id=session_id,
+                                     dir_agent_id=dir_agent_id, caller_agent_id=caller_agent_id,
+                                     permission="read"):
+            _send({"type": "error", "message": "access_denied"})
+            return
+        files = list_agent_files(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            agent_id=dir_agent_id,
+            box=box,
+        )
+        _send({
+            "type": "file_list_result",
+            "username": username,
+            "session_id": session_id,
+            "dir_agent_id": dir_agent_id,
+            "box": box,
+            "files": files,
+        })
+
+    def _handle_file_delete(msg: dict[str, Any]) -> None:
+        result = _require_joined_session(msg)
+        if result is None:
+            return
+        username, session_id, caller_agent_id, dir_agent_id = result
+        box = str(msg.get("box", "")).strip().lower()
+        filename = str(msg.get("filename", "")).strip()
+        if box not in {"inbox", "outbox"} or not filename:
+            _send({"type": "error", "message": "box_and_filename_required"})
+            return
+        if not check_agent_file_acl(runtime_root, username=username, session_id=session_id,
+                                     dir_agent_id=dir_agent_id, caller_agent_id=caller_agent_id,
+                                     permission="write"):
+            _send({"type": "error", "message": "access_denied"})
+            return
+        deleted = delete_agent_file(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            agent_id=dir_agent_id,
+            box=box,
+            filename=filename,
+        )
+        _send({
+            "type": "file_delete_ok",
+            "username": username,
+            "session_id": session_id,
+            "dir_agent_id": dir_agent_id,
+            "box": box,
+            "filename": filename,
+            "deleted": deleted,
+        })
+
     # ----------------------------------------------------------------- main loop
 
     _DISPATCH: dict[str, Callable[[dict[str, Any]], None]] = {
@@ -318,6 +538,10 @@ def handle_peer_connection(
         "join_session": _handle_join_session,
         "leave_session": _handle_leave_session,
         "message": _handle_message,
+        "file_write": _handle_file_write,
+        "file_read": _handle_file_read,
+        "file_list": _handle_file_list,
+        "file_delete": _handle_file_delete,
     }
 
     try:

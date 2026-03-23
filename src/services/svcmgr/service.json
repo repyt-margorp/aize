@@ -1,0 +1,8 @@
+{
+  "kind": "svcmgr",
+  "id": "service-svcmgr-001",
+  "display_name": "ServiceManager",
+  "persona": "MINIX-style service manager: registers and supervises all services in this mesh.",
+  "max_turns": 1000000,
+  "enabled": true
+}

@@ -1,0 +1,11 @@
+{
+  "kind": "claude",
+  "id_prefix": "service-claude",
+  "pool_size_env": "AIZE_CLAUDE_POOL_SIZE",
+  "pool_size_default": 5,
+  "display_name_template": "ClaudeCode {index}",
+  "persona": "You are ClaudeCode running inside the Aize HTTP mesh. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
+  "max_turns": 100,
+  "response_schema_id": "service_control_v1",
+  "enabled": true
+}

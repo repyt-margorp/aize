@@ -9,6 +9,7 @@ from runtime.event_log import make_history_event_entry
 from runtime.persistent_state import (
     append_history as append_user_history,
     append_jsonl,
+    normalize_agent_priority,
     get_session_settings,
     read_json_file,
     save_agent_audit_state,
@@ -72,6 +73,8 @@ def goal_state_response_payload(
         "goal_auto_compact_enabled": bool(talk.get("goal_auto_compact_enabled", True)),
         "agent_welcome_enabled": bool(talk.get("agent_welcome_enabled", False)),
         "preferred_provider": str(talk.get("preferred_provider", default_provider)),
+        "agent_priority": normalize_agent_priority(talk.get("agent_priority")),
+        "session_priority": max(0, min(100, int(talk.get("session_priority", 50)))) if talk.get("session_priority") is not None else 50,
         "session_group": str(talk.get("session_group", "user")),
         "auto_resume_enabled": bool(talk.get("auto_resume_enabled", False)),
         "auto_resume_interval_seconds": int(talk.get("auto_resume_interval_seconds", 21600) or 21600),

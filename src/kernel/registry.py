@@ -202,8 +202,7 @@ def build_service_record(
         "owner_roles": list(owner_roles),
         "owner_capabilities": list(owner_capabilities),
         "ports": {
-            "rx": f"ports/{service_id}.rx",
-            "tx": f"ports/{service_id}.tx",
+            "sock": "ports/router.sock",
         },
         "created_at": created_at or utc_ts(),
         "updated_at": utc_ts(),
