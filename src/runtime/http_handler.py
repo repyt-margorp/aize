@@ -1055,13 +1055,7 @@ def make_handler(
                         "<div class='stack'>",
                         "<p><strong>Superuser</strong></p>",
                         "<p>Create additional UI users directly from HTTPBridge. Passwords stay in runtime state and are not tracked in Git.</p>",
-                        "<form id='register-user-form' class='stack' method='post' action='/register'>",
-                        "<input id='register-user-username' name='username' placeholder='new username' autocomplete='off'>",
-                        "<input id='register-user-password' name='password' type='password' placeholder='new password (8+ chars)' autocomplete='new-password'>",
-                        "<input id='register-user-password-confirm' type='password' placeholder='confirm password' autocomplete='new-password'>",
-                        "<button class='ghost' type='submit'>Create User</button>",
-                        "<div id='register-user-status' class='context-action-status'>Creates a standard user account.</div>",
-                        "</form>",
+                        "<button id='account-register-toggle' class='ghost' type='button'>Account Register</button>",
                         "</div>",
                     ]
                 )
