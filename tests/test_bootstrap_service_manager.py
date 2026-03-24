@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 from cli.run_codex_http_mesh import build_core_manifest
 from kernel.registry import get_service_record, init_registry
+from kernel.router import register_delivery_socket, remove_delivery_socket
 from kernel.spawn import SpawnManager
 from services.svcmgr import run_service
 from services.svcmgr.loader import build_service_plan_for_kinds
@@ -139,6 +140,23 @@ class SpawnManagerBootstrapTests(unittest.TestCase):
             self.assertIn("service-claude-001", http_record["allowed_peers"])
             svcmgr_record = get_service_record(runtime_root, "service-svcmgr-001")
             self.assertIn("service-http-001", svcmgr_record["allowed_peers"])
+
+
+class RouterSocketRegistrationTests(unittest.TestCase):
+    def test_duplicate_sender_connection_does_not_replace_existing_delivery_socket(self) -> None:
+        primary = object()
+        duplicate = object()
+        write_socks: dict[str, object] = {}
+
+        self.assertTrue(register_delivery_socket(write_socks, sender_id="service-codex-001", sock=primary))
+        self.assertFalse(register_delivery_socket(write_socks, sender_id="service-codex-001", sock=duplicate))
+        self.assertIs(write_socks["service-codex-001"], primary)
+
+        remove_delivery_socket(write_socks, sender_id="service-codex-001", sock=duplicate)
+        self.assertIs(write_socks["service-codex-001"], primary)
+
+        remove_delivery_socket(write_socks, sender_id="service-codex-001", sock=primary)
+        self.assertNotIn("service-codex-001", write_socks)
 
 
 if __name__ == "__main__":

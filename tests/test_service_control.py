@@ -3,6 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from runtime.agent_service import (
     maybe_dispatch_panic_recovery_parent_resume,
@@ -54,6 +60,20 @@ class ServiceControlParserTests(unittest.TestCase):
         self.assertIn('"allowed_peers": [...]', prompt)
         self.assertIn('"initial_prompt": "..."', prompt)
         self.assertIn('"service_type"', prompt)
+
+    def test_build_prompt_treats_negative_max_turns_as_unlimited(self) -> None:
+        prompt = build_prompt(
+            {
+                "persona": "Test persona",
+                "max_turns": -1,
+                "response_schema_id": None,
+            },
+            {"display_name": "HttpBridge"},
+            "hello",
+            6,
+        )
+        self.assertIn("There is no max-turn limit for this service.", prompt)
+        self.assertNotIn("reply number 6 of -1", prompt)
 
 
 class PanicRecoveryReturnPathTests(unittest.TestCase):

@@ -125,6 +125,9 @@ def build_session_runtime_summary(
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
     )
+    goal_manager_provider = str(
+        (goal_manager_worker or {}).get("provider") or preferred_provider or default_provider
+    ).strip().lower() or default_provider
     user_response_wait_active = bool(talk.get("user_response_wait_active", False))
     user_response_wait_started_at = str(talk.get("user_response_wait_started_at", "") or "")
     user_response_wait_status = (
@@ -154,6 +157,7 @@ def build_session_runtime_summary(
         "worker": visible_worker,
         "agent_running": bool(active_service_id),
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
+        "goal_manager_provider": goal_manager_provider,
         "goal_manager_worker": goal_manager_worker,
         "user_response_wait_status": user_response_wait_status,
         "user_response_wait_active": user_response_wait_active,

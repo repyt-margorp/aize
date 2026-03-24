@@ -644,6 +644,8 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("goal_auto_compact_enabled", True)
     session.setdefault("agent_welcome_enabled", False)
     session.setdefault("preferred_provider", "codex")
+    session["goal_context_root_limit"] = max(1, int(session.get("goal_context_root_limit", 2) or 2))
+    session["goal_context_recent_limit"] = max(1, int(session.get("goal_context_recent_limit", 2) or 2))
     # agent_priority: ordered list with an optional border marker that disables entries below it
     session["agent_priority"] = normalize_agent_priority(session.get("agent_priority"))
     # session_priority: 0–100, higher means more important (default 50)

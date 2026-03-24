@@ -78,6 +78,7 @@ from runtime.persistent_state import (
     save_codex_session,
     session_goal_manager_state_path,
     session_dir,
+    session_goal_context,
     session_timeline_path,
     update_goal_manager_review_cursor,
     update_session_goal_flags,
@@ -324,6 +325,7 @@ def _goal_update_xml(
     goal_text: str,
     previous_goal_id: str = "",
     previous_goal_text: str = "",
+    goal_context: list[dict[str, str]] | None = None,
 ) -> str:
     lines = ["<aize_goal_update>"]
     if previous_goal_id:
@@ -333,6 +335,21 @@ def _goal_update_xml(
     if goal_id:
         lines.append(f"  <goal_id>{html.escape(goal_id)}</goal_id>")
     lines.append(f"  <goal_text>{html.escape(goal_text)}</goal_text>")
+    if goal_context:
+        lines.append("  <goal_context>")
+        for item in goal_context:
+            item_goal_id = str(item.get("goal_id") or "").strip()
+            item_goal_text = str(item.get("goal_text") or "").strip()
+            item_goal_created_at = str(item.get("goal_created_at") or "").strip()
+            if not item_goal_id or not item_goal_text:
+                continue
+            lines.append("    <goal>")
+            lines.append(f"      <goal_id>{html.escape(item_goal_id)}</goal_id>")
+            if item_goal_created_at:
+                lines.append(f"      <created_at>{html.escape(item_goal_created_at)}</created_at>")
+            lines.append(f"      <goal_text>{html.escape(item_goal_text)}</goal_text>")
+            lines.append("    </goal>")
+        lines.append("  </goal_context>")
     lines.append("  <instruction>Review the active goal and continue work toward it until GoalManager can mark it completed.</instruction>")
     lines.append("</aize_goal_update>")
     return "\n".join(lines)
@@ -350,6 +367,8 @@ def _child_session_broadcast_json(
     dispatch_service_id: str = "",
     summary: str = "",
 ) -> str:
+    # Broadcast payloads back the corresponding session_input kinds:
+    # kind="child_session_created" and kind="child_session_completed".
     return json.dumps(
         {
             "type": event_type,
@@ -381,6 +400,7 @@ def run_agent_service(
         router_conn = connect_to_router(runtime_root, service_id)
     config = dict(self_service.get("config", {}))
     history_limit = int(config.get("history_limit", 500))
+    max_turns = int(self_service.get("max_turns", 100) or 0)
     reply_count = 0
     reply_count_lock = threading.Lock()
     done_sent = threading.Event()
@@ -523,6 +543,28 @@ def run_agent_service(
             return default_service_id.strip()
         return None
 
+    def resolve_goal_manager_dispatch_service(
+        *,
+        username: str,
+        session_id: str,
+    ) -> str | None:
+        if list_active_in_progress_child_sessions(runtime_root, username=username, session_id=session_id):
+            return None
+        session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+        preferred_provider = (
+            str(session_settings.get("preferred_provider") or self_service.get("kind") or "").strip().lower()
+            or str(self_service.get("kind") or "codex")
+        )
+        pool = _pool_for_kind_from_manifest(preferred_provider)
+        if not pool:
+            return None
+        return lease_session_service(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            pool_service_ids=pool,
+        )
+
     def maybe_spawn_failure_recovery(
         *,
         username: str | None,
@@ -592,7 +634,15 @@ def run_agent_service(
                         entry=make_aize_pending_input(
                             kind="goal_update",
                             role="system",
-                            text=_goal_update_xml(goal_id=active_goal_id, goal_text=goal_text),
+                            text=_goal_update_xml(
+                                goal_id=active_goal_id,
+                                goal_text=goal_text,
+                                goal_context=session_goal_context(
+                                    runtime_root,
+                                    username=username,
+                                    session_id=session_id,
+                                ),
+                            ),
                         ),
                     )
                 fallback_dispatch = make_dispatch_pending_message(
@@ -700,6 +750,564 @@ def run_agent_service(
             panic_event=failure_event,
             panic_service_id=failure_service_id,
         )
+
+    def decode_goal_manager_review_inputs(
+        pending_inputs: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        decoded: list[dict[str, Any]] = []
+        for item in pending_inputs or []:
+            if str((item or {}).get("kind") or "").strip().lower() != "goal_manager_review":
+                continue
+            raw_text = str((item or {}).get("text") or "").strip()
+            if not raw_text:
+                continue
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                decoded.append(parsed)
+        return decoded
+
+    def run_goal_manager_review(
+        *,
+        username: str,
+        session_id: str,
+        session_settings: dict[str, Any],
+        goal_text: str,
+        reply_index: int,
+        goal_manager_service_id: str,
+        gm_work_items: list[dict[str, Any]],
+        append_scoped_history: Callable[[dict[str, Any], int], None],
+    ) -> None:
+        if not gm_work_items:
+            return
+        goal_audit_job_id = f"goal-audit-{uuid.uuid4().hex[:8]}"
+        goal_id = str(
+            session_settings.get("active_goal_id")
+            or session_settings.get("goal_id")
+            or ""
+        ).strip()
+
+        def goal_history_sink(entry: dict[str, Any]) -> None:
+            append_scoped_history(entry, limit=GOAL_AUDIT_HISTORY_LIMIT)
+
+        def goal_provider_event_sink(event: dict[str, Any]) -> None:
+            provider_event_type = str(event.get("type") or "event").strip() or "event"
+            history_entry = make_history_event_entry(event, service_id=goal_manager_service_id)
+            history_entry["direction"] = "agent"
+            history_entry["from"] = goal_manager_service_id
+            history_entry["session_id"] = session_id
+            history_entry["event_type"] = f"service.goal_audit_provider_event.{provider_event_type}"
+            history_entry["event"] = {
+                "type": "service.goal_audit_provider_event",
+                "goal_audit_job_id": goal_audit_job_id,
+                "provider_event": event,
+            }
+            write_jsonl(
+                log_path,
+                {
+                    "type": "service.goal_audit_provider_event",
+                    "ts": utc_ts(),
+                    "service_id": goal_manager_service_id,
+                    "process_id": process_id,
+                    "goal_audit_job_id": goal_audit_job_id,
+                    "scope": {"username": username, "session_id": session_id},
+                    "provider_event": event,
+                },
+            )
+            goal_history_sink(history_entry)
+
+        started_event = {
+            "type": "service.goal_audit_started",
+            "ts": utc_ts(),
+            "service_id": goal_manager_service_id,
+            "process_id": process_id,
+            "goal_audit_job_id": goal_audit_job_id,
+            "scope": {"username": username, "session_id": session_id},
+            "goal_id": goal_id,
+            "goal_text": goal_text,
+            "goal_manager_work_items": gm_work_items,
+        }
+        turn_started_event = {
+            "type": "agent.turn_started",
+            "ts": utc_ts(),
+            "service_id": goal_manager_service_id,
+            "process_id": process_id,
+            "run_id": goal_audit_job_id,
+            "reply_index": reply_index,
+            "scope": {"username": username, "session_id": session_id},
+            "goal_manager": True,
+        }
+        goal_manager_state_path = session_goal_manager_state_path(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+        )
+        goal_manager_state = read_json_file(goal_manager_state_path) or {}
+        goal_manager_state.update(
+            {
+                "state": "running",
+                "service_id": goal_manager_service_id,
+                "goal_audit_job_id": goal_audit_job_id,
+                "goal_id": goal_id,
+                "goal_text": goal_text,
+                "pending_work_items": gm_work_items,
+                "updated_at": utc_ts(),
+            }
+        )
+        write_jsonl(log_path, turn_started_event)
+        write_json_file(goal_manager_state_path, goal_manager_state)
+        write_jsonl(log_path, started_event)
+        record_session_agent_contact(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            service_id=goal_manager_service_id,
+            agent_id=resolve_session_agent_id(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=goal_manager_service_id,
+            ),
+            provider=str(self_service.get("kind", "")),
+        )
+        goal_history_sink(
+            {
+                "direction": "event",
+                "ts": utc_ts(),
+                "service_id": goal_manager_service_id,
+                "event_type": "agent.turn_started",
+                "text": f"GoalManager {goal_manager_service_id} started reviewing",
+                "event": turn_started_event,
+            }
+        )
+        goal_history_sink(
+            {
+                "direction": "agent",
+                "ts": utc_ts(),
+                "from": goal_manager_service_id,
+                "session_id": session_id,
+                "event_type": "service.goal_audit_started",
+                "text": "GoalManager is reviewing this session.",
+                "event": started_event,
+            }
+        )
+        try:
+            resolved_audit_state = load_agent_audit_state(
+                runtime_root,
+                service_id=goal_manager_service_id,
+                username=username,
+                session_id=session_id,
+            )
+            audit: dict[str, Any] | None = None
+            compact_event: dict[str, Any] | None = None
+            if resolved_audit_state == "all_clear":
+                snapshot = get_user_history(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                )
+                audit = run_goal_audit(
+                    runtime_root=runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_text=goal_text,
+                    history_entries=snapshot,
+                    provider_kind="",
+                    on_event=goal_provider_event_sink,
+                )
+                persist_goal_audit_completion(
+                    runtime_root=runtime_root,
+                    log_path=log_path,
+                    service_id=goal_manager_service_id,
+                    process_id=process_id,
+                    goal_audit_job_id=goal_audit_job_id,
+                    username=username,
+                    session_id=session_id,
+                    audit={**audit, "goal_id": goal_id, "goal_text": goal_text},
+                    history_sink=goal_history_sink,
+                )
+                compact_event = handle_goal_manager_compact_request(
+                    runtime_root=runtime_root,
+                    repo_root=Path(__file__).resolve().parents[2],
+                    log_path=log_path,
+                    service_id=goal_manager_service_id,
+                    process_id=process_id,
+                    goal_audit_job_id=goal_audit_job_id,
+                    username=username,
+                    session_id=session_id,
+                    audit=audit,
+                    history_sink=goal_history_sink,
+                )
+                resolved_audit_state = str(audit["audit_state"]).strip().lower()
+            elif resolved_audit_state == "needs_compact":
+                compact_event = handle_goal_manager_compact_request(
+                    runtime_root=runtime_root,
+                    repo_root=Path(__file__).resolve().parents[2],
+                    log_path=log_path,
+                    service_id=goal_manager_service_id,
+                    process_id=process_id,
+                    goal_audit_job_id=goal_audit_job_id,
+                    username=username,
+                    session_id=session_id,
+                    audit={
+                        "request_compact": True,
+                        "request_compact_reason": "TurnCompleted auto-compact threshold exceeded.",
+                    },
+                    history_sink=goal_history_sink,
+                )
+            compact_recovered = False
+            if resolved_audit_state == "needs_compact":
+                if compact_event is None:
+                    resolved_audit_state = "panic"
+                elif str(compact_event.get("type")) == "service.goal_manager_compact_failed":
+                    resolved_audit_state = "panic"
+                elif str(compact_event.get("compaction")) == "suppressed_by_session_setting":
+                    resolved_audit_state = "needs_compact"
+                else:
+                    resolved_audit_state = "all_clear"
+                    compact_recovered = True
+            audit_progress_state = (
+                str(audit["progress_state"]).strip().lower()
+                if audit is not None
+                else "in_progress"
+            )
+            if audit is not None:
+                reviewed_turns = audit.get("pending_turn_completed_events", [])
+                if isinstance(reviewed_turns, list):
+                    reviewed_ts = [
+                        str(item.get("completed_at") or "").strip()
+                        for item in reviewed_turns
+                        if isinstance(item, dict) and str(item.get("completed_at") or "").strip()
+                    ]
+                    if reviewed_ts:
+                        update_goal_manager_review_cursor(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            last_turn_completed_at=max(reviewed_ts),
+                        )
+            if audit_progress_state == "complete":
+                update_session_goal_flags(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_completed=True,
+                    goal_progress_state="complete",
+                )
+            elif resolved_audit_state == "panic":
+                save_agent_audit_state(
+                    runtime_root,
+                    service_id=goal_manager_service_id,
+                    username=username,
+                    session_id=session_id,
+                    audit_state="panic",
+                )
+                update_session_goal_flags(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_completed=False,
+                    goal_progress_state="in_progress",
+                )
+            else:
+                save_agent_audit_state(
+                    runtime_root,
+                    service_id=goal_manager_service_id,
+                    username=username,
+                    session_id=session_id,
+                    audit_state=resolved_audit_state,
+                )
+                update_session_goal_flags(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_completed=False,
+                    goal_progress_state="in_progress",
+                )
+            latest_session_settings = get_session_settings(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+            ) or {}
+            if resolved_audit_state == "panic" and compact_event is not None:
+                spawn_panic_recovery(
+                    username=username,
+                    session_id=session_id,
+                    panic_event=compact_event,
+                    panic_service_id=goal_manager_service_id,
+                )
+            if list_active_in_progress_child_sessions(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+            ):
+                return
+            if not goal_audit_should_enqueue_agent_followup(
+                progress_state=audit_progress_state,
+                audit_state=resolved_audit_state,
+            ):
+                return
+            feedback_xml = (
+                (audit["continue_xml"] or default_goal_continue_xml(summary=audit["summary"]))
+                if audit is not None
+                else default_goal_continue_xml(
+                    summary="Context compact succeeded. Continue toward the active goal."
+                )
+            )
+            if compact_recovered:
+                feedback_xml = default_goal_continue_xml(
+                    summary=(
+                        (
+                            f"{audit['summary']}\n\n"
+                            if audit is not None and audit["summary"]
+                            else ""
+                        )
+                        + "Context compact succeeded. Continue toward the active goal."
+                    )
+                )
+            raw_agent_directives = (
+                list(audit.get("agent_directives", []))
+                if audit is not None and isinstance(audit.get("agent_directives"), list)
+                else []
+            )
+            normalized_directives: list[dict[str, Any]] = []
+            for directive in raw_agent_directives:
+                if not isinstance(directive, dict):
+                    continue
+                directive_service_id = str(directive.get("service_id") or "").strip()
+                if not directive_service_id:
+                    continue
+                normalized_directives.append(
+                    {
+                        "service_id": directive_service_id,
+                        "audit_state": str(directive.get("audit_state") or "all_clear").strip().lower(),
+                        "continue_xml": str(directive.get("continue_xml") or "").strip(),
+                        "request_compact": bool(directive.get("request_compact", False)),
+                        "request_compact_reason": str(directive.get("request_compact_reason") or "").strip(),
+                    }
+                )
+            agent_welcome_enabled = bool(latest_session_settings.get("agent_welcome_enabled", False))
+            if not normalized_directives:
+                normalized_directives = [
+                    {
+                        "service_id": goal_manager_service_id,
+                        "audit_state": resolved_audit_state,
+                        "continue_xml": feedback_xml,
+                        "request_compact": resolved_audit_state == "needs_compact",
+                        "request_compact_reason": (
+                            str(audit.get("request_compact_reason") or "").strip()
+                            if audit is not None
+                            else ""
+                        ),
+                    }
+                ]
+            elif not agent_welcome_enabled:
+                normalized_directives = [
+                    directive
+                    for directive in normalized_directives
+                    if str(directive.get("service_id") or "").strip() == goal_manager_service_id
+                ] or [
+                    {
+                        "service_id": goal_manager_service_id,
+                        "audit_state": resolved_audit_state,
+                        "continue_xml": feedback_xml,
+                        "request_compact": resolved_audit_state == "needs_compact",
+                        "request_compact_reason": (
+                            str(audit.get("request_compact_reason") or "").strip()
+                            if audit is not None
+                            else ""
+                        ),
+                    }
+                ]
+            for directive in normalized_directives:
+                directive_state = str(directive.get("audit_state") or "all_clear").strip().lower()
+                if directive_state not in {"all_clear", "needs_compact", "panic"}:
+                    directive_state = "all_clear"
+                save_agent_audit_state(
+                    runtime_root,
+                    service_id=str(directive["service_id"]),
+                    username=username,
+                    session_id=session_id,
+                    audit_state=directive_state,
+                )
+            contacted_agents = list_session_agent_contacts(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+            )
+            dispatch_targets = goal_followup_dispatch_targets(
+                contacted_agents if agent_welcome_enabled else [],
+                normalized_directives,
+            )
+            explicit_followup_targets: list[str] = []
+            queued_target_counts: dict[str, int] = {}
+            queued_targeted_followup = False
+            for directive in normalized_directives:
+                directive_service_id = str(directive.get("service_id") or "").strip()
+                directive_state = str(directive.get("audit_state") or "all_clear").strip().lower()
+                directive_feedback_xml = str(directive.get("continue_xml") or "").strip()
+                if (
+                    directive_service_id
+                    and directive_state == "all_clear"
+                    and directive_feedback_xml
+                ):
+                    pending_for_service = append_service_pending_input(
+                        runtime_root,
+                        service_id=directive_service_id,
+                        agent_id=resolve_session_agent_id(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            service_id=directive_service_id,
+                        ),
+                        username=username,
+                        session_id=session_id,
+                        entry=make_aize_pending_input(
+                            kind="goal_feedback",
+                            role="system",
+                            text=directive_feedback_xml,
+                        ),
+                    )
+                    queued_target_counts[directive_service_id] = len(pending_for_service)
+                    if directive_service_id not in explicit_followup_targets:
+                        explicit_followup_targets.append(directive_service_id)
+                    queued_targeted_followup = True
+                    _feedback_summary = str(audit.get("summary") or "").strip() if audit is not None else ""
+                    goal_history_sink(
+                        {
+                            "direction": "session_input",
+                            "kind": "goal_feedback",
+                            "ts": utc_ts(),
+                            "service_id": directive_service_id,
+                            "to": directive_service_id,
+                            "text": _feedback_summary or "GoalManager requested more work",
+                        }
+                    )
+            if explicit_followup_targets:
+                dispatch_targets = goal_followup_dispatch_targets(
+                    [{"service_id": item} for item in explicit_followup_targets],
+                    normalized_directives,
+                )
+            if not queued_targeted_followup:
+                append_pending_input(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    entry=make_aize_pending_input(
+                        kind="goal_feedback",
+                        role="system",
+                        text=feedback_xml,
+                    ),
+                )
+                dispatch_targets = [goal_manager_service_id]
+            for dispatch_service_id in dispatch_targets:
+                pending_for_target_count = queued_target_counts.get(dispatch_service_id)
+                if pending_for_target_count is None:
+                    pending_for_target_count = len(
+                        load_service_pending_inputs(
+                            runtime_root,
+                            service_id=dispatch_service_id,
+                            agent_id=resolve_session_agent_id(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                service_id=dispatch_service_id,
+                            ),
+                            username=username,
+                            session_id=session_id,
+                        )
+                    )
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "service.goal_audit_dispatch_check",
+                        "ts": utc_ts(),
+                        "service_id": goal_manager_service_id,
+                        "process_id": process_id,
+                        "scope": {"username": username, "session_id": session_id},
+                        "dispatch_target": dispatch_service_id,
+                        "pending_for_target_count": pending_for_target_count,
+                        "queued_targeted_followup": queued_targeted_followup,
+                        "will_skip": bool(not pending_for_target_count and queued_targeted_followup),
+                    },
+                )
+                if not pending_for_target_count and queued_targeted_followup:
+                    continue
+                send_tx(
+                    make_dispatch_pending_message(
+                        manifest=manifest,
+                        from_service_id=goal_manager_service_id,
+                        to_service_id=dispatch_service_id,
+                        process_id=process_id,
+                        run_id=f"goal-audit-{uuid.uuid4().hex[:8]}",
+                        username=username,
+                        session_id=session_id,
+                        auth_context=None,
+                        reason="goal_feedback",
+                        session_agent_id=resolve_session_agent_id(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            service_id=dispatch_service_id,
+                        ),
+                    )
+                )
+        except Exception as exc:
+            save_agent_audit_state(
+                runtime_root,
+                service_id=goal_manager_service_id,
+                username=username,
+                session_id=session_id,
+                audit_state="panic",
+            )
+            update_session_goal_flags(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+            )
+            write_jsonl(
+                log_path,
+                {
+                    "type": "service.goal_audit_failed",
+                    "ts": utc_ts(),
+                    "service_id": goal_manager_service_id,
+                    "process_id": process_id,
+                    "goal_audit_job_id": goal_audit_job_id,
+                    "scope": {"username": username, "session_id": session_id},
+                    "error": repr(exc),
+                },
+            )
+            goal_history_sink(
+                {
+                    "direction": "agent",
+                    "ts": utc_ts(),
+                    "from": goal_manager_service_id,
+                    "session_id": session_id,
+                    "event_type": "service.goal_audit_failed",
+                    "text": f"GoalManager audit failed: {exc!r}",
+                    "event": {
+                        "type": "service.goal_audit_failed",
+                        "goal_audit_job_id": goal_audit_job_id,
+                        "error": repr(exc),
+                    },
+                }
+            )
+            maybe_spawn_failure_recovery(
+                username=username,
+                session_id=session_id,
+                failure_event={
+                    "type": "service.goal_audit_failed",
+                    "error": repr(exc),
+                    "service_id": goal_manager_service_id,
+                    "process_id": process_id,
+                    "goal_audit_job_id": goal_audit_job_id,
+                },
+                failure_service_id=goal_manager_service_id,
+            )
 
     def process_prompt_message(message: dict[str, Any], *, reply_index: int) -> None:
         dispatch_pending = message.get("type") == "dispatch_pending"
@@ -820,6 +1428,7 @@ def run_agent_service(
                 return
         try:
             with scope_lock_for(scope_username, scope_session_id):
+                goal_manager_review_items: list[dict[str, Any]] = []
                 # Drain pending inputs inside the scope lock to prevent a race where two
                 # dispatch_pending messages both see a non-empty queue and each launch Codex.
                 if dispatch_pending:
@@ -887,6 +1496,7 @@ def run_agent_service(
                         username=scope_username,
                         session_id=scope_session_id,
                     )
+                    goal_manager_review_items = decode_goal_manager_review_inputs(service_pending_inputs)
                     pending_inputs.extend(service_pending_inputs)
                     if not pending_inputs:
                         write_jsonl(
@@ -931,6 +1541,24 @@ def run_agent_service(
                         "message": message,
                     },
                 )
+
+                if dispatch_pending and goal_manager_review_items and scope_username and scope_session_id:
+                    goal_review_settings = get_session_settings(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    ) or {}
+                    run_goal_manager_review(
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        session_settings=goal_review_settings,
+                        goal_text=str(goal_review_settings.get("goal_text") or "").strip(),
+                        reply_index=reply_index,
+                        goal_manager_service_id=service_id,
+                        gm_work_items=goal_manager_review_items,
+                        append_scoped_history=append_scoped_history,
+                    )
+                    return
 
                 prompt = build_prompt(self_service, peer_service, incoming_text, reply_index)
                 next_session_id: str | None = None
@@ -1547,6 +2175,10 @@ def run_agent_service(
                             )
                             def run_goal_manager() -> None:
                                 try:
+                                    goal_manager_service_id = resolve_goal_manager_dispatch_service(
+                                        username=scope_username,
+                                        session_id=scope_session_id,
+                                    ) or service_id
                                     gm_work_items = drain_goal_manager_pending_inputs(
                                         runtime_root,
                                         username=scope_username,
@@ -1554,50 +2186,25 @@ def run_agent_service(
                                     )
                                     if not gm_work_items:
                                         return
-                                    goal_audit_job_id = f"goal-audit-{uuid.uuid4().hex[:8]}"
-                                    goal_id = str(
-                                        session_settings.get("active_goal_id")
-                                        or session_settings.get("goal_id")
-                                        or ""
-                                    ).strip()
-                                    def goal_history_sink(entry: dict[str, Any]) -> None:
-                                        append_scoped_history(entry, limit=GOAL_AUDIT_HISTORY_LIMIT)
-                                    def goal_provider_event_sink(event: dict[str, Any]) -> None:
-                                        provider_event_type = str(event.get("type") or "event").strip() or "event"
-                                        history_entry = make_history_event_entry(event, service_id=service_id)
-                                        history_entry["direction"] = "agent"
-                                        history_entry["from"] = service_id
-                                        history_entry["session_id"] = scope_session_id
-                                        history_entry["event_type"] = f"service.goal_audit_provider_event.{provider_event_type}"
-                                        history_entry["event"] = {
-                                            "type": "service.goal_audit_provider_event",
-                                            "goal_audit_job_id": goal_audit_job_id,
-                                            "provider_event": event,
-                                        }
-                                        write_jsonl(
-                                            log_path,
-                                            {
-                                                "type": "service.goal_audit_provider_event",
-                                                "ts": utc_ts(),
-                                                "service_id": service_id,
-                                                "process_id": process_id,
-                                                "goal_audit_job_id": goal_audit_job_id,
-                                                "scope": {"username": scope_username, "session_id": scope_session_id},
-                                                "provider_event": event,
-                                            },
+                                    queued_review = []
+                                    for gm_work_item in gm_work_items:
+                                        queued_review = append_service_pending_input(
+                                            runtime_root,
+                                            service_id=goal_manager_service_id,
+                                            agent_id=resolve_session_agent_id(
+                                                runtime_root,
+                                                username=scope_username,
+                                                session_id=scope_session_id,
+                                                service_id=goal_manager_service_id,
+                                            ),
+                                            username=scope_username,
+                                            session_id=scope_session_id,
+                                            entry=make_aize_pending_input(
+                                                kind="goal_manager_review",
+                                                role="system",
+                                                text=json.dumps(gm_work_item, ensure_ascii=False),
+                                            ),
                                         )
-                                        goal_history_sink(history_entry)
-                                    started_event = {
-                                        "type": "service.goal_audit_started",
-                                        "ts": utc_ts(),
-                                        "service_id": service_id,
-                                        "process_id": process_id,
-                                        "goal_audit_job_id": goal_audit_job_id,
-                                        "scope": {"username": scope_username, "session_id": scope_session_id},
-                                        "goal_id": goal_id,
-                                        "goal_text": goal_text,
-                                        "goal_manager_work_items": gm_work_items,
-                                    }
                                     goal_manager_state_path = session_goal_manager_state_path(
                                         runtime_root,
                                         username=scope_username,
@@ -1606,699 +2213,57 @@ def run_agent_service(
                                     goal_manager_state = read_json_file(goal_manager_state_path) or {}
                                     goal_manager_state.update(
                                         {
-                                            "state": "running",
-                                            "service_id": service_id,
-                                            "goal_audit_job_id": goal_audit_job_id,
-                                            "goal_id": goal_id,
-                                            "goal_text": goal_text,
+                                            "state": "queued",
+                                            "service_id": goal_manager_service_id,
                                             "pending_work_items": gm_work_items,
                                             "updated_at": utc_ts(),
                                         }
                                     )
                                     write_json_file(goal_manager_state_path, goal_manager_state)
-                                    write_jsonl(log_path, started_event)
-                                    goal_history_sink(
-                                        {
-                                            "direction": "agent",
-                                            "ts": utc_ts(),
-                                            "from": service_id,
-                                            "session_id": scope_session_id,
-                                            "event_type": "service.goal_audit_started",
-                                            "text": "GoalManager is reviewing this session.",
-                                            "event": started_event,
-                                        }
-                                    )
-                                    # Audit state is agent-side: read from agent record
-                                    resolved_audit_state = load_agent_audit_state(
-                                        runtime_root,
-                                        service_id=service_id,
-                                        username=scope_username,
-                                        session_id=scope_session_id,
-                                    )
-                                    audit: dict[str, Any] | None = None
-                                    compact_event: dict[str, Any] | None = None
-                                    if resolved_audit_state == "all_clear":
-                                        snapshot = get_user_history(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                        )
-                                        audit = run_goal_audit(
-                                            runtime_root=runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            goal_text=goal_text,
-                                            history_entries=snapshot,
-                                            provider_kind=str(self_service.get("kind", "codex")),
-                                            on_event=goal_provider_event_sink,
-                                        )
-                                        persist_goal_audit_completion(
-                                            runtime_root=runtime_root,
-                                            log_path=log_path,
-                                            service_id=service_id,
-                                            process_id=process_id,
-                                            goal_audit_job_id=goal_audit_job_id,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            audit={**audit, "goal_id": goal_id, "goal_text": goal_text},
-                                            history_sink=goal_history_sink,
-                                        )
-                                        compact_event = handle_goal_manager_compact_request(
-                                            runtime_root=runtime_root,
-                                            repo_root=Path(__file__).resolve().parents[2],
-                                            log_path=log_path,
-                                            service_id=service_id,
-                                            process_id=process_id,
-                                            goal_audit_job_id=goal_audit_job_id,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            audit=audit,
-                                            history_sink=goal_history_sink,
-                                        )
-                                        resolved_audit_state = str(audit["audit_state"]).strip().lower()
-                                    elif resolved_audit_state == "needs_compact":
-                                        compact_event = handle_goal_manager_compact_request(
-                                            runtime_root=runtime_root,
-                                            repo_root=Path(__file__).resolve().parents[2],
-                                            log_path=log_path,
-                                            service_id=service_id,
-                                            process_id=process_id,
-                                            goal_audit_job_id=goal_audit_job_id,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            audit={
-                                                "request_compact": True,
-                                                "request_compact_reason": "TurnCompleted auto-compact threshold exceeded.",
-                                            },
-                                            history_sink=goal_history_sink,
-                                        )
-                                    compact_recovered = False
-                                    if resolved_audit_state == "needs_compact":
-                                        if compact_event is None:
-                                            resolved_audit_state = "panic"
-                                        elif str(compact_event.get("type")) == "service.goal_manager_compact_failed":
-                                            resolved_audit_state = "panic"
-                                        elif str(compact_event.get("compaction")) == "suppressed_by_session_setting":
-                                            resolved_audit_state = "needs_compact"
-                                        else:
-                                            resolved_audit_state = "all_clear"
-                                            compact_recovered = True
-                                    audit_progress_state = (
-                                        str(audit["progress_state"]).strip().lower()
-                                        if audit is not None
-                                        else "in_progress"
-                                    )
-                                    if audit is not None:
-                                        reviewed_turns = audit.get("pending_turn_completed_events", [])
-                                        if isinstance(reviewed_turns, list):
-                                            reviewed_ts = [
-                                                str(item.get("completed_at") or "").strip()
-                                                for item in reviewed_turns
-                                                if isinstance(item, dict) and str(item.get("completed_at") or "").strip()
-                                            ]
-                                            if reviewed_ts:
-                                                update_goal_manager_review_cursor(
-                                                    runtime_root,
-                                                    username=scope_username,
-                                                    session_id=scope_session_id,
-                                                    last_turn_completed_at=max(reviewed_ts),
-                                                )
-                                    if audit_progress_state == "complete":
-                                        parent_session_id = str(
-                                            session_settings.get("parent_session_id") or ""
-                                        ).strip()
-                                        if parent_session_id and parent_session_id != scope_session_id:
-                                            parent_progress = complete_session_child(
-                                                runtime_root,
-                                                username=scope_username,
-                                                parent_session_id=parent_session_id,
-                                                child_session_id=scope_session_id,
-                                            )
-                                            if parent_progress is not None:
-                                                parent_session = get_session_settings(
-                                                    runtime_root,
-                                                    username=scope_username,
-                                                    session_id=parent_session_id,
-                                                ) or {}
-                                                parent_service_id = resolve_session_dispatch_service(
-                                                    username=scope_username,
-                                                    session_id=parent_session_id,
-                                                    default_service_id=str(
-                                                        parent_session.get("service_id") or ""
-                                                    ).strip() or None,
-                                                )
-                                                parent_summary = (
-                                                    f"Child session {scope_session_id} completed goal work."
-                                                )
-                                                if not bool(parent_progress.get("waiting_on_children")):
-                                                    parent_goal_id = str(
-                                                        parent_session.get("active_goal_id")
-                                                        or parent_session.get("goal_id")
-                                                        or ""
-                                                    ).strip()
-                                                    append_pending_input(
-                                                        runtime_root,
-                                                        username=scope_username,
-                                                        session_id=parent_session_id,
-                                                        entry=make_aize_pending_input(
-                                                            kind="child_session_completed",
-                                                            role="system",
-                                                            text=_child_session_broadcast_json(
-                                                                event_type="child_session_completed",
-                                                                parent_session_id=parent_session_id,
-                                                                child_session_id=scope_session_id,
-                                                                parent_goal_id=parent_goal_id,
-                                                                summary=parent_summary,
-                                                            ),
-                                                        ),
-                                                    )
-                                                    append_pending_input(
-                                                        runtime_root,
-                                                        username=scope_username,
-                                                        session_id=parent_session_id,
-                                                        entry=make_aize_pending_input(
-                                                            kind="goal_feedback",
-                                                            role="system",
-                                                            text=default_goal_continue_xml(summary=parent_summary),
-                                                        ),
-                                                    )
-                                                    append_goal_manager_pending_input(
-                                                        runtime_root,
-                                                        username=scope_username,
-                                                        session_id=parent_session_id,
-                                                        entry={
-                                                            "kind": "child_session_completed",
-                                                            "ts": utc_ts(),
-                                                            "service_id": service_id,
-                                                            "child_session_id": scope_session_id,
-                                                            "goal_id": parent_goal_id,
-                                                        },
-                                                    )
-                                                    append_user_history(
-                                                        runtime_root,
-                                                        username=scope_username,
-                                                        session_id=parent_session_id,
-                                                        entry={
-                                                            "direction": "session_input",
-                                                            "kind": "child_session_completed",
-                                                            "ts": utc_ts(),
-                                                            "service_id": service_id,
-                                                            "to": parent_service_id or service_id,
-                                                            "text": parent_summary,
-                                                        },
-                                                        limit=GOAL_AUDIT_HISTORY_LIMIT,
-                                                    )
-                                                    if parent_service_id:
-                                                        send_tx(
-                                                            make_dispatch_pending_message(
-                                                                manifest=manifest,
-                                                                from_service_id=service_id,
-                                                                to_service_id=parent_service_id,
-                                                                process_id=process_id,
-                                                                run_id=f"child-complete-{uuid.uuid4().hex[:8]}",
-                                                                username=scope_username,
-                                                                session_id=parent_session_id,
-                                                                auth_context=None,
-                                                                reason="child_session_completed",
-                                                                session_agent_id=resolve_session_agent_id(
-                                                                    runtime_root,
-                                                                    username=scope_username,
-                                                                    session_id=parent_session_id,
-                                                                    service_id=parent_service_id,
-                                                                ),
-                                                            )
-                                                        )
-                                        save_agent_audit_state(
-                                            runtime_root,
-                                            service_id=service_id,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            audit_state=resolved_audit_state,
-                                        )
-                                        completion_ok, completion_reason = _parent_resume_validated_for_recovery_completion(
-                                            runtime_root=runtime_root,
-                                            username=scope_username,
-                                            recovery_session_settings=session_settings,
-                                        )
-                                        if not completion_ok:
-                                            update_session_goal_flags(
-                                                runtime_root,
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                                goal_id=goal_id,
-                                                goal_completed=False,
-                                                goal_progress_state="in_progress",
-                                            )
-                                            scope_session_dir = session_dir(
-                                                runtime_root,
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                            )
-                                            scope_timeline = session_timeline_path(
-                                                runtime_root,
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                            )
-                                            append_pending_input(
-                                                runtime_root,
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                                entry=make_aize_pending_input(
-                                                    kind="completion_override",
-                                                    role="system",
-                                                    text=_session_completion_override_xml(
-                                                        reason=completion_reason,
-                                                        session_dir_path=str(scope_session_dir),
-                                                        timeline_path=str(scope_timeline),
-                                                    ),
-                                                ),
-                                            )
-                                            append_user_history(
-                                                runtime_root,
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                                entry={
-                                                    "direction": "event",
-                                                    "ts": utc_ts(),
-                                                    "service_id": service_id,
-                                                    "event_type": "service.session_completion_overridden",
-                                                    "text": f"Session completion overridden: {completion_reason}",
-                                                    "event": {
-                                                        "type": "service.session_completion_overridden",
-                                                        "reason": completion_reason,
-                                                    },
-                                                },
-                                                limit=GOAL_AUDIT_HISTORY_LIMIT,
-                                            )
-                                            send_tx(
-                                                make_dispatch_pending_message(
-                                                    manifest=manifest,
-                                                    from_service_id=service_id,
-                                                    to_service_id=service_id,
-                                                    process_id=process_id,
-                                                    run_id=f"completion-override-{uuid.uuid4().hex[:8]}",
-                                                    username=scope_username,
-                                                    session_id=scope_session_id,
-                                                    auth_context=None,
-                                                    reason="session_completion_overridden",
-                                                    session_agent_id=resolve_session_agent_id(
-                                                        runtime_root,
-                                                        username=scope_username,
-                                                        session_id=scope_session_id,
-                                                        service_id=service_id,
-                                                    ),
-                                                )
-                                            )
-                                            return
-                                        update_session_goal_flags(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            goal_id=goal_id,
-                                            goal_completed=True,
-                                            goal_progress_state=audit_progress_state,
-                                        )
-                                        latest_session_settings = get_session_settings(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                        )
-                                        maybe_release_session_provider(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            talk=latest_session_settings,
-                                        )
-                                        return
-                                    raw_child_goal_requests = (
-                                        list(audit.get("child_goal_requests", []))
-                                        if audit is not None and isinstance(audit.get("child_goal_requests"), list)
-                                        else []
-                                    )
-                                    for child_request in raw_child_goal_requests:
-                                        if not isinstance(child_request, dict):
-                                            continue
-                                        child_service_id = str(child_request.get("service_id") or "").strip()
-                                        child_goal_text = str(child_request.get("goal_text") or "").strip()
-                                        child_label = str(child_request.get("label") or "").strip()
-                                        if not child_service_id or not child_goal_text:
-                                            continue
-                                        child_session = create_child_conversation_session(
-                                            runtime_root,
-                                            username=scope_username,
-                                            parent_session_id=scope_session_id,
-                                            label=child_label or "Subgoal",
-                                            goal_text=child_goal_text,
-                                        )
-                                        if child_session is None:
-                                            continue
-                                        child_session_id = str(child_session.get("session_id") or "").strip()
-                                        child_goal_id = str(
-                                            child_session.get("active_goal_id")
-                                            or child_session.get("goal_id")
-                                            or ""
-                                        ).strip()
-                                        parent_goal_id = str(
-                                            session_settings.get("active_goal_id")
-                                            or session_settings.get("goal_id")
-                                            or ""
-                                        ).strip()
-                                        append_pending_input(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            entry=make_aize_pending_input(
-                                                kind="child_session_created",
-                                                role="system",
-                                                text=_child_session_broadcast_json(
-                                                    event_type="child_session_created",
-                                                    parent_session_id=scope_session_id,
-                                                    child_session_id=child_session_id,
-                                                    parent_goal_id=parent_goal_id,
-                                                    child_goal_id=child_goal_id,
-                                                    child_goal_text=child_goal_text,
-                                                    child_label=child_label or "Subgoal",
-                                                    dispatch_service_id=child_service_id,
-                                                    summary=f"GoalManager created child session {child_session_id}.",
-                                                ),
-                                            ),
-                                        )
-                                        append_pending_input(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=child_session_id,
-                                            entry=make_aize_pending_input(
-                                                kind="goal_update",
-                                                role="system",
-                                                text=_goal_update_xml(
-                                                    goal_id=child_goal_id,
-                                                    goal_text=child_goal_text,
-                                                ),
-                                            ),
-                                        )
-                                        record_session_agent_contact(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=child_session_id,
-                                            service_id=child_service_id,
-                                        )
-                                        write_jsonl(
-                                            log_path,
-                                            {
-                                                "type": "service.goal_child_session_created",
-                                                "ts": utc_ts(),
-                                                "service_id": service_id,
-                                                "process_id": process_id,
-                                                "scope": {"username": scope_username, "session_id": scope_session_id},
-                                                "child_session_id": child_session_id,
-                                                "dispatch_service_id": child_service_id,
-                                                "goal_text": child_goal_text,
-                                            },
-                                        )
-                                        goal_history_sink(
-                                            {
-                                                "direction": "session_input",
-                                                "kind": "child_session_created",
-                                                "ts": utc_ts(),
-                                                "service_id": service_id,
-                                                "to": child_service_id,
-                                                "event_type": "service.goal_child_session_created",
-                                                "text": f"GoalManager created child session {child_session_id}.",
-                                                "event": {
-                                                    "type": "service.goal_child_session_created",
-                                                    "child_session_id": child_session_id,
-                                                    "dispatch_service_id": child_service_id,
-                                                    "goal_text": child_goal_text,
-                                                },
-                                            }
-                                        )
-                                        send_tx(
-                                            make_dispatch_pending_message(
-                                                manifest=manifest,
-                                                from_service_id=service_id,
-                                                to_service_id=child_service_id,
-                                                process_id=process_id,
-                                                run_id=f"child-goal-{uuid.uuid4().hex[:8]}",
-                                                username=scope_username,
-                                                session_id=child_session_id,
-                                                auth_context=None,
-                                                reason="child_goal_request",
-                                                session_agent_id=resolve_session_agent_id(
-                                                    runtime_root,
-                                                    username=scope_username,
-                                                    session_id=child_session_id,
-                                                    service_id=child_service_id,
-                                                ),
-                                            )
-                                        )
-                                    save_agent_audit_state(
-                                        runtime_root,
-                                        service_id=service_id,
-                                        username=scope_username,
-                                        session_id=scope_session_id,
-                                        audit_state=resolved_audit_state,
-                                    )
-                                    update_session_goal_flags(
-                                        runtime_root,
-                                        username=scope_username,
-                                        session_id=scope_session_id,
-                                        goal_id=goal_id,
-                                        goal_completed=False,
-                                        goal_progress_state=audit_progress_state,
-                                    )
-                                    latest_session_settings = get_session_settings(
-                                        runtime_root,
-                                        username=scope_username,
-                                        session_id=scope_session_id,
-                                    ) or {}
-                                    if resolved_audit_state == "panic" and compact_event is not None:
-                                        spawn_panic_recovery(
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            panic_event=compact_event,
-                                            panic_service_id=service_id,
-                                        )
-                                    if list_active_in_progress_child_sessions(
-                                        runtime_root,
-                                        username=scope_username,
-                                        session_id=scope_session_id,
-                                    ):
-                                        return
-                                    agent_welcome_enabled = bool(
-                                        latest_session_settings.get("agent_welcome_enabled", False)
-                                    )
-                                    latest_goal_id = str(
-                                        latest_session_settings.get("active_goal_id")
-                                        or latest_session_settings.get("goal_id")
-                                        or ""
-                                    ).strip()
-                                    if goal_id and latest_goal_id and latest_goal_id != goal_id:
-                                        return
-                                    if not goal_audit_should_enqueue_agent_followup(
-                                        progress_state=audit_progress_state,
-                                        audit_state=resolved_audit_state,
-                                    ):
-                                        return
-                                    feedback_xml = (
-                                        (audit["continue_xml"] or default_goal_continue_xml(summary=audit["summary"]))
-                                        if audit is not None
-                                        else default_goal_continue_xml(
-                                            summary="Context compact succeeded. Continue toward the active goal."
-                                        )
-                                    )
-                                    if compact_recovered:
-                                        feedback_xml = default_goal_continue_xml(
-                                            summary=(
-                                                (
-                                                    f"{audit['summary']}\n\n"
-                                                    if audit is not None and audit["summary"]
-                                                    else ""
-                                                )
-                                                + "Context compact succeeded. Continue toward the active goal."
-                                            )
-                                        )
-                                    raw_agent_directives = (
-                                        list(audit.get("agent_directives", []))
-                                        if audit is not None and isinstance(audit.get("agent_directives"), list)
-                                        else []
-                                    )
-                                    normalized_directives: list[dict[str, Any]] = []
-                                    if raw_agent_directives:
-                                        for directive in raw_agent_directives:
-                                            if not isinstance(directive, dict):
-                                                continue
-                                            directive_service_id = str(directive.get("service_id") or "").strip()
-                                            if not directive_service_id:
-                                                continue
-                                            normalized_directives.append(
-                                                {
-                                                    "service_id": directive_service_id,
-                                                    "audit_state": str(
-                                                        directive.get("audit_state") or "all_clear"
-                                                    ).strip().lower(),
-                                                    "continue_xml": str(
-                                                        directive.get("continue_xml") or ""
-                                                    ).strip(),
-                                                    "request_compact": bool(
-                                                        directive.get("request_compact", False)
-                                                    ),
-                                                    "request_compact_reason": str(
-                                                        directive.get("request_compact_reason") or ""
-                                                    ).strip(),
-                                                }
-                                            )
-                                    if not normalized_directives:
-                                        normalized_directives = [
-                                            {
-                                                "service_id": service_id,
-                                                "audit_state": resolved_audit_state,
-                                                "continue_xml": feedback_xml,
-                                                "request_compact": resolved_audit_state == "needs_compact",
-                                                "request_compact_reason": (
-                                                    str(audit.get("request_compact_reason") or "").strip()
-                                                    if audit is not None
-                                                    else ""
-                                                ),
-                                            }
-                                        ]
-                                    elif not agent_welcome_enabled:
-                                        normalized_directives = [
-                                            directive
-                                            for directive in normalized_directives
-                                            if str(directive.get("service_id") or "").strip() == service_id
-                                        ] or [
-                                            {
-                                                "service_id": service_id,
-                                                "audit_state": resolved_audit_state,
-                                                "continue_xml": feedback_xml,
-                                                "request_compact": resolved_audit_state == "needs_compact",
-                                                "request_compact_reason": (
-                                                    str(audit.get("request_compact_reason") or "").strip()
-                                                    if audit is not None
-                                                    else ""
-                                                ),
-                                            }
-                                        ]
-                                    for directive in normalized_directives:
-                                        directive_state = str(directive.get("audit_state") or "all_clear").strip().lower()
-                                        if directive_state not in {"all_clear", "needs_compact", "panic"}:
-                                            directive_state = "all_clear"
-                                        save_agent_audit_state(
-                                            runtime_root,
-                                            service_id=str(directive["service_id"]),
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            audit_state=directive_state,
-                                        )
-                                    contacted_agents = list_session_agent_contacts(
-                                        runtime_root,
-                                        username=scope_username,
-                                        session_id=scope_session_id,
-                                    )
-                                    dispatch_targets = goal_followup_dispatch_targets(
-                                        contacted_agents if agent_welcome_enabled else [],
-                                        normalized_directives,
-                                    )
-                                    queued_targeted_followup = False
-                                    for directive in normalized_directives:
-                                        directive_service_id = str(directive.get("service_id") or "").strip()
-                                        directive_state = str(directive.get("audit_state") or "all_clear").strip().lower()
-                                        directive_feedback_xml = str(directive.get("continue_xml") or "").strip()
-                                        if (
-                                            directive_service_id
-                                            and directive_state == "all_clear"
-                                            and directive_feedback_xml
-                                        ):
-                                            append_service_pending_input(
-                                                runtime_root,
-                                                service_id=directive_service_id,
-                                                agent_id=resolve_session_agent_id(
-                                                    runtime_root,
-                                                    username=scope_username,
-                                                    session_id=scope_session_id,
-                                                    service_id=directive_service_id,
-                                                ),
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                                entry=make_aize_pending_input(
-                                                    kind="goal_feedback",
-                                                    role="system",
-                                                    text=directive_feedback_xml,
-                                                ),
-                                            )
-                                            queued_targeted_followup = True
-                                            _feedback_summary = str(audit.get("summary") or "").strip() if audit is not None else ""
-                                            append_scoped_history(
-                                                {
-                                                    "direction": "session_input",
-                                                    "kind": "goal_feedback",
-                                                    "ts": utc_ts(),
-                                                    "service_id": directive_service_id,
-                                                    "to": directive_service_id,
-                                                    "text": _feedback_summary or "GoalManager requested more work",
-                                                },
-                                                limit=GOAL_AUDIT_HISTORY_LIMIT,
-                                            )
-                                    if not queued_targeted_followup:
-                                        append_pending_input(
-                                            runtime_root,
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                            entry=make_aize_pending_input(
-                                                kind="goal_feedback",
-                                                role="system",
-                                                text=feedback_xml,
-                                            ),
-                                        )
-                                        dispatch_targets = [service_id]
-                                    for dispatch_service_id in dispatch_targets:
-                                        pending_for_target = load_service_pending_inputs(
-                                            runtime_root,
-                                            service_id=dispatch_service_id,
-                                            agent_id=resolve_session_agent_id(
-                                                runtime_root,
-                                                username=scope_username,
-                                                session_id=scope_session_id,
-                                                service_id=dispatch_service_id,
-                                            ),
-                                            username=scope_username,
-                                            session_id=scope_session_id,
-                                        )
-                                        write_jsonl(
-                                            log_path,
-                                            {
-                                                "type": "service.goal_audit_dispatch_check",
-                                                "ts": utc_ts(),
-                                                "service_id": service_id,
-                                                "process_id": process_id,
-                                                "scope": {"username": scope_username, "session_id": scope_session_id},
-                                                "dispatch_target": dispatch_service_id,
-                                                "pending_for_target_count": len(pending_for_target),
-                                                "queued_targeted_followup": queued_targeted_followup,
-                                                "will_skip": bool(not pending_for_target and queued_targeted_followup),
-                                            },
-                                        )
-                                        if not pending_for_target and queued_targeted_followup:
-                                            continue
-                                        goal_message = make_dispatch_pending_message(
+                                    send_tx(
+                                        make_dispatch_pending_message(
                                             manifest=manifest,
                                             from_service_id=service_id,
-                                            to_service_id=dispatch_service_id,
+                                            to_service_id=goal_manager_service_id,
                                             process_id=process_id,
-                                            run_id=f"goal-audit-{uuid.uuid4().hex[:8]}",
+                                            run_id=f"goal-manager-review-{uuid.uuid4().hex[:8]}",
                                             username=scope_username,
                                             session_id=scope_session_id,
                                             auth_context=None,
-                                            reason="goal_feedback",
+                                            reason="goal_manager_review",
                                             session_agent_id=resolve_session_agent_id(
                                                 runtime_root,
                                                 username=scope_username,
                                                 session_id=scope_session_id,
-                                                service_id=dispatch_service_id,
+                                                service_id=goal_manager_service_id,
                                             ),
                                         )
-                                        send_tx(goal_message)
+                                    )
+                                    write_jsonl(
+                                        log_path,
+                                        {
+                                            "type": "service.goal_manager_review_queued",
+                                            "ts": utc_ts(),
+                                            "service_id": service_id,
+                                            "process_id": process_id,
+                                            "scope": {"username": scope_username, "session_id": scope_session_id},
+                                            "goal_manager_service_id": goal_manager_service_id,
+                                            "goal_manager_pending_count": len(queued_review),
+                                        },
+                                    )
+                                    return
                                 except Exception as exc:
+                                    write_jsonl(
+                                        log_path,
+                                        {
+                                            "type": "service.goal_audit_failed",
+                                            "ts": utc_ts(),
+                                            "service_id": service_id,
+                                            "process_id": process_id,
+                                            "scope": {"username": scope_username, "session_id": scope_session_id},
+                                            "error": repr(exc),
+                                        },
+                                    )
                                     save_agent_audit_state(
                                         runtime_root,
                                         service_id=service_id,
@@ -2313,33 +2278,6 @@ def run_agent_service(
                                         goal_completed=False,
                                         goal_progress_state="in_progress",
                                     )
-                                    write_jsonl(
-                                        log_path,
-                                        {
-                                            "type": "service.goal_audit_failed",
-                                            "ts": utc_ts(),
-                                            "service_id": service_id,
-                                            "process_id": process_id,
-                                            "goal_audit_job_id": goal_audit_job_id,
-                                            "scope": {"username": scope_username, "session_id": scope_session_id},
-                                            "error": repr(exc),
-                                        },
-                                    )
-                                    goal_history_sink(
-                                        {
-                                            "direction": "agent",
-                                            "ts": utc_ts(),
-                                            "from": service_id,
-                                            "session_id": scope_session_id,
-                                            "event_type": "service.goal_audit_failed",
-                                            "text": f"GoalManager audit failed: {exc!r}",
-                                            "event": {
-                                                "type": "service.goal_audit_failed",
-                                                "goal_audit_job_id": goal_audit_job_id,
-                                                "error": repr(exc),
-                                            },
-                                        }
-                                    )
                                     maybe_spawn_failure_recovery(
                                         username=scope_username,
                                         session_id=scope_session_id,
@@ -2348,10 +2286,10 @@ def run_agent_service(
                                             "error": repr(exc),
                                             "service_id": service_id,
                                             "process_id": process_id,
-                                            "goal_audit_job_id": goal_audit_job_id,
                                         },
                                         failure_service_id=service_id,
                                     )
+
 
                             run_goal_manager()
 
@@ -2506,7 +2444,7 @@ def run_agent_service(
                 failure_event=failure_event,
                 failure_service_id=service_id,
             )
-        if reply_index >= int(self_service["max_turns"]) and not done_sent.is_set():
+        if max_turns >= 0 and reply_index >= max_turns and not done_sent.is_set():
             done_sent.set()
             done_message = make_message(
                 from_node_id=manifest["node_id"],
@@ -2555,7 +2493,7 @@ def run_agent_service(
             else:
                 process_prompt_message(message, reply_index=current_reply_index)
 
-            if current_reply_index >= int(self_service["max_turns"]):
+            if max_turns >= 0 and current_reply_index >= max_turns:
                 break
 
         for worker in list(workers):

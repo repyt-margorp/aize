@@ -213,6 +213,30 @@ def deliver_local_message(
         return False
 
 
+def register_delivery_socket(
+    write_socks: dict[str, socket.socket],
+    *,
+    sender_id: str,
+    sock: socket.socket,
+) -> bool:
+    existing = write_socks.get(sender_id)
+    if existing is None or existing is sock:
+        write_socks[sender_id] = sock
+        return True
+    return False
+
+
+def remove_delivery_socket(
+    write_socks: dict[str, socket.socket],
+    *,
+    sender_id: str,
+    sock: socket.socket,
+) -> None:
+    existing = write_socks.get(sender_id)
+    if existing is sock:
+        del write_socks[sender_id]
+
+
 @dataclass
 class _Conn:
     sock: socket.socket
@@ -296,8 +320,12 @@ def main() -> int:
 
             if not chunk:
                 # Connection closed
-                if conn.sender_id and conn.sender_id in write_socks:
-                    del write_socks[conn.sender_id]
+                if conn.sender_id:
+                    remove_delivery_socket(
+                        write_socks,
+                        sender_id=conn.sender_id,
+                        sock=conn.sock,
+                    )
                 try:
                     conn.sock.close()
                 except OSError:
@@ -323,7 +351,20 @@ def main() -> int:
                             conn.sender_id = sender_id
                             # Register socket for delivery (not for system senders)
                             if sender_id not in SYSTEM_SENDERS:
-                                write_socks[sender_id] = conn.sock
+                                registered = register_delivery_socket(
+                                    write_socks,
+                                    sender_id=sender_id,
+                                    sock=conn.sock,
+                                )
+                                if not registered:
+                                    write_jsonl(
+                                        router_log,
+                                        {
+                                            "type": "router.duplicate_sender_connection_ignored",
+                                            "ts": utc_ts(),
+                                            "sender_id": sender_id,
+                                        },
+                                    )
                     continue
 
                 message = decode_line(line)

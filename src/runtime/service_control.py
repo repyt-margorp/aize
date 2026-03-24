@@ -175,13 +175,19 @@ def extract_agent_message_visible_text(text: str) -> str:
 
 
 def build_prompt(service: dict[str, Any], peer_service: dict[str, Any], text: str, reply_index: int) -> str:
+    max_turns = int(service.get("max_turns", 100) or 0)
+    turn_limit_text = (
+        f"This is your reply number {reply_index}. There is no max-turn limit for this service."
+        if max_turns < 0
+        else f"This is your reply number {reply_index} of {max_turns}."
+    )
     parts = [
         str(service["persona"]),
         "Reply normally and directly for the task at hand. Never mention being an AI.",
         "Do not burn a turn on a plan-only or acknowledgment-only reply. If you have not advanced the work yet, keep assistant_text empty and continue executing.",
         "If you need information from the user before a goal can continue, keep the user-visible question in assistant_text and append a trailing <aize_user_response_wait><timeout_seconds>300</timeout_seconds></aize_user_response_wait> control block inside the same assistant_text. Values above 300 seconds are capped by the runtime; the XML block is hidden from the user-facing text and tells GoalManager to wait briefly, then resume autonomously after the timeout.",
         f"You are talking to {peer_service['display_name']}.",
-        f"This is your reply number {reply_index} of {service['max_turns']}.",
+        turn_limit_text,
     ]
     if text.lstrip().startswith("<aize_"):
         parts.extend(

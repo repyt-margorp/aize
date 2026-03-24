@@ -34,6 +34,7 @@ from runtime.persistent_state import (
     list_sessions_bound_to_service,
     normalize_auto_compact_threshold_left_percent,
     resolve_session_agent_id,
+    session_goal_manager_reviews_path,
     session_goal_manager_state_path,
     session_dir,
     session_timeline_path,
@@ -49,6 +50,27 @@ from runtime.providers import (
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
+
+
+def _latest_goal_manager_review(runtime_root: Path, *, username: str, session_id: str) -> dict[str, Any] | None:
+    path = session_goal_manager_reviews_path(runtime_root, username=username, session_id=session_id)
+    if not path.exists():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            return record
+    return None
 
 
 def context_status_from_history_entry(entry: dict[str, Any]) -> dict[str, str] | None:
@@ -371,6 +393,37 @@ def maybe_resume_after_restart(
             and goal_progress_state == "in_progress"
             and goal_audit_state in {"all_clear", "needs_compact"}
         )
+        latest_review = _latest_goal_manager_review(
+            runtime_root,
+            username=scope_username,
+            session_id=scope_session_id,
+        )
+        if (
+            should_standard_goal_route
+            and not has_actionable_pending
+            and not unfinished_turn
+            and isinstance(latest_review, dict)
+            and str(latest_review.get("progress_state") or "").strip().lower() == "in_progress"
+            and str(latest_review.get("audit_state") or "").strip().lower() == "all_clear"
+        ):
+            continue_xml = str(latest_review.get("continue_xml") or "").strip()
+            if continue_xml:
+                append_pending_input(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                    entry=make_aize_pending_input(
+                        kind="goal_feedback",
+                        role="system",
+                        text=continue_xml,
+                    ),
+                )
+                pending_inputs = load_pending_inputs(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                )
+                has_actionable_pending = has_actionable_pending_inputs(pending_inputs) or has_actionable_pending_inputs(service_pending_inputs)
         stale_goal_manager_reset, _goal_manager_runtime_state = reconcile_stale_goal_manager_runtime(
             scope_username,
             scope_session_id,

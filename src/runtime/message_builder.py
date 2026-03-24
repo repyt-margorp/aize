@@ -294,6 +294,7 @@ def dispatch_pending_opens_visible_turn(message: dict[str, Any], incoming_text: 
             reason = raw_reason.strip().lower()
     return reason not in {
         "goal_feedback",
+        "goal_manager_review",
         "turn_completed",
         "child_session_created",
         "child_session_completed",

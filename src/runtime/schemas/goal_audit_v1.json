@@ -74,6 +74,56 @@
     },
     "child_goal_requests": {
       "type": "array",
+      "anyOf": [
+        {
+          "type": "array",
+          "maxItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "service_id",
+              "label",
+              "goal_text"
+            ],
+            "properties": {
+              "service_id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "goal_text": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "service_id",
+              "label",
+              "goal_text"
+            ],
+            "properties": {
+              "service_id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "goal_text": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ],
       "items": {
         "type": "object",
         "additionalProperties": false,

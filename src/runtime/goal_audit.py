@@ -15,6 +15,9 @@ from urllib.parse import urlsplit
 from runtime.persistent_state import (
     get_session_settings,
     list_session_agent_contacts,
+    session_dir,
+    session_goal_context,
+    session_timeline_path,
     load_pending_inputs,
 )
 from wire.protocol import message_meta_get
@@ -355,7 +358,6 @@ def goal_followup_dispatch_targets(
 def build_goal_audit_prompt(
     *,
     goal_text: str,
-    history_text: str,
     log_bundle_path: Path,
     log_record_count: int,
     contacted_agents: list[dict[str, Any]],
@@ -363,6 +365,9 @@ def build_goal_audit_prompt(
     last_reviewed_turn_completed_at: str,
     agent_welcome_enabled: bool,
     verified_artifacts: list[dict[str, Any]],
+    session_dir_path: Path,
+    timeline_path: Path,
+    goal_context: list[dict[str, str]],
 ) -> str:
     contacted_agent_lines = [
         json.dumps(
@@ -410,6 +415,8 @@ def build_goal_audit_prompt(
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}',
             "Optional additional lines are child_goal_request records:",
             '  {"kind": "child_goal_request", "service_id": "...", "goal_text": "...", "label": ""}',
+            "Emit child_goal_request records only when you are splitting the remaining work into at least two parallel child goals.",
+            "If only one child task makes sense, do not emit any child_goal_request record; keep that work in the current session instead.",
             "CRITICAL: When progress_state is 'complete', output ONLY the goal_state line. Do NOT output any agent_directive or child_goal_request records.",
             'Use progress_state="complete" only when the goal itself is done. Otherwise use "in_progress".',
             'In each agent_directive: use audit_state="all_clear" when the agent is making honest progress, "needs_compact" when the session appears sabotaged/stuck and compact should be attempted before normal continuation, and "panic" when sabotage/stuck state remains unresolved after compact failure or the situation is otherwise unsafe.',
@@ -451,8 +458,16 @@ def build_goal_audit_prompt(
             str(log_bundle_path),
             f"JSONL record count: {log_record_count}",
             "",
-            "Conversation excerpt:",
-            history_text or "(no history)",
+            "Session files:",
+            str(session_dir_path),
+            f"Timeline JSONL: {timeline_path}",
+            "",
+            "Goal context to preserve across this session lineage:",
+            *(
+                [json.dumps(item, ensure_ascii=False) for item in goal_context]
+                if goal_context
+                else ["(no extra goal context)"]
+            ),
         ]
     )
 
@@ -578,7 +593,6 @@ def run_goal_audit(
     )
     prompt = build_goal_audit_prompt(
         goal_text=goal_text,
-        history_text=history_excerpt(history_entries),
         log_bundle_path=log_bundle_path,
         log_record_count=log_record_count,
         contacted_agents=contacted_agents,
@@ -586,8 +600,18 @@ def run_goal_audit(
         last_reviewed_turn_completed_at=last_reviewed_turn_completed_at,
         agent_welcome_enabled=bool(session_settings.get("agent_welcome_enabled", False)),
         verified_artifacts=verified_artifacts,
+        session_dir_path=session_dir(runtime_root, username=username, session_id=session_id),
+        timeline_path=session_timeline_path(runtime_root, username=username, session_id=session_id),
+        goal_context=session_goal_context(runtime_root, username=username, session_id=session_id),
     )
-    normalized_provider_kind = str(provider_kind).strip().lower()
+    requested_provider_kind = str(provider_kind or "").strip().lower()
+    preferred_provider = str(session_settings.get("preferred_provider") or "").strip().lower()
+    if requested_provider_kind in {"codex", "claude"}:
+        normalized_provider_kind = requested_provider_kind
+    elif preferred_provider in {"codex", "claude"}:
+        normalized_provider_kind = preferred_provider
+    else:
+        normalized_provider_kind = requested_provider_kind
     # JSONL output: no JSON schema enforcement — the prompt instructs the format
     if normalized_provider_kind == "claude":
         final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_claude(
@@ -719,6 +743,8 @@ def run_goal_audit(
                 if child_label:
                     child_req["label"] = child_label
                 child_goal_requests.append(child_req)
+        if len(child_goal_requests) == 1:
+            child_goal_requests = []
         return {
             "goal_audit_session_id": str(audit_session_id or ""),
             "progress_state": progress_state,
@@ -808,6 +834,8 @@ def run_goal_audit(
             if child_label:
                 child_goal_request["label"] = child_label
             child_goal_requests.append(child_goal_request)
+    if len(child_goal_requests) == 1:
+        child_goal_requests = []
     return {
         "goal_audit_session_id": str(audit_session_id or ""),
         "progress_state": progress_state,

@@ -74,6 +74,7 @@ from runtime.persistent_state import (
     resolve_session_agent_id,
     resolve_session,
     resolve_session_context,
+    session_goal_context,
     save_agent_audit_state,
     save_claude_session,
     save_codex_session,
@@ -571,6 +572,22 @@ def run_http_service(
         if active_goal_id:
             goal_update_lines.append(f"  <goal_id>{html.escape(active_goal_id)}</goal_id>")
         goal_update_lines.append(f"  <goal_text>{html.escape(goal_text)}</goal_text>")
+        goal_context = session_goal_context(runtime_root, username=username, session_id=session_id)
+        if goal_context:
+            goal_update_lines.append("  <goal_context>")
+            for item in goal_context:
+                item_goal_id = str(item.get("goal_id") or "").strip()
+                item_goal_text = str(item.get("goal_text") or "").strip()
+                item_goal_created_at = str(item.get("goal_created_at") or "").strip()
+                if not item_goal_id or not item_goal_text:
+                    continue
+                goal_update_lines.append("    <goal>")
+                goal_update_lines.append(f"      <goal_id>{html.escape(item_goal_id)}</goal_id>")
+                if item_goal_created_at:
+                    goal_update_lines.append(f"      <created_at>{html.escape(item_goal_created_at)}</created_at>")
+                goal_update_lines.append(f"      <goal_text>{html.escape(item_goal_text)}</goal_text>")
+                goal_update_lines.append("    </goal>")
+            goal_update_lines.append("  </goal_context>")
         goal_update_lines.append("  <instruction>Review the active goal and continue work toward it until GoalManager can mark it completed.</instruction>")
         goal_update_lines.append("</aize_goal_update>")
         append_pending_input(

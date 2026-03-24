@@ -1070,6 +1070,25 @@ def record_session_agent_contact(
                 welcomed_agents = talk.get("welcomed_agents")
                 if not isinstance(welcomed_agents, list):
                     welcomed_agents = []
+                native_provider_kinds = {"codex", "claude"}
+                is_native_contact = (
+                    normalized_provider in native_provider_kinds
+                    or normalized_service_id.startswith("service-codex-")
+                    or normalized_service_id.startswith("service-claude-")
+                )
+                if is_native_contact and not bool(talk.get("agent_welcome_enabled", False)):
+                    welcomed_agents = [
+                        item
+                        for item in welcomed_agents
+                        if not (
+                            isinstance(item, dict)
+                            and (
+                                str(item.get("provider") or "").strip().lower() in native_provider_kinds
+                                or str(item.get("service_id") or "").strip().startswith("service-codex-")
+                                or str(item.get("service_id") or "").strip().startswith("service-claude-")
+                            )
+                        )
+                    ]
                 existing: dict[str, Any] | None = None
                 for item in welcomed_agents:
                     if isinstance(item, dict) and str(item.get("service_id") or "").strip() == normalized_service_id:
@@ -1412,6 +1431,77 @@ def create_child_conversation_session(
         child_session_id=str(child["session_id"]),
     )
     return get_session_settings(runtime_root, username=username, session_id=str(child["session_id"]))
+
+
+def session_goal_context(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> list[dict[str, str]]:
+    normalized = normalize_username(username)
+    with state_read_lock(runtime_root):
+        seen_sessions: set[str] = set()
+
+        def _load_session(session_key: str) -> dict[str, Any]:
+            session = read_json_file(
+                session_metadata_path(runtime_root, username=normalized, session_id=session_key)
+            ) or {}
+            _ensure_session_defaults_unlocked(session)
+            return session
+
+        def _root_ancestors(session_key: str) -> list[str]:
+            if session_key in seen_sessions:
+                return []
+            seen_sessions.add(session_key)
+            parents = _list_session_parents_unlocked(runtime_root, username=normalized, session_id=session_key)
+            if not parents:
+                return [session_key]
+            roots: list[str] = []
+            for parent_id in parents:
+                for root_id in _root_ancestors(parent_id):
+                    if root_id not in roots:
+                        roots.append(root_id)
+            return roots
+
+        current_session = _load_session(session_id)
+        root_limit = max(1, int(current_session.get("goal_context_root_limit", 2) or 2))
+        recent_limit = max(1, int(current_session.get("goal_context_recent_limit", 2) or 2))
+        current_history = current_session.get("goal_history")
+        current_revisions = (
+            [item for item in current_history if isinstance(item, dict)]
+            if isinstance(current_history, list)
+            else []
+        )
+        root_revision_candidates: list[dict[str, Any]] = []
+        for root_session_id in _root_ancestors(session_id):
+            root_session = _load_session(root_session_id)
+            root_history = root_session.get("goal_history")
+            if not isinstance(root_history, list):
+                continue
+            for revision in root_history:
+                if isinstance(revision, dict):
+                    root_revision_candidates.append(revision)
+            if root_revision_candidates:
+                break
+
+        selected_revisions = root_revision_candidates[:root_limit] + current_revisions[-recent_limit:]
+        seen_goal_ids: set[str] = set()
+        context: list[dict[str, str]] = []
+        for revision in selected_revisions:
+            goal_id = str(revision.get("goal_id") or "").strip()
+            goal_text = str(revision.get("goal_text") or "").strip()
+            if not goal_id or not goal_text or goal_id in seen_goal_ids:
+                continue
+            seen_goal_ids.add(goal_id)
+            context.append(
+                {
+                    "goal_id": goal_id,
+                    "goal_text": goal_text,
+                    "goal_created_at": str(revision.get("created_at") or "").strip(),
+                }
+            )
+        return context
 
 
 def complete_session_child(
