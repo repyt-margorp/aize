@@ -135,6 +135,12 @@ class SpawnManager:
     def _add_reverse_routes(self, service_id: str, allowed_peers: list[str]) -> None:
         for peer_service_id in allowed_peers:
             if peer_service_id.startswith("service-"):
+                try:
+                    get_service_record(self.runtime_root, peer_service_id)
+                except KeyError:
+                    # During svcmgr bootstrap, peers may not be registered yet.
+                    # They will pick up their reverse routes when they spawn later.
+                    continue
                 add_allowed_peer(
                     self.runtime_root,
                     service_id=peer_service_id,
