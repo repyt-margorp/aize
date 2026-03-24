@@ -27,6 +27,7 @@ from runtime.persistent_state import (
     clear_session_service_runtime,
     create_conversation_session,
     create_session,
+    consume_session_due_user_response_wait,
     delete_session,
     get_session_service,
     get_session_settings,
@@ -43,12 +44,14 @@ from runtime.persistent_state import (
     register_history_subscriber,
     record_session_agent_contact,
     rename_session,
+    resolve_session_context,
     reset_agent_audit_states_for_session,
     select_session,
     unregister_history_subscriber,
     update_session_auto_compact_threshold,
     update_session_goal,
     update_session_goal_flags,
+    update_session_user_response_wait,
     update_session_peer_joinable,
     update_session_selected_agents,
     write_agent_file,
@@ -573,6 +576,7 @@ def make_handler(
     # State variables
     runtime_root, manifest, self_service, process_id, log_path,
     default_target, default_provider, history_limit,
+    tls_enabled,
     codex_service_pool, claude_service_pool, llm_service_kinds,
     pending, awaiting_replies,
     subscribers, subscribers_lock, stopped,
@@ -637,6 +641,17 @@ def make_handler(
             _preferred_provider = str(_talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
             _goal_completed = bool(_talk.get("goal_completed", False))
             _goal_progress_state = str(_talk.get("goal_progress_state", "complete" if _goal_completed else "in_progress")).strip().lower()
+            _wait_started_at = str(_talk.get("user_response_wait_started_at", "") or "").strip()
+            _wait_prompt_text = str(_talk.get("user_response_wait_prompt_text", "") or "").strip()
+            _wait_status = (
+                "waiting"
+                if bool(_talk.get("user_response_wait_active", False))
+                else (
+                    "timed_out"
+                    if str(_talk.get("user_response_wait_last_timeout_at", "") or "").strip()
+                    else ("recorded" if _wait_started_at else "idle")
+                )
+            )
             _summaries.append({
                 "username": _t_user,
                 "session_id": _t_id,
@@ -651,6 +666,10 @@ def make_handler(
                 "agent_running": _agent_turn is not None,
                 "goal_manager_state": "running" if _goal_audit else "idle",
                 "goal_manager_worker": _gm_worker,
+                "user_response_wait_status": _wait_status,
+                "user_response_wait_active": bool(_talk.get("user_response_wait_active", False)),
+                "user_response_wait_started_at": _wait_started_at,
+                "user_response_wait_prompt_text": _wait_prompt_text,
                 "parent_session_id": str(_talk.get("parent_session_id") or "").strip(),
             })
         _wc = build_worker_count_summary(service_snapshots=_snaps, session_summaries=_summaries)
@@ -723,6 +742,16 @@ def make_handler(
             if not session_id:
                 continue
             bound_service_id = str(talk.get("service_id") or "").strip()
+            wait_started_at = str(talk.get("user_response_wait_started_at", "") or "").strip()
+            wait_status = (
+                "waiting"
+                if bool(talk.get("user_response_wait_active", False))
+                else (
+                    "timed_out"
+                    if str(talk.get("user_response_wait_last_timeout_at", "") or "").strip()
+                    else ("recorded" if wait_started_at else "idle")
+                )
+            )
             goal_manager_runtime = _goal_manager_runtime_payload(
                 username=username,
                 session_id=session_id,
@@ -752,6 +781,9 @@ def make_handler(
                     "agent_running": False,
                     "goal_manager_state": str(goal_manager_runtime.get("goal_manager_state") or "idle"),
                     "goal_manager_worker": goal_manager_runtime.get("goal_manager_worker"),
+                    "user_response_wait_status": wait_status,
+                    "user_response_wait_active": bool(talk.get("user_response_wait_active", False)),
+                    "user_response_wait_started_at": wait_started_at,
                     "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
                 }
             )
@@ -773,6 +805,8 @@ def make_handler(
             active = sid == active_session_id
             goal_active = bool(summary.get("goal_active"))
             goal_completed = bool(summary.get("goal_completed"))
+            wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
+            wait_active = bool(summary.get("user_response_wait_active", False))
             parts.append(
                 "".join(
                     [
@@ -782,6 +816,7 @@ def make_handler(
                         "<span class='talk-nav-signals'>",
                         f"<span class='talk-signal talk-signal-active{' is-on' if goal_active else ''}' title='Goal active state'>●</span>",
                         f"<span class='talk-signal talk-signal-completed{' is-on' if goal_completed else ''}' title='Goal completed state'>●</span>",
+                        f"<span class='talk-signal talk-signal-wait{' is-on' if wait_status != 'idle' else ''}{' is-waiting' if wait_active else ''}{' is-timeout' if wait_status == 'timed_out' else ''}' title='User response wait state'>●</span>",
                         "</span>",
                         "</span>",
                         f"<span class='talk-nav-meta'>{html.escape(sid)}</span>",
@@ -808,6 +843,8 @@ def make_handler(
             goal_active = bool(summary.get("goal_active"))
             goal_completed = bool(summary.get("goal_completed"))
             goal_manager_state = str(summary.get("goal_manager_state") or "idle")
+            wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
+            wait_active = bool(summary.get("user_response_wait_active", False))
             classes = ["goal-session-card"]
             if sid == active_session_id:
                 classes.append("is-active-talk")
@@ -835,6 +872,13 @@ def make_handler(
                         "<div class='goal-session-state'>",
                         f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Active' if goal_active else 'Inactive'}</span>",
                         f"<span class='goal-session-badge{' is-done' if goal_completed else ''}'>{'Completed' if goal_completed else 'In Progress'}</span>",
+                        (
+                            f"<span class='goal-session-badge{' is-warn' if wait_active else ''}'>"
+                            f"{'Waiting User Response' if wait_active else ('Wait Timed Out' if wait_status == 'timed_out' else 'Wait Recorded')}"
+                            "</span>"
+                            if wait_status != "idle"
+                            else ""
+                        ),
                         "</div>",
                         "</a>",
                     ]
@@ -851,6 +895,8 @@ def make_handler(
             if token:
                 parts[0] = f"bridge_session={token}"
             parts.extend(["Path=/", "HttpOnly", "SameSite=Lax"])
+            if tls_enabled:
+                parts.append("Secure")
             if token is None:
                 parts.extend(["Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])
             self.send_header("Set-Cookie", "; ".join(parts))
@@ -885,6 +931,43 @@ def make_handler(
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _redirect(self, location: str, *, token: str | None | object = ... ) -> None:
+            self.send_response(303)
+            if token is not ...:
+                self._set_session_cookie(None if token is None else str(token))
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _trace_auth_request(
+            self,
+            *,
+            phase: str,
+            path: str,
+            username: str = "",
+            context: dict[str, Any] | None = None,
+        ) -> None:
+            cookie_header = self.headers.get("Cookie") or ""
+            token_present = bool(cookie_value("bridge_session", cookie_header))
+            payload = {
+                "type": "http.auth_trace",
+                "ts": utc_ts(),
+                "service_id": self_service.get("service_id"),
+                "process_id": process_id,
+                "phase": phase,
+                "method": self.command,
+                "path": path,
+                "host": str(self.headers.get("Host") or ""),
+                "origin": str(self.headers.get("Origin") or ""),
+                "referer": str(self.headers.get("Referer") or ""),
+                "user_agent": str(self.headers.get("User-Agent") or ""),
+                "cookie_present": token_present,
+                "username": username,
+                "context_username": str((context or {}).get("username") or ""),
+                "context_session_id": str((context or {}).get("session_id") or ""),
+            }
+            write_jsonl(log_path, payload)
 
         def _require_user(
             self,
@@ -937,6 +1020,7 @@ def make_handler(
         def _do_GET_root(self, path: str, query: dict) -> None:
             from runtime.html_renderer import render_login_page, render_main_page
             context = current_context(self, query=query)
+            self._trace_auth_request(phase="get_root", path=path, context=context)
             if not context:
                 req_session_id = requested_session_id(self, query=query)
                 login_hidden_talk = (
@@ -1002,6 +1086,33 @@ def make_handler(
             initial_auto_resume_interval_seconds = int(session_settings.get("auto_resume_interval_seconds", 21600) or 21600)
             initial_auto_resume_next_at = str(session_settings.get("auto_resume_next_at", "") or "")
             initial_auto_resume_reason = str(session_settings.get("auto_resume_reason", "") or "")
+            initial_user_response_wait_status = (
+                "waiting"
+                if bool(session_settings.get("user_response_wait_active", False))
+                else (
+                    "timed_out"
+                    if str(session_settings.get("user_response_wait_last_timeout_at", "") or "").strip()
+                    else (
+                        "answered"
+                        if str(session_settings.get("user_response_wait_last_cleared_at", "") or "").strip()
+                        else (
+                            "recorded"
+                            if str(session_settings.get("user_response_wait_started_at", "") or "").strip()
+                            else "idle"
+                        )
+                    )
+                )
+            )
+            initial_user_response_wait_active = bool(session_settings.get("user_response_wait_active", False))
+            initial_user_response_wait_timeout_seconds = int(session_settings.get("user_response_wait_timeout_seconds", 300) or 300)
+            initial_user_response_wait_effective_timeout_seconds = int(
+                session_settings.get("user_response_wait_effective_timeout_seconds", 300) or 300
+            )
+            initial_user_response_wait_started_at = str(session_settings.get("user_response_wait_started_at", "") or "")
+            initial_user_response_wait_until_at = str(session_settings.get("user_response_wait_until_at", "") or "")
+            initial_user_response_wait_prompt_text = str(session_settings.get("user_response_wait_prompt_text", "") or "")
+            initial_user_response_wait_last_cleared_at = str(session_settings.get("user_response_wait_last_cleared_at", "") or "")
+            initial_user_response_wait_last_timeout_at = str(session_settings.get("user_response_wait_last_timeout_at", "") or "")
             initial_session_group = str(session_settings.get("session_group", "user") or "user")
             initial_preferred_provider = str(session_settings.get("preferred_provider", default_provider))
             initial_agent_priority = normalize_agent_priority(session_settings.get("agent_priority"))
@@ -1094,6 +1205,15 @@ def make_handler(
                     initial_auto_resume_interval_seconds=initial_auto_resume_interval_seconds,
                     initial_auto_resume_next_at=initial_auto_resume_next_at,
                     initial_auto_resume_reason=initial_auto_resume_reason,
+                    initial_user_response_wait_status=initial_user_response_wait_status,
+                    initial_user_response_wait_active=initial_user_response_wait_active,
+                    initial_user_response_wait_timeout_seconds=initial_user_response_wait_timeout_seconds,
+                    initial_user_response_wait_effective_timeout_seconds=initial_user_response_wait_effective_timeout_seconds,
+                    initial_user_response_wait_started_at=initial_user_response_wait_started_at,
+                    initial_user_response_wait_until_at=initial_user_response_wait_until_at,
+                    initial_user_response_wait_prompt_text=initial_user_response_wait_prompt_text,
+                    initial_user_response_wait_last_cleared_at=initial_user_response_wait_last_cleared_at,
+                    initial_user_response_wait_last_timeout_at=initial_user_response_wait_last_timeout_at,
                     initial_session_group=initial_session_group,
                     initial_preferred_provider=initial_preferred_provider,
                     initial_agent_priority=initial_agent_priority,
@@ -1334,10 +1454,13 @@ def make_handler(
             )
 
         def do_POST(self) -> None:
+            path, _query = request_parts(self)
+            if path != "/" and path.endswith("/"):
+                path = path.rstrip("/")
             content_type = self.headers.get("Content-Type", "")
             length = int(self.headers.get("Content-Length", "0"))
             # Multipart file uploads are handled separately (binary safe)
-            if "multipart/form-data" in content_type and self.path == "/session/goal/attach":
+            if "multipart/form-data" in content_type and path == "/session/goal/attach":
                 raw_bytes = self.rfile.read(length) if length else b""
                 return self._do_POST_goal_attach_multipart(raw_bytes, content_type)
             raw = self.rfile.read(length).decode("utf-8") if length else ""
@@ -1353,55 +1476,55 @@ def make_handler(
 
                 form = parse_qs(raw, keep_blank_values=True)
                 payload = {key: values[0] for key, values in form.items()}
-            if self.path == "/bootstrap":
+            if path == "/bootstrap":
                 return self._do_POST_bootstrap(payload, content_type)
-            if self.path == "/peer/ping":
+            if path == "/peer/ping":
                 return self._do_POST_peer_ping(payload)
-            if self.path == "/federation/connect":
+            if path == "/federation/connect":
                 return self._do_POST_federation_connect(payload)
-            if self.path == "/federation/message":
+            if path == "/federation/message":
                 return self._do_POST_federation_message(payload)
-            if self.path == "/register":
+            if path == "/register":
                 return self._do_POST_register(payload, content_type)
-            if self.path == "/login":
+            if path == "/login":
                 return self._do_POST_login(payload, content_type)
-            if self.path == "/logout":
+            if path == "/logout":
                 return self._do_POST_logout(content_type)
-            if self.path == "/sessions":
+            if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
-            if self.path == "/session/select":
+            if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
-            if self.path == "/session/rename":
+            if path == "/session/rename":
                 return self._do_POST_session_rename(payload)
-            if self.path == "/compact":
+            if path == "/compact":
                 return self._do_POST_compact(payload, content_type)
-            if self.path == "/usage":
+            if path == "/usage":
                 return self._do_POST_usage(payload)
-            if self.path == "/session/auto-compact-threshold":
+            if path == "/session/auto-compact-threshold":
                 return self._do_POST_session_auto_compact_threshold(payload)
-            if self.path == "/session/goal":
+            if path == "/session/goal":
                 return self._do_POST_session_goal(payload)
-            if self.path == "/session/goal/state":
+            if path == "/session/goal/state":
                 return self._do_POST_session_goal_state(payload)
-            if self.path == "/session/goal/attach":
+            if path == "/session/goal/attach":
                 # Reached here only if not multipart (fallback error)
                 self._json(400, {"error": "multipart_form_data_required"})
                 return
-            if self.path == "/service/control":
+            if path == "/service/control":
                 return self._do_POST_service_control(payload)
-            if self.path == "/session/agent/welcome":
+            if path == "/session/agent/welcome":
                 return self._do_POST_session_agent_welcome(payload)
-            if self.path == "/session/peer-joinable":
+            if path == "/session/peer-joinable":
                 return self._do_POST_session_peer_joinable(payload)
-            if self.path == "/session/selected-agents":
+            if path == "/session/selected-agents":
                 return self._do_POST_session_selected_agents(payload)
-            if self.path == "/session/agent-file/write":
+            if path == "/session/agent-file/write":
                 return self._do_POST_agent_file_write(payload)
-            if self.path == "/session/agent-file/delete":
+            if path == "/session/agent-file/delete":
                 return self._do_POST_agent_file_delete(payload)
-            if self.path == "/session/agent-file/acl":
+            if path == "/session/agent-file/acl":
                 return self._do_POST_agent_file_acl(payload)
-            if self.path != "/message":
+            if path != "/message":
                 self._json(404, {"error": "not_found"})
                 return
             return self._do_POST_message(payload, content_type)
@@ -1416,10 +1539,7 @@ def make_handler(
             if "application/json" in content_type:
                 self._json_with_cookie(201, {"ok": True, "username": result, "role": "superuser"}, token)
                 return
-            self.send_response(303)
-            self._set_session_cookie(token)
-            self.send_header("Location", "/")
-            self.end_headers()
+            self._redirect("/", token=token)
             return
 
         def _do_POST_peer_ping(self, payload: dict) -> None:
@@ -1530,32 +1650,35 @@ def make_handler(
             if "application/json" in content_type:
                 self._json(201, {"ok": True, "username": result, "role": "user"})
                 return
-            self.send_response(303)
-            self.send_header("Location", "/")
-            self.end_headers()
+            self._redirect("/")
             return
 
         def _do_POST_login(self, payload: dict, content_type: str) -> None:
             username = str(payload.get("username", "")).strip()
             password = str(payload.get("password", ""))
             requested_login_session_id = requested_session_id(self, payload=payload)
+            self._trace_auth_request(phase="login_attempt", path="/login", username=username)
             if not verify_user_password(runtime_root, username=username, password=password):
+                self._trace_auth_request(phase="login_rejected", path="/login", username=username)
                 self._json(401, {"error": "invalid_credentials"})
                 return
             token = create_session(runtime_root, username=username)
+            self._trace_auth_request(
+                phase="login_accepted",
+                path="/login",
+                username=username,
+                context=resolve_session_context(runtime_root, token),
+            )
             if "application/json" in content_type:
                 response_payload = {"ok": True, "username": username.strip().lower()}
                 if requested_login_session_id:
                     response_payload["session_id"] = requested_login_session_id
                 self._json_with_cookie(200, response_payload, token)
                 return
-            self.send_response(303)
-            self._set_session_cookie(token)
             location = "/"
             if requested_login_session_id:
                 location = f"/?{urlencode({'session_id': requested_login_session_id})}"
-            self.send_header("Location", location)
-            self.end_headers()
+            self._redirect(location, token=token)
             return
 
         def _do_POST_logout(self, content_type: str) -> None:
@@ -1563,10 +1686,7 @@ def make_handler(
             if "application/json" in content_type:
                 self._json_with_cookie(200, {"ok": True}, None)
                 return
-            self.send_response(303)
-            self._set_session_cookie(None)
-            self.send_header("Location", "/")
-            self.end_headers()
+            self._redirect("/", token=None)
             return
 
         def _do_POST_sessions(self, payload: dict, content_type: str) -> None:
@@ -1587,9 +1707,7 @@ def make_handler(
                     },
                 )
                 return
-            self.send_response(303)
-            self.send_header("Location", f"/?{urlencode({'session_id': str(talk['session_id'])})}")
-            self.end_headers()
+            self._redirect(f"/?{urlencode({'session_id': str(talk['session_id'])})}")
             return
 
         def _do_POST_session_select(self, payload: dict, content_type: str) -> None:
@@ -1612,9 +1730,7 @@ def make_handler(
             if "application/json" in content_type:
                 self._json(200, {"ok": True, "username": context["username"], "session_id": session_id})
                 return
-            self.send_response(303)
-            self.send_header("Location", f"/?{urlencode({'session_id': session_id})}")
-            self.end_headers()
+            self._redirect(f"/?{urlencode({'session_id': session_id})}")
             return
 
         def _do_POST_session_rename(self, payload: dict) -> None:
@@ -1651,9 +1767,7 @@ def make_handler(
             if "application/json" in content_type:
                 self._json(status, response)
                 return
-            self.send_response(303)
-            self.send_header("Location", f"/?{urlencode({'session_id': context['session_id']})}")
-            self.end_headers()
+            self._redirect(f"/?{urlencode({'session_id': context['session_id']})}")
             return
 
         def _do_POST_usage(self, payload: dict) -> None:
@@ -2485,6 +2599,34 @@ def make_handler(
                 dispatch_error: str | None = None
                 to_service: str | None = None
                 try:
+                    previous_session_settings = get_session_settings(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                    ) or {}
+                    if bool(previous_session_settings.get("user_response_wait_active", False)):
+                        update_session_user_response_wait(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            active=False,
+                            cleared_reason="user_reply",
+                        )
+                        append_history(
+                            username,
+                            session_id,
+                            {
+                                "direction": "event",
+                                "ts": utc_ts(),
+                                "service_id": self_service["service_id"],
+                                "event_type": "service.user_response_wait_cleared",
+                                "text": "User replied to the pending question.",
+                                "event": {
+                                    "type": "service.user_response_wait_cleared",
+                                    "reason": "user_reply",
+                                },
+                            },
+                        )
                     if provider_override in {"codex", "claude"}:
                         update_session_goal_flags(
                             runtime_root,
@@ -2687,9 +2829,7 @@ def make_handler(
                     },
                 )
                 return
-            self.send_response(303)
-            self.send_header("Location", f"/?{urlencode({'session_id': session_id})}")
-            self.end_headers()
+            self._redirect(f"/?{urlencode({'session_id': session_id})}")
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -2703,6 +2843,101 @@ def make_handler(
             except Exception:
                 pass
 
+    def _user_response_wait_watcher() -> None:
+        while not stopped.wait(timeout=3.5):
+            try:
+                sessions = list_all_sessions_with_users(runtime_root)
+            except Exception:
+                continue
+            for talk in sessions:
+                if not isinstance(talk, dict):
+                    continue
+                username = str(talk.get("username") or "").strip()
+                session_id = str(talk.get("session_id") or "").strip()
+                if not username or not session_id:
+                    continue
+                due_wait = consume_session_due_user_response_wait(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                )
+                if not isinstance(due_wait, dict):
+                    continue
+                preferred_provider = (
+                    str(due_wait.get("preferred_provider", default_provider)).strip().lower()
+                    or default_provider
+                )
+                pool_service_ids = claude_service_pool if preferred_provider == "claude" else codex_service_pool
+                target_service_id = get_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                )
+                if not target_service_id and pool_service_ids:
+                    target_service_id = lease_session_service(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        pool_service_ids=pool_service_ids,
+                    )
+                append_pending_input(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    entry=make_aize_pending_input(
+                        kind="goal_feedback",
+                        role="system",
+                        text=(
+                            "<aize_goal_feedback>"
+                            "<summary>User response wait expired. Resume the active goal with the available information. "
+                            "Do not wait for the user any longer; continue with the best next step and state any assumptions when needed.</summary>"
+                            "</aize_goal_feedback>"
+                        ),
+                    ),
+                )
+                append_history(
+                    username,
+                    session_id,
+                    {
+                        "direction": "event",
+                        "ts": utc_ts(),
+                        "service_id": self_service["service_id"],
+                        "event_type": "service.user_response_wait_timed_out",
+                        "text": "User response wait timed out; autonomous work resumed.",
+                        "event": {
+                            "type": "service.user_response_wait_timed_out",
+                            "dispatch_service_id": target_service_id or "",
+                        },
+                    },
+                )
+                if isinstance(target_service_id, str) and target_service_id:
+                    send_router_control(
+                        make_dispatch_pending_message(
+                            manifest=manifest,
+                            from_service_id=self_service["service_id"],
+                            to_service_id=target_service_id,
+                            process_id=process_id,
+                            run_id=f"user-wait-timeout-{int(time.time())}",
+                            username=username,
+                            session_id=session_id,
+                            auth_context=None,
+                            reason="user_response_wait_timeout",
+                        )
+                    )
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "service.user_response_wait_timeout_processed",
+                        "ts": utc_ts(),
+                        "service_id": self_service["service_id"],
+                        "process_id": process_id,
+                        "username": username,
+                        "session_id": session_id,
+                        "dispatch_service_id": target_service_id,
+                    },
+                )
+
     threading.Thread(target=_overview_cache_warmer, daemon=True).start()
+    threading.Thread(target=_user_response_wait_watcher, daemon=True).start()
 
     return Handler

@@ -33,6 +33,14 @@ def list_service_descriptors(*, exclude_kinds: set[str] | None = None) -> list[d
     return descriptors
 
 
+def get_service_descriptor(kind: str) -> dict:
+    """Return the descriptor for a specific service kind."""
+    for descriptor in list_service_descriptors(exclude_kinds=set()):
+        if str(descriptor.get("kind", "")).strip() == kind:
+            return descriptor
+    raise KeyError(f"unknown service descriptor kind: {kind}")
+
+
 def _resolve_config_env(config_env: dict) -> dict:
     """Resolve config_env entries against environment variables."""
     config = {}
@@ -108,3 +116,8 @@ def build_service_plan(descriptors: list[dict]) -> list[dict]:
     for desc in descriptors:
         specs.extend(expand_descriptor(desc))
     return specs
+
+
+def build_service_plan_for_kinds(*, exclude_kinds: set[str] | None = None) -> list[dict]:
+    """Expand all enabled descriptors, excluding the given kinds."""
+    return build_service_plan(list_service_descriptors(exclude_kinds=exclude_kinds))

@@ -12,6 +12,7 @@ from wire.protocol import utc_ts
 from ._core import (
     DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
     DEFAULT_AUTO_RESUME_INTERVAL_SECONDS,
+    DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS,
     DEFAULT_SESSION_GROUP,
     SESSION_GROUP_DEFAULT_PERMISSIONS,
     _active_goal_revision_unlocked,
@@ -471,13 +472,25 @@ def lease_session_service(
         if not isinstance(target_session, dict):
             return None
         _ensure_session_defaults_unlocked(target_session)
+        blocking_child_sessions = _list_active_in_progress_child_sessions_unlocked(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+        )
+        target_session["waiting_on_children"] = bool(blocking_child_sessions)
         existing_service_id = target_session.get("service_id")
+        if blocking_child_sessions:
+            if isinstance(existing_service_id, str) and existing_service_id:
+                target_session.pop("service_id", None)
+            target_session["updated_at"] = utc_ts()
+            ensure_session_storage_unlocked(runtime_root, username=normalized, session=target_session)
+            return None
         if isinstance(existing_service_id, str) and existing_service_id in pool:
             return existing_service_id
         # Collect all sessions currently holding a pool slot, keyed by service_id.
         # Value is (holder_username, holder_session_id, holder_session_priority).
         leased: dict[str, tuple[str, str, int]] = {}
-        sessions_root = runtime_root.parent / ".aize-state" / "sessions"
+        sessions_root = sessions_dir(runtime_root)
         if sessions_root.exists():
             for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir()):
                 for talk_dir in sorted(path for path in user_dir.iterdir() if path.is_dir()):
@@ -563,7 +576,7 @@ def release_nonrunnable_session_services(runtime_root: Path) -> list[dict[str, s
 
     released: list[dict[str, str]] = []
     with state_lock(runtime_root):
-        sessions_root = runtime_root.parent / ".aize-state" / "sessions"
+        sessions_root = sessions_dir(runtime_root)
         if not sessions_root.exists():
             return released
         for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir()):
@@ -577,19 +590,33 @@ def release_nonrunnable_session_services(runtime_root: Path) -> list[dict[str, s
                 if not isinstance(service_id, str) or not service_id:
                     continue
                 _ensure_session_defaults_unlocked(talk)
+                blocking_child_sessions = _list_active_in_progress_child_sessions_unlocked(
+                    runtime_root,
+                    username=username,
+                    session_id=talk_dir.name,
+                )
+                talk["waiting_on_children"] = bool(blocking_child_sessions)
                 goal_active = bool(talk.get("goal_active", False))
                 goal_completed = bool(talk.get("goal_completed", False))
                 goal_progress_state = str(
                     talk.get("goal_progress_state", "complete" if goal_completed else "in_progress")
                 ).strip().lower()
                 release_reason = release_reason_for_service(service_id)
-                if goal_completed or not goal_active or goal_progress_state == "complete" or release_reason:
+                if (
+                    blocking_child_sessions
+                    or goal_completed
+                    or not goal_active
+                    or goal_progress_state == "complete"
+                    or release_reason
+                ):
                     released.append(
                         {
                             "username": username,
                             "session_id": str(talk.get("session_id", "")),
                             "service_id": service_id,
-                            "reason": release_reason or "goal_inactive",
+                            "reason": release_reason or (
+                                "child_sessions_in_progress" if blocking_child_sessions else "goal_inactive"
+                            ),
                         }
                     )
                     talk.pop("service_id", None)
@@ -818,6 +845,96 @@ def update_session_goal_flags(
                 if target_revision is not None:
                     write_goal_dir(runtime_root, username=normalized, session_id=session_id, revision=target_revision)
                 return dict(talk)
+        return None
+
+
+def update_session_user_response_wait(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    active: Any,
+    timeout_seconds: Any | None = None,
+    prompt_text: Any | None = None,
+    source_service_id: Any | None = None,
+    cleared_reason: str | None = None,
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if not isinstance(talk, dict) or str(talk.get("session_id")) != session_id:
+                continue
+            _ensure_session_defaults_unlocked(talk)
+            wait_active = bool(active)
+            if wait_active:
+                try:
+                    requested_timeout_seconds = int(
+                        timeout_seconds
+                        if timeout_seconds is not None
+                        else talk.get(
+                            "user_response_wait_timeout_seconds",
+                            DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    requested_timeout_seconds = DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS
+                effective_timeout_seconds = max(
+                    60,
+                    min(DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS, requested_timeout_seconds),
+                )
+                started_at = utc_ts()
+                talk["user_response_wait_active"] = True
+                talk["user_response_wait_timeout_seconds"] = requested_timeout_seconds
+                talk["user_response_wait_effective_timeout_seconds"] = effective_timeout_seconds
+                talk["user_response_wait_started_at"] = started_at
+                talk["user_response_wait_until_at"] = _utc_ts_after_seconds(effective_timeout_seconds)
+                talk["user_response_wait_prompt_text"] = str(prompt_text or "").strip()
+                talk["user_response_wait_source_service_id"] = str(source_service_id or "").strip()
+            else:
+                was_active = bool(talk.get("user_response_wait_active", False))
+                talk["user_response_wait_active"] = False
+                if was_active:
+                    cleared_at = utc_ts()
+                    talk["user_response_wait_last_cleared_at"] = cleared_at
+                    if str(cleared_reason or "").strip() == "timeout":
+                        talk["user_response_wait_last_timeout_at"] = cleared_at
+            talk["updated_at"] = utc_ts()
+            ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+            return dict(talk)
+        return None
+
+
+def consume_session_due_user_response_wait(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        now = datetime.now(UTC)
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if not isinstance(talk, dict) or str(talk.get("session_id")) != session_id:
+                continue
+            _ensure_session_defaults_unlocked(talk)
+            if not bool(talk.get("user_response_wait_active", False)):
+                return None
+            due_at = _parse_utc_ts(talk.get("user_response_wait_until_at"))
+            if due_at is None or due_at > now:
+                return None
+            talk["user_response_wait_active"] = False
+            cleared_at = utc_ts()
+            talk["user_response_wait_last_cleared_at"] = cleared_at
+            talk["user_response_wait_last_timeout_at"] = cleared_at
+            talk["updated_at"] = utc_ts()
+            ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+            return dict(talk)
         return None
 
 
@@ -1150,6 +1267,49 @@ def _session_descends_from(
     return False
 
 
+def _list_active_in_progress_child_sessions_unlocked(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> list[str]:
+    active_children: list[str] = []
+    for child_session_id in _list_session_children_unlocked(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    ):
+        child_session = read_json_file(
+            session_metadata_path(runtime_root, username=username, session_id=child_session_id)
+        ) or {}
+        _ensure_session_defaults_unlocked(child_session)
+        child_goal_active = bool(child_session.get("goal_active", False))
+        child_goal_progress_state = str(
+            child_session.get(
+                "goal_progress_state",
+                "complete" if bool(child_session.get("goal_completed", False)) else "in_progress",
+            )
+        ).strip().lower()
+        if child_goal_active and child_goal_progress_state == "in_progress":
+            active_children.append(child_session_id)
+    return active_children
+
+
+def list_active_in_progress_child_sessions(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> list[str]:
+    normalized = normalize_username(username)
+    with state_read_lock(runtime_root):
+        return _list_active_in_progress_child_sessions_unlocked(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+        )
+
+
 def add_session_child(
     runtime_root: Path,
     *,
@@ -1200,7 +1360,13 @@ def add_session_child(
         parent_session = read_json_file(
             session_metadata_path(runtime_root, username=normalized, session_id=parent_session_id)
         ) or {}
-        parent_session["waiting_on_children"] = True
+        parent_session["waiting_on_children"] = bool(
+            _list_active_in_progress_child_sessions_unlocked(
+                runtime_root,
+                username=normalized,
+                session_id=parent_session_id,
+            )
+        )
         parent_session["updated_at"] = utc_ts()
         if isinstance(parent_session.get("goal_progress_state"), str) and parent_session.get("goal_progress_state") == "complete":
             parent_session["goal_progress_state"] = "in_progress"
@@ -1269,28 +1435,19 @@ def complete_session_child(
         )
         if parent_session_id not in child_parents:
             return None
-        parent_children = _list_session_children_unlocked(
+        child_session = read_json_file(
+            session_metadata_path(runtime_root, username=normalized, session_id=child_session_id)
+        ) or {}
+        child_session["goal_completed"] = True
+        child_session["goal_progress_state"] = "complete"
+        child_session["child_completion_reported_at"] = utc_ts()
+        child_session["updated_at"] = utc_ts()
+        ensure_session_storage_unlocked(runtime_root, username=normalized, session=child_session)
+        remaining_children = _list_active_in_progress_child_sessions_unlocked(
             runtime_root,
             username=normalized,
             session_id=parent_session_id,
         )
-        remaining_children: list[str] = []
-        for sibling_session_id in parent_children:
-            sibling_session = read_json_file(
-                session_metadata_path(runtime_root, username=normalized, session_id=sibling_session_id)
-            ) or {}
-            sibling_progress_state = str(
-                sibling_session.get(
-                    "goal_progress_state",
-                    "complete" if bool(sibling_session.get("goal_completed", False)) else "in_progress",
-                )
-            ).strip().lower()
-            if sibling_session_id == child_session_id:
-                sibling_session["child_completion_reported_at"] = utc_ts()
-                sibling_session["updated_at"] = utc_ts()
-                ensure_session_storage_unlocked(runtime_root, username=normalized, session=sibling_session)
-            if sibling_progress_state != "complete":
-                remaining_children.append(sibling_session_id)
         parent_session = read_json_file(
             session_metadata_path(runtime_root, username=normalized, session_id=parent_session_id)
         ) or {}

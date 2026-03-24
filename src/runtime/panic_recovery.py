@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from runtime.persistent_state import (
-    create_child_conversation_session,
+    add_session_child,
+    create_conversation_session,
     get_session_settings,
     read_json_file,
     session_operation_allowed,
     session_goal_manager_dir,
+    session_metadata_path,
     update_session_goal,
     update_session_goal_flags,
     write_json_file,
@@ -146,12 +148,10 @@ def ensure_panic_recovery_session(
         panic_service_id=panic_service_id,
         event=event,
     )
-    child = create_child_conversation_session(
+    child = create_conversation_session(
         runtime_root,
         username=username,
-        parent_session_id=source_session_id,
         label=f"Recovery: {source_label or source_session_id}",
-        goal_text=goal_text,
         session_group="error",
         session_permissions={
             "create_child_session": False,
@@ -163,6 +163,36 @@ def ensure_panic_recovery_session(
     recovery_session_id = str(child.get("session_id") or "").strip()
     if not recovery_session_id:
         return None
+    recovery_session = get_session_settings(
+        runtime_root,
+        username=username,
+        session_id=recovery_session_id,
+    ) or {}
+    add_session_child(
+        runtime_root,
+        username=username,
+        parent_session_id=source_session_id,
+        child_session_id=recovery_session_id,
+    )
+    recovery_session = get_session_settings(
+        runtime_root,
+        username=username,
+        session_id=recovery_session_id,
+    ) or recovery_session
+    recovery_session["recovery_source_session_id"] = source_session_id
+    recovery_session["recovery_source_label"] = source_label
+    recovery_session["recovery_panic_service_id"] = panic_service_id
+    recovery_session["updated_at"] = utc_ts()
+    write_json_file(
+        session_metadata_path(runtime_root, username=username, session_id=recovery_session_id),
+        recovery_session,
+    )
+    update_session_goal(
+        runtime_root,
+        username=username,
+        session_id=recovery_session_id,
+        goal_text=goal_text,
+    )
     update_session_goal_flags(
         runtime_root,
         username=username,

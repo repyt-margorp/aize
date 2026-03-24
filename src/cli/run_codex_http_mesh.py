@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from collections import defaultdict
 
-from services.svcmgr.loader import build_service_plan, list_service_descriptors
+from services.svcmgr.loader import build_service_plan, build_service_plan_for_kinds, get_service_descriptor
 
 # Accept --runtime-root as a CLI arg so the runtime root appears in the process
 # command line, enabling per-instance pgrep matching in restart scripts.
@@ -46,29 +46,20 @@ else:
     HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
     HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))
     HTTP_TLS = os.environ.get("AIZE_TLS", "true").strip().lower() not in {"false", "0", "no", "off"}
-CORE_SERVICE_IDS = {"service-http-001", "service-svcmgr-001"} | {
-    f"service-codex-{index:03d}" for index in range(1, int(os.environ.get("AIZE_CODEX_POOL_SIZE", "5")) + 1)
-} | {
-    f"service-claude-{index:03d}" for index in range(1, int(os.environ.get("AIZE_CLAUDE_POOL_SIZE", "5")) + 1)
+BOOTSTRAP_SERVICE_IDS = {"service-svcmgr-001"}
+DESCRIPTOR_MANAGED_SERVICE_IDS = {
+    str(service["service_id"])
+    for service in build_service_plan_for_kinds(exclude_kinds={"svcmgr"})
 }
 
 
-def build_core_manifest() -> dict:
-    descriptors = list_service_descriptors(exclude_kinds={"svcmgr"})
-    services = build_service_plan(descriptors)
-    routes: list[dict] = []
-    service_ids = [str(service["service_id"]) for service in services]
-    for sender_id in service_ids:
-        for recipient_id in service_ids:
-            if sender_id == recipient_id:
-                continue
-            routes.append(
-                {
-                    "sender_id": sender_id,
-                    "recipient_id": recipient_id,
-                    "enabled": True,
-                }
-            )
+def build_core_manifest(
+    *,
+    extra_services: list[dict] | None = None,
+    extra_routes: list[dict] | None = None,
+    restart_resume: dict[str, dict] | None = None,
+) -> dict:
+    services = build_service_plan([get_service_descriptor("svcmgr")])
     return {
         "node_id": NODE_ID,
         "run_id": f"run-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}",
@@ -80,7 +71,12 @@ def build_core_manifest() -> dict:
             "inline_payload_max_bytes": 4096,
         },
         "services": services,
-        "routes": routes,
+        "routes": [],
+        "svcmgr": {
+            "restart_resume": restart_resume or {},
+            "extra_services": list(extra_services or []),
+            "extra_routes": list(extra_routes or []),
+        },
     }
 
 
@@ -149,7 +145,10 @@ def capture_restorable_runtime() -> tuple[list[dict], list[dict], dict[str, dict
     restored_ids = {
         service_id
         for service_id, record in services.items()
-        if service_id not in CORE_SERVICE_IDS and isinstance(record, dict) and str(record.get("status", "")) != "stopped"
+        if service_id not in BOOTSTRAP_SERVICE_IDS
+        and service_id not in DESCRIPTOR_MANAGED_SERVICE_IDS
+        and isinstance(record, dict)
+        and str(record.get("status", "")) != "stopped"
     }
     extra_services: list[dict] = []
     for service_id in sorted(restored_ids):
@@ -202,17 +201,13 @@ def write_manifest(
     extra_routes: list[dict] | None = None,
     restart_resume: dict[str, dict] | None = None,
 ) -> dict:
-    manifest = build_core_manifest()
+    manifest = build_core_manifest(
+        extra_services=extra_services,
+        extra_routes=extra_routes,
+        restart_resume=restart_resume,
+    )
     if restart_resume:
         manifest = apply_restart_resume_to_manifest_services(manifest, restart_resume)
-    manifest_services = list(manifest.get("services", []))
-    existing_ids = {str(service.get("service_id")) for service in manifest_services}
-    for extra in extra_services or []:
-        if str(extra.get("service_id")) in existing_ids:
-            continue
-        manifest_services.append(extra)
-    manifest["services"] = manifest_services
-    manifest["routes"] = list(manifest.get("routes", [])) + list(extra_routes or [])
     MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest
 
@@ -272,6 +267,9 @@ def spawn_logged(name: str, *argv: str) -> subprocess.Popen:
     env["AIZE_HTTP_HOST"] = HTTP_HOST
     env["AIZE_HTTP_PORT"] = str(HTTP_PORT)
     env["AIZE_TLS"] = "true" if HTTP_TLS else "false"
+    for key in ("AIZE_TLS_CERT", "AIZE_TLS_KEY", "AIZE_TLS_CN", "AIZE_TLS_HOSTS"):
+        if key in os.environ and str(os.environ.get(key) or "").strip():
+            env[key] = str(os.environ[key])
     LOGS.mkdir(parents=True, exist_ok=True)
     stdout_handle = (LOGS / f"{name}.stdout.log").open("a", encoding="utf-8")
     stderr_handle = (LOGS / f"{name}.stderr.log").open("a", encoding="utf-8")

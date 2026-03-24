@@ -20,6 +20,7 @@ DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT = 30
 DEFAULT_PENDING_INPUT_LIMIT = 100
 DEFAULT_SESSION_GROUP = "user"
 DEFAULT_AUTO_RESUME_INTERVAL_SECONDS = 6 * 60 * 60
+DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS = 5 * 60
 AGENT_PRIORITY_BORDER = "border"
 DEFAULT_AGENT_PRIORITY = ["codex", "claude", AGENT_PRIORITY_BORDER]
 SESSION_GROUP_DEFAULT_PERMISSIONS = {
@@ -117,7 +118,13 @@ def service_pending_state_key(service_id: str, username: str, session_id: str) -
 
 
 def state_dir(runtime_root: Path) -> Path:
-    return runtime_root.parent / ".aize-state"
+    runtime_root = Path(runtime_root)
+    # The canonical repo runtime lives at .agent-mesh-runtime/, so durable state
+    # should sit beside it. Ephemeral/test runtimes use an isolated nested state
+    # directory to avoid cross-run collisions under shared parents like /tmp.
+    if runtime_root.name.startswith(".agent-mesh-runtime"):
+        return runtime_root.parent / ".aize-state"
+    return runtime_root / ".aize-state"
 
 
 def sessions_dir(runtime_root: Path) -> Path:
@@ -673,6 +680,30 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("auto_resume_last_scheduled_at", "")
     session.setdefault("auto_resume_last_started_at", "")
     session.setdefault("auto_resume_last_error", "")
+    session.setdefault("user_response_wait_active", False)
+    try:
+        user_response_wait_requested_timeout_seconds = int(
+            session.get("user_response_wait_timeout_seconds", DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS)
+        )
+    except (TypeError, ValueError):
+        user_response_wait_requested_timeout_seconds = DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS
+    session["user_response_wait_timeout_seconds"] = user_response_wait_requested_timeout_seconds
+    try:
+        user_response_wait_effective_timeout_seconds = int(
+            session.get("user_response_wait_effective_timeout_seconds", DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS)
+        )
+    except (TypeError, ValueError):
+        user_response_wait_effective_timeout_seconds = DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS
+    session["user_response_wait_effective_timeout_seconds"] = max(
+        60,
+        min(DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS, user_response_wait_effective_timeout_seconds),
+    )
+    session.setdefault("user_response_wait_started_at", "")
+    session.setdefault("user_response_wait_until_at", "")
+    session.setdefault("user_response_wait_prompt_text", "")
+    session.setdefault("user_response_wait_source_service_id", "")
+    session.setdefault("user_response_wait_last_cleared_at", "")
+    session.setdefault("user_response_wait_last_timeout_at", "")
     welcomed_agents = session.get("welcomed_agents")
     if not isinstance(welcomed_agents, list):
         welcomed_agents = []

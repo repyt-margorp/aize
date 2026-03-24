@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from kernel.ipc import RouterConnection
-from services.svcmgr.loader import build_service_plan, list_service_descriptors
+from services.svcmgr.loader import build_service_plan_for_kinds
 from wire.protocol import encode_line, make_message, utc_ts, write_jsonl
 
 
@@ -32,6 +32,7 @@ def run_service(
     svcmgr_cfg = manifest.get("svcmgr", {})
     restart_resume: dict = svcmgr_cfg.get("restart_resume") or {}
     extra_services: list[dict] = svcmgr_cfg.get("extra_services") or []
+    extra_routes: list[dict] = svcmgr_cfg.get("extra_routes") or []
 
     write_jsonl(log_path, {
         "type": "svcmgr.started",
@@ -40,51 +41,59 @@ def run_service(
         "process_id": process_id,
     })
 
-    descriptors = list_service_descriptors()
-    all_specs = build_service_plan(descriptors)
+    all_specs = sorted(
+        build_service_plan_for_kinds(exclude_kinds={"svcmgr"}),
+        key=lambda spec: (spec.get("spawn_order", 100), spec["service_id"]),
+    )
+    planned_service_ids = [str(spec["service_id"]) for spec in all_specs]
+    extra_peer_map: dict[str, set[str]] = {}
+    for route in extra_routes:
+        if not isinstance(route, dict) or not route.get("enabled", True):
+            continue
+        sender_id = str(route.get("sender_id", "")).strip()
+        recipient_id = str(route.get("recipient_id", "")).strip()
+        if sender_id and recipient_id:
+            extra_peer_map.setdefault(sender_id, set()).add(recipient_id)
 
-    # Split into two spawn waves based on spawn_order.
-    # Wave 1 (spawn_order < 50): front-end / gateway services (e.g. HttpBridge).
-    # Wave 2 (spawn_order >= 50): back-end / agent services.
-    # Each wave gets the other wave's service IDs as allowed peers so messages
-    # can flow bidirectionally without hardcoding service kinds in this manager.
-    _WAVE_THRESHOLD = 50
-    all_specs_ordered = sorted(all_specs, key=lambda s: s.get("spawn_order", 100))
-    wave1 = [s for s in all_specs_ordered if s.get("spawn_order", 100) < _WAVE_THRESHOLD]
-    wave2 = [s for s in all_specs_ordered if s.get("spawn_order", 100) >= _WAVE_THRESHOLD]
-    wave1_ids = [s["service_id"] for s in wave1]
-    wave2_ids = [s["service_id"] for s in wave2]
-
-    # Spawn wave 1 first so reverse routes from wave 2 can be registered
-    for spec in wave1:
+    for spec in all_specs:
         config = dict(spec.get("config", {}))
         config["restart_resume"] = restart_resume.get(spec["service_id"])
         spec = {**spec, "config": config}
-        _spawn_service(router_conn, log_path, service_id, node_id, run_id, spec, wave2_ids)
-
-    # Spawn wave 2 with wave 1 as allowed peers
-    for spec in wave2:
-        config = dict(spec.get("config", {}))
-        config["restart_resume"] = restart_resume.get(spec["service_id"])
-        spec = {**spec, "config": config}
-        _spawn_service(router_conn, log_path, service_id, node_id, run_id, spec, wave1_ids)
+        allowed_peers = sorted(
+            {
+                peer_service_id
+                for peer_service_id in planned_service_ids
+                if peer_service_id != spec["service_id"]
+            }
+            | extra_peer_map.get(str(spec["service_id"]), set())
+        )
+        _spawn_service(router_conn, log_path, service_id, node_id, run_id, spec, allowed_peers)
 
     # Restore extra (dynamically spawned) services from previous run,
     # excluding any already covered by the descriptor-based plan.
     plan_ids = {s["service_id"] for s in all_specs}
+    restored_extra_count = 0
     for extra in extra_services:
         if extra["service_id"] in plan_ids:
             continue
-        _spawn_service(router_conn, log_path, service_id, node_id, run_id, extra, [])
+        restored_extra_count += 1
+        _spawn_service(
+            router_conn,
+            log_path,
+            service_id,
+            node_id,
+            run_id,
+            extra,
+            sorted(extra_peer_map.get(str(extra["service_id"]), set())),
+        )
 
-    total = len(all_specs) + len(extra_services)
+    total = len(all_specs) + restored_extra_count
     write_jsonl(log_path, {
         "type": "svcmgr.spawn_complete",
         "ts": utc_ts(),
         "spawned_count": total,
-        "wave1_count": len(wave1),
-        "wave2_count": len(wave2),
-        "extra_count": len(extra_services),
+        "planned_count": len(all_specs),
+        "extra_count": restored_extra_count,
     })
 
     # Stay alive as supervisor (MINIX RS-like long-running service)

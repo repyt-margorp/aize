@@ -24,6 +24,35 @@ from wire.protocol import utc_ts, write_jsonl
 GOAL_AUDIT_HISTORY_LIMIT = 500
 
 
+def _user_response_wait_status(talk: dict[str, Any]) -> str:
+    if bool(talk.get("user_response_wait_active", False)):
+        return "waiting"
+    if str(talk.get("user_response_wait_last_timeout_at", "") or "").strip():
+        return "timed_out"
+    if str(talk.get("user_response_wait_last_cleared_at", "") or "").strip():
+        return "answered"
+    if str(talk.get("user_response_wait_started_at", "") or "").strip():
+        return "recorded"
+    return "idle"
+
+
+def _normalize_goal_manager_compact_event(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or "").strip().lower()
+    if event_type != "service.goal_manager_compact_checked":
+        return event
+    compaction = str(event.get("compaction") or "").strip().lower()
+    if compaction in {"triggered", "suppressed_by_session_setting"}:
+        return event
+    wait_status = str(event.get("wait_status") or "").strip().lower()
+    if compaction == "skipped" and wait_status == "helper_not_available_noninteractive":
+        return event
+    normalized = dict(event)
+    normalized["type"] = "service.goal_manager_compact_failed"
+    if not str(normalized.get("error") or "").strip():
+        normalized["error"] = f"goal_manager_compact_not_recovered:{compaction or 'unknown'}"
+    return normalized
+
+
 def _persist_goal_manager_runtime_state(
     *,
     runtime_root: Path,
@@ -83,6 +112,18 @@ def goal_state_response_payload(
         "auto_resume_last_scheduled_at": str(talk.get("auto_resume_last_scheduled_at", "") or ""),
         "auto_resume_last_started_at": str(talk.get("auto_resume_last_started_at", "") or ""),
         "auto_resume_last_error": str(talk.get("auto_resume_last_error", "") or ""),
+        "user_response_wait_status": _user_response_wait_status(talk),
+        "user_response_wait_active": bool(talk.get("user_response_wait_active", False)),
+        "user_response_wait_timeout_seconds": int(talk.get("user_response_wait_timeout_seconds", 300) or 300),
+        "user_response_wait_effective_timeout_seconds": int(
+            talk.get("user_response_wait_effective_timeout_seconds", 300) or 300
+        ),
+        "user_response_wait_started_at": str(talk.get("user_response_wait_started_at", "") or ""),
+        "user_response_wait_until_at": str(talk.get("user_response_wait_until_at", "") or ""),
+        "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or ""),
+        "user_response_wait_source_service_id": str(talk.get("user_response_wait_source_service_id", "") or ""),
+        "user_response_wait_last_cleared_at": str(talk.get("user_response_wait_last_cleared_at", "") or ""),
+        "user_response_wait_last_timeout_at": str(talk.get("user_response_wait_last_timeout_at", "") or ""),
         "goal_manager_state": str(goal_manager_state or "idle"),
         "goal_manager_service_id": str(goal_manager_service_id or ""),
         "goal_manager_worker": goal_manager_worker if isinstance(goal_manager_worker, dict) else None,
@@ -379,6 +420,7 @@ def handle_goal_manager_compact_request(
             "left_percent": "?",
             "reason": compact_reason or "requested but suppressed by session setting",
         }
+    event = _normalize_goal_manager_compact_event(event)
     persist_goal_manager_compact_event(
         runtime_root=runtime_root,
         log_path=log_path,

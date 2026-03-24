@@ -125,6 +125,17 @@ def build_session_runtime_summary(
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
     )
+    user_response_wait_active = bool(talk.get("user_response_wait_active", False))
+    user_response_wait_started_at = str(talk.get("user_response_wait_started_at", "") or "")
+    user_response_wait_status = (
+        "waiting"
+        if user_response_wait_active
+        else (
+            "timed_out"
+            if str(talk.get("user_response_wait_last_timeout_at", "") or "").strip()
+            else ("recorded" if user_response_wait_started_at else "idle")
+        )
+    )
     goal_text = str(talk.get("goal_text", "")).strip()
     goal_completed = bool(talk.get("goal_completed", False))
     goal_progress_state = str(
@@ -144,7 +155,12 @@ def build_session_runtime_summary(
         "agent_running": bool(active_service_id),
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
         "goal_manager_worker": goal_manager_worker,
-}
+        "user_response_wait_status": user_response_wait_status,
+        "user_response_wait_active": user_response_wait_active,
+        "user_response_wait_started_at": user_response_wait_started_at,
+        "user_response_wait_until_at": str(talk.get("user_response_wait_until_at", "") or ""),
+        "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),
+    }
 
 
 def build_worker_count_summary(

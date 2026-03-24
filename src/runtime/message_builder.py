@@ -292,4 +292,9 @@ def dispatch_pending_opens_visible_turn(message: dict[str, Any], incoming_text: 
         raw_reason = payload.get("reason")
         if isinstance(raw_reason, str):
             reason = raw_reason.strip().lower()
-    return reason not in {"goal_feedback", "turn_completed"}
+    return reason not in {
+        "goal_feedback",
+        "turn_completed",
+        "child_session_created",
+        "child_session_completed",
+    }

@@ -42,20 +42,28 @@ from runtime.cli_service_adapter import (  # noqa: E402
 from kernel.lifecycle import init_lifecycle_state, register_process  # noqa: E402
 from kernel.registry import init_registry, update_service_process  # noqa: E402
 from runtime.providers.claude import normalize_claude_stream_event, run_claude  # noqa: E402
+from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
+from runtime.agent_service import (  # noqa: E402
+    _extract_user_response_wait_control,
+    _should_defer_dispatch_for_completed_goal,
+)
 from runtime.persistent_state import (  # noqa: E402
     add_session_child,
     append_history,
     append_goal_manager_pending_input,
+    consume_session_due_user_response_wait,
     complete_session_child,
     create_conversation_session,
     create_child_conversation_session,
     ensure_state,
     get_history,
     list_session_agent_contacts,
+    list_active_in_progress_child_sessions,
     list_session_children,
     list_session_parents,
     get_session_settings,
     load_goal_manager_pending_inputs,
+    lease_session_service,
     list_codex_sessions,
     load_pending_inputs,
     record_session_agent_contact,
@@ -63,12 +71,18 @@ from runtime.persistent_state import (  # noqa: E402
     save_codex_session,
     session_dag_children_path,
     session_dag_parents_path,
+    session_goal_manager_pending_path,
     session_goal_manager_reviews_path,
     session_goal_manager_state_path,
     session_metadata_path,
+    session_service_state_path,
+    session_timeline_path,
+    state_path,
     update_session_goal_flags,
+    update_session_user_response_wait,
     write_json_file,
 )
+from runtime.service_control import build_prompt  # noqa: E402
 
 
 TEST_USERNAME = "test-user"
@@ -77,7 +91,7 @@ TEST_USERNAME = "test-user"
 class GoalManagerCompactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
-        self.runtime_root = Path(self.tempdir.name)
+        self.runtime_root = Path(self.tempdir.name) / "runtime"
         ensure_state(self.runtime_root)
         (self.runtime_root / "logs").mkdir(parents=True, exist_ok=True)
         talk = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Goal Talk")
@@ -266,7 +280,11 @@ class GoalManagerCompactTests(unittest.TestCase):
             limit=20,
         )
 
-        timeline_path = self.runtime_root.parent / ".aize-state" / "sessions" / TEST_USERNAME / self.session_id / "timeline.jsonl"
+        timeline_path = session_timeline_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
         self.assertTrue(timeline_path.exists())
         lines = timeline_path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 1)
@@ -280,14 +298,10 @@ class GoalManagerCompactTests(unittest.TestCase):
             entry={"kind": "turn_completed", "ts": "2026-03-22T19:00:01Z", "service_id": "service-codex-001"},
         )
 
-        fifo_path = (
-            self.runtime_root.parent
-            / ".aize-state"
-            / "sessions"
-            / TEST_USERNAME
-            / self.session_id
-            / "pending"
-            / "goal_manager.jsonl"
+        fifo_path = session_goal_manager_pending_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
         )
         self.assertTrue(fifo_path.exists())
         self.assertEqual(len(pending), 1)
@@ -343,14 +357,11 @@ class GoalManagerCompactTests(unittest.TestCase):
             session_id=self.session_id,
         )
 
-        service_state_path = (
-            self.runtime_root.parent
-            / ".aize-state"
-            / "sessions"
-            / TEST_USERNAME
-            / self.session_id
-            / "services"
-            / "service-codex-001.json"
+        service_state_path = session_service_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
         )
         self.assertTrue(service_state_path.exists())
         payload = json.loads(service_state_path.read_text(encoding="utf-8"))
@@ -366,6 +377,124 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert talk is not None
         payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
         self.assertTrue(payload["agent_welcome_enabled"])
+
+    def test_goal_state_response_payload_includes_user_response_wait_fields(self) -> None:
+        talk = update_session_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            active=True,
+            timeout_seconds=600,
+            prompt_text="Need the deployment region.",
+            source_service_id="service-codex-001",
+        )
+        assert talk is not None
+
+        payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
+
+        self.assertTrue(payload["user_response_wait_active"])
+        self.assertEqual(payload["user_response_wait_timeout_seconds"], 600)
+        self.assertEqual(payload["user_response_wait_effective_timeout_seconds"], 300)
+        self.assertEqual(payload["user_response_wait_prompt_text"], "Need the deployment region.")
+        self.assertEqual(payload["user_response_wait_source_service_id"], "service-codex-001")
+        self.assertTrue(payload["user_response_wait_until_at"])
+
+    def test_consume_session_due_user_response_wait_clears_wait_state(self) -> None:
+        talk = update_session_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            active=True,
+            timeout_seconds=600,
+            prompt_text="Need the deployment region.",
+            source_service_id="service-codex-001",
+        )
+        assert talk is not None
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["user_response_wait_until_at"] = "2026-03-20T12:00:00Z"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+
+        cleared = consume_session_due_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        assert cleared is not None
+        self.assertFalse(cleared["user_response_wait_active"])
+        self.assertEqual(cleared["user_response_wait_started_at"], talk["user_response_wait_started_at"])
+        self.assertEqual(cleared["user_response_wait_timeout_seconds"], 600)
+        self.assertTrue(cleared["user_response_wait_last_timeout_at"])
+
+    def test_extract_user_response_wait_control_strips_hidden_xml(self) -> None:
+        visible_text, control = _extract_user_response_wait_control(
+            "Need the deployment region.\n<aize_user_response_wait><timeout_seconds>600</timeout_seconds></aize_user_response_wait>"
+        )
+
+        self.assertEqual(visible_text, "Need the deployment region.")
+        self.assertEqual(control, {"timeout_seconds": 600})
+
+    def test_completed_goal_dispatch_is_deferred_for_non_user_fifo_inputs(self) -> None:
+        self.assertTrue(
+            _should_defer_dispatch_for_completed_goal(
+                session_settings={
+                    "goal_active": True,
+                    "goal_completed": True,
+                    "goal_progress_state": "complete",
+                },
+                pending_inputs=[
+                    {"kind": "goal_feedback"},
+                    {"kind": "turn_completed"},
+                ],
+            )
+        )
+
+    def test_completed_goal_dispatch_is_not_deferred_for_user_message(self) -> None:
+        self.assertFalse(
+            _should_defer_dispatch_for_completed_goal(
+                session_settings={
+                    "goal_active": True,
+                    "goal_completed": True,
+                    "goal_progress_state": "complete",
+                },
+                pending_inputs=[
+                    {"kind": "goal_feedback"},
+                    {"kind": "user_message"},
+                ],
+            )
+        )
+
+    def test_build_prompt_mentions_user_response_wait_control(self) -> None:
+        prompt = build_prompt(
+            {
+                "persona": "Test persona",
+                "max_turns": 100,
+                "response_schema_id": "service_control_v1",
+            },
+            {"display_name": "HttpBridge"},
+            "<aize_input_batch />",
+            8,
+        )
+
+        self.assertIn("aize_user_response_wait", prompt)
+        self.assertIn("300", prompt)
+
+    def test_http_handler_source_renders_wait_signal_in_nav_and_session_map(self) -> None:
+        source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
+        self.assertIn("talk-signal-wait", source)
+        self.assertIn("Waiting User Response", source)
+        self.assertIn("Wait Timed Out", source)
+
+    def test_html_renderer_source_tracks_wait_state_in_nav_and_goal_board(self) -> None:
+        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("userResponseWaitStatus", source)
+        self.assertIn("talk-signal-wait", source)
+        self.assertIn("Wait Recorded", source)
+        self.assertIn("Waiting User Response", source)
 
     def test_pending_turn_completed_events_since_last_review_aggregates_multiple_agents(self) -> None:
         history = [
@@ -680,6 +809,55 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(summary["goal_manager_state"], "running")
         self.assertEqual(summary["goal_manager_worker"]["slot"], 2)
 
+    def test_build_session_runtime_summary_derives_wait_status(self) -> None:
+        talk = {
+            "session_id": self.session_id,
+            "label": "Goal Talk",
+            "goal_text": "Ship it",
+            "goal_active": True,
+            "goal_completed": False,
+            "goal_progress_state": "in_progress",
+            "preferred_provider": "codex",
+            "user_response_wait_active": False,
+            "user_response_wait_started_at": "2026-03-23T20:00:00Z",
+            "user_response_wait_last_timeout_at": "2026-03-23T20:05:00Z",
+        }
+
+        summary = build_session_runtime_summary(
+            talk,
+            history_entries=[],
+            codex_service_pool=["service-codex-001"],
+            claude_service_pool=["service-claude-001"],
+            default_provider="codex",
+        )
+
+        self.assertEqual(summary["user_response_wait_status"], "timed_out")
+        self.assertEqual(summary["user_response_wait_started_at"], "2026-03-23T20:00:00Z")
+
+    def test_build_session_runtime_summary_carries_wait_prompt_text(self) -> None:
+        talk = {
+            "session_id": self.session_id,
+            "label": "Goal Talk",
+            "goal_text": "Ship it",
+            "goal_active": True,
+            "goal_completed": False,
+            "goal_progress_state": "in_progress",
+            "preferred_provider": "codex",
+            "user_response_wait_active": True,
+            "user_response_wait_started_at": "2026-03-23T20:00:00Z",
+            "user_response_wait_prompt_text": "Need the deployment region and account ID.",
+        }
+
+        summary = build_session_runtime_summary(
+            talk,
+            history_entries=[],
+            codex_service_pool=["service-codex-001"],
+            claude_service_pool=["service-claude-001"],
+            default_provider="codex",
+        )
+
+        self.assertEqual(summary["user_response_wait_prompt_text"], "Need the deployment region and account ID.")
+
     def test_talk_records_are_normalized_to_session_ids(self) -> None:
         stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
@@ -763,8 +941,101 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert stored_parent is not None
         self.assertFalse(stored_parent["waiting_on_children"])
 
+    def test_list_active_in_progress_child_sessions_ignores_inactive_children(self) -> None:
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Subgoal",
+            goal_text="Do child work",
+        )
+        assert child is not None
+        child_id = str(child["session_id"])
+
+        self.assertEqual(
+            list_active_in_progress_child_sessions(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            [child_id],
+        )
+
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=child_id,
+            goal_active=False,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+
+        self.assertEqual(
+            list_active_in_progress_child_sessions(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            [],
+        )
+
+    def test_lease_session_service_blocks_parent_while_child_goal_in_progress(self) -> None:
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Subgoal",
+            goal_text="Do child work",
+        )
+        assert child is not None
+
+        leased = lease_session_service(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            pool_service_ids=["service-codex-001"],
+        )
+
+        self.assertIsNone(leased)
+        stored_parent = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored_parent is not None
+        self.assertTrue(stored_parent["waiting_on_children"])
+        self.assertIsNone(stored_parent.get("service_id"))
+
+    def test_ensure_panic_recovery_session_preserves_parent_child_linkage(self) -> None:
+        recovery = ensure_panic_recovery_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            source_session_id=self.session_id,
+            source_label="Goal Talk",
+            panic_service_id="service-codex-001",
+            event={"type": "service.worker_failed", "error": "boom"},
+            preferred_provider="codex",
+        )
+
+        assert recovery is not None
+        recovery_session_id = str(recovery["session_id"])
+        self.assertNotEqual(recovery_session_id, self.session_id)
+        self.assertEqual(
+            list_session_children(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            [recovery_session_id],
+        )
+        self.assertEqual(
+            list_session_parents(self.runtime_root, username=TEST_USERNAME, session_id=recovery_session_id),
+            [self.session_id],
+        )
+        stored_recovery = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=recovery_session_id,
+        )
+        assert stored_recovery is not None
+        self.assertEqual(stored_recovery.get("session_group"), "error")
+        self.assertEqual(stored_recovery.get("recovery_source_session_id"), self.session_id)
+        self.assertEqual(stored_recovery.get("parent_session_id"), self.session_id)
+
     def test_ensure_state_ignores_legacy_talk_and_auth_session_keys(self) -> None:
-        legacy_state_path = self.runtime_root.parent / ".aize-state" / "persistent.json"
+        legacy_state_path = state_path(self.runtime_root)
         legacy_state_path.parent.mkdir(parents=True, exist_ok=True)
         legacy_state_path.write_text(
             json.dumps(
@@ -917,6 +1188,69 @@ class GoalManagerCompactTests(unittest.TestCase):
         stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
         self.assertEqual(stored.get("service_id"), "service-claude-001")
+
+    def test_release_nonrunnable_session_services_releases_parent_bound_worker_while_child_runs(self) -> None:
+        init_registry(
+            self.runtime_root,
+            {
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [
+                    {
+                        "service_id": "service-claude-001",
+                        "kind": "claude",
+                        "display_name": "Claude 1",
+                        "persona": "test",
+                        "max_turns": 100,
+                    }
+                ],
+                "routes": [],
+            },
+        )
+        init_lifecycle_state(self.runtime_root, node_id="node-test", run_id="run-test")
+        register_process(
+            self.runtime_root,
+            process_id="proc-service-claude-001",
+            service_id="service-claude-001",
+            node_id="node-test",
+            status="running",
+        )
+        update_service_process(
+            self.runtime_root,
+            service_id="service-claude-001",
+            process_id="proc-service-claude-001",
+            status="running",
+        )
+        session = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert session is not None
+        session["service_id"] = "service-claude-001"
+        session["preferred_provider"] = "claude"
+        session["goal_text"] = "Ship it"
+        session["goal_active"] = True
+        session["goal_progress_state"] = "in_progress"
+        session["goal_completed"] = False
+        write_json_file(session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id), session)
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Subgoal",
+            goal_text="Do child work",
+        )
+        assert child is not None
+
+        released = release_nonrunnable_session_services(self.runtime_root)
+
+        matching = [
+            item for item in released
+            if item["session_id"] == self.session_id and item["service_id"] == "service-claude-001"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["reason"], "child_sessions_in_progress")
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertTrue(stored["waiting_on_children"])
+        self.assertIsNone(stored.get("service_id"))
 
     def test_run_goal_audit_parses_two_axis_state(self) -> None:
         with patch(
@@ -1257,6 +1591,62 @@ class GoalManagerCompactTests(unittest.TestCase):
         checked_entry = next(entry for entry in history if entry.get("event_type") == "service.goal_manager_compact_checked")
         self.assertIn("Repeated sabotage", str(checked_entry.get("text", "")))
 
+    def test_handle_goal_manager_compact_request_keeps_noninteractive_helper_skip_as_checked(self) -> None:
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_auto_compact_enabled=True,
+        )
+        audit = {
+            "request_compact": True,
+            "request_compact_reason": "TurnCompleted auto-compact threshold exceeded.",
+        }
+
+        with patch(
+            "runtime.cli_service_adapter.goal_manager_compact_codex_session",
+            return_value=(
+                {
+                    "type": "service.goal_manager_compact_checked",
+                    "session_id": self.session_id,
+                    "left_percent": "18",
+                    "used_percent": "82",
+                    "command_status": "skipped",
+                    "compaction": "skipped",
+                    "wait_status": "helper_not_available_noninteractive",
+                },
+                0,
+            ),
+        ):
+            event = handle_goal_manager_compact_request(
+                runtime_root=self.runtime_root,
+                repo_root=ROOT,
+                log_path=self.runtime_root / "logs" / "goal-manager.jsonl",
+                service_id="service-codex-001",
+                process_id="proc-1",
+                goal_audit_job_id="job-1",
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                audit=audit,
+            )
+
+        assert event is not None
+        self.assertEqual(event["type"], "service.goal_manager_compact_checked")
+        self.assertEqual(event["compaction"], "skipped")
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        event_types = [str(entry.get("event_type")) for entry in history[:2]]
+        self.assertIn("service.goal_manager_compact_started", event_types)
+        self.assertIn("service.goal_manager_compact_checked", event_types)
+        state = json.loads(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["state"], "idle")
+        self.assertEqual(state["compact_event"]["type"], "service.goal_manager_compact_checked")
+
     def test_run_claude_emits_normalized_events_through_callback(self) -> None:
         class FakeProc:
             def __init__(self) -> None:
@@ -1460,6 +1850,17 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         self.assertFalse(dispatch_pending_opens_visible_turn(turn_completed_message, turn_completed_batch))
 
+        child_completed_message = {
+            "type": "dispatch_pending",
+            "payload": {"reason": "child_session_completed"},
+        }
+        child_completed_batch = (
+            "<aize_input_batch><inputs>"
+            '<input index="1" kind="child_session_completed"><role>system</role><text>{}</text></input>'
+            "</inputs></aize_input_batch>"
+        )
+        self.assertFalse(dispatch_pending_opens_visible_turn(child_completed_message, child_completed_batch))
+
     def test_active_agent_turn_state_detects_open_turn(self) -> None:
         history = [
             {"direction": "event", "ts": "2026-03-19T10:00:00Z", "service_id": "service-codex-001", "event_type": "agent.turn_started"},
@@ -1573,6 +1974,22 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn('message_type="dispatch_pending"', source)
         self.assertIn("goal_audit_should_enqueue_agent_followup(", source)
 
+    def test_source_mentions_child_session_broadcast_inputs(self) -> None:
+        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
+        self.assertIn('kind="child_session_created"', source)
+        self.assertIn('kind="child_session_completed"', source)
+        self.assertIn("_child_session_broadcast_json(", source)
+
+    def test_source_uses_recovery_source_session_id_for_recovery_resume(self) -> None:
+        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
+        self.assertIn("recovery_source_session_id", source)
+        self.assertIn("source_session_id", source)
+
+    def test_panic_recovery_source_uses_top_level_session_creation(self) -> None:
+        source = (SRC / "runtime" / "panic_recovery.py").read_text(encoding="utf-8")
+        self.assertIn("create_conversation_session(", source)
+        self.assertNotIn("create_child_conversation_session(", source)
+
     def test_source_shows_goal_manager_and_agent_clusters_share_renderer(self) -> None:
         source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
         self.assertIn("entry?.kind === 'turn_cluster' || entry?.kind === 'goal_manager_cluster'", source)
@@ -1671,6 +2088,14 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("initial_session_map_open = requested_session_id(self, query=query) is None", source)
         self.assertIn('f"let sessionMapOpen = {json.dumps(initial_session_map_open)};"', source)
         self.assertIn("setSessionMapOpen(sessionMapOpen);", source)
+
+    def test_httpbridge_session_map_source_includes_and_filters(self) -> None:
+        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("goal-board-filter-active", source)
+        self.assertIn("goal-board-filter-in-progress", source)
+        self.assertIn("goal-board-filter-awaiting-user", source)
+        self.assertIn("const waitingWithoutUserReply = Boolean(summary?.user_response_wait_active) || waitStatus === 'timed_out';", source)
+        self.assertIn("return baseList.filter(sessionMatchesMapFilters);", source)
 
     def test_httpbridge_source_keeps_timeline_chronological_when_not_showing_all(self) -> None:
         source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")

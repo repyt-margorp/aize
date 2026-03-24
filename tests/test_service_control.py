@@ -17,7 +17,7 @@ from runtime.persistent_state import (
     load_pending_inputs,
     read_jsonl,
 )
-from runtime.service_control import parse_service_response
+from runtime.service_control import build_prompt, parse_service_response
 
 
 TEST_USERNAME = "test-user"
@@ -38,6 +38,22 @@ class ServiceControlParserTests(unittest.TestCase):
         text, spawn_requests = parse_service_response(wrapped, "service_control_v1")
         self.assertEqual(text, "ok")
         self.assertEqual(spawn_requests, [])
+
+    def test_build_prompt_spells_out_spawn_request_shape(self) -> None:
+        prompt = build_prompt(
+            {
+                "persona": "Test persona",
+                "max_turns": 100,
+                "response_schema_id": "service_control_v1",
+            },
+            {"display_name": "HttpBridge"},
+            "<aize_input_batch />",
+            6,
+        )
+        self.assertIn('"service": {...}', prompt)
+        self.assertIn('"allowed_peers": [...]', prompt)
+        self.assertIn('"initial_prompt": "..."', prompt)
+        self.assertIn('"service_type"', prompt)
 
 
 class PanicRecoveryReturnPathTests(unittest.TestCase):

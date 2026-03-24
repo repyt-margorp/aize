@@ -53,6 +53,7 @@ from runtime.persistent_state import (
     ensure_state,
     get_history as get_user_history,
     lease_session_service,
+    list_active_in_progress_child_sessions,
     list_all_sessions_with_users,
     release_session_service,
     release_nonrunnable_session_services,
@@ -272,9 +273,25 @@ def run_http_service(
     host = str(config.get("host", "127.0.0.1"))
     port = int(config.get("port", 4123))
     _tls_dir = runtime_root / "tls"
-    tls_enabled = str(os.environ.get("AIZE_TLS", str(config.get("tls_enabled", "true")))).lower() not in ("0", "false", "no")
-    tls_cert = Path(os.environ.get("AIZE_TLS_CERT", str(config.get("tls_cert", _tls_dir / "server.crt"))))
-    tls_key = Path(os.environ.get("AIZE_TLS_KEY", str(config.get("tls_key", _tls_dir / "server.key"))))
+    _tls_enabled_raw = str(os.environ.get("AIZE_TLS", str(config.get("tls_enabled", "true")))).strip()
+    tls_enabled = _tls_enabled_raw.lower() not in ("0", "false", "no")
+    _tls_cert_raw = str(os.environ.get("AIZE_TLS_CERT", "") or "").strip()
+    _tls_key_raw = str(os.environ.get("AIZE_TLS_KEY", "") or "").strip()
+    _tls_cn_raw = str(os.environ.get("AIZE_TLS_CN", "") or "").strip()
+    tls_cert = Path(_tls_cert_raw or str(config.get("tls_cert", _tls_dir / "server.crt")))
+    tls_key = Path(_tls_key_raw or str(config.get("tls_key", _tls_dir / "server.key")))
+    tls_cn = _tls_cn_raw or str(config.get("tls_cn", "localhost")).strip() or "localhost"
+    _tls_hosts_raw = os.environ.get("AIZE_TLS_HOSTS")
+    if _tls_hosts_raw is None:
+        _cfg_tls_hosts = config.get("tls_hosts", [])
+        if isinstance(_cfg_tls_hosts, str):
+            tls_hosts = [part.strip() for part in _cfg_tls_hosts.split(",") if part.strip()]
+        elif isinstance(_cfg_tls_hosts, list):
+            tls_hosts = [str(part).strip() for part in _cfg_tls_hosts if str(part).strip()]
+        else:
+            tls_hosts = []
+    else:
+        tls_hosts = [part.strip() for part in _tls_hosts_raw.split(",") if part.strip()]
     default_target = str(config.get("default_target", "service-codex-001"))
     default_provider = str(config.get("default_provider", "codex")).strip().lower() or "codex"
     history_limit = int(config.get("history_limit", 500))
@@ -445,6 +462,8 @@ def run_http_service(
 
     def resolve_session_service_for_dispatch(*, username: str, session_id: str) -> str | None:
         release_stale_session_bindings()
+        if list_active_in_progress_child_sessions(runtime_root, username=username, session_id=session_id):
+            return None
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
 
@@ -980,6 +999,7 @@ def run_http_service(
         default_target=default_target,
         default_provider=default_provider,
         history_limit=history_limit,
+        tls_enabled=tls_enabled,
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
         llm_service_kinds=llm_service_kinds,
@@ -1052,7 +1072,7 @@ def run_http_service(
     if tls_enabled:
         if not tls_cert.exists() or not tls_key.exists():
             from tls.gen_self_signed_cert import generate_self_signed_cert
-            generate_self_signed_cert(tls_cert, tls_key)
+            generate_self_signed_cert(tls_cert, tls_key, cn=tls_cn, extra_hosts=tls_hosts)
         tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_ctx.load_cert_chain(certfile=str(tls_cert), keyfile=str(tls_key))
         for server in servers:

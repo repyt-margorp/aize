@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import threading
 import uuid
 import re
@@ -60,6 +61,7 @@ from runtime.persistent_state import (
     get_session_settings,
     active_agent_priority,
     lease_session_service,
+    list_active_in_progress_child_sessions,
     load_agent_audit_state,
     load_codex_session,
     load_claude_session,
@@ -79,6 +81,7 @@ from runtime.persistent_state import (
     session_timeline_path,
     update_goal_manager_review_cursor,
     update_session_goal_flags,
+    update_session_user_response_wait,
     write_json_file,
 )
 from runtime.providers import run_claude, run_codex
@@ -98,6 +101,10 @@ from wire.protocol import (
 
 
 _USAGE_LIMIT_RETRY_RE = re.compile(r"try again at ([0-9]{1,2}:[0-9]{2}\s*[AP]M)", re.IGNORECASE)
+_USER_RESPONSE_WAIT_RE = re.compile(
+    r"<aize_user_response_wait>(?P<body>[\s\S]*?)</aize_user_response_wait>",
+    re.IGNORECASE,
+)
 
 
 def _is_usage_limit_error_text(text: str) -> bool:
@@ -137,7 +144,12 @@ def _parent_resume_validated_for_recovery_completion(
 ) -> tuple[bool, str]:
     if str(recovery_session_settings.get("session_group") or "").strip().lower() != "error":
         return True, ""
-    parent_session_id = str(recovery_session_settings.get("parent_session_id") or "").strip()
+    parent_session_id = str(
+        recovery_session_settings.get("recovery_source_session_id")
+        or recovery_session_settings.get("source_session_id")
+        or recovery_session_settings.get("parent_session_id")
+        or ""
+    ).strip()
     if not parent_session_id:
         return True, ""
     recovery_created_at = str(recovery_session_settings.get("created_at") or "").strip()
@@ -168,6 +180,49 @@ def _session_completion_override_xml(*, reason: str, session_dir_path: str, time
     )
 
 
+def _extract_user_response_wait_control(text: str) -> tuple[str, dict[str, Any] | None]:
+    raw_text = str(text or "")
+    match = _USER_RESPONSE_WAIT_RE.search(raw_text)
+    if not match:
+        return raw_text.strip(), None
+    body = match.group("body") or ""
+    timeout_match = re.search(
+        r"<timeout_seconds>\s*([0-9]{1,6})\s*</timeout_seconds>",
+        body,
+        flags=re.IGNORECASE,
+    )
+    timeout_seconds = 300
+    if timeout_match:
+        try:
+            timeout_seconds = max(60, int(timeout_match.group(1)))
+        except (TypeError, ValueError):
+            timeout_seconds = 300
+    visible_text = (raw_text[: match.start()] + raw_text[match.end() :]).strip()
+    return visible_text, {"timeout_seconds": timeout_seconds}
+
+
+def _should_defer_dispatch_for_completed_goal(
+    *,
+    session_settings: dict[str, Any] | None,
+    pending_inputs: list[dict[str, Any]] | None,
+) -> bool:
+    if not isinstance(session_settings, dict):
+        return False
+    goal_active = bool(session_settings.get("goal_active", False))
+    goal_progress_state = str(
+        session_settings.get(
+            "goal_progress_state",
+            "complete" if bool(session_settings.get("goal_completed", False)) else "in_progress",
+        )
+    ).strip().lower()
+    if not (goal_active and goal_progress_state == "complete"):
+        return False
+    for entry in pending_inputs or []:
+        if str((entry or {}).get("kind", "")).strip().lower() == "user_message":
+            return False
+    return True
+
+
 def maybe_dispatch_panic_recovery_parent_resume(
     *,
     incoming_text: str,
@@ -184,7 +239,12 @@ def maybe_dispatch_panic_recovery_parent_resume(
     if not batch_has_input_kind(incoming_text, "panic_recovery"):
         return
 
-    parent_session_id = str(session_settings.get("parent_session_id") or "").strip()
+    parent_session_id = str(
+        session_settings.get("recovery_source_session_id")
+        or session_settings.get("source_session_id")
+        or session_settings.get("parent_session_id")
+        or ""
+    ).strip()
     if not parent_session_id or parent_session_id == scope_session_id:
         return
 
@@ -276,6 +336,34 @@ def _goal_update_xml(
     lines.append("  <instruction>Review the active goal and continue work toward it until GoalManager can mark it completed.</instruction>")
     lines.append("</aize_goal_update>")
     return "\n".join(lines)
+
+
+def _child_session_broadcast_json(
+    *,
+    event_type: str,
+    parent_session_id: str,
+    child_session_id: str,
+    parent_goal_id: str = "",
+    child_goal_id: str = "",
+    child_goal_text: str = "",
+    child_label: str = "",
+    dispatch_service_id: str = "",
+    summary: str = "",
+) -> str:
+    return json.dumps(
+        {
+            "type": event_type,
+            "parent_session_id": parent_session_id,
+            "child_session_id": child_session_id,
+            "parent_goal_id": parent_goal_id,
+            "child_goal_id": child_goal_id,
+            "child_goal_text": child_goal_text,
+            "child_label": child_label,
+            "dispatch_service_id": dispatch_service_id,
+            "summary": summary,
+        },
+        ensure_ascii=False,
+    )
 
 
 def run_agent_service(
@@ -401,6 +489,39 @@ def run_agent_service(
             for s in manifest.get("services", [])
             if isinstance(s.get("service_id"), str) and s.get("kind") == kind
         ]
+
+    def resolve_session_dispatch_service(
+        *,
+        username: str,
+        session_id: str,
+        default_service_id: str | None = None,
+    ) -> str | None:
+        if list_active_in_progress_child_sessions(runtime_root, username=username, session_id=session_id):
+            return None
+        session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+        agent_priority = active_agent_priority(session_settings.get("agent_priority"))
+        if not agent_priority:
+            preferred_provider = (
+                str(session_settings.get("preferred_provider") or self_service.get("kind") or "").strip().lower()
+                or str(self_service.get("kind") or "codex")
+            )
+            agent_priority = [preferred_provider]
+        current_service_id = str(session_settings.get("service_id") or "").strip()
+        for provider in agent_priority:
+            pool = _pool_for_kind_from_manifest(provider)
+            if current_service_id and current_service_id in pool:
+                return current_service_id
+            leased_service_id = lease_session_service(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                pool_service_ids=pool,
+            )
+            if leased_service_id:
+                return leased_service_id
+        if isinstance(default_service_id, str) and default_service_id.strip():
+            return default_service_id.strip()
+        return None
 
     def maybe_spawn_failure_recovery(
         *,
@@ -622,6 +743,23 @@ def run_agent_service(
         if dispatch_pending:
             if not (scope_username and scope_session_id):
                 return
+            if list_active_in_progress_child_sessions(
+                runtime_root,
+                username=scope_username,
+                session_id=scope_session_id,
+            ):
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "service.dispatch_pending_waiting_on_children",
+                        "ts": utc_ts(),
+                        "service_id": service_id,
+                        "process_id": process_id,
+                        "reply_index": reply_index,
+                        "scope": {"username": scope_username, "session_id": scope_session_id},
+                    },
+                )
+                return
             target_agent_id = str(
                 message_meta_get(message, "session_agent_id")
                 or resolve_session_agent_id(
@@ -657,11 +795,86 @@ def run_agent_service(
                     },
                 )
                 return
+            dispatch_session_settings = get_session_settings(
+                runtime_root,
+                username=scope_username,
+                session_id=scope_session_id,
+            ) or {}
+            pending_inputs_preview = list(session_pending_inputs) + list(service_pending_inputs)
+            if _should_defer_dispatch_for_completed_goal(
+                session_settings=dispatch_session_settings,
+                pending_inputs=pending_inputs_preview,
+            ):
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "service.dispatch_pending_goal_complete_deferred",
+                        "ts": utc_ts(),
+                        "service_id": service_id,
+                        "process_id": process_id,
+                        "reply_index": reply_index,
+                        "scope": {"username": scope_username, "session_id": scope_session_id},
+                        "queued_input_count": len(pending_inputs_preview),
+                    },
+                )
+                return
         try:
             with scope_lock_for(scope_username, scope_session_id):
                 # Drain pending inputs inside the scope lock to prevent a race where two
                 # dispatch_pending messages both see a non-empty queue and each launch Codex.
                 if dispatch_pending:
+                    if list_active_in_progress_child_sessions(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    ):
+                        write_jsonl(
+                            log_path,
+                            {
+                                "type": "service.dispatch_pending_waiting_on_children",
+                                "ts": utc_ts(),
+                                "service_id": service_id,
+                                "process_id": process_id,
+                                "reply_index": reply_index,
+                                "scope": {"username": scope_username, "session_id": scope_session_id},
+                            },
+                        )
+                        return
+                    dispatch_session_settings = get_session_settings(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    ) or {}
+                    session_pending_inputs = load_pending_inputs(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    )
+                    service_pending_inputs = load_service_pending_inputs(
+                        runtime_root,
+                        service_id=service_id,
+                        agent_id=target_agent_id,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    )
+                    pending_inputs_preview = list(session_pending_inputs) + list(service_pending_inputs)
+                    if _should_defer_dispatch_for_completed_goal(
+                        session_settings=dispatch_session_settings,
+                        pending_inputs=pending_inputs_preview,
+                    ):
+                        write_jsonl(
+                            log_path,
+                            {
+                                "type": "service.dispatch_pending_goal_complete_deferred",
+                                "ts": utc_ts(),
+                                "service_id": service_id,
+                                "process_id": process_id,
+                                "reply_index": reply_index,
+                                "scope": {"username": scope_username, "session_id": scope_session_id},
+                                "queued_input_count": len(pending_inputs_preview),
+                            },
+                        )
+                        return
                     pending_inputs = drain_pending_inputs(
                         runtime_root,
                         username=scope_username,
@@ -685,32 +898,6 @@ def run_agent_service(
                                 "process_id": process_id,
                                 "reply_index": reply_index,
                                 "scope": {"username": scope_username, "session_id": scope_session_id},
-                            },
-                        )
-                        return
-                    # Goal-complete dispatch gate: drop inputs silently when the active goal
-                    # is already complete so no further feedback reaches the agent.
-                    _dispatch_session_settings = get_session_settings(
-                        runtime_root, username=scope_username, session_id=scope_session_id
-                    ) or {}
-                    _dispatch_goal_active = bool(_dispatch_session_settings.get("goal_active", False))
-                    _dispatch_goal_progress = str(
-                        _dispatch_session_settings.get(
-                            "goal_progress_state",
-                            "complete" if bool(_dispatch_session_settings.get("goal_completed", False)) else "in_progress",
-                        )
-                    ).strip().lower()
-                    if _dispatch_goal_active and _dispatch_goal_progress == "complete":
-                        write_jsonl(
-                            log_path,
-                            {
-                                "type": "service.dispatch_pending_goal_complete_skip",
-                                "ts": utc_ts(),
-                                "service_id": service_id,
-                                "process_id": process_id,
-                                "reply_index": reply_index,
-                                "scope": {"username": scope_username, "session_id": scope_session_id},
-                                "dropped_input_count": len(pending_inputs),
                             },
                         )
                         return
@@ -969,6 +1156,44 @@ def run_agent_service(
                 final_text,
                 self_service.get("response_schema_id"),
             )
+            visible_text, user_response_wait = _extract_user_response_wait_control(visible_text)
+            if scope_username and scope_session_id:
+                if isinstance(user_response_wait, dict):
+                    update_session_user_response_wait(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        active=True,
+                        timeout_seconds=user_response_wait.get("timeout_seconds"),
+                        prompt_text=visible_text,
+                        source_service_id=service_id,
+                    )
+                    append_user_history(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        entry={
+                            "direction": "event",
+                            "ts": utc_ts(),
+                            "service_id": service_id,
+                            "event_type": "service.user_response_wait_started",
+                            "text": "Agent requested a user reply before continuing the goal.",
+                            "event": {
+                                "type": "service.user_response_wait_started",
+                                "timeout_seconds": int(user_response_wait.get("timeout_seconds", 300) or 300),
+                                "prompt_text": visible_text,
+                                "source_service_id": service_id,
+                            },
+                        },
+                        limit=GOAL_AUDIT_HISTORY_LIMIT,
+                    )
+                    update_session_goal_flags(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        goal_completed=False,
+                        goal_progress_state="in_progress",
+                    )
             write_jsonl(
                 log_path,
                 {
@@ -979,6 +1204,7 @@ def run_agent_service(
                     "scope": {"username": scope_username, "session_id": scope_session_id},
                     "spawn_request_count": len(spawn_requests),
                     "has_visible_text": bool(visible_text),
+                    "user_response_wait_active": bool(user_response_wait),
                 },
             )
             for control in spawn_requests:
@@ -1157,6 +1383,14 @@ def run_agent_service(
                             scope_session_id=scope_session_id,
                             session_settings=session_settings,
                         )
+                        session_settings = (
+                            get_session_settings(
+                                runtime_root,
+                                username=scope_username,
+                                session_id=scope_session_id,
+                            )
+                            or session_settings
+                        )
                         goal_text = str(session_settings.get("goal_text", "")).strip()
                         goal_active = bool(session_settings.get("goal_active", False))
                         goal_completed = bool(session_settings.get("goal_completed", False))
@@ -1265,6 +1499,7 @@ def run_agent_service(
                             and not goal_completed
                             and goal_progress_state == "in_progress"
                             and goal_audit_state in {"all_clear", "needs_compact"}
+                            and not bool(session_settings.get("user_response_wait_active", False))
                         )
                         write_jsonl(
                             log_path,
@@ -1505,9 +1740,13 @@ def run_agent_service(
                                                     username=scope_username,
                                                     session_id=parent_session_id,
                                                 ) or {}
-                                                parent_service_id = str(
-                                                    parent_session.get("service_id") or service_id
-                                                ).strip()
+                                                parent_service_id = resolve_session_dispatch_service(
+                                                    username=scope_username,
+                                                    session_id=parent_session_id,
+                                                    default_service_id=str(
+                                                        parent_session.get("service_id") or ""
+                                                    ).strip() or None,
+                                                )
                                                 parent_summary = (
                                                     f"Child session {scope_session_id} completed goal work."
                                                 )
@@ -1517,6 +1756,22 @@ def run_agent_service(
                                                         or parent_session.get("goal_id")
                                                         or ""
                                                     ).strip()
+                                                    append_pending_input(
+                                                        runtime_root,
+                                                        username=scope_username,
+                                                        session_id=parent_session_id,
+                                                        entry=make_aize_pending_input(
+                                                            kind="child_session_completed",
+                                                            role="system",
+                                                            text=_child_session_broadcast_json(
+                                                                event_type="child_session_completed",
+                                                                parent_session_id=parent_session_id,
+                                                                child_session_id=scope_session_id,
+                                                                parent_goal_id=parent_goal_id,
+                                                                summary=parent_summary,
+                                                            ),
+                                                        ),
+                                                    )
                                                     append_pending_input(
                                                         runtime_root,
                                                         username=scope_username,
@@ -1539,25 +1794,40 @@ def run_agent_service(
                                                             "goal_id": parent_goal_id,
                                                         },
                                                     )
-                                                    send_tx(
-                                                        make_dispatch_pending_message(
-                                                            manifest=manifest,
-                                                            from_service_id=service_id,
-                                                            to_service_id=parent_service_id,
-                                                            process_id=process_id,
-                                                            run_id=f"child-complete-{uuid.uuid4().hex[:8]}",
-                                                            username=scope_username,
-                                                            session_id=parent_session_id,
-                                                            auth_context=None,
-                                                            reason="child_session_completed",
-                                                            session_agent_id=resolve_session_agent_id(
-                                                                runtime_root,
+                                                    append_user_history(
+                                                        runtime_root,
+                                                        username=scope_username,
+                                                        session_id=parent_session_id,
+                                                        entry={
+                                                            "direction": "session_input",
+                                                            "kind": "child_session_completed",
+                                                            "ts": utc_ts(),
+                                                            "service_id": service_id,
+                                                            "to": parent_service_id or service_id,
+                                                            "text": parent_summary,
+                                                        },
+                                                        limit=GOAL_AUDIT_HISTORY_LIMIT,
+                                                    )
+                                                    if parent_service_id:
+                                                        send_tx(
+                                                            make_dispatch_pending_message(
+                                                                manifest=manifest,
+                                                                from_service_id=service_id,
+                                                                to_service_id=parent_service_id,
+                                                                process_id=process_id,
+                                                                run_id=f"child-complete-{uuid.uuid4().hex[:8]}",
                                                                 username=scope_username,
                                                                 session_id=parent_session_id,
-                                                                service_id=parent_service_id,
-                                                            ),
+                                                                auth_context=None,
+                                                                reason="child_session_completed",
+                                                                session_agent_id=resolve_session_agent_id(
+                                                                    runtime_root,
+                                                                    username=scope_username,
+                                                                    session_id=parent_session_id,
+                                                                    service_id=parent_service_id,
+                                                                ),
+                                                            )
                                                         )
-                                                    )
                                         save_agent_audit_state(
                                             runtime_root,
                                             service_id=service_id,
@@ -1688,6 +1958,31 @@ def run_agent_service(
                                             or child_session.get("goal_id")
                                             or ""
                                         ).strip()
+                                        parent_goal_id = str(
+                                            session_settings.get("active_goal_id")
+                                            or session_settings.get("goal_id")
+                                            or ""
+                                        ).strip()
+                                        append_pending_input(
+                                            runtime_root,
+                                            username=scope_username,
+                                            session_id=scope_session_id,
+                                            entry=make_aize_pending_input(
+                                                kind="child_session_created",
+                                                role="system",
+                                                text=_child_session_broadcast_json(
+                                                    event_type="child_session_created",
+                                                    parent_session_id=scope_session_id,
+                                                    child_session_id=child_session_id,
+                                                    parent_goal_id=parent_goal_id,
+                                                    child_goal_id=child_goal_id,
+                                                    child_goal_text=child_goal_text,
+                                                    child_label=child_label or "Subgoal",
+                                                    dispatch_service_id=child_service_id,
+                                                    summary=f"GoalManager created child session {child_session_id}.",
+                                                ),
+                                            ),
+                                        )
                                         append_pending_input(
                                             runtime_root,
                                             username=scope_username,
@@ -1722,10 +2017,11 @@ def run_agent_service(
                                         )
                                         goal_history_sink(
                                             {
-                                                "direction": "agent",
+                                                "direction": "session_input",
+                                                "kind": "child_session_created",
                                                 "ts": utc_ts(),
-                                                "from": service_id,
-                                                "session_id": scope_session_id,
+                                                "service_id": service_id,
+                                                "to": child_service_id,
                                                 "event_type": "service.goal_child_session_created",
                                                 "text": f"GoalManager created child session {child_session_id}.",
                                                 "event": {
@@ -1782,6 +2078,12 @@ def run_agent_service(
                                             panic_event=compact_event,
                                             panic_service_id=service_id,
                                         )
+                                    if list_active_in_progress_child_sessions(
+                                        runtime_root,
+                                        username=scope_username,
+                                        session_id=scope_session_id,
+                                    ):
+                                        return
                                     agent_welcome_enabled = bool(
                                         latest_session_settings.get("agent_welcome_enabled", False)
                                     )

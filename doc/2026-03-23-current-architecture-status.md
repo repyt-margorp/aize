@@ -48,22 +48,21 @@ At startup it does the following:
 1. Resolves `AIZE_ROOT` and `AIZE_RUNTIME_ROOT`
 2. Decides HTTP bind settings
    For the primary runtime root, it forces `0.0.0.0:4123` with TLS enabled by default
-3. Discovers service descriptors from `src/services/*/service.json`
-4. Expands those descriptors into concrete service specs
-5. Builds a runtime manifest with:
+3. Captures restart-resume state for previously known services when possible
+4. Builds a bootstrap runtime manifest with:
    - `node_id`
    - `run_id`
    - peer metadata
-   - service list
-   - all-to-all local route permissions
-6. Captures restart-resume state for previously known services when possible
-7. Rebuilds `.agent-mesh-runtime/`
+   - only the Service Manager (`service-svcmgr-001`) as a boot-time service
+   - `svcmgr` restart/restore metadata for descriptor-managed and dynamically restored services
+5. Rebuilds `.agent-mesh-runtime/`
    It preserves TLS material and outbound WS peer client config across restart
-8. Starts the kernel router
-9. Starts service adapters for the planned services
+6. Starts the kernel router
+7. Starts the bootstrap service adapters
+8. Lets `service-svcmgr-001` discover descriptors and spawn `HttpBridge`, Codex, Claude, and restored dynamic services
 
 The runtime manifest is generated at boot and lives under `.agent-mesh-runtime/manifest.json`.
-It is not treated as a source-of-truth file checked into the repository.
+It is a bootstrap manifest, not the full long-term service inventory, and is not treated as a source-of-truth file checked into the repository.
 
 ## Service Model
 
@@ -228,7 +227,8 @@ Used for durable user/session state:
 
 This split is implemented in `src/runtime/persistent_state_pkg/_core.py`:
 
-- `state_dir(runtime_root)` points to `runtime_root.parent / ".aize-state"`
+- Canonical repo runtime roots named `.agent-mesh-runtime*` store durable state at the sibling path `runtime_root.parent / ".aize-state"`
+- Ephemeral/test runtime roots store durable state under `runtime_root / ".aize-state"` to avoid collisions under shared scratch parents
 
 That is a strong design signal:
 

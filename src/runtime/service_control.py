@@ -14,6 +14,9 @@ def build_schema_instructions(schema_id: str) -> str:
             'Use "assistant_text" only when you have user-visible output worth showing now: concrete progress made, a result, a blocker with evidence, or a direct answer.',
             'Do not use "assistant_text" for plan-only, intent-only, acknowledgment-only, or "I will continue" status replies. In those cases, return an empty string.',
             'Use "spawn_requests" for new service creation requests.',
+            'Each spawn_requests item must be exactly {"service": {...}, "allowed_peers": [...], "initial_prompt": "..."}; do not invent keys like "service_type", "goal", or "context".',
+            'The "service" object must include exactly: "service_id", "kind", "display_name", "persona", "response_schema_id", and "max_turns".',
+            'Example: {"assistant_text":"","spawn_requests":[{"service":{"service_id":"service-codex-helper","kind":"codex","display_name":"Helper","persona":"You are a focused helper.","response_schema_id":"service_control_v1","max_turns":4},"allowed_peers":["service-codex-001"],"initial_prompt":"Do the delegated task and report back."}]}',
             'If no services should be created, return "spawn_requests": [].',
             "Do not wrap the JSON in markdown fences.",
         ]
@@ -176,6 +179,7 @@ def build_prompt(service: dict[str, Any], peer_service: dict[str, Any], text: st
         str(service["persona"]),
         "Reply normally and directly for the task at hand. Never mention being an AI.",
         "Do not burn a turn on a plan-only or acknowledgment-only reply. If you have not advanced the work yet, keep assistant_text empty and continue executing.",
+        "If you need information from the user before a goal can continue, keep the user-visible question in assistant_text and append a trailing <aize_user_response_wait><timeout_seconds>300</timeout_seconds></aize_user_response_wait> control block inside the same assistant_text. Values above 300 seconds are capped by the runtime; the XML block is hidden from the user-facing text and tells GoalManager to wait briefly, then resume autonomously after the timeout.",
         f"You are talking to {peer_service['display_name']}.",
         f"This is your reply number {reply_index} of {service['max_turns']}.",
     ]

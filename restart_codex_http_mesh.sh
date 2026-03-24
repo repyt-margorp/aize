@@ -65,12 +65,21 @@ mkdir -p "$(dirname "$SUPERVISOR_LOG_PATH")"
 
 if [[ "${SYNC_RESTART:-0}" != "1" && "${DETACHED_RESTART:-0}" != "1" ]]; then
   : >"$SUPERVISOR_LOG_PATH"
+  TLS_CERT="${AIZE_TLS_CERT:-}"
+  TLS_KEY="${AIZE_TLS_KEY:-}"
+  TLS_CN="${AIZE_TLS_CN:-}"
+  TLS_HOSTS="${AIZE_TLS_HOSTS:-}"
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid env \
       ROOT="$ROOT" \
       AIZE_RUNTIME_ROOT="$RUNTIME_ROOT" \
       AIZE_HTTP_HOST="$HTTP_HOST" \
       AIZE_HTTP_PORT="$HTTP_PORT" \
+      AIZE_TLS="${AIZE_TLS:-}" \
+      AIZE_TLS_CERT="$TLS_CERT" \
+      AIZE_TLS_KEY="$TLS_KEY" \
+      AIZE_TLS_CN="$TLS_CN" \
+      AIZE_TLS_HOSTS="$TLS_HOSTS" \
       LOG_PATH="$LOG_PATH" \
       SUPERVISOR_LOG_PATH="$SUPERVISOR_LOG_PATH" \
       RESTART_LOCK_PATH="$RESTART_LOCK_PATH" \
@@ -85,6 +94,11 @@ if [[ "${SYNC_RESTART:-0}" != "1" && "${DETACHED_RESTART:-0}" != "1" ]]; then
       AIZE_RUNTIME_ROOT="$RUNTIME_ROOT" \
       AIZE_HTTP_HOST="$HTTP_HOST" \
       AIZE_HTTP_PORT="$HTTP_PORT" \
+      AIZE_TLS="${AIZE_TLS:-}" \
+      AIZE_TLS_CERT="$TLS_CERT" \
+      AIZE_TLS_KEY="$TLS_KEY" \
+      AIZE_TLS_CN="$TLS_CN" \
+      AIZE_TLS_HOSTS="$TLS_HOSTS" \
       LOG_PATH="$LOG_PATH" \
       SUPERVISOR_LOG_PATH="$SUPERVISOR_LOG_PATH" \
       RESTART_LOCK_PATH="$RESTART_LOCK_PATH" \
@@ -115,9 +129,9 @@ log "adapter processes terminated"
 
 cd "$ROOT"
 if command -v setsid >/dev/null 2>&1; then
-  nohup setsid /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
+  nohup setsid /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' AIZE_TLS='${AIZE_TLS:-}' AIZE_TLS_CERT='${AIZE_TLS_CERT:-}' AIZE_TLS_KEY='${AIZE_TLS_KEY:-}' AIZE_TLS_CN='${AIZE_TLS_CN:-}' AIZE_TLS_HOSTS='${AIZE_TLS_HOSTS:-}' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
 else
-  nohup /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
+  nohup /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' AIZE_TLS='${AIZE_TLS:-}' AIZE_TLS_CERT='${AIZE_TLS_CERT:-}' AIZE_TLS_KEY='${AIZE_TLS_KEY:-}' AIZE_TLS_CN='${AIZE_TLS_CN:-}' AIZE_TLS_HOSTS='${AIZE_TLS_HOSTS:-}' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
 fi
 new_pid=$!
 log "launched new parent pid=$new_pid"
