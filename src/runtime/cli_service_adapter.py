@@ -470,6 +470,67 @@ def run_http_service(
             return None
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+        selected_agents_cfg = [
+            str(item).strip()
+            for item in list(session_settings.get("selected_agents", []))
+            if str(item).strip()
+        ]
+        all_local_service_ids = set(codex_service_pool) | set(claude_service_pool)
+        has_local = any(
+            service_id in {"codex_pool", "claude_pool"} or service_id in all_local_service_ids
+            for service_id in selected_agents_cfg
+        )
+
+        if selected_agents_cfg:
+            if not has_local:
+                ws_contacts = list_session_agent_contacts(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                )
+                available_ws_service_ids = {
+                    str(item.get("service_id") or "").strip()
+                    for item in ws_contacts
+                    if str(item.get("provider") or "").strip() == "ws_peer"
+                    and str(item.get("service_id") or "").strip()
+                }
+                for service_id in selected_agents_cfg:
+                    if service_id in available_ws_service_ids:
+                        return service_id
+                return None
+
+            if leased_service_id and leased_service_id in all_local_service_ids:
+                if "codex_pool" in selected_agents_cfg and leased_service_id in codex_service_pool:
+                    return leased_service_id
+                if "claude_pool" in selected_agents_cfg and leased_service_id in claude_service_pool:
+                    return leased_service_id
+                if leased_service_id in selected_agents_cfg:
+                    return leased_service_id
+
+            if "codex_pool" in selected_agents_cfg:
+                return lease_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    pool_service_ids=codex_service_pool,
+                )
+            if "claude_pool" in selected_agents_cfg:
+                return lease_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    pool_service_ids=claude_service_pool,
+                )
+
+            selected_local = [service_id for service_id in selected_agents_cfg if service_id in all_local_service_ids]
+            if selected_local:
+                return lease_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    pool_service_ids=selected_local,
+                )
+            return None
 
         # Build ordered provider list from agent_priority; fall back to preferred_provider
         agent_priority = active_agent_priority(session_settings.get("agent_priority"))

@@ -2593,6 +2593,18 @@ class GoalManagerCompactTests(unittest.TestCase):
         # previous_goal capture comes before or within same dispatch call
         self.assertLess(dispatch_idx, prev_idx + 200)
 
+    def test_source_goal_dispatch_honors_selected_agents_and_joined_ws_peers(self) -> None:
+        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
+        start = source.index("def resolve_session_service_for_dispatch")
+        end = source.index("def codex_service_candidates_for_session")
+        function_source = source[start:end]
+        self.assertIn("selected_agents_cfg = [", function_source)
+        self.assertIn("list_session_agent_contacts(", function_source)
+        self.assertIn('if str(item.get("provider") or "").strip() == "ws_peer"', function_source)
+        self.assertIn("if selected_agents_cfg:", function_source)
+        self.assertIn("if not has_local:", function_source)
+        self.assertIn("return None", function_source)
+
     def test_httpbridge_source_keeps_session_map_title_and_layout_stable(self) -> None:
         source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
         self.assertIn("renderPageTitle", source)
