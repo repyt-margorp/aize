@@ -11,6 +11,7 @@ from runtime.persistent_state import (
     append_pending_input,
     get_history as get_user_history,
     load_pending_inputs,
+    session_ui_mode,
 )
 from wire.protocol import utc_ts, write_jsonl
 
@@ -159,11 +160,22 @@ def build_session_runtime_summary(
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
         "goal_manager_provider": goal_manager_provider,
         "goal_manager_worker": goal_manager_worker,
+        "auto_resume_enabled": bool(talk.get("auto_resume_enabled", False)),
         "user_response_wait_status": user_response_wait_status,
         "user_response_wait_active": user_response_wait_active,
         "user_response_wait_started_at": user_response_wait_started_at,
         "user_response_wait_until_at": str(talk.get("user_response_wait_until_at", "") or ""),
         "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),
+        "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
+        "created_by_username": str(talk.get("created_by_username") or "").strip(),
+        "created_by_type": str(talk.get("created_by_type") or "").strip(),
+        "origin_session_id": str(talk.get("origin_session_id") or "").strip(),
+        "origin_goal_id": str(talk.get("origin_goal_id") or "").strip(),
+        "session_group": str(talk.get("session_group") or "user").strip().lower() or "user",
+        "session_ui_mode": session_ui_mode(talk),
+        "session_permissions": dict(talk.get("session_permissions", {}))
+        if isinstance(talk.get("session_permissions"), dict)
+        else {},
     }
 
 

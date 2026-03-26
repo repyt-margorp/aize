@@ -40,14 +40,17 @@ from runtime.cli_service_adapter import (  # noqa: E402
     summarize_provider_event,
 )
 from kernel.lifecycle import init_lifecycle_state, register_process  # noqa: E402
+from kernel.auth import bootstrap_root_user, has_users as auth_has_users, resolve_user_record, verify_user_password  # noqa: E402
 from kernel.registry import init_registry, update_service_process  # noqa: E402
 from runtime.providers.claude import normalize_claude_stream_event, run_claude  # noqa: E402
 from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
 from runtime.compaction import maybe_resume_after_restart  # noqa: E402
 from runtime.agent_service import (  # noqa: E402
+    _materialize_goal_child_sessions,
     _extract_user_response_wait_control,
     _should_defer_dispatch_for_completed_goal,
 )
+from runtime.ws_peer_client import _remote_session_entry_to_dispatch  # noqa: E402
 from runtime.persistent_state import (  # noqa: E402
     add_session_child,
     append_history,
@@ -55,6 +58,7 @@ from runtime.persistent_state import (  # noqa: E402
     consume_session_due_user_response_wait,
     complete_session_child,
     create_conversation_session,
+    create_session,
     create_child_conversation_session,
     ensure_state,
     get_history,
@@ -70,6 +74,8 @@ from runtime.persistent_state import (  # noqa: E402
     record_session_agent_contact,
     release_nonrunnable_session_services,
     save_codex_session,
+    session_ui_mode,
+    session_operation_allowed,
     session_goal_context,
     session_dag_children_path,
     session_dag_parents_path,
@@ -86,6 +92,7 @@ from runtime.persistent_state import (  # noqa: E402
     write_json_file,
 )
 from runtime.service_control import build_prompt  # noqa: E402
+from runtime.message_builder import build_aize_input_batch_xml, make_aize_pending_input  # noqa: E402
 
 
 TEST_USERNAME = "test-user"
@@ -410,6 +417,24 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert talk is not None
         payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
         self.assertTrue(payload["agent_welcome_enabled"])
+
+    def test_goal_state_response_payload_includes_session_permissions(self) -> None:
+        talk = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert talk is not None
+
+        payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
+
+        self.assertEqual(
+            payload["session_permissions"],
+            {
+                "create_child_session": True,
+                "update_goal": True,
+                "send_prompt": True,
+                "auto_spawn_recovery": True,
+                "auto_resume": True,
+            },
+        )
+        self.assertEqual(payload["session_ui_mode"], "standard")
 
     def test_goal_state_response_payload_includes_user_response_wait_fields(self) -> None:
         talk = update_session_user_response_wait(
@@ -938,6 +963,96 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert stored_parent is not None
         self.assertTrue(stored_parent["waiting_on_children"])
 
+    def test_create_child_conversation_session_records_origin_provenance(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Parent goal",
+            updated_by_username=TEST_USERNAME,
+            updated_by_type="user",
+            origin_session_id=self.session_id,
+        )
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Subgoal",
+            goal_text="Child goal",
+            created_by_username="goalmanager",
+            created_by_type="system",
+        )
+        assert child is not None
+        self.assertEqual(child.get("created_by_username"), "goalmanager")
+        self.assertEqual(child.get("created_by_type"), "system")
+        self.assertEqual(child.get("origin_session_id"), self.session_id)
+        self.assertEqual(child.get("origin_goal_text"), "Parent goal")
+        history = child.get("goal_history")
+        assert isinstance(history, list)
+        self.assertEqual(history[-1].get("updated_by_username"), "goalmanager")
+        self.assertEqual(history[-1].get("updated_by_type"), "system")
+        self.assertEqual(history[-1].get("origin_session_id"), self.session_id)
+        self.assertEqual(history[-1].get("origin_goal_text"), "Parent goal")
+
+    def test_goalmanager_system_account_is_reserved_and_not_counted_as_bootstrap_user(self) -> None:
+        self.assertFalse(auth_has_users(self.runtime_root))
+        record = resolve_user_record(self.runtime_root, username="goalmanager")
+        assert record is not None
+        self.assertTrue(record.get("system_account"))
+        self.assertTrue(record.get("login_disabled"))
+        self.assertFalse(verify_user_password(self.runtime_root, username="goalmanager", password="anything"))
+        ok, username = bootstrap_root_user(self.runtime_root, password="root-pass")
+        self.assertTrue(ok)
+        self.assertEqual(username, "root")
+        self.assertTrue(auth_has_users(self.runtime_root))
+
+    def test_default_root_session_is_migrated_to_root_label_and_creator(self) -> None:
+        ok, _username = bootstrap_root_user(self.runtime_root, password="root-pass")
+        self.assertTrue(ok)
+        create_session(self.runtime_root, username="root")
+        session = get_session_settings(self.runtime_root, username="root", session_id="default")
+        assert session is not None
+        self.assertEqual(session.get("label"), "Root")
+        self.assertEqual(session.get("created_by_username"), "root")
+        self.assertEqual(session.get("session_group"), "root")
+        self.assertEqual(session_ui_mode(session), "map_only")
+        self.assertTrue(session_operation_allowed(session, "create_child_session"))
+        self.assertFalse(session_operation_allowed(session, "update_goal"))
+        self.assertFalse(session_operation_allowed(session, "send_prompt"))
+
+    def test_materialize_goal_child_sessions_creates_children_with_goalmanager_provenance(self) -> None:
+        created = _materialize_goal_child_sessions(
+            runtime_root=self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_id="goal-123",
+            goal_text="Parent goal",
+            goal_manager_service_id="service-codex-001",
+            child_goal_requests=[
+                {
+                    "service_id": "service-codex-001",
+                    "label": "Implement",
+                    "goal_text": "Write code",
+                },
+                {
+                    "service_id": "service-claude-001",
+                    "label": "Verify",
+                    "goal_text": "Review code",
+                },
+            ],
+        )
+        self.assertEqual(len(created), 2)
+        children = list_session_children(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual(len(children), 2)
+        first_child = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=children[0])
+        assert first_child is not None
+        self.assertEqual(first_child.get("created_by_username"), "goalmanager")
+        self.assertEqual(first_child.get("origin_session_id"), self.session_id)
+        self.assertEqual(first_child.get("origin_goal_id"), "goal-123")
+        self.assertEqual(first_child.get("goal_history", [])[-1].get("updated_by_username"), "goalmanager")
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertTrue(any(entry.get("event_type") == "service.goal_child_sessions_created" for entry in history))
+
     def test_session_goal_context_includes_root_two_and_current_two_without_duplicates(self) -> None:
         root_first = update_session_goal(
             self.runtime_root,
@@ -1071,6 +1186,40 @@ class GoalManagerCompactTests(unittest.TestCase):
             [item["service_id"] for item in contacts],
             ["ws-peer-node-a", "service-claude-001"],
         )
+
+    def test_ws_peer_client_maps_targeted_goal_feedback_entry_to_system_input(self) -> None:
+        dispatch = _remote_session_entry_to_dispatch(
+            {
+                "direction": "session_input",
+                "kind": "goal_feedback",
+                "service_id": "ws-peer-node-a",
+                "to": "ws-peer-node-a",
+                "text": "GoalManager requested more work",
+                "pending_input_text": "<aize_goal_feedback><summary>continue</summary></aize_goal_feedback>",
+            },
+            peer_service_id="ws-peer-node-a",
+        )
+
+        assert dispatch is not None
+        self.assertEqual(dispatch["log_type"], "ws_peer_client.goal_feedback_received")
+        self.assertEqual(dispatch["pending_inputs"][0]["kind"], "goal_feedback")
+        self.assertEqual(dispatch["pending_inputs"][0]["role"], "system")
+        self.assertIn("continue", dispatch["pending_inputs"][0]["text"])
+
+    def test_ws_peer_client_ignores_goal_feedback_for_other_peer(self) -> None:
+        dispatch = _remote_session_entry_to_dispatch(
+            {
+                "direction": "session_input",
+                "kind": "goal_feedback",
+                "service_id": "ws-peer-node-b",
+                "to": "ws-peer-node-b",
+                "text": "GoalManager requested more work",
+                "pending_input_text": "<aize_goal_feedback><summary>continue</summary></aize_goal_feedback>",
+            },
+            peer_service_id="ws-peer-node-a",
+        )
+
+        self.assertIsNone(dispatch)
 
     def test_add_session_child_rejects_cycle(self) -> None:
         child = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Child")
@@ -2341,6 +2490,12 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn('message_type="dispatch_pending"', source)
         self.assertIn("goal_audit_should_enqueue_agent_followup(", source)
 
+    def test_agent_service_source_shows_ws_peer_goal_feedback_history_transport(self) -> None:
+        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
+        self.assertIn('directive_service_id.startswith("ws-peer-")', source)
+        self.assertIn('"pending_input_text"', source)
+        self.assertIn('"service.goal_audit_ws_peer_dispatch"', source)
+
     def test_source_mentions_child_session_broadcast_inputs(self) -> None:
         source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
         self.assertIn('kind="child_session_created"', source)
@@ -2450,6 +2605,25 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("const captureElementScrollState = (element) => element ? ({", source)
         self.assertIn("const restoreElementScrollPosition = (element, state) => {", source)
 
+    def test_httpbridge_sources_create_child_sessions_and_render_goal_history(self) -> None:
+        handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
+        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("create_child_conversation_session(", handler_source)
+        self.assertIn('session_operation_allowed(talk, "update_goal")', handler_source)
+        self.assertIn('session_operation_allowed(talk, "send_prompt")', handler_source)
+        self.assertIn("parent_session_id = str(payload.get(\"parent_session_id\") or context[\"session_id\"] or \"\").strip()", handler_source)
+        self.assertIn("updated_by_username=context[\"username\"]", handler_source)
+        self.assertIn("goal-history-list", renderer_source)
+        self.assertIn("renderGoalHistory", renderer_source)
+        self.assertIn("renderSessionCapabilityState", renderer_source)
+        self.assertIn("Create Child Session", renderer_source)
+
+    def test_goal_manager_source_creates_child_sessions_from_audit_requests(self) -> None:
+        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
+        self.assertIn('audit.get("child_goal_requests")', source)
+        self.assertIn("created_by_username=GOAL_MANAGER_USERNAME", source)
+        self.assertIn('event_type": "service.goal_child_sessions_created"', source)
+
     def test_httpbridge_source_opens_session_map_when_no_session_is_requested(self) -> None:
         source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
         self.assertIn("initial_session_map_open = requested_session_id(self, query=query) is None", source)
@@ -2461,8 +2635,71 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("goal-board-filter-active", source)
         self.assertIn("goal-board-filter-in-progress", source)
         self.assertIn("goal-board-filter-awaiting-user", source)
+        self.assertIn("goal-board-filter-auto-schedule", source)
+        self.assertIn("if (sessionMapFilters.autoScheduleOnly && !summary?.auto_resume_enabled) return false;", source)
         self.assertIn("const waitingWithoutUserReply = Boolean(summary?.user_response_wait_active) || waitStatus === 'timed_out';", source)
-        self.assertIn("return baseList.filter(sessionMatchesMapFilters);", source)
+        self.assertIn("const scopedList = sessionTreeSessions(baseList, sessionMapRootSessionId());", source)
+        self.assertIn("return scopedList.filter(sessionMatchesMapFilters);", source)
+        self.assertIn("goal-board-scope-session", source)
+        self.assertIn("goal-board-scope-all", source)
+
+    def test_httpbridge_settings_popover_and_agent_priority_ui_match_goal_shell(self) -> None:
+        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("session-toolbar-actions", source)
+        self.assertIn("setSettingsPopoverOpen(false);", source)
+        self.assertIn("settingsPopoverCard || settingsPopover", source)
+        self.assertIn("data-priority-move='up'", source)
+        self.assertIn("row.draggable = true;", source)
+
+    def test_httpbridge_session_panels_include_sessions_talk_toggle(self) -> None:
+        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("id='view-session-map'", source)
+        self.assertIn("viewSessionMapButton.textContent = sessionMapOpen ? 'Talk' : 'Sessions';", source)
+        self.assertIn("viewSessionMapButton.setAttribute('aria-pressed', sessionMapOpen ? 'true' : 'false');", source)
+        self.assertIn("viewSessionMapButton.onclick = (event) => { event.preventDefault(); toggleSessionMap(); };", source)
+
+    def test_httpbridge_session_title_rename_defers_during_ime_composition(self) -> None:
+        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("let sessionNameIsComposing = false;", source)
+        self.assertIn("sessionNameTextarea.addEventListener('compositionstart', () => { sessionNameIsComposing = true; clearTimeout(_renameDebounce); });", source)
+        self.assertIn("sessionNameTextarea.addEventListener('compositionend', () => { sessionNameIsComposing = false;", source)
+        self.assertIn("if (sessionNameIsComposing) return;", source)
+        self.assertIn("if (sessionNameIsComposing || ev.isComposing || ev.keyCode === 229) return;", source)
+
+    def test_httpbridge_session_map_only_mode_hides_talk_toggle_and_forces_map_view(self) -> None:
+        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
+        goal_persist_source = (SRC / "runtime" / "goal_persist.py").read_text(encoding="utf-8")
+        self.assertIn("const sessionUsesMapOnlyUI = () => String(sessionUiMode || 'standard').trim().toLowerCase() === 'map_only';", renderer_source)
+        self.assertIn("viewSessionMapButton.classList.toggle('is-hidden', mapOnly || accountRegisterOpen);", renderer_source)
+        self.assertIn("const nextOpen = sessionUsesMapOnlyUI() ? true : Boolean(open);", renderer_source)
+        self.assertIn("initial_session_map_open = bool(initial_session_map_open or initial_session_ui_mode == \"map_only\")", handler_source)
+        self.assertIn('"session_ui_mode": session_ui_mode(talk),', goal_persist_source)
+
+    def test_httpbridge_prompt_input_records_submitter_and_rejects_non_owner(self) -> None:
+        source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
+        self.assertIn('session_owner_username = str(talk.get("username") or "").strip()', source)
+        self.assertIn('self._json(403, {"error": "session_owner_required"})', source)
+        self.assertIn('"submitted_by_username": username,', source)
+        self.assertIn("submitted_by_username=username,", source)
+
+    def test_make_aize_pending_input_and_batch_xml_preserve_submitter(self) -> None:
+        entry = make_aize_pending_input(
+            kind="user_message",
+            role="user",
+            text="hello",
+            submitted_by_username="alice",
+            date="2026-03-26T03:21:56Z",
+        )
+        self.assertEqual(entry.get("submitted_by_username"), "alice")
+        batch_xml = build_aize_input_batch_xml(
+            sender_display_name="HttpBridge",
+            username="owner",
+            session_id="sess-1",
+            inputs=[entry],
+            instruction="continue",
+        )
+        self.assertIn('submitted_by_username="alice"', batch_xml)
 
     def test_httpbridge_source_keeps_timeline_chronological_when_not_showing_all(self) -> None:
         source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")

@@ -12,9 +12,11 @@ from wire.protocol import utc_ts
 from ._core import (
     DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
     DEFAULT_AUTO_RESUME_INTERVAL_SECONDS,
+    DEFAULT_SESSION_UI_MODE,
     DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS,
     DEFAULT_SESSION_GROUP,
     SESSION_GROUP_DEFAULT_PERMISSIONS,
+    SESSION_UI_MODES,
     _active_goal_revision_unlocked,
     _apply_active_goal_snapshot_unlocked,
     _auth_sessions,
@@ -79,6 +81,24 @@ def session_group_permissions(session: dict[str, Any] | None) -> dict[str, bool]
             SESSION_GROUP_DEFAULT_PERMISSIONS[DEFAULT_SESSION_GROUP],
         ).items()
     }
+
+
+def session_ui_mode(session: dict[str, Any] | None) -> str:
+    record = dict(session or {})
+    _ensure_session_defaults_unlocked(record)
+    requested = str(record.get("session_ui_mode") or "").strip().lower()
+    if requested in SESSION_UI_MODES:
+        return requested
+    permissions = session_group_permissions(record)
+    if str(record.get("session_group") or DEFAULT_SESSION_GROUP).strip().lower() == "root":
+        return "map_only"
+    if not bool(permissions.get("update_goal", True)) and not bool(permissions.get("send_prompt", True)):
+        return "map_only"
+    return DEFAULT_SESSION_UI_MODE
+
+
+def session_uses_map_only_ui(session: dict[str, Any] | None) -> bool:
+    return session_ui_mode(session) == "map_only"
 
 
 def session_operation_allowed(session: dict[str, Any] | None, operation: str) -> bool:
@@ -409,6 +429,11 @@ def create_conversation_session(
     label: str | None = None,
     session_group: str | None = None,
     session_permissions: dict[str, Any] | None = None,
+    created_by_username: str | None = None,
+    created_by_type: str | None = None,
+    origin_session_id: str | None = None,
+    origin_goal_id: str | None = None,
+    origin_goal_text: str | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
@@ -438,6 +463,11 @@ def create_conversation_session(
             "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
             "created_at": utc_ts(),
             "updated_at": utc_ts(),
+            "created_by_username": str(created_by_username or normalized).strip(),
+            "created_by_type": str(created_by_type or "user").strip().lower() or "user",
+            "origin_session_id": str(origin_session_id or "").strip(),
+            "origin_goal_id": str(origin_goal_id or "").strip(),
+            "origin_goal_text": str(origin_goal_text or ""),
         }
         sessions.append(session)
         ensure_session_storage_unlocked(runtime_root, username=normalized, session=session)
@@ -665,6 +695,11 @@ def update_session_goal(
     username: str,
     session_id: str,
     goal_text: Any,
+    updated_by_username: str | None = None,
+    updated_by_type: str | None = None,
+    origin_session_id: str | None = None,
+    origin_goal_id: str | None = None,
+    origin_goal_text: str | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
@@ -688,6 +723,11 @@ def update_session_goal(
                     "goal_progress_state": "in_progress",
                     "created_at": revision_ts,
                     "updated_at": revision_ts,
+                    "updated_by_username": str(updated_by_username or normalized).strip(),
+                    "updated_by_type": str(updated_by_type or "user").strip().lower() or "user",
+                    "origin_session_id": str(origin_session_id or session_id).strip(),
+                    "origin_goal_id": str(origin_goal_id or "").strip(),
+                    "origin_goal_text": str(origin_goal_text or ""),
                 }
                 goal_history = talk.get("goal_history")
                 if not isinstance(goal_history, list):
@@ -1409,7 +1449,13 @@ def create_child_conversation_session(
     goal_text: str | None = None,
     session_group: str | None = None,
     session_permissions: dict[str, Any] | None = None,
+    created_by_username: str | None = None,
+    created_by_type: str | None = None,
+    origin_session_id: str | None = None,
+    origin_goal_id: str | None = None,
+    origin_goal_text: str | None = None,
 ) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
     parent = get_session_settings(runtime_root, username=username, session_id=parent_session_id)
     if not isinstance(parent, dict):
         return None
@@ -1421,9 +1467,24 @@ def create_child_conversation_session(
         label=label or "Subgoal",
         session_group=session_group,
         session_permissions=session_permissions,
+        created_by_username=created_by_username or normalized,
+        created_by_type=created_by_type or "user",
+        origin_session_id=origin_session_id or parent_session_id,
+        origin_goal_id=origin_goal_id or str(parent.get("active_goal_id") or parent.get("goal_id") or "").strip(),
+        origin_goal_text=origin_goal_text if origin_goal_text is not None else str(parent.get("goal_text") or ""),
     )
     if goal_text:
-        update_session_goal(runtime_root, username=username, session_id=str(child["session_id"]), goal_text=goal_text)
+        update_session_goal(
+            runtime_root,
+            username=username,
+            session_id=str(child["session_id"]),
+            goal_text=goal_text,
+            updated_by_username=created_by_username or normalized,
+            updated_by_type=created_by_type or "user",
+            origin_session_id=origin_session_id or parent_session_id,
+            origin_goal_id=origin_goal_id or str(parent.get("active_goal_id") or parent.get("goal_id") or "").strip(),
+            origin_goal_text=origin_goal_text if origin_goal_text is not None else str(parent.get("goal_text") or ""),
+        )
     add_session_child(
         runtime_root,
         username=username,

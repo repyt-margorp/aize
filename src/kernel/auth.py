@@ -10,13 +10,39 @@ ROLE_CAPABILITIES: dict[str, set[str]] = {
     "root": {"spawn_service", "manage_users", "control_service", "read_service_status", "superuser"},
     "superuser": {"spawn_service", "manage_users", "control_service", "read_service_status", "superuser"},
     "user": set(),
+    "system": set(),
 }
+
+GOAL_MANAGER_USERNAME = "goalmanager"
+
+
+def _goal_manager_user_record() -> dict[str, Any]:
+    return {
+        "username": GOAL_MANAGER_USERNAME,
+        "roles": ["system"],
+        "capabilities": [],
+        "login_disabled": True,
+        "system_account": True,
+        "created_at": utc_ts(),
+    }
+
+
+def ensure_system_users(runtime_root) -> None:
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not isinstance(state["users"].get(GOAL_MANAGER_USERNAME), dict):
+            state["users"][GOAL_MANAGER_USERNAME] = _goal_manager_user_record()
+            write_state(runtime_root, state)
 
 
 def has_users(runtime_root) -> bool:
+    ensure_system_users(runtime_root)
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
-        return bool(state["users"])
+        return any(
+            isinstance(record, dict) and not bool(record.get("system_account"))
+            for record in state["users"].values()
+        )
 
 
 def _normalize_user_record(username: str, record: dict[str, Any]) -> dict[str, Any]:
@@ -48,6 +74,7 @@ def _write_user_record(runtime_root, *, username: str, record: dict[str, Any]) -
 
 def resolve_user_record(runtime_root, *, username: str) -> dict[str, Any] | None:
     normalized = normalize_username(username)
+    ensure_system_users(runtime_root)
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         record = state["users"].get(normalized)
@@ -63,7 +90,10 @@ def resolve_user_record(runtime_root, *, username: str) -> dict[str, Any] | None
 def bootstrap_root_user(runtime_root, *, password: str) -> tuple[bool, str]:
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
-        if state["users"]:
+        if any(
+            isinstance(record, dict) and not bool(record.get("system_account"))
+            for record in state["users"].values()
+        ):
             return False, "bootstrap_already_completed"
         import secrets
         import hashlib
@@ -77,6 +107,7 @@ def bootstrap_root_user(runtime_root, *, password: str) -> tuple[bool, str]:
             "password_hash": hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000).hex(),
             "created_at": utc_ts(),
         }
+        state["users"].setdefault(GOAL_MANAGER_USERNAME, _goal_manager_user_record())
         write_state(runtime_root, state)
     return True, "root"
 
@@ -94,6 +125,7 @@ def create_user(
         return False, "username_required"
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
+        state["users"].setdefault(GOAL_MANAGER_USERNAME, _goal_manager_user_record())
         if normalized in state["users"]:
             return False, "username_exists"
         import secrets
@@ -120,6 +152,8 @@ def verify_user_password(runtime_root, *, username: str, password: str) -> bool:
 
     record = resolve_user_record(runtime_root, username=username)
     if not record:
+        return False
+    if bool(record.get("login_disabled")):
         return False
     expected = str(record["password_hash"])
     actual = hashlib.pbkdf2_hmac(

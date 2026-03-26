@@ -212,12 +212,18 @@ def build_aize_input_batch_xml(
         role = html.escape(str(item.get("role", "user")))
         text = html.escape(str(item.get("text", "")))
         date_attr = ""
+        submitted_by_attr = ""
         raw_date = item.get("date")
         if isinstance(raw_date, str) and raw_date.strip():
             date_attr = f' date="{html.escape(raw_date.strip(), quote=True)}"'
+        raw_submitted_by_username = item.get("submitted_by_username")
+        if isinstance(raw_submitted_by_username, str) and raw_submitted_by_username.strip():
+            submitted_by_attr = (
+                f' submitted_by_username="{html.escape(raw_submitted_by_username.strip(), quote=True)}"'
+            )
         lines.extend(
             [
-                f"    <input index=\"{index}\" kind=\"{kind}\"{date_attr}>",
+                f"    <input index=\"{index}\" kind=\"{kind}\"{date_attr}{submitted_by_attr}>",
                 f"      <role>{role}</role>",
                 f"      <text>{text}</text>",
                 "    </input>",
@@ -266,14 +272,24 @@ def make_dispatch_pending_message(
     return message
 
 
-def make_aize_pending_input(*, kind: str, role: str, text: str, date: str | None = None) -> dict[str, str]:
+def make_aize_pending_input(
+    *,
+    kind: str,
+    role: str,
+    text: str,
+    date: str | None = None,
+    submitted_by_username: str | None = None,
+) -> dict[str, str]:
     date_value = date.strip() if isinstance(date, str) and date.strip() else utc_ts()
-    return {
+    entry = {
         "kind": kind,
         "role": role,
         "text": text,
         "date": date_value,
     }
+    if isinstance(submitted_by_username, str) and submitted_by_username.strip():
+        entry["submitted_by_username"] = submitted_by_username.strip()
+    return entry
 
 
 def batch_has_input_kind(batch_xml: str, kind: str) -> bool:

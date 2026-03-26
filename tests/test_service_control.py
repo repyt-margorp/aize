@@ -23,7 +23,11 @@ from runtime.persistent_state import (
     load_pending_inputs,
     read_jsonl,
 )
-from runtime.service_control import build_prompt, parse_service_response
+from runtime.service_control import (
+    build_prompt,
+    parse_service_response,
+    parse_service_response_with_fallback,
+)
 
 
 TEST_USERNAME = "test-user"
@@ -44,6 +48,15 @@ class ServiceControlParserTests(unittest.TestCase):
         text, spawn_requests = parse_service_response(wrapped, "service_control_v1")
         self.assertEqual(text, "ok")
         self.assertEqual(spawn_requests, [])
+
+    def test_parse_service_response_with_fallback_keeps_plain_text(self) -> None:
+        text, spawn_requests, error = parse_service_response_with_fallback(
+            "plain text progress update",
+            "service_control_v1",
+        )
+        self.assertEqual(text, "plain text progress update")
+        self.assertEqual(spawn_requests, [])
+        self.assertIn("invalid JSON output for service_control_v1", str(error))
 
     def test_build_prompt_spells_out_spawn_request_shape(self) -> None:
         prompt = build_prompt(

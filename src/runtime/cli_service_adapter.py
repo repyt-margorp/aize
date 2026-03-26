@@ -237,6 +237,9 @@ renderPageTitle
 setSessionMapOpen(sessionMapOpen);
 captureElementScrollState(goalBoardGrid)
 restoreElementScrollPosition(goalBoardGrid, scrollState)
+id='view-session-map'
+viewSessionMapButton.textContent = sessionMapOpen ? 'Talk' : 'Sessions';
+viewSessionMapButton.onclick = (event) => { event.preventDefault(); toggleSessionMap(); };
 const captureElementScrollState = (element) => element ? ({
 const restoreElementScrollPosition = (element, state) => {
 initial_session_map_open = requested_session_id(self, query=query) is None

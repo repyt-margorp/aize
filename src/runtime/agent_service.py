@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
+from kernel.auth import GOAL_MANAGER_USERNAME
 from kernel.lifecycle import get_process_record, register_process, update_process_fields
 from kernel.registry import update_service_process
 from runtime.compaction import (
@@ -88,7 +89,7 @@ from runtime.persistent_state import (
 from runtime.providers import run_claude, run_codex
 from runtime.service_control import (
     build_prompt,
-    parse_service_response,
+    parse_service_response_with_fallback,
 )
 from wire.protocol import (
     decode_line,
@@ -106,6 +107,88 @@ _USER_RESPONSE_WAIT_RE = re.compile(
     r"<aize_user_response_wait>(?P<body>[\s\S]*?)</aize_user_response_wait>",
     re.IGNORECASE,
 )
+
+
+def _materialize_goal_child_sessions(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    goal_id: str,
+    goal_text: str,
+    goal_manager_service_id: str,
+    child_goal_requests: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    created_child_sessions: list[dict[str, str]] = []
+    for child_request in child_goal_requests:
+        if not isinstance(child_request, dict):
+            continue
+        child_label = str(child_request.get("label") or "").strip() or "Subgoal"
+        child_goal_text = str(child_request.get("goal_text") or "").strip()
+        requested_service_id = str(child_request.get("service_id") or "").strip()
+        preferred_provider = "claude" if "claude" in requested_service_id else "codex"
+        child_session = create_child_conversation_session(
+            runtime_root,
+            username=username,
+            parent_session_id=session_id,
+            label=child_label,
+            goal_text=child_goal_text,
+            created_by_username=GOAL_MANAGER_USERNAME,
+            created_by_type="system",
+            origin_session_id=session_id,
+            origin_goal_id=goal_id,
+            origin_goal_text=goal_text,
+        )
+        if not isinstance(child_session, dict):
+            continue
+        child_session_id = str(child_session.get("session_id") or "").strip()
+        if not child_session_id:
+            continue
+        update_session_goal_flags(
+            runtime_root,
+            username=username,
+            session_id=child_session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider=preferred_provider,
+        )
+        if requested_service_id:
+            record_session_agent_contact(
+                runtime_root,
+                username=username,
+                session_id=child_session_id,
+                service_id=requested_service_id,
+                provider=preferred_provider,
+            )
+        created_child_sessions.append(
+            {
+                "session_id": child_session_id,
+                "label": child_label,
+                "provider": preferred_provider,
+            }
+        )
+    if created_child_sessions:
+        append_user_history(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            limit=GOAL_AUDIT_HISTORY_LIMIT,
+            entry={
+                "direction": "agent",
+                "ts": utc_ts(),
+                "from": goal_manager_service_id,
+                "session_id": session_id,
+                "event_type": "service.goal_child_sessions_created",
+                "text": f"GoalManager created {len(created_child_sessions)} child sessions.",
+                "event": {
+                    "type": "service.goal_child_sessions_created",
+                    "children": created_child_sessions,
+                    "goal_id": goal_id,
+                },
+            },
+        )
+    return created_child_sessions
 
 
 def _is_usage_limit_error_text(text: str) -> bool:
@@ -988,6 +1071,16 @@ def run_agent_service(
                             session_id=session_id,
                             last_turn_completed_at=max(reviewed_ts),
                         )
+            if audit is not None and isinstance(audit.get("child_goal_requests"), list):
+                _materialize_goal_child_sessions(
+                    runtime_root=runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_id=goal_id,
+                    goal_text=goal_text,
+                    goal_manager_service_id=goal_manager_service_id,
+                    child_goal_requests=list(audit.get("child_goal_requests", [])),
+                )
             if audit_progress_state == "complete":
                 update_session_goal_flags(
                     runtime_root,
@@ -1153,38 +1246,46 @@ def run_agent_service(
                     and directive_state == "all_clear"
                     and directive_feedback_xml
                 ):
-                    pending_for_service = append_service_pending_input(
-                        runtime_root,
-                        service_id=directive_service_id,
-                        agent_id=resolve_session_agent_id(
+                    is_ws_peer_target = directive_service_id.startswith("ws-peer-")
+                    if is_ws_peer_target:
+                        # WS peers do not have a local adapter process to receive router
+                        # dispatch_pending. Transport their goal feedback through the
+                        # subscribed session history stream instead.
+                        queued_target_counts[directive_service_id] = 1
+                    else:
+                        pending_for_service = append_service_pending_input(
                             runtime_root,
+                            service_id=directive_service_id,
+                            agent_id=resolve_session_agent_id(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                service_id=directive_service_id,
+                            ),
                             username=username,
                             session_id=session_id,
-                            service_id=directive_service_id,
-                        ),
-                        username=username,
-                        session_id=session_id,
-                        entry=make_aize_pending_input(
-                            kind="goal_feedback",
-                            role="system",
-                            text=directive_feedback_xml,
-                        ),
-                    )
-                    queued_target_counts[directive_service_id] = len(pending_for_service)
+                            entry=make_aize_pending_input(
+                                kind="goal_feedback",
+                                role="system",
+                                text=directive_feedback_xml,
+                            ),
+                        )
+                        queued_target_counts[directive_service_id] = len(pending_for_service)
                     if directive_service_id not in explicit_followup_targets:
                         explicit_followup_targets.append(directive_service_id)
                     queued_targeted_followup = True
                     _feedback_summary = str(audit.get("summary") or "").strip() if audit is not None else ""
-                    goal_history_sink(
-                        {
-                            "direction": "session_input",
-                            "kind": "goal_feedback",
-                            "ts": utc_ts(),
-                            "service_id": directive_service_id,
-                            "to": directive_service_id,
-                            "text": _feedback_summary or "GoalManager requested more work",
-                        }
-                    )
+                    feedback_history_entry = {
+                        "direction": "session_input",
+                        "kind": "goal_feedback",
+                        "ts": utc_ts(),
+                        "service_id": directive_service_id,
+                        "to": directive_service_id,
+                        "text": _feedback_summary or "GoalManager requested more work",
+                    }
+                    if is_ws_peer_target:
+                        feedback_history_entry["pending_input_text"] = directive_feedback_xml
+                    goal_history_sink(feedback_history_entry)
             if explicit_followup_targets:
                 dispatch_targets = goal_followup_dispatch_targets(
                     [{"service_id": item} for item in explicit_followup_targets],
@@ -1234,6 +1335,20 @@ def run_agent_service(
                     },
                 )
                 if not pending_for_target_count and queued_targeted_followup:
+                    continue
+                if dispatch_service_id.startswith("ws-peer-"):
+                    write_jsonl(
+                        log_path,
+                        {
+                            "type": "service.goal_audit_ws_peer_dispatch",
+                            "ts": utc_ts(),
+                            "service_id": goal_manager_service_id,
+                            "process_id": process_id,
+                            "scope": {"username": username, "session_id": session_id},
+                            "dispatch_target": dispatch_service_id,
+                            "transport": "history_subscriber",
+                        },
+                    )
                     continue
                 send_tx(
                     make_dispatch_pending_message(
@@ -1780,7 +1895,7 @@ def run_agent_service(
                     "scope": {"username": scope_username, "session_id": scope_session_id},
                 },
             )
-            visible_text, spawn_requests = parse_service_response(
+            visible_text, spawn_requests, schema_error = parse_service_response_with_fallback(
                 final_text,
                 self_service.get("response_schema_id"),
             )
@@ -1833,8 +1948,27 @@ def run_agent_service(
                     "spawn_request_count": len(spawn_requests),
                     "has_visible_text": bool(visible_text),
                     "user_response_wait_active": bool(user_response_wait),
+                    "schema_error": schema_error,
                 },
             )
+            if schema_error:
+                append_user_history(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                    entry={
+                        "direction": "event",
+                        "ts": utc_ts(),
+                        "service_id": service_id,
+                        "event_type": "service.response_schema_fallback",
+                        "text": "Agent reply used plain-text fallback because schema parsing failed.",
+                        "event": {
+                            "type": "service.response_schema_fallback",
+                            "error": schema_error,
+                        },
+                    },
+                    limit=GOAL_AUDIT_HISTORY_LIMIT,
+                )
             for control in spawn_requests:
                 spawn_message = make_message(
                     from_node_id=manifest["node_id"],

@@ -23,14 +23,28 @@ DEFAULT_AUTO_RESUME_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS = 5 * 60
 AGENT_PRIORITY_BORDER = "border"
 DEFAULT_AGENT_PRIORITY = ["codex", "claude", AGENT_PRIORITY_BORDER]
+GOAL_MANAGER_USERNAME = "goalmanager"
+DEFAULT_SESSION_UI_MODE = "standard"
+SESSION_UI_MODES = {"standard", "map_only"}
 SESSION_GROUP_DEFAULT_PERMISSIONS = {
+    "root": {
+        "create_child_session": True,
+        "update_goal": False,
+        "send_prompt": False,
+        "auto_spawn_recovery": True,
+        "auto_resume": True,
+    },
     "user": {
         "create_child_session": True,
+        "update_goal": True,
+        "send_prompt": True,
         "auto_spawn_recovery": True,
         "auto_resume": True,
     },
     "error": {
         "create_child_session": False,
+        "update_goal": False,
+        "send_prompt": False,
         "auto_spawn_recovery": False,
         "auto_resume": True,
     },
@@ -437,6 +451,12 @@ def ensure_session_storage_unlocked(
     session_goal_manager_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
     session_dag_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
     session_payload = dict(session)
+    if not str(session_payload.get("created_by_username") or "").strip():
+        session_payload["created_by_username"] = normalized
+    if not str(session_payload.get("created_by_type") or "").strip():
+        session_payload["created_by_type"] = "user"
+    if session_id == "default" and str(session_payload.get("label") or "").strip() in {"", "Default"}:
+        session_payload["label"] = "Root"
     session_payload["_runtime_root"] = str(runtime_root)
     write_json_file(session_metadata_path(runtime_root, username=normalized, session_id=session_id), session_payload)
     goal_manager_state_path = session_goal_manager_state_path(runtime_root, username=normalized, session_id=session_id)
@@ -529,6 +549,11 @@ def _normalize_goal_revision_unlocked(revision: dict[str, Any], *, fallback_ts: 
         "goal_progress_state": progress_state,
         "created_at": str(revision.get("created_at") or updated_at),
         "updated_at": updated_at,
+        "updated_by_username": str(revision.get("updated_by_username") or "").strip(),
+        "updated_by_type": str(revision.get("updated_by_type") or "").strip().lower() or "user",
+        "origin_session_id": str(revision.get("origin_session_id") or "").strip(),
+        "origin_goal_id": str(revision.get("origin_goal_id") or "").strip(),
+        "origin_goal_text": str(revision.get("origin_goal_text") or ""),
     }
 
 
@@ -656,8 +681,17 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("goal_updated_at", session.get("updated_at", utc_ts()))
     session.setdefault("last_context_status", None)
     session.setdefault("last_context_status_updated_at", session.get("updated_at", utc_ts()))
-    group = str(session.get("session_group") or DEFAULT_SESSION_GROUP).strip().lower()
-    if group not in SESSION_GROUP_DEFAULT_PERMISSIONS:
+    session.setdefault("created_by_username", "")
+    session.setdefault("created_by_type", "user")
+    session.setdefault("origin_session_id", str(session.get("parent_session_id") or "").strip())
+    session.setdefault("origin_goal_id", "")
+    session.setdefault("origin_goal_text", "")
+    requested_group = str(session.get("session_group") or DEFAULT_SESSION_GROUP).strip().lower()
+    if str(session.get("session_id") or "").strip() == "default":
+        group = "root"
+    elif requested_group in SESSION_GROUP_DEFAULT_PERMISSIONS:
+        group = requested_group
+    else:
         group = DEFAULT_SESSION_GROUP
     session["session_group"] = group
     permissions = session.get("session_permissions")
@@ -671,6 +705,16 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
         else:
             normalized_permissions[operation_name] = bool(default_value)
     session["session_permissions"] = normalized_permissions
+    requested_ui_mode = str(session.get("session_ui_mode") or "").strip().lower()
+    if requested_ui_mode in SESSION_UI_MODES:
+        session["session_ui_mode"] = requested_ui_mode
+    elif group == "root" or (
+        not bool(normalized_permissions.get("update_goal", True))
+        and not bool(normalized_permissions.get("send_prompt", True))
+    ):
+        session["session_ui_mode"] = "map_only"
+    else:
+        session["session_ui_mode"] = DEFAULT_SESSION_UI_MODE
     session.setdefault("auto_resume_enabled", bool(normalized_permissions.get("auto_resume", False)))
     try:
         auto_resume_interval_seconds = int(session.get("auto_resume_interval_seconds", DEFAULT_AUTO_RESUME_INTERVAL_SECONDS))
@@ -727,10 +771,16 @@ def _ensure_default_session_unlocked(state: dict[str, Any], username: str) -> st
         return "default"
     session = {
         "session_id": "default",
-        "label": "Default",
+        "label": "Root",
+        "session_group": "root",
         "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
         "created_at": utc_ts(),
         "updated_at": utc_ts(),
+        "created_by_username": normalized,
+        "created_by_type": "user",
+        "origin_session_id": "",
+        "origin_goal_id": "",
+        "origin_goal_text": "",
     }
     ensure_session_storage_unlocked(runtime_root, username=normalized, session=session)
     if "conversation_sessions" not in state:

@@ -25,7 +25,7 @@ from runtime.message_builder import (
 from runtime.persistent_state import (
     append_pending_input,
     clear_session_service_runtime,
-    create_conversation_session,
+    create_child_conversation_session,
     create_session,
     consume_session_due_user_response_wait,
     delete_session,
@@ -47,6 +47,8 @@ from runtime.persistent_state import (
     resolve_session_context,
     reset_agent_audit_states_for_session,
     select_session,
+    session_ui_mode,
+    session_operation_allowed,
     unregister_history_subscriber,
     update_session_auto_compact_threshold,
     update_session_goal,
@@ -666,11 +668,17 @@ def make_handler(
                 "agent_running": _agent_turn is not None,
                 "goal_manager_state": "running" if _goal_audit else "idle",
                 "goal_manager_worker": _gm_worker,
+                "auto_resume_enabled": bool(_talk.get("auto_resume_enabled", False)),
                 "user_response_wait_status": _wait_status,
                 "user_response_wait_active": bool(_talk.get("user_response_wait_active", False)),
                 "user_response_wait_started_at": _wait_started_at,
                 "user_response_wait_prompt_text": _wait_prompt_text,
                 "parent_session_id": str(_talk.get("parent_session_id") or "").strip(),
+                "created_by_username": str(_talk.get("created_by_username") or "").strip(),
+                "created_by_type": str(_talk.get("created_by_type") or "").strip(),
+                "origin_session_id": str(_talk.get("origin_session_id") or "").strip(),
+                "origin_goal_id": str(_talk.get("origin_goal_id") or "").strip(),
+                "session_ui_mode": session_ui_mode(_talk),
             })
         _wc = build_worker_count_summary(service_snapshots=_snaps, session_summaries=_summaries)
         return {
@@ -781,10 +789,16 @@ def make_handler(
                     "agent_running": False,
                     "goal_manager_state": str(goal_manager_runtime.get("goal_manager_state") or "idle"),
                     "goal_manager_worker": goal_manager_runtime.get("goal_manager_worker"),
+                    "auto_resume_enabled": bool(talk.get("auto_resume_enabled", False)),
                     "user_response_wait_status": wait_status,
                     "user_response_wait_active": bool(talk.get("user_response_wait_active", False)),
                     "user_response_wait_started_at": wait_started_at,
                     "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
+                    "created_by_username": str(talk.get("created_by_username") or "").strip(),
+                    "created_by_type": str(talk.get("created_by_type") or "").strip(),
+                    "origin_session_id": str(talk.get("origin_session_id") or "").strip(),
+                    "origin_goal_id": str(talk.get("origin_goal_id") or "").strip(),
+                    "session_ui_mode": session_ui_mode(talk),
                 }
             )
         return summaries
@@ -807,6 +821,13 @@ def make_handler(
             goal_completed = bool(summary.get("goal_completed"))
             wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
             wait_active = bool(summary.get("user_response_wait_active", False))
+            created_by_username = str(summary.get("created_by_username") or "").strip() or "unknown"
+            origin_session_id = str(summary.get("origin_session_id") or "").strip()
+            origin_meta = (
+                f"from {created_by_username} via {origin_session_id}"
+                if origin_session_id
+                else f"created by {created_by_username}"
+            )
             parts.append(
                 "".join(
                     [
@@ -820,6 +841,7 @@ def make_handler(
                         "</span>",
                         "</span>",
                         f"<span class='talk-nav-meta'>{html.escape(sid)}</span>",
+                        f"<span class='talk-nav-origin'>{html.escape(origin_meta)}</span>",
                         "</a>",
                     ]
                 )
@@ -845,6 +867,13 @@ def make_handler(
             goal_manager_state = str(summary.get("goal_manager_state") or "idle")
             wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
             wait_active = bool(summary.get("user_response_wait_active", False))
+            created_by_username = str(summary.get("created_by_username") or "").strip() or "unknown"
+            origin_session_id = str(summary.get("origin_session_id") or "").strip()
+            origin_meta = (
+                f" | from {created_by_username} via {origin_session_id}"
+                if origin_session_id
+                else f" | created by {created_by_username}"
+            )
             classes = ["goal-session-card"]
             if sid == active_session_id:
                 classes.append("is-active-talk")
@@ -867,7 +896,7 @@ def make_handler(
                         "<div class='goal-session-card-head'>",
                         f"<div class='goal-session-title'>{html.escape(label)}</div>",
                         "</div>",
-                        f"<div class='goal-session-meta'>{html.escape(summary.get('username', ''))}{' · ' if summary.get('username') else ''}{html.escape(sid)}</div>",
+                        f"<div class='goal-session-meta'>{html.escape(summary.get('username', ''))}{' · ' if summary.get('username') else ''}{html.escape(sid)}{html.escape(origin_meta)}</div>",
                         f"<div class='goal-session-goal'>{goal_html}</div>",
                         "<div class='goal-session-state'>",
                         f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Active' if goal_active else 'Inactive'}</span>",
@@ -1060,6 +1089,12 @@ def make_handler(
             initial_session_label = str(session_settings.get("label", session_id))
             initial_goal_text = str(session_settings.get("goal_text", ""))
             initial_active_goal_id = str(session_settings.get("active_goal_id", "") or "")
+            initial_goal_history_json = json.dumps(
+                list(session_settings.get("goal_history", []))
+                if isinstance(session_settings.get("goal_history"), list)
+                else [],
+                ensure_ascii=False,
+            ).replace("</", "<\\/")
             initial_goal_active = bool(session_settings.get("goal_active", bool(initial_goal_text)))
             initial_goal_completed = bool(session_settings.get("goal_completed", False))
             initial_goal_progress_state = str(
@@ -1114,6 +1149,14 @@ def make_handler(
             initial_user_response_wait_last_cleared_at = str(session_settings.get("user_response_wait_last_cleared_at", "") or "")
             initial_user_response_wait_last_timeout_at = str(session_settings.get("user_response_wait_last_timeout_at", "") or "")
             initial_session_group = str(session_settings.get("session_group", "user") or "user")
+            initial_session_ui_mode = session_ui_mode(session_settings)
+            initial_session_map_open = bool(initial_session_map_open or initial_session_ui_mode == "map_only")
+            initial_session_permissions_json = json.dumps(
+                dict(session_settings.get("session_permissions", {}))
+                if isinstance(session_settings.get("session_permissions"), dict)
+                else {},
+                ensure_ascii=False,
+            ).replace("</", "<\\/")
             initial_preferred_provider = str(session_settings.get("preferred_provider", default_provider))
             initial_agent_priority = normalize_agent_priority(session_settings.get("agent_priority"))
             try:
@@ -1193,6 +1236,7 @@ def make_handler(
                     initial_session_label=initial_session_label,
                     initial_goal_text=initial_goal_text,
                     initial_active_goal_id=initial_active_goal_id,
+                    initial_goal_history_json=initial_goal_history_json,
                     initial_goal_active=initial_goal_active,
                     initial_goal_completed=initial_goal_completed,
                     initial_goal_progress_state=initial_goal_progress_state,
@@ -1215,6 +1259,8 @@ def make_handler(
                     initial_user_response_wait_last_cleared_at=initial_user_response_wait_last_cleared_at,
                     initial_user_response_wait_last_timeout_at=initial_user_response_wait_last_timeout_at,
                     initial_session_group=initial_session_group,
+                    initial_session_ui_mode=initial_session_ui_mode,
+                    initial_session_permissions_json=initial_session_permissions_json,
                     initial_preferred_provider=initial_preferred_provider,
                     initial_agent_priority=initial_agent_priority,
                     initial_session_priority=initial_session_priority,
@@ -1694,7 +1740,26 @@ def make_handler(
             if not context:
                 return
             label = str(payload.get("label", "")).strip() or None
-            talk = create_conversation_session(runtime_root, username=context["username"], label=label)
+            parent_session_id = str(payload.get("parent_session_id") or context["session_id"] or "").strip()
+            parent_talk = get_session_settings(
+                runtime_root,
+                username=context["username"],
+                session_id=parent_session_id,
+            ) or {}
+            talk = create_child_conversation_session(
+                runtime_root,
+                username=context["username"],
+                parent_session_id=parent_session_id,
+                label=label,
+                created_by_username=context["username"],
+                created_by_type="user",
+                origin_session_id=parent_session_id,
+                origin_goal_id=str(parent_talk.get("active_goal_id") or parent_talk.get("goal_id") or "").strip(),
+                origin_goal_text=str(parent_talk.get("goal_text") or ""),
+            )
+            if not talk:
+                self._json(404, {"error": "parent_session_not_found"})
+                return
             with _ov_cache_lock:
                 _ov_cache_state[0] = None  # invalidate so next /overview reflects the new session
             if "application/json" in content_type:
@@ -1833,6 +1898,10 @@ def make_handler(
             context = self._require_user(payload=payload)
             if not context:
                 return
+            talk = get_session_settings(runtime_root, username=context["username"], session_id=context["session_id"])
+            if not session_operation_allowed(talk, "update_goal"):
+                self._json(403, {"error": "goal_update_disabled"})
+                return
             write_jsonl(
                 log_path,
                 {
@@ -1844,7 +1913,7 @@ def make_handler(
                     "session_id": context["session_id"],
                 },
             )
-            old_talk = get_session_settings(runtime_root, username=context["username"], session_id=context["session_id"]) or {}
+            old_talk = talk or {}
             previous_goal = str(old_talk.get("goal_text", "")).strip()
             previous_goal_id = str(old_talk.get("active_goal_id") or old_talk.get("goal_id") or "").strip() or None
             talk = update_session_goal(
@@ -1852,6 +1921,11 @@ def make_handler(
                 username=context["username"],
                 session_id=context["session_id"],
                 goal_text=payload.get("goal_text"),
+                updated_by_username=context["username"],
+                updated_by_type="user",
+                origin_session_id=context["session_id"],
+                origin_goal_id=previous_goal_id or "",
+                origin_goal_text=previous_goal,
             )
             if not talk:
                 self._json(404, {"error": "session_not_found"})
@@ -1896,6 +1970,16 @@ def make_handler(
         def _do_POST_session_goal_state(self, payload: dict) -> None:
             context = self._require_user(payload=payload)
             if not context:
+                return
+            current_talk = get_session_settings(runtime_root, username=context["username"], session_id=context["session_id"])
+            if not current_talk:
+                self._json(404, {"error": "session_not_found"})
+                return
+            if (
+                any(key in payload for key in ("goal_active", "goal_completed"))
+                and not session_operation_allowed(current_talk, "update_goal")
+            ):
+                self._json(403, {"error": "goal_update_disabled"})
                 return
             write_jsonl(
                 log_path,
@@ -2468,6 +2552,10 @@ def make_handler(
                 return
             username = context["username"]
             session_id = context["session_id"]
+            talk = get_session_settings(runtime_root, username=username, session_id=session_id)
+            if not talk:
+                self._json(404, {"error": "session_not_found"})
+                return
             mode = str(payload.get("mode", "prompt")).strip().lower() or "prompt"
             auth_context = issue_auth_context(runtime_root, username=username)
             provider_override = str(payload.get("provider", "")).strip().lower()
@@ -2484,6 +2572,9 @@ def make_handler(
                 self._json(400, {"error": "text_required"})
                 return
             if mode == "goal":
+                if not session_operation_allowed(talk, "update_goal"):
+                    self._json(403, {"error": "goal_update_disabled"})
+                    return
                 def process_goal_dispatch() -> None:
                     try:
                         write_jsonl(
@@ -2511,6 +2602,11 @@ def make_handler(
                             username=username,
                             session_id=session_id,
                             goal_text=text,
+                            updated_by_username=username,
+                            updated_by_type="user",
+                            origin_session_id=session_id,
+                            origin_goal_id=previous_goal_id or "",
+                            origin_goal_text=previous_goal,
                         )
                         if not talk:
                             write_jsonl(
@@ -2588,6 +2684,13 @@ def make_handler(
                 return
             if mode not in {"prompt", ""}:
                 self._json(400, {"error": "unsupported_mode"})
+                return
+            session_owner_username = str(talk.get("username") or "").strip()
+            if session_owner_username and session_owner_username != username:
+                self._json(403, {"error": "session_owner_required"})
+                return
+            if not session_operation_allowed(talk, "send_prompt"):
+                self._json(403, {"error": "prompt_disabled"})
                 return
             requested_to_service = payload.get("to", default_target)
             if not isinstance(requested_to_service, str) or not requested_to_service:
@@ -2723,6 +2826,7 @@ def make_handler(
                             "to": display_to,
                             "session_id": session_id,
                             "text": prompt_text,
+                            "submitted_by_username": username,
                         },
                     )
                     # When WS-only, write a degraded-state event if no WS peer is
@@ -2756,6 +2860,7 @@ def make_handler(
                             kind="user_message",
                             role="user",
                             text=prompt_text,
+                            submitted_by_username=username,
                         ),
                     )
                     maybe_enqueue_mid_turn_progress_inquiry(
@@ -2792,6 +2897,7 @@ def make_handler(
                             "service_id": self_service["service_id"],
                             "process_id": process_id,
                             "username": username,
+                            "submitted_by_username": username,
                             "session_id": session_id,
                             "to": to_service,
                             "dispatch_error": dispatch_error,
@@ -2806,6 +2912,7 @@ def make_handler(
                             "service_id": self_service["service_id"],
                             "process_id": process_id,
                             "username": username,
+                            "submitted_by_username": username,
                             "session_id": session_id,
                             "to": to_service,
                             "error": repr(exc),

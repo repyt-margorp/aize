@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from kernel.auth import GOAL_MANAGER_USERNAME
 from runtime.persistent_state import (
     add_session_child,
     create_conversation_session,
@@ -131,6 +132,11 @@ def ensure_panic_recovery_session(
                 username=username,
                 session_id=existing_session_id,
                 goal_text=goal_text,
+                updated_by_username=GOAL_MANAGER_USERNAME,
+                updated_by_type="system",
+                origin_session_id=source_session_id,
+                origin_goal_id=str(source_session.get("active_goal_id") or source_session.get("goal_id") or "").strip(),
+                origin_goal_text=str(source_session.get("goal_text") or ""),
             )
             update_session_goal_flags(
                 runtime_root,
@@ -157,6 +163,11 @@ def ensure_panic_recovery_session(
             "create_child_session": False,
             "auto_spawn_recovery": False,
         },
+        created_by_username=GOAL_MANAGER_USERNAME,
+        created_by_type="system",
+        origin_session_id=source_session_id,
+        origin_goal_id=str(source_session.get("active_goal_id") or source_session.get("goal_id") or "").strip(),
+        origin_goal_text=str(source_session.get("goal_text") or ""),
     )
     if not isinstance(child, dict):
         return None
@@ -192,6 +203,11 @@ def ensure_panic_recovery_session(
         username=username,
         session_id=recovery_session_id,
         goal_text=goal_text,
+        updated_by_username=GOAL_MANAGER_USERNAME,
+        updated_by_type="system",
+        origin_session_id=source_session_id,
+        origin_goal_id=str(source_session.get("active_goal_id") or source_session.get("goal_id") or "").strip(),
+        origin_goal_text=str(source_session.get("goal_text") or ""),
     )
     update_session_goal_flags(
         runtime_root,

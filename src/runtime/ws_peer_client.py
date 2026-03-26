@@ -58,6 +58,72 @@ RECONNECT_BACKOFF_BASE = 5  # initial reconnect wait (seconds)
 RECONNECT_BACKOFF_MAX = 120 # cap on reconnect wait
 
 
+def _remote_session_entry_to_dispatch(
+    entry: dict[str, Any],
+    *,
+    peer_service_id: str | None,
+) -> dict[str, Any] | None:
+    """Translate a remote session_event entry into local pending inputs.
+
+    User prompts arrive as ``direction="out"`` entries. GoalManager follow-up
+    for external agents is transported via ``direction="session_input"``
+    entries targeted at the joined WS peer service id.
+    """
+    if not isinstance(entry, dict):
+        return None
+
+    direction = str(entry.get("direction") or "").strip().lower()
+    text = str(entry.get("text") or "").strip()
+    if direction == "out" and text:
+        return {
+            "pending_inputs": [
+                {
+                    "kind": "user_message",
+                    "role": "user",
+                    "text": text,
+                    "date": utc_ts(),
+                }
+            ],
+            "history_entry": {
+                "direction": "out",
+                "text": text,
+            },
+            "log_type": "ws_peer_client.prompt_received",
+            "text_preview": text[:120],
+        }
+
+    target_service_id = str(entry.get("service_id") or entry.get("to") or "").strip()
+    pending_input_text = str(entry.get("pending_input_text") or "").strip()
+    if (
+        direction == "session_input"
+        and str(entry.get("kind") or "").strip().lower() == "goal_feedback"
+        and peer_service_id
+        and target_service_id == peer_service_id
+        and pending_input_text
+    ):
+        return {
+            "pending_inputs": [
+                {
+                    "kind": "goal_feedback",
+                    "role": "system",
+                    "text": pending_input_text,
+                    "date": utc_ts(),
+                }
+            ],
+            "history_entry": {
+                "direction": "session_input",
+                "kind": "goal_feedback",
+                "service_id": target_service_id,
+                "text": text or "GoalManager requested more work",
+                "pending_input_text": pending_input_text,
+            },
+            "log_type": "ws_peer_client.goal_feedback_received",
+            "text_preview": (text or pending_input_text)[:120],
+        }
+
+    return None
+
+
 def _send(wfile: Any, msg: dict[str, Any], write_lock: threading.Lock) -> bool:
     try:
         with write_lock:
@@ -141,13 +207,14 @@ def _dispatch_to_local_llm(
     process_id: str,
     local_username: str,
     local_session_id: str,
-    prompt_text: str,
+    pending_inputs: list[dict[str, Any]],
     provider_pool: list[str],
     log_path: Path,
     append_history: Any,
     write_jsonl_fn: Any,
+    history_entry: dict[str, Any] | None = None,
 ) -> str | None:
-    """Dispatch prompt_text to the local LLM and return the response text.
+    """Dispatch pending_inputs to the local LLM and return the response text.
 
     Returns the first ``direction="in"`` text seen in the local session history
     after the dispatch, or None on timeout / error.
@@ -189,24 +256,26 @@ def _dispatch_to_local_llm(
         })
         return None
 
-    # Write the user message to local history and pending inputs.
-    append_history(local_username, local_session_id, {
-        "direction": "out",
-        "ts": dispatch_ts,
-        "to": leased_service_id,
-        "session_id": local_session_id,
-        "text": prompt_text,
-    })
-    append_pending_input(
-        runtime_root,
-        username=local_username,
-        session_id=local_session_id,
-        entry=make_aize_pending_input(
-            kind="user_message",
-            role="user",
-            text=prompt_text,
-        ),
-    )
+    # Mirror the remote entry into the local proxy session before dispatch.
+    if history_entry is not None:
+        local_history_entry = dict(history_entry)
+        local_history_entry.setdefault("ts", dispatch_ts)
+        local_history_entry["session_id"] = local_session_id
+        if str(local_history_entry.get("direction") or "") == "out":
+            local_history_entry.setdefault("to", leased_service_id)
+        append_history(local_username, local_session_id, local_history_entry)
+    for item in pending_inputs:
+        append_pending_input(
+            runtime_root,
+            username=local_username,
+            session_id=local_session_id,
+            entry=make_aize_pending_input(
+                kind=str(item.get("kind") or "user_message"),
+                role=str(item.get("role") or "user"),
+                text=str(item.get("text") or ""),
+                date=str(item.get("date") or dispatch_ts),
+            ),
+        )
 
     # Send dispatch control message to the router.
     dispatch_msg = make_dispatch_pending_message(
@@ -351,6 +420,7 @@ def run_ws_peer_client(
         rfile = None
         wfile = None
         write_lock = threading.Lock()
+        peer_service_id: str | None = None
 
         try:
             write_jsonl(log_path, {
@@ -410,6 +480,7 @@ def run_ws_peer_client(
                     continue
                 msg = json.loads(payload.decode("utf-8"))
                 if msg.get("type") == "session_joined":
+                    peer_service_id = str(msg.get("peer_service_id") or "").strip() or None
                     joined = True
                     break
                 if msg.get("type") == "error":
@@ -423,7 +494,20 @@ def run_ws_peer_client(
                 "name": name,
                 "remote_username": remote_username,
                 "remote_session_id": remote_session_id,
+                "peer_service_id": peer_service_id,
             })
+
+            if peer_service_id and local_session_id:
+                from runtime.persistent_state_pkg import record_session_agent_contact
+
+                record_session_agent_contact(
+                    runtime_root,
+                    username=local_username,
+                    session_id=local_session_id,
+                    service_id=peer_service_id,
+                    agent_id=f"{peer_service_id}@@{remote_session_id}",
+                    provider="ws_peer",
+                )
 
             # --- Backlog recovery ---
             # Scan the remote session's recent history for "out" prompts that
@@ -479,11 +563,19 @@ def run_ws_peer_client(
                             process_id=process_id,
                             local_username=local_username,
                             local_session_id=local_session_id,
-                            prompt_text=pt,
+                            pending_inputs=[
+                                {
+                                    "kind": "user_message",
+                                    "role": "user",
+                                    "text": pt,
+                                    "date": utc_ts(),
+                                }
+                            ],
                             provider_pool=provider_pool,
                             log_path=log_path,
                             append_history=append_history,
                             write_jsonl_fn=write_jsonl,
+                            history_entry={"direction": "out", "text": pt},
                         )
                         if response_text:
                             _send(wfile, {
@@ -563,24 +655,23 @@ def run_ws_peer_client(
                     entry = msg.get("entry", {})
                     if not isinstance(entry, dict):
                         continue
-                    direction = str(entry.get("direction", ""))
-                    # Only act on user-visible outbound prompts
-                    if direction != "out":
-                        continue
-                    prompt_text = str(entry.get("text", "")).strip()
-                    if not prompt_text:
+                    dispatch_request = _remote_session_entry_to_dispatch(
+                        entry,
+                        peer_service_id=peer_service_id,
+                    )
+                    if dispatch_request is None:
                         continue
 
                     write_jsonl(log_path, {
-                        "type": "ws_peer_client.prompt_received",
+                        "type": dispatch_request["log_type"],
                         "ts": utc_ts(),
                         "name": name,
                         "remote_session_id": remote_session_id,
-                        "text_preview": prompt_text[:120],
+                        "text_preview": dispatch_request["text_preview"],
                     })
 
                     # Dispatch in a separate thread so the receive loop stays live.
-                    def _handle_prompt(pt: str = prompt_text) -> None:
+                    def _handle_prompt(request: dict[str, Any] = dispatch_request) -> None:
                         response_text = _dispatch_to_local_llm(
                             runtime_root=runtime_root,
                             manifest=manifest,
@@ -588,11 +679,12 @@ def run_ws_peer_client(
                             process_id=process_id,
                             local_username=local_username,
                             local_session_id=local_session_id,
-                            prompt_text=pt,
+                            pending_inputs=list(request["pending_inputs"]),
                             provider_pool=provider_pool,
                             log_path=log_path,
                             append_history=append_history,
                             write_jsonl_fn=write_jsonl,
+                            history_entry=dict(request["history_entry"]),
                         )
                         if response_text:
                             _send(wfile, {
