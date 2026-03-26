@@ -1402,13 +1402,15 @@ class GoalManagerCompactTests(unittest.TestCase):
                 {"agent_running": True, "worker": {"provider": "codex"}},
                 {"agent_running": True, "worker": {"provider": "claude"}},
                 {"agent_running": False, "worker": {"provider": "codex"}},
+                {"agent_running": True, "preferred_provider": "codex"},
+                {"agent_running": True, "bound_service_id": "service-claude-001"},
             ],
         )
 
         self.assertEqual(counts["codex"]["running"], 1)
         self.assertEqual(counts["claude"]["running"], 1)
-        self.assertEqual(counts["codex"]["active_turns"], 1)
-        self.assertEqual(counts["claude"]["active_turns"], 1)
+        self.assertEqual(counts["codex"]["active_turns"], 2)
+        self.assertEqual(counts["claude"]["active_turns"], 2)
 
     def test_release_nonrunnable_session_services_releases_stopped_bound_worker(self) -> None:
         init_registry(
@@ -2605,7 +2607,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("const captureElementScrollState = (element) => element ? ({", source)
         self.assertIn("const restoreElementScrollPosition = (element, state) => {", source)
 
-    def test_httpbridge_sources_create_child_sessions_and_render_goal_history(self) -> None:
+    def test_httpbridge_sources_render_goal_history_without_child_session_create_ui(self) -> None:
         handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
         renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
         self.assertIn("create_child_conversation_session(", handler_source)
@@ -2616,7 +2618,10 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("goal-history-list", renderer_source)
         self.assertIn("renderGoalHistory", renderer_source)
         self.assertIn("renderSessionCapabilityState", renderer_source)
-        self.assertIn("Create Child Session", renderer_source)
+        self.assertNotIn("Create Child Session", renderer_source)
+        self.assertNotIn("goal-board-create-form", renderer_source)
+        self.assertNotIn("session-toolbar-create-form", renderer_source)
+        self.assertNotIn("session-create-form", renderer_source)
 
     def test_goal_manager_source_creates_child_sessions_from_audit_requests(self) -> None:
         source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
@@ -2685,6 +2690,12 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("applyGoalPayload(goalPayload);", renderer_source)
         self.assertIn("setSessionMapOpen(sessionUsesMapOnlyUI());", renderer_source)
         self.assertIn("history.pushState(null, '', sessionUsesMapOnlyUI() ? sessionPathFor('') : sessionPathFor(sid));", renderer_source)
+
+    def test_httpbridge_session_map_activity_labels_reflect_replying_and_goal_manager_review(self) -> None:
+        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("if (String(summary?.goal_manager_state || '').trim() === 'running') return 'Reviewing';", renderer_source)
+        self.assertIn("if (summary?.agent_running) return 'Replying';", renderer_source)
+        self.assertIn("const goalBoardActivityBadgeClass = (summary) => {", renderer_source)
 
     def test_httpbridge_prompt_input_records_submitter_and_rejects_non_owner(self) -> None:
         source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")

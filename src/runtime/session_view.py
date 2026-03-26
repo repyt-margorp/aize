@@ -200,12 +200,18 @@ def build_worker_count_summary(
         if status and status != "stopped":
             counts[kind]["running"] += 1
     for talk in session_summaries:
-        worker = talk.get("worker") if isinstance(talk, dict) else None
-        if not isinstance(worker, dict):
+        if not isinstance(talk, dict):
             continue
         if not talk.get("agent_running"):
             continue
-        provider = str(worker.get("provider") or "").strip().lower()
+        worker = talk.get("worker") if isinstance(talk.get("worker"), dict) else {}
+        provider = str(worker.get("provider") or talk.get("preferred_provider") or "").strip().lower()
+        if provider not in counts:
+            bound_service_id = str(talk.get("bound_service_id") or "").strip().lower()
+            if "claude" in bound_service_id:
+                provider = "claude"
+            elif "codex" in bound_service_id:
+                provider = "codex"
         if provider in counts:
             counts[provider]["active_turns"] += 1
     return counts
