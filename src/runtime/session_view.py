@@ -205,7 +205,9 @@ def build_worker_count_summary(
         if not talk.get("agent_running"):
             continue
         worker = talk.get("worker") if isinstance(talk.get("worker"), dict) else {}
-        provider = str(worker.get("provider") or talk.get("preferred_provider") or "").strip().lower()
+        provider = str(worker.get("provider") or "").strip().lower()
+        if provider not in counts:
+            provider = str(talk.get("preferred_provider") or "").strip().lower()
         if provider not in counts:
             bound_service_id = str(talk.get("bound_service_id") or "").strip().lower()
             if "claude" in bound_service_id:

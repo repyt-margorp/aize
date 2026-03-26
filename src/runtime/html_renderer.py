@@ -1604,7 +1604,7 @@ def render_main_page(
     "const buildGoalSessionCard = (summary) => {"
     "const link = document.createElement('a');"
     "const worker = summary?.worker || null;"
-    "const workerProvider = String(worker?.provider || summary?.preferred_provider || 'codex');"
+    "const workerProvider = ['codex', 'claude'].includes(String(worker?.provider || '').trim().toLowerCase()) ? String(worker.provider).trim().toLowerCase() : String(summary?.preferred_provider || 'codex');"
     "const workerSlot = worker?.slot == null ? '·' : String(worker.slot);"
     "const goalWorker = summary?.goal_manager_worker || null;"
     "const goalWorkerSlot = goalWorker?.slot == null ? '·' : String(goalWorker.slot);"

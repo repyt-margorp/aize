@@ -1403,13 +1403,14 @@ class GoalManagerCompactTests(unittest.TestCase):
                 {"agent_running": True, "worker": {"provider": "claude"}},
                 {"agent_running": False, "worker": {"provider": "codex"}},
                 {"agent_running": True, "preferred_provider": "codex"},
+                {"agent_running": True, "worker": {"provider": "unknown"}, "preferred_provider": "codex"},
                 {"agent_running": True, "bound_service_id": "service-claude-001"},
             ],
         )
 
         self.assertEqual(counts["codex"]["running"], 1)
         self.assertEqual(counts["claude"]["running"], 1)
-        self.assertEqual(counts["codex"]["active_turns"], 2)
+        self.assertEqual(counts["codex"]["active_turns"], 3)
         self.assertEqual(counts["claude"]["active_turns"], 2)
 
     def test_release_nonrunnable_session_services_releases_stopped_bound_worker(self) -> None:
@@ -2696,6 +2697,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("if (String(summary?.goal_manager_state || '').trim() === 'running') return 'Reviewing';", renderer_source)
         self.assertIn("if (summary?.agent_running) return 'Replying';", renderer_source)
         self.assertIn("const goalBoardActivityBadgeClass = (summary) => {", renderer_source)
+        self.assertIn("const workerProvider = ['codex', 'claude'].includes(String(worker?.provider || '').trim().toLowerCase()) ? String(worker.provider).trim().toLowerCase() : String(summary?.preferred_provider || 'codex');", renderer_source)
 
     def test_httpbridge_prompt_input_records_submitter_and_rejects_non_owner(self) -> None:
         source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
