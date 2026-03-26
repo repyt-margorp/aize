@@ -2676,6 +2676,16 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("initial_session_map_open = bool(initial_session_map_open or initial_session_ui_mode == \"map_only\")", handler_source)
         self.assertIn('"session_ui_mode": session_ui_mode(talk),', goal_persist_source)
 
+    def test_httpbridge_session_switch_reloads_session_ui_mode_before_toggling_map(self) -> None:
+        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("if (Array.isArray(payload?.welcomed_agents)) welcomedAgents = payload.welcomed_agents;", renderer_source)
+        self.assertIn("if (Array.isArray(payload?.selected_agents)) selectedAgents = payload.selected_agents;", renderer_source)
+        self.assertIn("renderActiveAgentsSelection();", renderer_source)
+        self.assertIn("const goalRes = await fetch(`/session/goal/state?session_id=${encodeURIComponent(sid)}&_=${Date.now()}`, { cache: 'no-store' });", renderer_source)
+        self.assertIn("applyGoalPayload(goalPayload);", renderer_source)
+        self.assertIn("setSessionMapOpen(sessionUsesMapOnlyUI());", renderer_source)
+        self.assertIn("history.pushState(null, '', sessionUsesMapOnlyUI() ? sessionPathFor('') : sessionPathFor(sid));", renderer_source)
+
     def test_httpbridge_prompt_input_records_submitter_and_rejects_non_owner(self) -> None:
         source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
         self.assertIn('session_owner_username = str(talk.get("username") or "").strip()', source)
