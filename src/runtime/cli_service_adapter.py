@@ -401,6 +401,9 @@ def run_http_service(
             snapshots.append({"service": record, "process": process})
         return snapshots
 
+    def current_llm_service_topology() -> tuple[list[str], list[str], dict[str, str]]:
+        return _resolve_llm_service_topology(runtime_root, manifest)
+
     def session_runtime_payload(username: str, preloaded_histories: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
         release_stale_session_bindings()
         sessions, histories_by_session_id = list_sessions_with_histories(runtime_root, username=username)
@@ -468,6 +471,7 @@ def run_http_service(
         release_stale_session_bindings()
         if list_active_in_progress_child_sessions(runtime_root, username=username, session_id=session_id):
             return None
+        current_codex_service_pool, current_claude_service_pool, _current_llm_service_kinds = current_llm_service_topology()
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
         selected_agents_cfg = [
@@ -475,7 +479,7 @@ def run_http_service(
             for item in list(session_settings.get("selected_agents", []))
             if str(item).strip()
         ]
-        all_local_service_ids = set(codex_service_pool) | set(claude_service_pool)
+        all_local_service_ids = set(current_codex_service_pool) | set(current_claude_service_pool)
         has_local = any(
             service_id in {"codex_pool", "claude_pool"} or service_id in all_local_service_ids
             for service_id in selected_agents_cfg
@@ -500,9 +504,9 @@ def run_http_service(
                 return None
 
             if leased_service_id and leased_service_id in all_local_service_ids:
-                if "codex_pool" in selected_agents_cfg and leased_service_id in codex_service_pool:
+                if "codex_pool" in selected_agents_cfg and leased_service_id in current_codex_service_pool:
                     return leased_service_id
-                if "claude_pool" in selected_agents_cfg and leased_service_id in claude_service_pool:
+                if "claude_pool" in selected_agents_cfg and leased_service_id in current_claude_service_pool:
                     return leased_service_id
                 if leased_service_id in selected_agents_cfg:
                     return leased_service_id
@@ -512,14 +516,14 @@ def run_http_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
-                    pool_service_ids=codex_service_pool,
+                    pool_service_ids=current_codex_service_pool,
                 )
             if "claude_pool" in selected_agents_cfg:
                 return lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
-                    pool_service_ids=claude_service_pool,
+                    pool_service_ids=current_claude_service_pool,
                 )
 
             selected_local = [service_id for service_id in selected_agents_cfg if service_id in all_local_service_ids]
@@ -538,7 +542,7 @@ def run_http_service(
             preferred_provider = str(session_settings.get("preferred_provider", default_provider)).strip().lower() or default_provider
             agent_priority = [preferred_provider]
 
-        pool_for_kind: dict[str, list[str]] = {"codex": codex_service_pool, "claude": claude_service_pool}
+        pool_for_kind: dict[str, list[str]] = {"codex": current_codex_service_pool, "claude": current_claude_service_pool}
 
         # If already leased, keep it if it belongs to any provider in the priority list
         if leased_service_id:
@@ -569,11 +573,12 @@ def run_http_service(
         return None
 
     def codex_service_candidates_for_session(*, username: str, session_id: str) -> list[str]:
+        current_codex_service_pool, _current_claude_service_pool, _current_llm_service_kinds = current_llm_service_topology()
         candidates: list[str] = []
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         if leased_service_id:
             candidates.append(leased_service_id)
-        for service_id in codex_service_pool:
+        for service_id in current_codex_service_pool:
             if service_id not in candidates:
                 candidates.append(service_id)
         if isinstance(default_target, str) and default_target and default_target not in candidates:
@@ -782,14 +787,15 @@ def run_http_service(
         if not target_service_id:
             target_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         if not target_service_id:
+            current_codex_service_pool, _current_claude_service_pool, _current_llm_service_kinds = current_llm_service_topology()
             target_service_id = lease_session_service(
                 runtime_root,
                 username=username,
                 session_id=session_id,
-                pool_service_ids=codex_service_pool,
+                pool_service_ids=current_codex_service_pool,
             )
         if not target_service_id:
-            return 409, {"error": "no_available_codex_worker", "pool": codex_service_pool, "session_id": session_id}
+            return 409, {"error": "no_available_codex_worker", "pool": current_codex_service_pool, "session_id": session_id}
         write_jsonl(
             log_path,
             {
@@ -1102,6 +1108,7 @@ def run_http_service(
         session_runtime_payload=session_runtime_payload,
         peer_descriptor=peer_descriptor,
         resolve_session_service_for_dispatch=resolve_session_service_for_dispatch,
+        current_llm_service_topology=current_llm_service_topology,
         codex_service_candidates_for_session=codex_service_candidates_for_session,
         resolve_bound_codex_session=resolve_bound_codex_session,
         enqueue_goal_dispatch=enqueue_goal_dispatch,

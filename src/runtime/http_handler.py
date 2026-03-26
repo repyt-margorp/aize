@@ -589,6 +589,7 @@ def make_handler(
     send_router_control, enqueue_service_control,
     service_snapshots, session_runtime_payload, peer_descriptor,
     resolve_session_service_for_dispatch, codex_service_candidates_for_session,
+    current_llm_service_topology,
     resolve_bound_codex_session, enqueue_goal_dispatch,
     session_auto_compact_threshold,
     context_status_from_entry, latest_context_status,
@@ -2746,22 +2747,25 @@ def make_handler(
                         str(session_settings.get("preferred_provider", default_provider)).strip().lower()
                         or default_provider
                     )
+                    current_codex_service_pool, current_claude_service_pool, _current_llm_service_kinds = (
+                        current_llm_service_topology()
+                    )
                     # selected_agents overrides provider routing when present.
                     # If the list contains only WS-peer service_ids (no pool token and
                     # no individual local service_id) we skip the local LLM entirely.
                     selected_agents_cfg = list(session_settings.get("selected_agents", []))
-                    all_local_service_ids = set(codex_service_pool) | set(claude_service_pool)
+                    all_local_service_ids = set(current_codex_service_pool) | set(current_claude_service_pool)
                     has_local = any(
                         a in {"codex_pool", "claude_pool"} or a in all_local_service_ids
                         for a in selected_agents_cfg
                     )
                     ws_only_mode = bool(selected_agents_cfg) and not has_local
-                    provider_pool = codex_service_pool if preferred_provider == "codex" else claude_service_pool
+                    provider_pool = current_codex_service_pool if preferred_provider == "codex" else current_claude_service_pool
                     # When codex_pool or claude_pool is explicitly selected, prefer that pool.
                     if "codex_pool" in selected_agents_cfg:
-                        provider_pool = codex_service_pool
+                        provider_pool = current_codex_service_pool
                     elif "claude_pool" in selected_agents_cfg:
-                        provider_pool = claude_service_pool
+                        provider_pool = current_claude_service_pool
                     else:
                         # When individual local service_ids are selected, restrict pool to those.
                         selected_local = [a for a in selected_agents_cfg if a in all_local_service_ids]
@@ -2775,7 +2779,7 @@ def make_handler(
                     if ws_only_mode:
                         # No local LLM worker — WS peer handles this session
                         to_service = None
-                    elif requested_to_service == default_target and (codex_service_pool or claude_service_pool):
+                    elif requested_to_service == default_target and (current_codex_service_pool or current_claude_service_pool):
                         if leased_service_id and provider_pool and leased_service_id not in provider_pool:
                             leased_service_id = None
                         if not leased_service_id:
@@ -2974,7 +2978,10 @@ def make_handler(
                     str(due_wait.get("preferred_provider", default_provider)).strip().lower()
                     or default_provider
                 )
-                pool_service_ids = claude_service_pool if preferred_provider == "claude" else codex_service_pool
+                current_codex_service_pool, current_claude_service_pool, _current_llm_service_kinds = (
+                    current_llm_service_topology()
+                )
+                pool_service_ids = current_claude_service_pool if preferred_provider == "claude" else current_codex_service_pool
                 target_service_id = get_session_service(
                     runtime_root,
                     username=username,
