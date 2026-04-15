@@ -38,7 +38,17 @@ from runtime.goal_audit import (
     pending_turn_completed_events_since_last_review,
     run_goal_audit,
 )
-from runtime.providers import run_claude, run_claude_compaction, run_claude_context_check, run_codex, run_codex_compaction, run_codex_context_check
+from runtime.providers import (
+    provider_supports_context_compaction,
+    run_claude,
+    run_claude_compaction,
+    run_claude_context_check,
+    run_codex,
+    run_codex_compaction,
+    run_codex_context_check,
+    run_gemini,
+    run_gemini_compaction,
+)
 from runtime.persistent_state import (
     append_history as append_user_history,
     append_pending_input,
@@ -53,7 +63,6 @@ from runtime.persistent_state import (
     ensure_state,
     get_history as get_user_history,
     lease_session_service,
-    list_active_in_progress_child_sessions,
     list_all_sessions_with_users,
     release_session_service,
     release_nonrunnable_session_services,
@@ -63,11 +72,11 @@ from runtime.persistent_state import (
     reset_agent_audit_states_for_session,
     list_sessions,
     list_sessions_bound_to_service,
-    list_sessions_with_histories,
     list_codex_sessions,
     list_session_agent_contacts,
     load_claude_session,
     load_codex_session,
+    load_gemini_session,
     active_agent_priority,
     normalize_auto_compact_threshold_left_percent,
     record_session_agent_contact,
@@ -78,6 +87,7 @@ from runtime.persistent_state import (
     save_agent_audit_state,
     save_claude_session,
     save_codex_session,
+    save_gemini_session,
     select_session,
     rename_session,
     update_session_auto_compact_threshold,
@@ -129,6 +139,7 @@ from runtime.session_view import (
     active_agent_turn_state,
     worker_slot_badge,
     latest_goal_manager_runtime_state,
+    persisted_goal_manager_runtime_state,
     build_session_runtime_summary,
     build_worker_count_summary,
     pending_progress_inquiry_exists,
@@ -146,9 +157,12 @@ from runtime.compaction import (
     goal_manager_compact_codex_session,
     maybe_auto_compact_codex_session,
     manual_compact_claude_session,
+    manual_compact_gemini_session,
     manual_compact_clears_audit_state,
     goal_manager_compact_claude_session,
     maybe_auto_compact_claude_session,
+    goal_manager_compact_gemini_session,
+    maybe_auto_compact_gemini_session,
 )
 from runtime.goal_persist import (
     goal_state_response_payload,
@@ -215,7 +229,7 @@ goal_message = make_dispatch_pending_message
 goal_feedback_message = make_dispatch_pending_message
 goal_message = make_dispatch_pending_message(
 message_type="dispatch_pending"
-provider_pool = codex_service_pool if preferred_provider == "codex" else claude_service_pool
+provider_pool = {"codex": codex_service_pool, "claude": claude_service_pool, "gemini": gemini_service_pool}.get(preferred_provider, codex_service_pool)
 return lease_session_service(
 goal_audit_should_enqueue_agent_followup(
 previous_goal_text=previous_goal,
@@ -309,10 +323,15 @@ def run_http_service(
         for service in manifest.get("services", [])
         if isinstance(service, dict) and str(service.get("kind")) == "claude" and isinstance(service.get("service_id"), str)
     )
+    gemini_service_pool = sorted(
+        str(service.get("service_id"))
+        for service in manifest.get("services", [])
+        if isinstance(service, dict) and str(service.get("kind")) == "gemini" and isinstance(service.get("service_id"), str)
+    )
     llm_service_kinds = {
         str(service.get("service_id")): str(service.get("kind"))
         for service in manifest.get("services", [])
-        if isinstance(service, dict) and isinstance(service.get("service_id"), str) and str(service.get("kind")) in {"codex", "claude"}
+        if isinstance(service, dict) and isinstance(service.get("service_id"), str) and str(service.get("kind")) in {"codex", "claude", "gemini"}
     }
     pending: queue.Queue[dict[str, str]] = queue.Queue()
     awaiting_replies: deque[dict[str, str]] = deque()
@@ -401,15 +420,41 @@ def run_http_service(
             snapshots.append({"service": record, "process": process})
         return snapshots
 
-    def current_llm_service_topology() -> tuple[list[str], list[str], dict[str, str]]:
+    def _resolve_llm_service_topology(
+        runtime_root: Path,
+        manifest: dict[str, Any],
+    ) -> tuple[list[str], list[str], list[str], dict[str, str]]:
+        manifest_kinds = {
+            str(service.get("service_id")): str(service.get("kind"))
+            for service in manifest.get("services", [])
+            if isinstance(service, dict)
+            and isinstance(service.get("service_id"), str)
+            and str(service.get("kind")) in {"codex", "claude", "gemini"}
+        }
+        live_kinds: dict[str, str] = {}
+        for record in list_service_records(runtime_root):
+            service_id = str(record.get("service_id") or "").strip()
+            kind = str(record.get("kind") or manifest_kinds.get(service_id) or "").strip().lower()
+            if not service_id or kind not in {"codex", "claude", "gemini"}:
+                continue
+            live_kinds[service_id] = kind
+        if not live_kinds:
+            live_kinds = dict(manifest_kinds)
+        codex_pool = sorted(service_id for service_id, kind in live_kinds.items() if kind == "codex")
+        claude_pool = sorted(service_id for service_id, kind in live_kinds.items() if kind == "claude")
+        gemini_pool = sorted(service_id for service_id, kind in live_kinds.items() if kind == "gemini")
+        return codex_pool, claude_pool, gemini_pool, live_kinds
+
+    def current_llm_service_topology() -> tuple[list[str], list[str], list[str], dict[str, str]]:
         return _resolve_llm_service_topology(runtime_root, manifest)
 
     def session_runtime_payload(username: str, preloaded_histories: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
         release_stale_session_bindings()
-        sessions, histories_by_session_id = list_sessions_with_histories(runtime_root, username=username)
+        sessions = list_sessions(runtime_root, username=username)
         sessions = [session_payload(session) for session in sessions]
-        if preloaded_histories is not None:
-            histories_by_session_id.update(preloaded_histories)
+        current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
+            current_llm_service_topology()
+        )
         with _active_agent_turns_lock:
             active_turns_snap = dict(_active_agent_turns)
         with _active_goal_audits_lock:
@@ -417,12 +462,12 @@ def run_http_service(
         summaries: list[dict[str, Any]] = []
         for session in sessions:
             session_id = str(session.get("session_id") or "")
-            history_entries = histories_by_session_id.get(session_id, [])
             summary = build_session_runtime_summary(
                 session,
-                history_entries=history_entries,
-                codex_service_pool=codex_service_pool,
-                claude_service_pool=claude_service_pool,
+                history_entries=[],
+                codex_service_pool=current_codex_service_pool,
+                claude_service_pool=current_claude_service_pool,
+                gemini_service_pool=current_gemini_service_pool,
                 default_provider=default_provider,
             )
             scope_key = f"{username}::{session_id}"
@@ -430,20 +475,35 @@ def run_http_service(
             active_goal_audit = active_audits_snap.get(scope_key)
             bound_service_id = str(session.get("service_id") or "").strip()
             active_service_id = str((active_turn or {}).get("service_id") or "").strip()
+            persisted_goal_manager = persisted_goal_manager_runtime_state(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                bound_service_id=bound_service_id,
+            )
+            summary["goal_manager_state"] = str(persisted_goal_manager.get("state") or summary.get("goal_manager_state") or "idle")
+            summary["goal_manager_worker"] = worker_slot_badge(
+                str(persisted_goal_manager.get("service_id") or bound_service_id),
+                codex_service_pool=current_codex_service_pool,
+                claude_service_pool=current_claude_service_pool,
+                gemini_service_pool=current_gemini_service_pool,
+            ) if str(persisted_goal_manager.get("service_id") or bound_service_id).strip() else None
             if active_turn is not None:
                 summary["agent_running"] = True
                 summary["worker"] = worker_slot_badge(
                     active_service_id or bound_service_id,
-                    codex_service_pool=codex_service_pool,
-                    claude_service_pool=claude_service_pool,
+                    codex_service_pool=current_codex_service_pool,
+                    claude_service_pool=current_claude_service_pool,
+                    gemini_service_pool=current_gemini_service_pool,
                 )
             if active_goal_audit is not None:
                 goal_manager_service_id = str((active_goal_audit or {}).get("service_id") or bound_service_id).strip()
                 summary["goal_manager_state"] = "running"
                 summary["goal_manager_worker"] = worker_slot_badge(
                     goal_manager_service_id,
-                    codex_service_pool=codex_service_pool,
-                    claude_service_pool=claude_service_pool,
+                    codex_service_pool=current_codex_service_pool,
+                    claude_service_pool=current_claude_service_pool,
+                    gemini_service_pool=current_gemini_service_pool,
                 )
             summaries.append(summary)
         return {
@@ -469,9 +529,7 @@ def run_http_service(
 
     def resolve_session_service_for_dispatch(*, username: str, session_id: str) -> str | None:
         release_stale_session_bindings()
-        if list_active_in_progress_child_sessions(runtime_root, username=username, session_id=session_id):
-            return None
-        current_codex_service_pool, current_claude_service_pool, _current_llm_service_kinds = current_llm_service_topology()
+        current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = current_llm_service_topology()
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
         selected_agents_cfg = [
@@ -479,9 +537,9 @@ def run_http_service(
             for item in list(session_settings.get("selected_agents", []))
             if str(item).strip()
         ]
-        all_local_service_ids = set(current_codex_service_pool) | set(current_claude_service_pool)
+        all_local_service_ids = set(current_codex_service_pool) | set(current_claude_service_pool) | set(current_gemini_service_pool)
         has_local = any(
-            service_id in {"codex_pool", "claude_pool"} or service_id in all_local_service_ids
+            service_id in {"codex_pool", "claude_pool", "gemini_pool"} or service_id in all_local_service_ids
             for service_id in selected_agents_cfg
         )
 
@@ -508,6 +566,8 @@ def run_http_service(
                     return leased_service_id
                 if "claude_pool" in selected_agents_cfg and leased_service_id in current_claude_service_pool:
                     return leased_service_id
+                if "gemini_pool" in selected_agents_cfg and leased_service_id in current_gemini_service_pool:
+                    return leased_service_id
                 if leased_service_id in selected_agents_cfg:
                     return leased_service_id
 
@@ -524,6 +584,13 @@ def run_http_service(
                     username=username,
                     session_id=session_id,
                     pool_service_ids=current_claude_service_pool,
+                )
+            if "gemini_pool" in selected_agents_cfg:
+                return lease_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    pool_service_ids=current_gemini_service_pool,
                 )
 
             selected_local = [service_id for service_id in selected_agents_cfg if service_id in all_local_service_ids]
@@ -542,7 +609,11 @@ def run_http_service(
             preferred_provider = str(session_settings.get("preferred_provider", default_provider)).strip().lower() or default_provider
             agent_priority = [preferred_provider]
 
-        pool_for_kind: dict[str, list[str]] = {"codex": current_codex_service_pool, "claude": current_claude_service_pool}
+        pool_for_kind: dict[str, list[str]] = {
+            "codex": current_codex_service_pool,
+            "claude": current_claude_service_pool,
+            "gemini": current_gemini_service_pool,
+        }
 
         # If already leased, keep it if it belongs to any provider in the priority list
         if leased_service_id:
@@ -573,7 +644,7 @@ def run_http_service(
         return None
 
     def codex_service_candidates_for_session(*, username: str, session_id: str) -> list[str]:
-        current_codex_service_pool, _current_claude_service_pool, _current_llm_service_kinds = current_llm_service_topology()
+        current_codex_service_pool, _current_claude_service_pool, _current_gemini_service_pool, _current_llm_service_kinds = current_llm_service_topology()
         candidates: list[str] = []
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         if leased_service_id:
@@ -669,6 +740,21 @@ def run_http_service(
                 text="\n".join(goal_update_lines),
             ),
         )
+        if str(to_service).startswith("ws-peer-"):
+            append_history(
+                username,
+                session_id,
+                {
+                    "direction": "session_input",
+                    "kind": "goal_feedback",
+                    "ts": utc_ts(),
+                    "service_id": to_service,
+                    "to": to_service,
+                    "text": "Goal updated. Continue work toward the active goal.",
+                    "pending_input_text": "\n".join(goal_update_lines),
+                },
+            )
+            return to_service, None
         goal_dispatch_message = make_dispatch_pending_message(
             manifest=manifest,
             from_service_id=self_service["service_id"],
@@ -717,6 +803,19 @@ def run_http_service(
                 status[key] = raw
         return status
 
+    def unsupported_context_status(provider_kind: str) -> dict[str, str]:
+        normalized = str(provider_kind or "").strip().lower() or "unknown"
+        provider_label = {"codex": "Codex", "claude": "Claude Code", "gemini": "Gemini"}.get(
+            normalized,
+            normalized.title() or "Unknown",
+        )
+        return {
+            "label": f"Context status unavailable for {provider_label}",
+            "meta": "This provider does not expose compact/context-window helpers yet.",
+            "event_type": "service.context_status_unsupported",
+            "compaction": "unsupported_provider",
+        }
+
     def refresh_context_status(username: str, session_id: str) -> dict[str, str] | None:
         conversation_session_id = session_id
         bound_service_id, provider_session_id = resolve_bound_codex_session(
@@ -744,24 +843,51 @@ def run_http_service(
                 service_kind = str(get_service_record(runtime_root, session_service_id).get("kind", ""))
             except (KeyError, FileNotFoundError):
                 return None
-            if service_kind != "claude":
+            if not provider_supports_context_compaction(service_kind):
+                status = unsupported_context_status(service_kind)
+                update_session_context_status(
+                    runtime_root,
+                    username=username,
+                    session_id=conversation_session_id,
+                    context_status=status,
+                )
+                return status
+            if service_kind == "claude":
+                claude_session_id = load_claude_session(
+                    runtime_root,
+                    service_id=session_service_id,
+                    username=username,
+                    session_id=conversation_session_id,
+                )
+                if not claude_session_id:
+                    return None
+                bound_service_id = session_service_id
+                provider_session_id = claude_session_id
+                event, _returncode = run_claude_compaction(
+                    repo_root=repo_root,
+                    session_id=provider_session_id,
+                    threshold_left_percent=threshold,
+                    mode="auto",
+                )
+            elif service_kind == "gemini":
+                gemini_session_id = load_gemini_session(
+                    runtime_root,
+                    service_id=session_service_id,
+                    username=username,
+                    session_id=conversation_session_id,
+                )
+                if not gemini_session_id:
+                    return None
+                bound_service_id = session_service_id
+                provider_session_id = gemini_session_id
+                event, _returncode = run_gemini_compaction(
+                    repo_root=repo_root,
+                    session_id=provider_session_id,
+                    threshold_left_percent=threshold,
+                    mode="auto",
+                )
+            else:
                 return None
-            claude_session_id = load_claude_session(
-                runtime_root,
-                service_id=session_service_id,
-                username=username,
-                session_id=conversation_session_id,
-            )
-            if not claude_session_id:
-                return None
-            bound_service_id = session_service_id
-            provider_session_id = claude_session_id
-            event, _returncode = run_claude_compaction(
-                repo_root=repo_root,
-                session_id=provider_session_id,
-                threshold_left_percent=threshold,
-                mode="auto",
-            )
         persist_session_context_status(
             runtime_root,
             username=username,
@@ -783,19 +909,34 @@ def run_http_service(
         return refresh_context_status(username, session_id)
 
     def manual_compact_current_session(*, username: str, session_id: str) -> tuple[int, dict[str, Any]]:
+        session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+        preferred_provider = str(session_settings.get("preferred_provider") or default_provider or "codex").strip().lower() or "codex"
         target_service_id, _bound_session_id = resolve_bound_codex_session(username=username, session_id=session_id)
         if not target_service_id:
             target_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         if not target_service_id:
-            current_codex_service_pool, _current_claude_service_pool, _current_llm_service_kinds = current_llm_service_topology()
+            current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = current_llm_service_topology()
+            target_pool = {
+                "codex": current_codex_service_pool,
+                "claude": current_claude_service_pool,
+                "gemini": current_gemini_service_pool,
+            }.get(preferred_provider, current_codex_service_pool)
             target_service_id = lease_session_service(
                 runtime_root,
                 username=username,
                 session_id=session_id,
-                pool_service_ids=current_codex_service_pool,
+                pool_service_ids=target_pool,
             )
         if not target_service_id:
-            return 409, {"error": "no_available_codex_worker", "pool": current_codex_service_pool, "session_id": session_id}
+            return 409, {
+                "error": f"no_available_{preferred_provider}_worker",
+                "pool": {
+                    "codex": current_codex_service_pool,
+                    "claude": current_claude_service_pool,
+                    "gemini": current_gemini_service_pool,
+                }.get(preferred_provider, current_codex_service_pool),
+                "session_id": session_id,
+            }
         write_jsonl(
             log_path,
             {
@@ -813,8 +954,13 @@ def run_http_service(
         except KeyError:
             return 404, {"error": "target_not_found", "service_id": target_service_id}
         target_kind = str(target_service.get("kind"))
-        if target_kind not in {"codex", "claude"}:
-            return 409, {"error": "manual_compact_requires_codex_or_claude_target", "service_id": target_service_id}
+        if target_kind not in {"codex", "claude", "gemini"}:
+            return 409, {
+                "error": "manual_compact_unsupported_for_provider",
+                "provider": target_kind,
+                "service_id": target_service_id,
+                "session_id": session_id,
+            }
         started_event = {
             "type": "service.manual_compact_started",
             "reason": "Manual compact requested from HTTPBridge.",
@@ -823,6 +969,14 @@ def run_http_service(
         append_history(username, session_id, make_history_event_entry(started_event, service_id=target_service_id))
         if target_kind == "claude":
             status, response, history_entry = manual_compact_claude_session(
+                repo_root=Path(__file__).resolve().parents[2],
+                runtime_root=runtime_root,
+                service_id=target_service_id,
+                username=username,
+                session_id=session_id,
+            )
+        elif target_kind == "gemini":
+            status, response, history_entry = manual_compact_gemini_session(
                 repo_root=Path(__file__).resolve().parents[2],
                 runtime_root=runtime_root,
                 service_id=target_service_id,
@@ -854,7 +1008,6 @@ def run_http_service(
                 goal_completed=False,
                 goal_progress_state="in_progress",
             )
-            session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
             recovery_session = ensure_panic_recovery_session(
                 runtime_root,
                 username=username,
@@ -862,7 +1015,11 @@ def run_http_service(
                 source_label=str(session_settings.get("label") or session_id),
                 panic_service_id=target_service_id,
                 event=response,
-                preferred_provider="claude" if "claude" in target_service_id else "codex",
+                preferred_provider=(
+                    "gemini"
+                    if "gemini" in target_service_id
+                    else ("claude" if "claude" in target_service_id else "codex")
+                ),
             )
             if isinstance(recovery_session, dict):
                 recovery_session_id = str(recovery_session.get("session_id") or "").strip()
@@ -1089,6 +1246,7 @@ def run_http_service(
         tls_enabled=tls_enabled,
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
+        gemini_service_pool=gemini_service_pool,
         llm_service_kinds=llm_service_kinds,
         pending=pending,
         awaiting_replies=awaiting_replies,
@@ -1179,6 +1337,7 @@ def run_http_service(
         log_path=log_path,
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
+        gemini_service_pool=gemini_service_pool,
         append_history=append_history,
         stopped=stopped,
     )

@@ -11,12 +11,13 @@ from urllib.parse import parse_qs, urlencode
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
+from app_launcher import get_launchable_app, launch_app_session, list_launchable_apps
 from kernel.auth import bootstrap_root_user, create_user, has_users, issue_auth_context, verify_user_password
 from kernel.auth import auth_context_allows
 from kernel.lifecycle import load_lifecycle_state
 from kernel.peers import list_peers, register_peer
 from kernel.registry import get_service_record
-from runtime.goal_persist import goal_state_response_payload
+from runtime.goal_persist import goal_state_response_payload, persist_goal_manager_runtime_reset
 from runtime.message_builder import (
     maybe_release_session_provider,
     make_dispatch_pending_message,
@@ -31,7 +32,6 @@ from runtime.persistent_state import (
     delete_session,
     get_session_service,
     get_session_settings,
-    get_history as get_user_history,
     lease_session_service,
     list_peer_joinable_sessions,
     release_session_service,
@@ -69,9 +69,11 @@ from runtime.persistent_state import (
 from runtime.session_view import (
     build_worker_count_summary,
     latest_goal_manager_runtime_state,
+    persisted_goal_manager_runtime_state,
     maybe_enqueue_mid_turn_progress_inquiry,
     worker_slot_badge,
 )
+from runtime.ui_history import build_session_ui_history
 from wire.protocol import (
     message_meta_get,
     utc_ts,
@@ -427,7 +429,7 @@ def _render_cluster_html(item: dict[str, Any]) -> str:
         )
     is_goal_cluster = kind == "goal_manager_cluster"
     service_id = str(item.get("service_id") or "")
-    title = "GoalManager Review" if is_goal_cluster else ("Claude Code" if "claude" in service_id else "Codex")
+    title = "GoalManager Review" if is_goal_cluster else ("Claude Code" if "claude" in service_id else ("Gemini" if "gemini" in service_id else "Codex"))
     if is_goal_cluster:
         last = entries[-1]
         last_type = str(last.get("event_type") or "")
@@ -579,7 +581,7 @@ def make_handler(
     runtime_root, manifest, self_service, process_id, log_path,
     default_target, default_provider, history_limit,
     tls_enabled,
-    codex_service_pool, claude_service_pool, llm_service_kinds,
+    codex_service_pool, claude_service_pool, gemini_service_pool, llm_service_kinds,
     pending, awaiting_replies,
     subscribers, subscribers_lock, stopped,
     _active_goal_audits, _active_goal_audits_lock,
@@ -639,8 +641,18 @@ def make_handler(
             _goal_audit = _active_audits_snap.get(_ov_key)
             _active_svc = str((_agent_turn or {}).get("service_id") or "").strip()
             _gm_svc = str((_goal_audit or {}).get("service_id") or _bound_svc).strip()
-            _worker = worker_slot_badge(_active_svc or _bound_svc, codex_service_pool=codex_service_pool, claude_service_pool=claude_service_pool)
-            _gm_worker = worker_slot_badge(_gm_svc, codex_service_pool=codex_service_pool, claude_service_pool=claude_service_pool) if _goal_audit else None
+            _worker = worker_slot_badge(
+                _active_svc or _bound_svc,
+                codex_service_pool=codex_service_pool,
+                claude_service_pool=claude_service_pool,
+                gemini_service_pool=gemini_service_pool,
+            )
+            _gm_worker = worker_slot_badge(
+                _gm_svc,
+                codex_service_pool=codex_service_pool,
+                claude_service_pool=claude_service_pool,
+                gemini_service_pool=gemini_service_pool,
+            ) if _goal_audit else None
             _preferred_provider = str(_talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
             _goal_completed = bool(_talk.get("goal_completed", False))
             _goal_progress_state = str(_talk.get("goal_progress_state", "complete" if _goal_completed else "in_progress")).strip().lower()
@@ -687,6 +699,7 @@ def make_handler(
             "worker_counts": _wc,
             "codex_pool": codex_service_pool,
             "claude_pool": claude_service_pool,
+            "gemini_pool": gemini_service_pool,
             "ts": utc_ts(),
         }
 
@@ -703,6 +716,14 @@ def make_handler(
             _ov_cache_state[1] = time.monotonic()
             _ov_cache_state[2] = _cache_key
         return _result
+
+    def _app_catalog_payload() -> dict[str, Any]:
+        apps = list_launchable_apps(default_provider=default_provider)
+        return {
+            "apps": apps,
+            "default_provider": default_provider,
+            "ts": utc_ts(),
+        }
 
     def _goal_manager_runtime_payload(
         *,
@@ -723,15 +744,18 @@ def make_handler(
                     service_id,
                     codex_service_pool=codex_service_pool,
                     claude_service_pool=claude_service_pool,
+                    gemini_service_pool=gemini_service_pool,
                 ) if service_id else None,
             }
         if history_entries is None:
-            history_entries = get_user_history(
+            runtime_state = persisted_goal_manager_runtime_state(
                 runtime_root,
                 username=username,
                 session_id=session_id,
+                bound_service_id=bound_service_id or "",
             )
-        runtime_state = latest_goal_manager_runtime_state(history_entries)
+        else:
+            runtime_state = latest_goal_manager_runtime_state(history_entries)
         service_id = str(runtime_state.get("service_id") or bound_service_id or "").strip()
         return {
             "goal_manager_state": str(runtime_state.get("state") or "idle"),
@@ -740,10 +764,14 @@ def make_handler(
                 service_id,
                 codex_service_pool=codex_service_pool,
                 claude_service_pool=claude_service_pool,
+                gemini_service_pool=gemini_service_pool,
                 ) if service_id else None,
         }
 
     def _initial_session_summaries_for_view(*, viewer_username: str, include_all: bool) -> list[dict[str, Any]]:
+        current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
+            current_llm_service_topology()
+        )
         summaries: list[dict[str, Any]] = []
         for talk in _visible_session_records(viewer_username=viewer_username, include_all=include_all):
             username = str(talk.get("username") or viewer_username).strip() or viewer_username
@@ -784,8 +812,9 @@ def make_handler(
                     "bound_service_id": bound_service_id,
                     "worker": worker_slot_badge(
                         bound_service_id,
-                        codex_service_pool=codex_service_pool,
-                        claude_service_pool=claude_service_pool,
+                        codex_service_pool=current_codex_service_pool,
+                        claude_service_pool=current_claude_service_pool,
+                        gemini_service_pool=current_gemini_service_pool,
                     ) if bound_service_id else None,
                     "agent_running": False,
                     "goal_manager_state": str(goal_manager_runtime.get("goal_manager_state") or "idle"),
@@ -1011,6 +1040,54 @@ def make_handler(
             self._json(401, {"error": "auth_required_or_invalid_talk"})
             return None
 
+        def _render_ui_probe_page(self, query: dict[str, list[str]]) -> str:
+            requested_password = ""
+            requested_session_token = ""
+            requested_provider = ""
+            if isinstance(query, dict):
+                requested_password = str((query.get("password") or [""])[0] or "").strip()
+                requested_session_token = str((query.get("session_token") or [""])[0] or "").strip()
+                requested_provider = str((query.get("provider") or [""])[0] or "").strip().lower()
+            password = requested_password or "ui-verify-pass"
+            provider = requested_provider if requested_provider in {"codex", "claude", "gemini"} else "codex"
+            return (
+                "<!doctype html><html lang='en'><meta charset='utf-8'><title>HTTPBridge UI Probe</title><body>"
+                "<pre id='result'>running</pre>"
+                "<script>"
+                f"const password={json.dumps(password, ensure_ascii=False)};"
+                f"const sessionToken={json.dumps(requested_session_token, ensure_ascii=False)};"
+                f"const provider={json.dumps(provider, ensure_ascii=False)};"
+                "const result=document.getElementById('result');"
+                "const parseJson=async (response)=>{const text=await response.text();try{return text?JSON.parse(text):{};}catch(_err){return {raw_text:text};}};"
+                "const postJson=async (path,body)=>{const response=await fetch(path,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:response.status,payload:await parseJson(response)};};"
+                "const getText=async (path)=>{const response=await fetch(path,{credentials:'include'});return {status:response.status,text:await response.text()};};"
+                "const hasUiMarkers=(html)=>({session_map:(html.includes('id=\"session-map-pane\"')||html.includes(\"id='session-map-pane'\")),talk_history:(html.includes('id=\"messages\"')||html.includes(\"id='messages'\"))&&(html.includes('id=\"talk-view\"')||html.includes(\"id='talk-view'\")),goal_editor:(html.includes('id=\"view-goal\"')||html.includes(\"id='view-goal'\"))});"
+                "(async()=>{"
+                "if(sessionToken){document.cookie=`bridge_session=${sessionToken}; path=/; SameSite=Lax`;}"
+                "else{"
+                "const bootstrap=await postJson('/bootstrap',{password});"
+                "if(bootstrap.status===400&&bootstrap.payload&&bootstrap.payload.error==='bootstrap_already_completed'){"
+                "const login=await postJson('/login',{username:'root',password});"
+                "if(!(login.status>=200&&login.status<300)) throw new Error('login_failed:'+JSON.stringify(login));"
+                "}else if(!(bootstrap.status>=200&&bootstrap.status<300)) throw new Error('bootstrap_failed:'+JSON.stringify(bootstrap));"
+                "}"
+                "const rootPage=await getText('/');"
+                "const sessionMarkers=hasUiMarkers(rootPage.text);"
+                "const childSession=await postJson('/sessions',{label:'UI Verify Child'});"
+                "const sessionId=String(childSession.payload?.active_session_id||childSession.payload?.session?.session_id||'').trim();"
+                "if(!sessionId) throw new Error('session_create_failed:'+JSON.stringify(childSession));"
+                "const goalUpdate=await postJson('/session/goal',{session_id:sessionId,goal_text:'Verify HTTPBridge goal save flow'});"
+                "const providerUpdate=await postJson('/session/goal/state',{session_id:sessionId,preferred_provider:provider});"
+                "const promptSend=await postJson('/message',{session_id:sessionId,text:`UI smoke prompt after restart via ${provider}`,provider});"
+                "const childPage=await getText('/?session_id='+encodeURIComponent(sessionId));"
+                "const childMarkers=hasUiMarkers(childPage.text);"
+                "const effectiveProvider=String(providerUpdate.payload?.preferred_provider||provider||'').trim();"
+                "const promptProvider=String(promptSend.payload?.provider||'').trim();"
+                "result.textContent=JSON.stringify({ok:sessionMarkers.session_map&&sessionMarkers.talk_history&&childMarkers.session_map&&childMarkers.talk_history&&goalUpdate.status>=200&&goalUpdate.status<300&&providerUpdate.status>=200&&providerUpdate.status<300&&effectiveProvider===provider&&promptSend.status===202&&promptProvider===provider,provider,session_markers:sessionMarkers,child_markers:childMarkers,created_session_id:sessionId,goal_update_status:goalUpdate.status,provider_update_status:providerUpdate.status,effective_provider:effectiveProvider,prompt_send_status:promptSend.status,prompt_provider:promptProvider});"
+                "})().catch((error)=>{result.textContent=JSON.stringify({ok:false,error:String(error&&error.message?error.message:error)});});"
+                "</script></body></html>"
+            )
+
         def do_GET(self) -> None:
             path, query = request_parts(self)
             if path == "/ws":
@@ -1021,6 +1098,8 @@ def make_handler(
                 return self._do_GET_events(path, query)
             if path == "/health":
                 return self._do_GET_health(path, query)
+            if path == "/diagnostics/ui-probe":
+                return self._html(200, self._render_ui_probe_page(query))
             if path == "/peer/ping":
                 return self._do_GET_peer_ping(path, query)
             if path == "/federation/peers":
@@ -1029,6 +1108,8 @@ def make_handler(
                 return self._do_GET_session_goal_state(path, query)
             if path == "/messages":
                 return self._do_GET_messages(path, query)
+            if path == "/apps":
+                return self._do_GET_apps(path, query)
             if path == "/sessions":
                 return self._do_GET_sessions(path, query)
             if path == "/services":
@@ -1073,10 +1154,11 @@ def make_handler(
             initial_session_scope = "all" if _scope_include_all(context=context, query=query) else "owned"
             initial_session_map_open = requested_session_id(self, query=query) is None
             initial_context_status = stored_context_status(username, session_id)
-            initial_history = get_user_history(
+            initial_history = build_session_ui_history(
                 runtime_root,
                 username=username,
                 session_id=session_id,
+                limit=INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT,
             )
             initial_history = _history_tail_with_latest_goal_cluster(
                 initial_history,
@@ -1118,7 +1200,7 @@ def make_handler(
             initial_goal_auto_compact_enabled = bool(
                 session_settings.get("goal_auto_compact_enabled", True)
             )
-            initial_auto_resume_enabled = bool(session_settings.get("auto_resume_enabled", True))
+            initial_auto_resume_enabled = bool(session_settings.get("auto_resume_enabled", False))
             initial_auto_resume_interval_seconds = int(session_settings.get("auto_resume_interval_seconds", 21600) or 21600)
             initial_auto_resume_next_at = str(session_settings.get("auto_resume_next_at", "") or "")
             initial_auto_resume_reason = str(session_settings.get("auto_resume_reason", "") or "")
@@ -1279,6 +1361,7 @@ def make_handler(
                     sidebar_system_html=sidebar_system_html,
                     codex_service_pool=codex_service_pool,
                     claude_service_pool=claude_service_pool,
+                    gemini_service_pool=gemini_service_pool,
                     items=items,
                 )
             )
@@ -1391,10 +1474,11 @@ def make_handler(
                 default=DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT,
                 maximum=MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT,
             )
-            history = get_user_history(
+            history = build_session_ui_history(
                 runtime_root,
                 username=context["username"],
                 session_id=context["session_id"],
+                limit=limit,
             )
             visible_history = _history_tail_with_latest_goal_cluster(history, limit=limit)
             self._json(
@@ -1427,6 +1511,20 @@ def make_handler(
                     "sessions": talks_payload["session_summaries"],
                     "session_summaries": talks_payload["session_summaries"],
                     "worker_counts": talks_payload["worker_counts"],
+                },
+            )
+            return
+
+        def _do_GET_apps(self, path: str, query: dict) -> None:
+            context = self._require_user(query=query)
+            if not context:
+                return
+            self._json(
+                200,
+                {
+                    **_app_catalog_payload(),
+                    "username": context["username"],
+                    "active_session_id": context["session_id"],
                 },
             )
             return
@@ -1539,6 +1637,8 @@ def make_handler(
                 return self._do_POST_logout(content_type)
             if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
+            if path == "/apps/launch":
+                return self._do_POST_apps_launch(payload)
             if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
             if path == "/session/rename":
@@ -1776,6 +1876,59 @@ def make_handler(
             self._redirect(f"/?{urlencode({'session_id': str(talk['session_id'])})}")
             return
 
+        def _do_POST_apps_launch(self, payload: dict) -> None:
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            app_id = str(payload.get("app_id") or "").strip()
+            if not app_id:
+                self._json(400, {"error": "app_id_required"})
+                return
+            parent_session_id = str(payload.get("parent_session_id") or context["session_id"] or "").strip()
+            if not parent_session_id:
+                self._json(400, {"error": "parent_session_id_required"})
+                return
+            try:
+                app = get_launchable_app(app_id, default_provider=default_provider)
+            except KeyError:
+                self._json(404, {"error": "app_not_found", "app_id": app_id})
+                return
+            selected_agents = payload.get("selected_agents")
+            if selected_agents is not None and not isinstance(selected_agents, list):
+                self._json(400, {"error": "selected_agents_list_required"})
+                return
+            try:
+                launched = launch_app_session(
+                    runtime_root,
+                    username=context["username"],
+                    parent_session_id=parent_session_id,
+                    app=app,
+                    label=str(payload.get("label") or "").strip() or None,
+                    goal_text=str(payload.get("goal_text") or "").strip() if "goal_text" in payload else None,
+                    initial_prompt=str(payload.get("initial_prompt") or "").strip() if "initial_prompt" in payload else None,
+                    preferred_provider=str(payload.get("preferred_provider") or "").strip() or None,
+                    selected_agents=selected_agents,
+                )
+            except RuntimeError as exc:
+                self._json(400, {"error": str(exc), "app_id": app_id})
+                return
+            session = launched.get("session") if isinstance(launched, dict) else {}
+            session_id = str((session or {}).get("session_id") or "").strip()
+            with _ov_cache_lock:
+                _ov_cache_state[0] = None
+            self._json(
+                201,
+                {
+                    "ok": True,
+                    "app": launched.get("app"),
+                    "session": session,
+                    "session_id": session_id,
+                    "active_session_id": session_id,
+                    "launch_plan": launched.get("launch_plan"),
+                },
+            )
+            return
+
         def _do_POST_session_select(self, payload: dict, content_type: str) -> None:
             context = self._require_user(payload=payload)
             if not context:
@@ -1937,6 +2090,13 @@ def make_handler(
                 username=context["username"],
                 session_id=context["session_id"],
             )
+            persist_goal_manager_runtime_reset(
+                runtime_root=runtime_root,
+                service_id=self_service["service_id"],
+                username=context["username"],
+                session_id=context["session_id"],
+                reason="goal_updated",
+            )
             dispatched_to, dispatch_error = enqueue_goal_dispatch(
                 username=context["username"],
                 session_id=context["session_id"],
@@ -2038,7 +2198,7 @@ def make_handler(
                 else ""
             )
             released_for_provider_switch: str | None = None
-            if requested_provider in {"codex", "claude"} and previous_bound_service_id:
+            if requested_provider in {"codex", "claude", "gemini"} and previous_bound_service_id:
                 previous_kind = str(llm_service_kinds.get(previous_bound_service_id) or "").strip().lower()
                 if previous_kind and previous_kind != requested_provider:
                     released_for_provider_switch = release_session_service(
@@ -2061,8 +2221,12 @@ def make_handler(
             runnable_goal = bool(talk.get("goal_active", False)) and not bool(talk.get("goal_completed", False)) and (
                 str(talk.get("goal_progress_state", "in_progress")).strip().lower() == "in_progress"
             )
-            if requested_provider in {"codex", "claude"} and runnable_goal:
-                provider_pool = codex_service_pool if requested_provider == "codex" else claude_service_pool
+            if requested_provider in {"codex", "claude", "gemini"} and runnable_goal:
+                provider_pool = (
+                    codex_service_pool
+                    if requested_provider == "codex"
+                    else (claude_service_pool if requested_provider == "claude" else gemini_service_pool)
+                )
                 leased_service_id = lease_session_service(
                     runtime_root,
                     username=context["username"],
@@ -2560,7 +2724,7 @@ def make_handler(
             mode = str(payload.get("mode", "prompt")).strip().lower() or "prompt"
             auth_context = issue_auth_context(runtime_root, username=username)
             provider_override = str(payload.get("provider", "")).strip().lower()
-            if provider_override in {"codex", "claude"}:
+            if provider_override in {"codex", "claude", "gemini"}:
                 update_session_goal_flags(
                     runtime_root,
                     username=username,
@@ -2731,7 +2895,7 @@ def make_handler(
                                 },
                             },
                         )
-                    if provider_override in {"codex", "claude"}:
+                    if provider_override in {"codex", "claude", "gemini"}:
                         update_session_goal_flags(
                             runtime_root,
                             username=username,
@@ -2747,25 +2911,36 @@ def make_handler(
                         str(session_settings.get("preferred_provider", default_provider)).strip().lower()
                         or default_provider
                     )
-                    current_codex_service_pool, current_claude_service_pool, _current_llm_service_kinds = (
+                    current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
                     # selected_agents overrides provider routing when present.
                     # If the list contains only WS-peer service_ids (no pool token and
                     # no individual local service_id) we skip the local LLM entirely.
                     selected_agents_cfg = list(session_settings.get("selected_agents", []))
-                    all_local_service_ids = set(current_codex_service_pool) | set(current_claude_service_pool)
+                    all_local_service_ids = (
+                        set(current_codex_service_pool)
+                        | set(current_claude_service_pool)
+                        | set(current_gemini_service_pool)
+                    )
                     has_local = any(
-                        a in {"codex_pool", "claude_pool"} or a in all_local_service_ids
+                        a in {"codex_pool", "claude_pool", "gemini_pool"} or a in all_local_service_ids
                         for a in selected_agents_cfg
                     )
                     ws_only_mode = bool(selected_agents_cfg) and not has_local
-                    provider_pool = current_codex_service_pool if preferred_provider == "codex" else current_claude_service_pool
-                    # When codex_pool or claude_pool is explicitly selected, prefer that pool.
+                    pool_for_kind: dict[str, list[str]] = {
+                        "codex": current_codex_service_pool,
+                        "claude": current_claude_service_pool,
+                        "gemini": current_gemini_service_pool,
+                    }
+                    provider_pool = pool_for_kind.get(preferred_provider, current_codex_service_pool)
+                    # When a provider pool token is explicitly selected, prefer that pool.
                     if "codex_pool" in selected_agents_cfg:
                         provider_pool = current_codex_service_pool
                     elif "claude_pool" in selected_agents_cfg:
                         provider_pool = current_claude_service_pool
+                    elif "gemini_pool" in selected_agents_cfg:
+                        provider_pool = current_gemini_service_pool
                     else:
                         # When individual local service_ids are selected, restrict pool to those.
                         selected_local = [a for a in selected_agents_cfg if a in all_local_service_ids]
@@ -2779,7 +2954,7 @@ def make_handler(
                     if ws_only_mode:
                         # No local LLM worker — WS peer handles this session
                         to_service = None
-                    elif requested_to_service == default_target and (current_codex_service_pool or current_claude_service_pool):
+                    elif requested_to_service == default_target and (current_codex_service_pool or current_claude_service_pool or current_gemini_service_pool):
                         if leased_service_id and provider_pool and leased_service_id not in provider_pool:
                             leased_service_id = None
                         if not leased_service_id:
@@ -2978,10 +3153,14 @@ def make_handler(
                     str(due_wait.get("preferred_provider", default_provider)).strip().lower()
                     or default_provider
                 )
-                current_codex_service_pool, current_claude_service_pool, _current_llm_service_kinds = (
+                current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                     current_llm_service_topology()
                 )
-                pool_service_ids = current_claude_service_pool if preferred_provider == "claude" else current_codex_service_pool
+                pool_service_ids = (
+                    current_claude_service_pool
+                    if preferred_provider == "claude"
+                    else (current_gemini_service_pool if preferred_provider == "gemini" else current_codex_service_pool)
+                )
                 target_service_id = get_session_service(
                     runtime_root,
                     username=username,

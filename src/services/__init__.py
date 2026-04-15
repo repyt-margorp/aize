@@ -1,9 +1,9 @@
 """
 Service plugin loader for Aize.
 
-A service plugin is a Python package under src/services/{kind}/ that exports
-a run_service(**kwargs) -> int function. New service types can be added by
-creating a new subdirectory with __init__.py.
+A service plugin is a Python module that exports a run_service(**kwargs) -> int
+function. Builtins live under src/services/{kind}/ and repo-local plugin
+services can live under ./plugins/**/services/{kind}/.
 
 Example layout:
   src/services/
@@ -13,8 +13,9 @@ Example layout:
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 from typing import Callable, Any
+
+from services.svcmgr.loader import get_service_descriptor, list_service_descriptors
 
 
 def load_service_handler(kind: str) -> Callable[..., int]:
@@ -22,7 +23,8 @@ def load_service_handler(kind: str) -> Callable[..., int]:
 
     Raises ValueError if the kind is unknown or the module lacks run_service.
     """
-    module_name = f"services.{kind}"
+    descriptor = get_service_descriptor(kind)
+    module_name = str(descriptor.get("module") or f"services.{kind}")
     try:
         mod = importlib.import_module(module_name)
     except ImportError as exc:
@@ -35,9 +37,4 @@ def load_service_handler(kind: str) -> Callable[..., int]:
 
 def list_available_kinds() -> list[str]:
     """Return a list of service kinds available in the services package."""
-    pkg_dir = Path(__file__).parent
-    return sorted(
-        p.name
-        for p in pkg_dir.iterdir()
-        if p.is_dir() and not p.name.startswith("_") and (p / "__init__.py").exists()
-    )
+    return sorted(str(descriptor.get("kind", "")).strip() for descriptor in list_service_descriptors(exclude_kinds=set()))

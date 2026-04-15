@@ -7,6 +7,8 @@ temp/
 .tmux-agent-chat/
 .tmux-agent-chat-loop/
 .tmux-agent-mesh/
+plugins/private/*
+!plugins/private/.gitkeep
 
 # Python
 __pycache__/

@@ -410,15 +410,17 @@ def build_goal_audit_prompt(
             "Return JSONL — output one JSON object per line, no markdown fences, no extra text.",
             "Line 1 is always the goal_state record:",
             '  {"kind": "goal_state", "progress_state": "complete" | "in_progress", "goal_satisfied": true | false, "summary": "..."}',
-            "Lines 2+ are agent_directive records, one per agent that should receive a follow-up (only when in_progress):",
-            "These follow-up records are the agent_directives for the session.",
+            "Optional later lines are agent_directive records, one per agent that should receive a follow-up now (only when in_progress):",
+            "Emit agent_directive records only for agents that should actively continue now.",
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}',
             "Optional additional lines are child_goal_request records:",
             '  {"kind": "child_goal_request", "service_id": "...", "goal_text": "...", "label": ""}',
-            "Emit child_goal_request records only when you are splitting the remaining work into at least two parallel child goals.",
-            "If only one child task makes sense, do not emit any child_goal_request record; keep that work in the current session instead.",
+            "Emit child_goal_request records whenever splitting the remaining work into child sessions is useful, including a single child goal when that best matches the work decomposition.",
+            "Each child goal remains subordinate to the current goal: the spawned child session inherits parent-goal lineage/context and continues the broader parent objective while focusing on its own subgoal.",
             "CRITICAL: When progress_state is 'complete', output ONLY the goal_state line. Do NOT output any agent_directive or child_goal_request records.",
             'Use progress_state="complete" only when the goal itself is done. Otherwise use "in_progress".',
+            "If child sessions are the right next step and no currently welcomed agent needs more work in this session right now, output child_goal_request records and omit agent_directive records.",
+            "Do not send agent feedback just because an agent exists in the welcomed roster. Omit agent_directive records when there is no concrete follow-up for that agent yet.",
             'In each agent_directive: use audit_state="all_clear" when the agent is making honest progress, "needs_compact" when the session appears sabotaged/stuck and compact should be attempted before normal continuation, and "panic" when sabotage/stuck state remains unresolved after compact failure or the situation is otherwise unsafe.',
             'Treat plan-only, intent-only, acknowledgment-only, or status-only replies as stuck/sabotaged behavior when they consume a TurnCompleted without concrete work advancement, especially after restart_resume or GoalManager feedback. In that case, set audit_state="needs_compact" and request_compact=true rather than all_clear.',
             'Examples of stuck replies that should push toward needs_compact: "I will continue", "next I will...", "I checked and will now...", "resumed and will proceed", or restatements of remaining tasks without edits/tests/results.',
@@ -511,6 +513,21 @@ def extract_jsonl_records(text: str) -> list[dict[str, Any]]:
     return records
 
 
+def _extract_embedded_goal_audit_records(candidate: Any) -> list[dict[str, Any]]:
+    """Recover JSONL goal-audit records nested inside a legacy wrapper payload.
+
+    Some providers can return a top-level JSON object that is schema-valid while
+    stuffing the actual JSONL goal_state/agent_directive lines into `summary`.
+    When that happens, the embedded records are the authoritative audit result.
+    """
+    if not isinstance(candidate, dict):
+        return []
+    embedded_records = extract_jsonl_records(str(candidate.get("summary", "")).strip())
+    if any(str(item.get("kind", "")).strip() == "goal_state" for item in embedded_records):
+        return embedded_records
+    return []
+
+
 def default_goal_continue_xml(*, summary: str) -> str:
     return (
         "<aize_goal_feedback>"
@@ -521,12 +538,61 @@ def default_goal_continue_xml(*, summary: str) -> str:
     )
 
 
+def _normalize_child_goal_requests(
+    raw_requests: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    child_goal_requests: list[dict[str, str]] = []
+    if isinstance(raw_requests, list):
+        for item in raw_requests:
+            if not isinstance(item, dict):
+                continue
+            child_service_id = str(item.get("service_id") or "").strip()
+            child_goal_text = str(item.get("goal_text") or "").strip()
+            if not child_service_id or not child_goal_text:
+                continue
+            child_goal_request = {
+                "service_id": child_service_id,
+                "goal_text": child_goal_text,
+            }
+            child_label = str(item.get("label") or "").strip()
+            if child_label:
+                child_goal_request["label"] = child_label
+            child_goal_requests.append(child_goal_request)
+    return child_goal_requests
+
+
+def _summarize_rejected_child_goal_split(
+    summary: str,
+    *,
+    child_goal_requests: list[dict[str, str]],
+) -> str:
+    if len(child_goal_requests) >= 2:
+        return summary
+    rejection_note = "Rejected child-session split: fewer than two valid child goals remained after normalization."
+    normalized_summary = str(summary).strip()
+    if rejection_note in normalized_summary:
+        return normalized_summary
+    if not child_goal_requests:
+        return normalized_summary
+    if not normalized_summary:
+        return rejection_note
+    return f"{normalized_summary} {rejection_note}"
+
+
 def goal_audit_should_enqueue_agent_followup(
-    *, progress_state: str | None, audit_state: str | None
+    *,
+    progress_state: str | None,
+    audit_state: str | None,
+    agent_directives: list[dict[str, Any]] | None = None,
 ) -> bool:
     normalized_progress_state = str(progress_state or "").strip().lower()
     normalized_audit_state = str(audit_state or "").strip().lower()
-    return normalized_progress_state == "in_progress" and normalized_audit_state == "all_clear"
+    has_agent_directives = bool(agent_directives)
+    return (
+        normalized_progress_state == "in_progress"
+        and normalized_audit_state == "all_clear"
+        and has_agent_directives
+    )
 
 
 def run_goal_audit(
@@ -546,30 +612,12 @@ def run_goal_audit(
         *,
         request_session_id: str | None,
     ) -> tuple[str, list[dict[str, Any]], str | None]:
-        try:
-            return _runtime_cli_service_adapter.run_codex(
-                request_prompt,
-                session_id=request_session_id,
-                response_schema_id="goal_audit_v1",
-                on_event=on_event,
-            )
-        except RuntimeError as exc:
-            error_text = str(exc)
-            if "invalid_json_schema" not in error_text:
-                raise
-            if on_event:
-                on_event(
-                    {
-                        "type": "service.goal_audit_schema_fallback",
-                        "error": error_text,
-                    }
-                )
-            return _runtime_cli_service_adapter.run_codex(
-                request_prompt,
-                session_id=request_session_id,
-                response_schema_id=None,
-                on_event=on_event,
-            )
+        return _runtime_cli_service_adapter.run_codex(
+            request_prompt,
+            session_id=request_session_id,
+            response_schema_id=None,
+            on_event=on_event,
+        )
 
     session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
     contacted_agents = list_session_agent_contacts(runtime_root, username=username, session_id=session_id)
@@ -606,15 +654,22 @@ def run_goal_audit(
     )
     requested_provider_kind = str(provider_kind or "").strip().lower()
     preferred_provider = str(session_settings.get("preferred_provider") or "").strip().lower()
-    if requested_provider_kind in {"codex", "claude"}:
+    if requested_provider_kind in {"codex", "claude", "gemini"}:
         normalized_provider_kind = requested_provider_kind
-    elif preferred_provider in {"codex", "claude"}:
+    elif preferred_provider in {"codex", "claude", "gemini"}:
         normalized_provider_kind = preferred_provider
     else:
         normalized_provider_kind = requested_provider_kind
     # JSONL output: no JSON schema enforcement — the prompt instructs the format
     if normalized_provider_kind == "claude":
         final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_claude(
+            prompt,
+            session_id=None,
+            response_schema_id=None,
+            on_event=on_event,
+        )
+    elif normalized_provider_kind == "gemini":
+        final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_gemini(
             prompt,
             session_id=None,
             response_schema_id=None,
@@ -646,7 +701,12 @@ def run_goal_audit(
         try:
             result = json.loads(candidate)
             if isinstance(result, dict):
-                parsed_legacy = result
+                embedded_records = _extract_embedded_goal_audit_records(result)
+                if embedded_records:
+                    parsed_records = embedded_records
+                    parsed_legacy = None
+                else:
+                    parsed_legacy = result
                 audit_session_id = retry_session_id
                 parse_ok = True
             else:
@@ -669,12 +729,20 @@ def run_goal_audit(
             "Please respond again with JSONL — one JSON object per line, no markdown fences.\n"
             "Line 1 (required): goal_state record:\n"
             '  {"kind": "goal_state", "progress_state": "complete" or "in_progress", "goal_satisfied": true or false, "summary": "..."}\n'
-            "Lines 2+ (only when in_progress): agent_directive records:\n"
+            "Optional later lines (only when in_progress): agent_directive records for agents that should continue now:\n"
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}\n'
+            "These lines are optional. Omit them when no agent should receive immediate follow-up.\n"
             "When progress_state is 'complete', output ONLY the goal_state line."
         )
         if normalized_provider_kind == "claude":
             retry_final_text, _, retry_session_id = _runtime_cli_service_adapter.run_claude(
+                retry_prompt,
+                session_id=retry_session_id,
+                response_schema_id=None,
+                on_event=on_event,
+            )
+        elif normalized_provider_kind == "gemini":
+            retry_final_text, _, retry_session_id = _runtime_cli_service_adapter.run_gemini(
                 retry_prompt,
                 session_id=retry_session_id,
                 response_schema_id=None,
@@ -733,20 +801,15 @@ def run_goal_audit(
         # Build child_goal_requests list
         child_goal_requests: list[dict[str, str]] = []
         if not goal_satisfied:
-            for item in raw_child_goal_recs:
-                child_service_id = str(item.get("service_id") or "").strip()
-                child_goal_text = str(item.get("goal_text") or "").strip()
-                if not child_service_id or not child_goal_text:
-                    continue
-                child_req: dict[str, str] = {"service_id": child_service_id, "goal_text": child_goal_text}
-                child_label = str(item.get("label") or "").strip()
-                if child_label:
-                    child_req["label"] = child_label
-                child_goal_requests.append(child_req)
-        if len(child_goal_requests) == 1:
-            child_goal_requests = []
+            child_goal_requests = _normalize_child_goal_requests(raw_child_goal_recs)
+            summary = _summarize_rejected_child_goal_split(
+                summary,
+                child_goal_requests=child_goal_requests,
+            )
         return {
             "goal_audit_session_id": str(audit_session_id or ""),
+            "goal_audit_provider_session_id": str(audit_session_id or ""),
+            "goal_audit_conversation_session_id": "",
             "progress_state": progress_state,
             "audit_state": audit_state,
             "goal_satisfied": goal_satisfied,
@@ -817,27 +880,18 @@ def run_goal_audit(
                 }
             )
     raw_child_goal_requests = parsed.get("child_goal_requests", [])
-    child_goal_requests: list[dict[str, str]] = []
-    if isinstance(raw_child_goal_requests, list):
-        for item in raw_child_goal_requests:
-            if not isinstance(item, dict):
-                continue
-            child_service_id = str(item.get("service_id") or "").strip()
-            child_goal_text = str(item.get("goal_text") or "").strip()
-            if not child_service_id or not child_goal_text:
-                continue
-            child_goal_request = {
-                "service_id": child_service_id,
-                "goal_text": child_goal_text,
-            }
-            child_label = str(item.get("label") or "").strip()
-            if child_label:
-                child_goal_request["label"] = child_label
-            child_goal_requests.append(child_goal_request)
-    if len(child_goal_requests) == 1:
-        child_goal_requests = []
+    child_goal_requests = _normalize_child_goal_requests(
+        raw_child_goal_requests if not goal_satisfied else []
+    )
+    if not goal_satisfied:
+        summary = _summarize_rejected_child_goal_split(
+            summary,
+            child_goal_requests=child_goal_requests,
+        )
     return {
         "goal_audit_session_id": str(audit_session_id or ""),
+        "goal_audit_provider_session_id": str(audit_session_id or ""),
+        "goal_audit_conversation_session_id": "",
         "progress_state": progress_state,
         "audit_state": audit_state,
         "goal_satisfied": goal_satisfied,

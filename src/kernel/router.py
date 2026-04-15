@@ -19,6 +19,13 @@ from kernel.spawn import SpawnManager
 from wire.protocol import decode_line, encode_line, message_meta_get, utc_ts, write_jsonl
 
 
+def resolve_repo_root() -> Path:
+    configured = str(os.environ.get("AIZE_ROOT") or "").strip()
+    if configured:
+        return Path(configured).resolve()
+    return Path(__file__).resolve().parents[2]
+
+
 def record_payload_mode(message: dict) -> str:
     return "ref" if message.get("payload_ref") else "inline"
 
@@ -283,7 +290,7 @@ def main() -> int:
     spawn_manager = SpawnManager(
         runtime_root=runtime_root,
         manifest_path=Path(args.manifest),
-        root_dir=Path(args.manifest).resolve().parent.parent,
+        root_dir=resolve_repo_root(),
         write_socks=write_socks,
     )
     spawn_manager.attach_existing_services()

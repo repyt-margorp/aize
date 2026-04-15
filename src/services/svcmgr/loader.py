@@ -1,8 +1,8 @@
 """
 Service descriptor loader for the Service Manager.
 
-Reads service.json files from src/services/*/service.json and expands
-them into concrete service specs, resolving environment variables.
+Reads builtin and plugin-backed service.json files and expands them into
+concrete service specs, resolving environment variables.
 """
 from __future__ import annotations
 
@@ -10,23 +10,55 @@ import json
 import os
 from pathlib import Path
 
+from plugin_catalog import list_plugin_service_descriptors
+
 
 def _services_pkg_dir() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def list_service_descriptors(*, exclude_kinds: set[str] | None = None) -> list[dict]:
-    """Scan services/*/service.json and return enabled descriptors, sorted by kind name."""
-    pkg_dir = _services_pkg_dir()
-    exclude = exclude_kinds if exclude_kinds is not None else {"svcmgr"}
+def _builtin_service_descriptors() -> list[dict]:
     descriptors = []
-    for d in sorted(pkg_dir.iterdir()):
-        if not d.is_dir() or d.name.startswith("_") or d.name in exclude:
+    pkg_dir = _services_pkg_dir()
+    for service_dir in sorted(pkg_dir.iterdir()):
+        if not service_dir.is_dir() or service_dir.name.startswith("_"):
             continue
-        desc_file = d / "service.json"
+        desc_file = service_dir / "service.json"
         if not desc_file.exists():
             continue
         desc = json.loads(desc_file.read_text(encoding="utf-8"))
+        desc.setdefault("module", f"services.{service_dir.name}")
+        desc["_descriptor_path"] = str(desc_file)
+        descriptors.append(desc)
+    return descriptors
+
+
+def _all_service_descriptors() -> list[dict]:
+    descriptors = _builtin_service_descriptors() + list_plugin_service_descriptors()
+    by_kind: dict[str, dict] = {}
+    for descriptor in descriptors:
+        kind = str(descriptor.get("kind", "")).strip()
+        if not kind:
+            source = descriptor.get("_descriptor_path", "<unknown>")
+            raise RuntimeError(f"service descriptor missing kind: {source}")
+        previous = by_kind.get(kind)
+        if previous is not None:
+            raise RuntimeError(
+                "duplicate service descriptor kind "
+                f"{kind!r}: {previous.get('_descriptor_path')} and {descriptor.get('_descriptor_path')}"
+            )
+        by_kind[kind] = descriptor
+    return sorted(by_kind.values(), key=lambda item: str(item.get("kind", "")))
+
+
+def list_service_descriptors(*, exclude_kinds: set[str] | None = None) -> list[dict]:
+    """Scan builtin and plugin descriptors and return enabled descriptors."""
+    exclude = exclude_kinds if exclude_kinds is not None else {"svcmgr"}
+    descriptors = []
+    for desc in _all_service_descriptors():
+        kind = str(desc.get("kind", "")).strip()
+        if kind in exclude:
+            continue
         if not desc.get("enabled", True):
             continue
         descriptors.append(desc)

@@ -15,17 +15,45 @@ cleanup() {
 }
 trap cleanup EXIT
 
+capture_pane() {
+  tmux capture-pane -pt "$TMUX_SESSION" -S -140 2>/dev/null || true
+}
+
+maybe_dismiss_prompt() {
+  local pane_text="$1"
+  if grep -q 'Update available!' <<<"$pane_text"; then
+    tmux send-keys -t "$TMUX_SESSION" 2 Enter
+    sleep 4
+    return 0
+  fi
+  if grep -q 'Approaching rate limits' <<<"$pane_text"; then
+    tmux send-keys -t "$TMUX_SESSION" 2 Enter
+    sleep 2
+    return 0
+  fi
+  return 1
+}
+
 tmux new-session -d -s "$TMUX_SESSION" "bash -lc 'cd \"$WORKDIR\" && codex resume \"$SESSION_ID\" --no-alt-screen'"
 sleep 3
 
-pane="$(tmux capture-pane -pt "$TMUX_SESSION" -S -60 || true)"
-if grep -q 'Update available!' <<<"$pane"; then
-  tmux send-keys -t "$TMUX_SESSION" 2 Enter
-  sleep 4
-  pane="$(tmux capture-pane -pt "$TMUX_SESSION" -S -80 || true)"
-fi
+pane="$(capture_pane)"
+for _ in 1 2 3; do
+  if ! maybe_dismiss_prompt "$pane"; then
+    break
+  fi
+  pane="$(capture_pane)"
+done
 
-status_line="$(grep -E 'gpt-[^·]+ · .*% left · ' <<<"$pane" | tail -n 1 || true)"
+status_line=""
+for _ in 1 2 3 4 5 6; do
+  status_line="$(grep -E '[0-9]+% left' <<<"$pane" | tail -n 1 || true)"
+  if [[ -n "$status_line" ]]; then
+    break
+  fi
+  sleep 1
+  pane="$(capture_pane)"
+done
 if [[ -z "$status_line" ]]; then
   echo "context-window footer not found" >&2
   printf '%s\n' "$pane" >&2

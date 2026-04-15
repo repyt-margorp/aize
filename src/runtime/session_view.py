@@ -11,6 +11,8 @@ from runtime.persistent_state import (
     append_pending_input,
     get_history as get_user_history,
     load_pending_inputs,
+    read_json_file,
+    session_goal_manager_state_path,
     session_ui_mode,
 )
 from wire.protocol import utc_ts, write_jsonl
@@ -25,6 +27,13 @@ def active_agent_turn_state(history_entries: list[dict[str, Any]]) -> dict[str, 
         event_type = str(entry.get("event_type") or "")
         ts = str(entry.get("ts") or "")
         if event_type == "agent.turn_started":
+            event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+            # GoalManager reviews have their own runtime lane and should not make the
+            # session look like a user-visible agent reply is still in progress.
+            if bool(event.get("goal_manager")):
+                active_service_id = ""
+                active_started_ts = ""
+                continue
             active_service_id = str(entry.get("service_id") or entry.get("from") or "").strip()
             active_started_ts = ts
             continue
@@ -33,6 +42,18 @@ def active_agent_turn_state(history_entries: list[dict[str, Any]]) -> dict[str, 
         if event_type == "turn.completed":
             completed_ts = ts
             if completed_ts >= active_started_ts:
+                active_service_id = ""
+                active_started_ts = ""
+                continue
+        if event_type in {
+            "service.goal_audit_completed",
+            "service.goal_audit_failed",
+            "service.goal_manager_reset",
+            "service.goal_manager_compact_failed",
+            "service.post_turn_followup_failed",
+        }:
+            event_service_id = str(entry.get("service_id") or entry.get("from") or "").strip()
+            if not event_service_id or event_service_id == active_service_id:
                 active_service_id = ""
                 active_started_ts = ""
                 continue
@@ -51,6 +72,7 @@ def worker_slot_badge(
     *,
     codex_service_pool: list[str],
     claude_service_pool: list[str],
+    gemini_service_pool: list[str],
 ) -> dict[str, Any] | None:
     normalized_service_id = str(service_id or "").strip()
     if not normalized_service_id:
@@ -66,6 +88,12 @@ def worker_slot_badge(
             "service_id": normalized_service_id,
             "provider": "claude",
             "slot": claude_service_pool.index(normalized_service_id) + 1,
+        }
+    if normalized_service_id in gemini_service_pool:
+        return {
+            "service_id": normalized_service_id,
+            "provider": "gemini",
+            "slot": gemini_service_pool.index(normalized_service_id) + 1,
         }
     return {
         "service_id": normalized_service_id,
@@ -84,6 +112,8 @@ def latest_goal_manager_runtime_state(history_entries: list[dict[str, Any]]) -> 
             "service.goal_manager_compact_started",
         }:
             return {"state": "running", "service_id": service_id}
+        if event_type == "service.goal_manager_reset":
+            return {"state": "idle", "service_id": ""}
         if event_type == "service.goal_audit_completed":
             event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
             progress_state = str(
@@ -102,29 +132,54 @@ def latest_goal_manager_runtime_state(history_entries: list[dict[str, Any]]) -> 
     return {"state": "idle", "service_id": ""}
 
 
+def persisted_goal_manager_runtime_state(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    bound_service_id: str = "",
+) -> dict[str, Any]:
+    state = read_json_file(
+        session_goal_manager_state_path(runtime_root, username=username, session_id=session_id)
+    ) or {}
+    service_id = str(state.get("service_id") or bound_service_id or "").strip()
+    runtime_state = str(state.get("state") or "idle").strip().lower()
+    if runtime_state == "running":
+        return {"state": "running", "service_id": service_id}
+    if runtime_state == "failed":
+        return {"state": "failed", "service_id": service_id}
+    progress_state = str(state.get("progress_state") or "").strip().lower()
+    if progress_state == "complete":
+        return {"state": "complete", "service_id": service_id}
+    if progress_state == "in_progress":
+        return {"state": "waiting", "service_id": service_id}
+    return {"state": "idle", "service_id": service_id}
+
+
 def build_session_runtime_summary(
     talk: dict[str, Any],
     *,
     history_entries: list[dict[str, Any]],
     codex_service_pool: list[str],
     claude_service_pool: list[str],
+    gemini_service_pool: list[str],
     default_provider: str,
 ) -> dict[str, Any]:
     session_id = str(talk.get("session_id") or "")
     preferred_provider = str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
     bound_service_id = str(talk.get("service_id") or "").strip()
-    active_turn = active_agent_turn_state(history_entries) or {}
-    active_service_id = str(active_turn.get("service_id") or "").strip()
     visible_worker = worker_slot_badge(
-        active_service_id or bound_service_id,
+        bound_service_id,
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
+        gemini_service_pool=gemini_service_pool,
     )
     goal_manager_state = latest_goal_manager_runtime_state(history_entries)
     goal_manager_worker = worker_slot_badge(
         str(goal_manager_state.get("service_id") or bound_service_id),
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
+        gemini_service_pool=gemini_service_pool,
     )
     goal_manager_provider = str(
         (goal_manager_worker or {}).get("provider") or preferred_provider or default_provider
@@ -156,7 +211,7 @@ def build_session_runtime_summary(
         "preferred_provider": preferred_provider,
         "bound_service_id": bound_service_id,
         "worker": visible_worker,
-        "agent_running": bool(active_service_id),
+        "agent_running": False,
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
         "goal_manager_provider": goal_manager_provider,
         "goal_manager_worker": goal_manager_worker,
@@ -185,8 +240,9 @@ def build_worker_count_summary(
     session_summaries: list[dict[str, Any]],
 ) -> dict[str, dict[str, int]]:
     counts = {
-        "codex": {"running": 0, "active_turns": 0},
-        "claude": {"running": 0, "active_turns": 0},
+        "codex": {"running": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
+        "claude": {"running": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
+        "gemini": {"running": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
     }
     for snapshot in service_snapshots:
         service = snapshot.get("service") if isinstance(snapshot, dict) else None
@@ -202,20 +258,34 @@ def build_worker_count_summary(
     for talk in session_summaries:
         if not isinstance(talk, dict):
             continue
-        if not talk.get("agent_running"):
-            continue
-        worker = talk.get("worker") if isinstance(talk.get("worker"), dict) else {}
-        provider = str(worker.get("provider") or "").strip().lower()
-        if provider not in counts:
-            provider = str(talk.get("preferred_provider") or "").strip().lower()
-        if provider not in counts:
-            bound_service_id = str(talk.get("bound_service_id") or "").strip().lower()
-            if "claude" in bound_service_id:
-                provider = "claude"
-            elif "codex" in bound_service_id:
-                provider = "codex"
-        if provider in counts:
-            counts[provider]["active_turns"] += 1
+        def resolve_provider(candidate: dict[str, Any] | None) -> str:
+            worker = candidate if isinstance(candidate, dict) else {}
+            provider = str(worker.get("provider") or "").strip().lower()
+            if provider not in counts:
+                provider = str(talk.get("preferred_provider") or "").strip().lower()
+            if provider not in counts:
+                bound_service_id = str(talk.get("bound_service_id") or "").strip().lower()
+                if "claude" in bound_service_id:
+                    provider = "claude"
+                elif "codex" in bound_service_id:
+                    provider = "codex"
+                elif "gemini" in bound_service_id:
+                    provider = "gemini"
+            return provider
+
+        if talk.get("agent_running"):
+            provider = resolve_provider(talk.get("worker") if isinstance(talk.get("worker"), dict) else None)
+            if provider in counts:
+                counts[provider]["active_turns"] += 1
+                counts[provider]["replying_turns"] += 1
+
+        if str(talk.get("goal_manager_state") or "").strip().lower() == "running":
+            provider = resolve_provider(
+                talk.get("goal_manager_worker") if isinstance(talk.get("goal_manager_worker"), dict) else None
+            )
+            if provider in counts:
+                counts[provider]["active_turns"] += 1
+                counts[provider]["reviewing_turns"] += 1
     return counts
 
 

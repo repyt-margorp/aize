@@ -21,6 +21,24 @@ from ._core import (
 
 _history_subscribers: dict[str, set[queue.Queue[dict[str, Any]]]] = defaultdict(set)
 _history_subscribers_lock = threading.Lock()
+MAX_HISTORY_STRING_LENGTH = 4000
+
+
+def _sanitize_history_value(value: Any) -> Any:
+    if isinstance(value, str):
+        if len(value) <= MAX_HISTORY_STRING_LENGTH:
+            return value
+        omitted = len(value) - MAX_HISTORY_STRING_LENGTH
+        return f"{value[:MAX_HISTORY_STRING_LENGTH]}...[truncated {omitted} chars]"
+    if isinstance(value, list):
+        return [_sanitize_history_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_history_value(item) for key, item in value.items()}
+    return value
+
+
+def sanitize_history_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return _sanitize_history_value(dict(entry))
 
 
 def history_subscriber_key(username: str, session_id: str) -> str:
@@ -74,10 +92,11 @@ def append_history(
     limit: int,
 ) -> list[dict[str, Any]]:
     normalized = normalize_username(username)
+    sanitized_entry = sanitize_history_entry(entry)
     with state_lock(runtime_root):
         timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
-        history = read_jsonl(timeline_path)
-        history.append(entry)
+        history = [sanitize_history_entry(item) for item in read_jsonl(timeline_path)]
+        history.append(sanitized_entry)
         if len(history) > limit:
             # Protect user-visible reply/message entries from being evicted by event flooding.
             # Try to trim only event/agent-direction entries first; fall back to tail-trim if needed.
@@ -89,7 +108,7 @@ def append_history(
             else:
                 history = history[-limit:]
         write_jsonl(timeline_path, history)
-    _notify_history_subscribers(username=normalized, session_id=session_id, entry=entry)
+    _notify_history_subscribers(username=normalized, session_id=session_id, entry=sanitized_entry)
     return history
 
 

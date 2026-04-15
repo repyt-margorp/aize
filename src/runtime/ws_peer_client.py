@@ -25,7 +25,7 @@ remote_username    str    owner of the remote session to join
 remote_session_id  str    session_id on the remote Aize
 local_username     str    username for the local proxy session
 local_session_id   str    session_id of the local proxy session (LLM runs here)
-provider           str    "claude" | "codex"  (default "claude")
+provider           str    "claude" | "codex" | "gemini"  (default "claude")
 name               str    optional label used in log messages
 """
 from __future__ import annotations
@@ -56,6 +56,88 @@ PING_INTERVAL = 30          # seconds between client-side pings
 RESPONSE_TIMEOUT = 300      # seconds to wait for local LLM response
 RECONNECT_BACKOFF_BASE = 5  # initial reconnect wait (seconds)
 RECONNECT_BACKOFF_MAX = 120 # cap on reconnect wait
+
+
+def ws_proxy_goal_text(
+    *,
+    name: str,
+    target_ws_url: str,
+    remote_username: str,
+    remote_session_id: str,
+) -> str:
+    return "\n".join(
+        [
+            f"WS proxy agent for {name}",
+            f"remote_ws_url={target_ws_url}",
+            f"remote_username={remote_username}",
+            f"remote_session_id={remote_session_id}",
+        ]
+    )
+
+
+def ensure_local_proxy_session(
+    runtime_root: Path,
+    *,
+    local_username: str,
+    local_session_id: str,
+    name: str,
+    target_ws_url: str,
+    remote_username: str,
+    remote_session_id: str,
+) -> tuple[str | None, bool]:
+    from runtime.persistent_state_pkg import (
+        create_conversation_session,
+        get_session_settings,
+        list_sessions,
+        update_session_goal,
+    )
+
+    expected_goal_text = ws_proxy_goal_text(
+        name=name,
+        target_ws_url=target_ws_url,
+        remote_username=remote_username,
+        remote_session_id=remote_session_id,
+    )
+    expected_label = f"[ws-proxy] {name}"
+
+    def _goal_matches(session_id: str) -> bool:
+        talk = get_session_settings(runtime_root, username=local_username, session_id=session_id) or {}
+        return str(talk.get("goal_text") or "").strip() == expected_goal_text
+
+    reused_existing = False
+    resolved_session_id = str(local_session_id or "").strip()
+
+    if not resolved_session_id:
+        existing = list_sessions(runtime_root, username=local_username)
+        proxy = next(
+            (
+                session
+                for session in existing
+                if str(session.get("label") or "").strip() == expected_label
+                and str(session.get("goal_text") or "").strip() == expected_goal_text
+            ),
+            None,
+        )
+        if proxy:
+            resolved_session_id = str(proxy.get("session_id") or "").strip()
+            reused_existing = bool(resolved_session_id)
+        else:
+            session = create_conversation_session(
+                runtime_root,
+                username=local_username,
+                label=expected_label,
+            )
+            if session:
+                resolved_session_id = str(session["session_id"])
+
+    if resolved_session_id:
+        update_session_goal(
+            runtime_root,
+            username=local_username,
+            session_id=resolved_session_id,
+            goal_text=expected_goal_text,
+        )
+    return resolved_session_id or None, reused_existing
 
 
 def _remote_session_entry_to_dispatch(
@@ -341,6 +423,7 @@ def run_ws_peer_client(
     log_path: Path,
     codex_service_pool: list[str],
     claude_service_pool: list[str],
+    gemini_service_pool: list[str],
     append_history: Any,
     stopped: threading.Event,
 ) -> None:
@@ -368,41 +451,33 @@ def run_ws_peer_client(
         })
         return
 
-    provider_pool = codex_service_pool if provider == "codex" else claude_service_pool
+    provider_pool = {
+        "codex": codex_service_pool,
+        "claude": claude_service_pool,
+        "gemini": gemini_service_pool,
+    }.get(provider, claude_service_pool)
 
-    # Auto-create the local proxy session if not configured or not found.
-    if not local_session_id:
-        from runtime.persistent_state_pkg import (
-            create_conversation_session,
-            list_sessions,
-            update_session_goal,
-        )
-        existing = list_sessions(runtime_root, username=local_username)
-        proxy = next((s for s in existing if s.get("label") == f"[ws-proxy] {name}"), None)
-        if proxy:
-            local_session_id = str(proxy["session_id"])
-        else:
-            session = create_conversation_session(
-                runtime_root,
-                username=local_username,
-                label=f"[ws-proxy] {name}",
-            )
-            if session:
-                local_session_id = str(session["session_id"])
-        # Ensure the proxy session has an active goal so the periodic
-        # release_nonrunnable_session_services sweep doesn't evict its lease.
-        if local_session_id:
-            update_session_goal(
-                runtime_root,
-                username=local_username,
-                session_id=local_session_id,
-                goal_text=f"WS proxy agent for {name}",
-            )
+    # Auto-create the local proxy session if not configured or if the configured
+    # one belongs to a different remote target. This prevents stale proxy-session
+    # reuse when operators retarget the same ws-peer client name to another
+    # remote session.
+    local_session_id, reused_proxy_session = ensure_local_proxy_session(
+        runtime_root,
+        local_username=local_username,
+        local_session_id=local_session_id,
+        name=name,
+        target_ws_url=target_ws_url,
+        remote_username=remote_username,
+        remote_session_id=remote_session_id,
+    )
+    if local_session_id:
         write_jsonl(log_path, {
             "type": "ws_peer_client.proxy_session",
             "ts": utc_ts(),
             "name": name,
             "local_session_id": local_session_id,
+            "remote_session_id": remote_session_id,
+            "reused_existing": reused_proxy_session,
         })
 
     parsed = urlparse(target_ws_url)
@@ -779,6 +854,7 @@ def start_ws_peer_clients(
     log_path: Path,
     codex_service_pool: list[str],
     claude_service_pool: list[str],
+    gemini_service_pool: list[str],
     append_history: Any,
     stopped: threading.Event,
 ) -> list[threading.Thread]:
@@ -803,6 +879,7 @@ def start_ws_peer_clients(
                 log_path=log_path,
                 codex_service_pool=codex_service_pool,
                 claude_service_pool=claude_service_pool,
+                gemini_service_pool=gemini_service_pool,
                 append_history=append_history,
                 stopped=stopped,
             ),

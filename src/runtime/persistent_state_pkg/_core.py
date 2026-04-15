@@ -22,7 +22,8 @@ DEFAULT_SESSION_GROUP = "user"
 DEFAULT_AUTO_RESUME_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS = 5 * 60
 AGENT_PRIORITY_BORDER = "border"
-DEFAULT_AGENT_PRIORITY = ["codex", "claude", AGENT_PRIORITY_BORDER]
+NATIVE_PROVIDER_KINDS = ("codex", "claude", "gemini")
+DEFAULT_AGENT_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
 GOAL_MANAGER_USERNAME = "goalmanager"
 DEFAULT_SESSION_UI_MODE = "standard"
 SESSION_UI_MODES = {"standard", "map_only"}
@@ -63,8 +64,10 @@ def normalize_auto_compact_threshold_left_percent(value: Any) -> int:
 def normalize_agent_priority(value: Any) -> list[str]:
     if not isinstance(value, list):
         return list(DEFAULT_AGENT_PRIORITY)
-    normalized: list[str] = []
+    active: list[str] = []
+    saved: list[str] = []
     seen: set[str] = set()
+    border_seen = False
     for raw_item in value:
         item = str(raw_item or "").strip().lower()
         if not item:
@@ -74,12 +77,25 @@ def normalize_agent_priority(value: Any) -> list[str]:
         if item in seen:
             continue
         seen.add(item)
-        normalized.append(item)
+        if item == AGENT_PRIORITY_BORDER:
+            border_seen = True
+            continue
+        if border_seen:
+            saved.append(item)
+        else:
+            active.append(item)
+    for provider in NATIVE_PROVIDER_KINDS:
+        if provider not in seen:
+            saved.append(provider)
+    normalized = active
+    if border_seen or saved:
+        normalized.append(AGENT_PRIORITY_BORDER)
+        normalized.extend(saved)
     return normalized or list(DEFAULT_AGENT_PRIORITY)
 
 
 def active_agent_priority(value: Any, *, available_kinds: set[str] | None = None) -> list[str]:
-    available = available_kinds or {"codex", "claude"}
+    available = available_kinds or set(NATIVE_PROVIDER_KINDS)
     active: list[str] = []
     for item in normalize_agent_priority(value):
         if item == AGENT_PRIORITY_BORDER:
@@ -715,7 +731,7 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
         session["session_ui_mode"] = "map_only"
     else:
         session["session_ui_mode"] = DEFAULT_SESSION_UI_MODE
-    session.setdefault("auto_resume_enabled", bool(normalized_permissions.get("auto_resume", False)))
+    session.setdefault("auto_resume_enabled", False)
     try:
         auto_resume_interval_seconds = int(session.get("auto_resume_interval_seconds", DEFAULT_AUTO_RESUME_INTERVAL_SECONDS))
     except (TypeError, ValueError):

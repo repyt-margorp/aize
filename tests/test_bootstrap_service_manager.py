@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ if str(SRC) not in sys.path:
 
 from cli.run_codex_http_mesh import build_core_manifest
 from kernel.registry import get_service_record, init_registry
-from kernel.router import register_delivery_socket, remove_delivery_socket
+from kernel.router import register_delivery_socket, remove_delivery_socket, resolve_repo_root
 from kernel.spawn import SpawnManager
 from services.svcmgr import run_service
 from services.svcmgr.loader import build_service_plan_for_kinds
@@ -40,6 +41,11 @@ class BootstrapManifestTests(unittest.TestCase):
                 ],
             },
         )
+
+    def test_gemini_descriptor_defaults_to_five_workers(self) -> None:
+        descriptor = json.loads((ROOT / "src" / "services" / "gemini" / "service.json").read_text(encoding="utf-8"))
+        self.assertEqual(descriptor["kind"], "gemini")
+        self.assertEqual(descriptor["pool_size_default"], 5)
 
 
 class ServiceManagerSpawnTests(unittest.TestCase):
@@ -157,6 +163,17 @@ class RouterSocketRegistrationTests(unittest.TestCase):
 
         remove_delivery_socket(write_socks, sender_id="service-codex-001", sock=primary)
         self.assertNotIn("service-codex-001", write_socks)
+
+
+class RouterRootResolutionTests(unittest.TestCase):
+    def test_resolve_repo_root_uses_aize_root_when_configured(self) -> None:
+        configured_root = ROOT / ".temp" / "router-root-override"
+        with patch.dict("os.environ", {"AIZE_ROOT": str(configured_root)}):
+            self.assertEqual(resolve_repo_root(), configured_root.resolve())
+
+    def test_resolve_repo_root_defaults_to_repo_root_not_runtime_parent(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_repo_root(), ROOT.resolve())
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ _TLS_CTX = ssl.create_default_context()
 _TLS_CTX.check_hostname = False
 _TLS_CTX.verify_mode = ssl.CERT_NONE
 PROCESS_PATTERNS = {
-    "parent": "python3 -m cli.run_codex_http_mesh",
+    "parent": f"cli.run_codex_http_mesh --runtime-root {RUNTIME_ROOT}",
     "router": f"python3 -m kernel.router --manifest {RUNTIME_ROOT / 'manifest.json'}",
     "adapter": f"python3 -m runtime.cli_service_adapter --manifest {RUNTIME_ROOT / 'manifest.json'}",
 }

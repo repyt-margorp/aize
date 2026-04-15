@@ -15,6 +15,7 @@ from ._core import (
     DEFAULT_SESSION_UI_MODE,
     DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS,
     DEFAULT_SESSION_GROUP,
+    NATIVE_PROVIDER_KINDS,
     SESSION_GROUP_DEFAULT_PERMISSIONS,
     SESSION_UI_MODES,
     _active_goal_revision_unlocked,
@@ -460,6 +461,7 @@ def create_conversation_session(
             "label": (label or "").strip() or f"Session {len(sessions) + 1}",
             "session_group": normalized_group,
             "session_permissions": normalized_permissions,
+            "auto_resume_enabled": False,
             "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
             "created_at": utc_ts(),
             "updated_at": utc_ts(),
@@ -502,19 +504,7 @@ def lease_session_service(
         if not isinstance(target_session, dict):
             return None
         _ensure_session_defaults_unlocked(target_session)
-        blocking_child_sessions = _list_active_in_progress_child_sessions_unlocked(
-            runtime_root,
-            username=normalized,
-            session_id=session_id,
-        )
-        target_session["waiting_on_children"] = bool(blocking_child_sessions)
         existing_service_id = target_session.get("service_id")
-        if blocking_child_sessions:
-            if isinstance(existing_service_id, str) and existing_service_id:
-                target_session.pop("service_id", None)
-            target_session["updated_at"] = utc_ts()
-            ensure_session_storage_unlocked(runtime_root, username=normalized, session=target_session)
-            return None
         if isinstance(existing_service_id, str) and existing_service_id in pool:
             return existing_service_id
         # Collect all sessions currently holding a pool slot, keyed by service_id.
@@ -620,12 +610,6 @@ def release_nonrunnable_session_services(runtime_root: Path) -> list[dict[str, s
                 if not isinstance(service_id, str) or not service_id:
                     continue
                 _ensure_session_defaults_unlocked(talk)
-                blocking_child_sessions = _list_active_in_progress_child_sessions_unlocked(
-                    runtime_root,
-                    username=username,
-                    session_id=talk_dir.name,
-                )
-                talk["waiting_on_children"] = bool(blocking_child_sessions)
                 goal_active = bool(talk.get("goal_active", False))
                 goal_completed = bool(talk.get("goal_completed", False))
                 goal_progress_state = str(
@@ -633,8 +617,7 @@ def release_nonrunnable_session_services(runtime_root: Path) -> list[dict[str, s
                 ).strip().lower()
                 release_reason = release_reason_for_service(service_id)
                 if (
-                    blocking_child_sessions
-                    or goal_completed
+                    goal_completed
                     or not goal_active
                     or goal_progress_state == "complete"
                     or release_reason
@@ -644,9 +627,7 @@ def release_nonrunnable_session_services(runtime_root: Path) -> list[dict[str, s
                             "username": username,
                             "session_id": str(talk.get("session_id", "")),
                             "service_id": service_id,
-                            "reason": release_reason or (
-                                "child_sessions_in_progress" if blocking_child_sessions else "goal_inactive"
-                            ),
+                            "reason": release_reason or "goal_inactive",
                         }
                     )
                     talk.pop("service_id", None)
@@ -664,6 +645,39 @@ def get_session_settings(runtime_root: Path, *, username: str, session_id: str) 
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=stored)
             return dict(stored)
         return None
+
+
+def claim_session_restart_resume(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    run_id: str,
+    service_id: str,
+) -> bool:
+    normalized = normalize_username(username)
+    normalized_run_id = str(run_id or "").strip()
+    normalized_service_id = str(service_id or "").strip()
+    if not normalized_run_id or not normalized_service_id:
+        return False
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return False
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if not isinstance(talk, dict) or str(talk.get("session_id")) != session_id:
+                continue
+            _ensure_session_defaults_unlocked(talk)
+            claimed_run_id = str(talk.get("restart_resume_claim_run_id") or "").strip()
+            if claimed_run_id == normalized_run_id:
+                return False
+            talk["restart_resume_claim_run_id"] = normalized_run_id
+            talk["restart_resume_claim_service_id"] = normalized_service_id
+            talk["restart_resume_claimed_at"] = utc_ts()
+            talk["updated_at"] = utc_ts()
+            ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+            return True
+        return False
 
 
 def update_session_auto_compact_threshold(
@@ -849,7 +863,7 @@ def update_session_goal_flags(
                     talk["agent_welcome_enabled"] = bool(agent_welcome_enabled)
                 if preferred_provider is not None:
                     provider = str(preferred_provider).strip().lower()
-                    talk["preferred_provider"] = provider if provider in {"codex", "claude"} else "codex"
+                    talk["preferred_provider"] = provider if provider in set(NATIVE_PROVIDER_KINDS) else "codex"
                 if agent_priority is not None:
                     talk["agent_priority"] = normalize_agent_priority(agent_priority)
                 if session_priority is not None:
@@ -1110,25 +1124,26 @@ def record_session_agent_contact(
                 welcomed_agents = talk.get("welcomed_agents")
                 if not isinstance(welcomed_agents, list):
                     welcomed_agents = []
-                native_provider_kinds = {"codex", "claude"}
+                native_provider_kinds = set(NATIVE_PROVIDER_KINDS)
                 is_native_contact = (
                     normalized_provider in native_provider_kinds
-                    or normalized_service_id.startswith("service-codex-")
-                    or normalized_service_id.startswith("service-claude-")
+                    or any(normalized_service_id.startswith(f"service-{kind}-") for kind in native_provider_kinds)
                 )
-                if is_native_contact and not bool(talk.get("agent_welcome_enabled", False)):
+                if is_native_contact:
                     welcomed_agents = [
                         item
                         for item in welcomed_agents
                         if not (
-                            isinstance(item, dict)
-                            and (
-                                str(item.get("provider") or "").strip().lower() in native_provider_kinds
-                                or str(item.get("service_id") or "").strip().startswith("service-codex-")
-                                or str(item.get("service_id") or "").strip().startswith("service-claude-")
+                                isinstance(item, dict)
+                                and (
+                                    str(item.get("provider") or "").strip().lower() in native_provider_kinds
+                                    or any(
+                                        str(item.get("service_id") or "").strip().startswith(f"service-{kind}-")
+                                        for kind in native_provider_kinds
+                                    )
+                                )
                             )
-                        )
-                    ]
+                        ]
                 existing: dict[str, Any] | None = None
                 for item in welcomed_agents:
                     if isinstance(item, dict) and str(item.get("service_id") or "").strip() == normalized_service_id:
@@ -1543,8 +1558,6 @@ def session_goal_context(
             for revision in root_history:
                 if isinstance(revision, dict):
                     root_revision_candidates.append(revision)
-            if root_revision_candidates:
-                break
 
         selected_revisions = root_revision_candidates[:root_limit] + current_revisions[-recent_limit:]
         seen_goal_ids: set[str] = set()
@@ -1663,6 +1676,44 @@ def update_session_selected_agents(
             if isinstance(talk, dict) and str(talk.get("session_id")) == session_id:
                 _ensure_session_defaults_unlocked(talk)
                 talk["selected_agents"] = [str(a) for a in selected_agents if a]
+                talk["updated_at"] = utc_ts()
+                ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+                return dict(talk)
+    return None
+
+
+def update_session_launcher_profile(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    launcher_app_id: str,
+    launcher_display_name: str,
+    preferred_provider: str,
+    selected_agents: list[str],
+    service_targets: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if isinstance(talk, dict) and str(talk.get("session_id")) == session_id:
+                _ensure_session_defaults_unlocked(talk)
+                talk["launcher_app_id"] = str(launcher_app_id or "").strip()
+                talk["launcher_display_name"] = str(launcher_display_name or "").strip()
+                talk["launcher_preferred_provider"] = str(preferred_provider or "").strip().lower()
+                talk["launcher_selected_agents"] = [str(agent) for agent in selected_agents if str(agent).strip()]
+                talk["launcher_service_targets"] = [
+                    {
+                        "mode": str(target.get("mode") or "").strip(),
+                        "provider": str(target.get("provider") or "").strip(),
+                        "target": str(target.get("target") or "").strip(),
+                    }
+                    for target in service_targets
+                    if isinstance(target, dict) and str(target.get("target") or "").strip()
+                ]
                 talk["updated_at"] = utc_ts()
                 ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
                 return dict(talk)

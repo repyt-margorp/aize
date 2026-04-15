@@ -2,10 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$SCRIPT_DIR"
-RUNTIME_ROOT="$ROOT/.agent-mesh-runtime"
-HTTP_HOST="0.0.0.0"
-HTTP_PORT="4123"
+ROOT="${ROOT:-$SCRIPT_DIR}"
+RUNTIME_ROOT="${AIZE_RUNTIME_ROOT:-$ROOT/.agent-mesh-runtime}"
+HTTP_HOST="${AIZE_HTTP_HOST:-0.0.0.0}"
+HTTP_PORT="${AIZE_HTTP_PORT:-4123}"
 LOG_PATH="$ROOT/.temp/restart-debug/launcher.log"
 SUPERVISOR_LOG_PATH="$ROOT/.temp/restart-debug/restart-supervisor.log"
 RESTART_LOCK_PATH="$ROOT/.temp/restart-debug/restart.lock"

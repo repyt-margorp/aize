@@ -146,8 +146,15 @@ def goal_audit_history_text(audit: dict[str, Any]) -> str:
     audit_state = str(audit.get("audit_state", "all_clear"))
     compact_requested = bool(audit.get("request_compact"))
     compact_reason = str(audit.get("request_compact_reason", "")).strip()
+    provider_session_id = str(
+        audit.get("goal_audit_provider_session_id", audit.get("goal_audit_session_id", ""))
+    ).strip()
+    conversation_session_id = str(audit.get("goal_audit_conversation_session_id", "")).strip()
+    review_target = f"GoalManager provider session {provider_session_id or '(ephemeral)'}"
+    if conversation_session_id:
+        review_target = f"{review_target} via conversation session {conversation_session_id}"
     lines = [
-        f"GoalManager session {audit['goal_audit_session_id'] or '(ephemeral)'}: progress={status}, audit={audit_state}",
+        f"{review_target}: progress={status}, audit={audit_state}",
     ]
     if audit.get("summary"):
         lines.extend(["", str(audit["summary"])])
@@ -174,6 +181,10 @@ def persist_goal_audit_completion(
             "ts": utc_ts(),
             "goal_audit_job_id": goal_audit_job_id,
             "goal_audit_session_id": audit["goal_audit_session_id"],
+            "goal_audit_provider_session_id": str(
+                audit.get("goal_audit_provider_session_id", audit["goal_audit_session_id"])
+            ),
+            "goal_audit_conversation_session_id": str(audit.get("goal_audit_conversation_session_id", "")),
             "goal_id": str(audit.get("goal_id") or ""),
             "goal_text": str(audit.get("goal_text") or ""),
             "progress_state": audit["progress_state"],
@@ -195,7 +206,12 @@ def persist_goal_audit_completion(
         payload={
             "state": "idle",
             "goal_audit_job_id": goal_audit_job_id,
+            "pending_work_items": [],
             "goal_audit_session_id": audit["goal_audit_session_id"],
+            "goal_audit_provider_session_id": str(
+                audit.get("goal_audit_provider_session_id", audit["goal_audit_session_id"])
+            ),
+            "goal_audit_conversation_session_id": str(audit.get("goal_audit_conversation_session_id", "")),
             "progress_state": audit["progress_state"],
             "audit_state": audit["audit_state"],
             "goal_satisfied": audit["goal_satisfied"],
@@ -212,6 +228,10 @@ def persist_goal_audit_completion(
             "goal_audit_job_id": goal_audit_job_id,
             "scope": {"username": username, "session_id": session_id},
             "goal_audit_session_id": audit["goal_audit_session_id"],
+            "goal_audit_provider_session_id": str(
+                audit.get("goal_audit_provider_session_id", audit["goal_audit_session_id"])
+            ),
+            "goal_audit_conversation_session_id": str(audit.get("goal_audit_conversation_session_id", "")),
             "goal_id": str(audit.get("goal_id") or ""),
             "goal_text": str(audit.get("goal_text") or ""),
             "progress_state": audit["progress_state"],
@@ -237,6 +257,10 @@ def persist_goal_audit_completion(
             "type": "service.goal_audit_completed",
             "goal_audit_job_id": goal_audit_job_id,
             "goal_audit_session_id": audit["goal_audit_session_id"],
+            "goal_audit_provider_session_id": str(
+                audit.get("goal_audit_provider_session_id", audit["goal_audit_session_id"])
+            ),
+            "goal_audit_conversation_session_id": str(audit.get("goal_audit_conversation_session_id", "")),
             "goal_id": str(audit.get("goal_id") or ""),
             "goal_text": str(audit.get("goal_text") or ""),
             "progress_state": audit["progress_state"],
@@ -250,6 +274,67 @@ def persist_goal_audit_completion(
             if isinstance(audit.get("agent_directives"), list)
             else [],
         },
+    }
+    if history_sink is not None:
+        history_sink(history_entry)
+        return
+    append_user_history(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        entry=history_entry,
+        limit=GOAL_AUDIT_HISTORY_LIMIT,
+    )
+
+
+def persist_goal_audit_failure(
+    *,
+    runtime_root: Path,
+    log_path: Path,
+    service_id: str,
+    process_id: str,
+    goal_audit_job_id: str,
+    username: str,
+    session_id: str,
+    error: str,
+    history_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    _persist_goal_manager_runtime_state(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        payload={
+            "state": "failed",
+            "goal_audit_job_id": str(goal_audit_job_id or ""),
+            "pending_work_items": [],
+            "error": str(error or "").strip(),
+        },
+    )
+    event = {
+        "type": "service.goal_audit_failed",
+        "goal_audit_job_id": str(goal_audit_job_id or ""),
+        "error": str(error or "").strip(),
+    }
+    write_jsonl(
+        log_path,
+        {
+            "type": event["type"],
+            "ts": utc_ts(),
+            "service_id": service_id,
+            "process_id": process_id,
+            "goal_audit_job_id": str(goal_audit_job_id or ""),
+            "scope": {"username": username, "session_id": session_id},
+            "error": event["error"],
+        },
+    )
+    history_entry = {
+        "direction": "agent",
+        "ts": utc_ts(),
+        "from": service_id,
+        "session_id": session_id,
+        "event_type": event["type"],
+        "text": f"GoalManager audit failed: {event['error']}",
+        "event": event,
     }
     if history_sink is not None:
         history_sink(history_entry)
@@ -281,6 +366,7 @@ def persist_goal_manager_compact_event(
         session_id=session_id,
         payload={
             "state": "idle" if str(event.get("type") or "").endswith("_checked") else "failed",
+            "pending_work_items": [],
             "compact_event": dict(event),
         },
     )
@@ -368,6 +454,52 @@ def persist_goal_manager_compact_started(
     )
 
 
+def persist_goal_manager_runtime_reset(
+    *,
+    runtime_root: Path,
+    service_id: str,
+    username: str,
+    session_id: str,
+    reason: str,
+    history_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    event = {
+        "type": "service.goal_manager_reset",
+        "reason": reason,
+        "session_id": session_id,
+    }
+    _persist_goal_manager_runtime_state(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        payload={
+            "state": "idle",
+            "goal_audit_job_id": "",
+            "service_id": "",
+            "pending_work_items": [],
+            "reset_reason": reason,
+        },
+    )
+    history_entry = {
+        "direction": "event",
+        "ts": utc_ts(),
+        "service_id": service_id,
+        "event_type": event["type"],
+        "text": f"GoalManager reset: {reason or 'no reason provided'}",
+        "event": event,
+    }
+    if history_sink is not None:
+        history_sink(history_entry)
+        return
+    append_user_history(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        entry=history_entry,
+        limit=GOAL_AUDIT_HISTORY_LIMIT,
+    )
+
+
 def handle_goal_manager_compact_request(
     *,
     runtime_root: Path,
@@ -406,6 +538,14 @@ def handle_goal_manager_compact_request(
 
         if service_kind == "claude":
             event, _returncode = compact_entrypoints.goal_manager_compact_claude_session(
+                repo_root=repo_root,
+                runtime_root=runtime_root,
+                service_id=service_id,
+                username=username,
+                session_id=session_id,
+            )
+        elif service_kind == "gemini":
+            event, _returncode = compact_entrypoints.goal_manager_compact_gemini_session(
                 repo_root=repo_root,
                 runtime_root=runtime_root,
                 service_id=service_id,

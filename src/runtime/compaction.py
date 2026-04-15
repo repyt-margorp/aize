@@ -20,12 +20,14 @@ from runtime.persistent_state import (
     append_history as append_user_history,
     append_pending_input,
     append_service_pending_input,
+    claim_session_restart_resume,
     consume_session_due_auto_resume,
     get_history as get_user_history,
     get_session_settings,
     load_agent_audit_state,
     load_codex_session,
     load_claude_session,
+    load_gemini_session,
     load_pending_inputs,
     read_json_file,
     load_service_pending_inputs,
@@ -46,6 +48,8 @@ from runtime.providers import (
     run_claude_context_check,
     run_codex_compaction,
     run_codex_context_check,
+    run_gemini_compaction,
+    run_gemini_context_check,
 )
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
@@ -321,6 +325,7 @@ def maybe_resume_after_restart(
             and (not updated_at or updated_at < latest_turn_completed)
         ):
             goal_manager_state["state"] = "idle"
+            goal_manager_state["pending_work_items"] = []
             goal_manager_state["stale_reason"] = "unreviewed_turn_completed_after_stale_running_state"
             goal_manager_state["updated_at"] = utc_ts()
             write_json_file(goal_manager_state_path, goal_manager_state)
@@ -474,7 +479,7 @@ def maybe_resume_after_restart(
                     "error": str(gm_failure_entry.get("text") or "").strip(),
                 }
             session_label = str(talk.get("label") or scope_session_id)
-            preferred_provider = "claude" if service_kind == "claude" else "codex"
+            preferred_provider = service_kind if service_kind in {"codex", "claude", "gemini"} else "codex"
             recovery_session = ensure_panic_recovery_session(
                 runtime_root,
                 username=scope_username,
@@ -582,6 +587,36 @@ def maybe_resume_after_restart(
             )
             continue
         run_id = f"system-restart-{int(time.time())}"
+        if not claim_session_restart_resume(
+            runtime_root,
+            username=scope_username,
+            session_id=scope_session_id,
+            run_id=str(manifest.get("run_id") or ""),
+            service_id=service_id,
+        ):
+            write_jsonl(
+                log_path,
+                {
+                    "type": "service.restart_resume_skipped",
+                    "ts": utc_ts(),
+                    "service_id": service_id,
+                    "process_id": process_id,
+                    "scope": {"username": scope_username, "session_id": scope_session_id},
+                    "session_id": session_id,
+                    "recovery_mode": recovery_mode,
+                    "reason": "restart_resume_already_claimed_for_run",
+                    "unfinished_turn": unfinished_turn,
+                    "has_actionable_pending": has_actionable_pending,
+                    "dangling_goal_audit": dangling_goal_audit,
+                    "has_unreviewed_turn_completed": has_unreviewed_turn_completed,
+                    "latest_turn_completed_at": latest_turn_completed_at,
+                    "last_reviewed_turn_completed_at": last_reviewed_turn_completed_at,
+                    "stale_goal_manager_reset": stale_goal_manager_reset,
+                    "due_auto_resume": bool(isinstance(due_auto_resume, dict)),
+                    "should_standard_goal_route": should_standard_goal_route,
+                },
+            )
+            continue
         if (
             unfinished_turn
             or has_actionable_pending
@@ -905,6 +940,108 @@ def manual_compact_claude_session(
         200 if returncode == 0 else 500,
         {"ok": returncode == 0, "service_id": service_id, "session_id": session_id, "event": event},
         make_history_event_entry(event, service_id=service_id),
+    )
+
+
+def manual_compact_gemini_session(
+    *,
+    repo_root: Path,
+    runtime_root: Path,
+    service_id: str,
+    username: str,
+    session_id: str,
+) -> tuple[int, dict[str, Any], dict[str, Any] | None]:
+    provider_session_id = load_gemini_session(
+        runtime_root,
+        service_id=service_id,
+        username=username,
+        session_id=session_id,
+    )
+    if not provider_session_id:
+        return (
+            409,
+            {"error": "gemini_session_not_found", "service_id": service_id, "session_id": session_id},
+            None,
+        )
+    event, _returncode = run_gemini_compaction(
+        repo_root=repo_root,
+        session_id=str(provider_session_id),
+        threshold_left_percent=101,
+        mode="manual",
+    )
+    return (
+        200,
+        {"ok": True, "service_id": service_id, "session_id": str(provider_session_id), "event": event},
+        make_history_event_entry(event, service_id=service_id),
+    )
+
+
+def goal_manager_compact_gemini_session(
+    *,
+    repo_root: Path,
+    runtime_root: Path,
+    service_id: str,
+    username: str,
+    session_id: str,
+) -> tuple[dict[str, Any], int]:
+    provider_session_id = load_gemini_session(
+        runtime_root,
+        service_id=service_id,
+        username=username,
+        session_id=session_id,
+    )
+    if not provider_session_id:
+        return (
+            {
+                "type": "service.goal_manager_compact_failed",
+                "session_id": "",
+                "error": "gemini_session_not_found",
+            },
+            1,
+        )
+    return run_gemini_compaction(
+        repo_root=repo_root,
+        session_id=str(provider_session_id),
+        threshold_left_percent=101,
+        mode="goal_manager",
+    )
+
+
+def maybe_auto_compact_gemini_session(
+    *,
+    runtime_root: Path,
+    manifest: dict[str, Any],
+    service_id: str,
+    process_id: str,
+    log_path: Path,
+    tx_handle: Any,
+    sender_service_id: str,
+    run_id: str,
+    scope_username: str | None,
+    scope_session_id: str | None,
+    session_id: str | None,
+    threshold_left_percent: int,
+) -> None:
+    if not session_id:
+        return
+    repo_root = Path(__file__).resolve().parents[2]
+    event, _returncode = run_gemini_context_check(
+        repo_root=repo_root,
+        session_id=str(session_id),
+        threshold_left_percent=threshold_left_percent,
+    )
+    emit_codex_compaction_event(
+        runtime_root=runtime_root,
+        manifest=manifest,
+        service_id=service_id,
+        process_id=process_id,
+        log_path=log_path,
+        tx_handle=tx_handle,
+        sender_service_id=sender_service_id,
+        run_id=run_id,
+        scope_username=scope_username,
+        scope_session_id=scope_session_id,
+        event=event,
     )
 
 

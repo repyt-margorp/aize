@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "plugin_app_v1.json",
+  "title": "Aize Plugin Launcher App",
+  "type": "object",
+  "required": ["app_id", "launcher"],
+  "properties": {
+    "app_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "launcher": {
+      "type": "object",
+      "properties": {
+        "create_as_child": {
+          "type": "boolean"
+        },
+        "default_label": {
+          "type": "string"
+        },
+        "goal_text": {
+          "type": "string"
+        },
+        "initial_prompt": {
+          "type": "string"
+        },
+        "preferred_provider": {
+          "type": "string",
+          "enum": ["codex", "claude", "gemini"]
+        },
+        "selected_agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_group": {
+          "type": "string",
+          "enum": ["root", "user", "error"]
+        },
+        "session_permissions": {
+          "type": "object"
+        },
+        "auto_select_session": {
+          "type": "boolean"
+        },
+        "auto_send_initial_prompt": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
