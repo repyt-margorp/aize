@@ -25,4 +25,5 @@ Notes:
 - Service modules are auto-discovered from `./plugins/**/services/*/service.json`.
 - App descriptors are auto-discovered from `./plugins/**/apps/*/app.json`.
 - App descriptor shape is documented in `./src/runtime/schemas/plugin_app_v1.json`.
+- Launcher apps may set `"workspace_scope": "app"` when they need a durable app-level workspace across launches.
 - If a service directory is importable from the repo root, its Python module path is derived automatically.

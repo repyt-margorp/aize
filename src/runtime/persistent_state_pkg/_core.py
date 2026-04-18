@@ -278,6 +278,30 @@ def session_agent_files_dir(runtime_root: Path, *, username: str, session_id: st
     return session_dir(runtime_root, username=username, session_id=session_id) / "agent_files"
 
 
+def safe_app_id_for_path(app_id: str) -> str:
+    return str(app_id or "").replace("/", "_").replace("\\", "_").replace("..", "_").strip() or "app"
+
+
+def apps_dir(runtime_root: Path) -> Path:
+    return state_dir(runtime_root) / "apps"
+
+
+def app_user_dir(runtime_root: Path, *, username: str) -> Path:
+    return apps_dir(runtime_root) / normalize_username(username)
+
+
+def app_dir(runtime_root: Path, *, username: str, app_id: str) -> Path:
+    return app_user_dir(runtime_root, username=username) / safe_app_id_for_path(app_id)
+
+
+def app_workspace_dir(runtime_root: Path, *, username: str, app_id: str) -> Path:
+    return app_dir(runtime_root, username=username, app_id=app_id) / "workspace"
+
+
+def app_metadata_path(runtime_root: Path, *, username: str, app_id: str) -> Path:
+    return app_dir(runtime_root, username=username, app_id=app_id) / "app.json"
+
+
 def session_agent_entry_files_dir(
     runtime_root: Path,
     *,
@@ -402,6 +426,38 @@ def read_json_file(path: Path) -> dict[str, Any] | None:
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else None
+
+
+def ensure_app_workspace(
+    runtime_root: Path,
+    *,
+    username: str,
+    app_id: str,
+    display_name: str = "",
+    plugin_id: str = "",
+    session_id: str = "",
+) -> Path:
+    normalized_username = normalize_username(username)
+    normalized_app_id = str(app_id or "").strip()
+    target_dir = app_workspace_dir(runtime_root, username=normalized_username, app_id=normalized_app_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = app_metadata_path(runtime_root, username=normalized_username, app_id=normalized_app_id)
+    current = read_json_file(metadata_path) or {}
+    created_at = str(current.get("created_at") or utc_ts())
+    write_json_file(
+        metadata_path,
+        {
+            "app_id": normalized_app_id,
+            "username": normalized_username,
+            "display_name": str(display_name or normalized_app_id).strip(),
+            "plugin_id": str(plugin_id or "").strip(),
+            "workspace_path": str(target_dir),
+            "created_at": created_at,
+            "updated_at": utc_ts(),
+            "last_session_id": str(session_id or "").strip(),
+        },
+    )
+    return target_dir
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -766,6 +822,11 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("user_response_wait_source_service_id", "")
     session.setdefault("user_response_wait_last_cleared_at", "")
     session.setdefault("user_response_wait_last_timeout_at", "")
+    session.setdefault("launcher_app_id", "")
+    session.setdefault("launcher_display_name", "")
+    session.setdefault("launcher_preferred_provider", "")
+    session.setdefault("launcher_workspace_scope", "none")
+    session.setdefault("launcher_workspace_path", "")
     welcomed_agents = session.get("welcomed_agents")
     if not isinstance(welcomed_agents, list):
         welcomed_agents = []

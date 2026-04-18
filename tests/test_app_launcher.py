@@ -39,6 +39,7 @@ class AppLauncherTests(unittest.TestCase):
                         "preferred_provider": "claude",
                         "selected_agents": ["claude_pool"],
                         "session_group": "user",
+                        "workspace_scope": "app",
                     },
                 }
             )
@@ -61,6 +62,7 @@ class AppLauncherTests(unittest.TestCase):
             app["launcher"]["service_targets"],
             [{"mode": "pool", "provider": "claude", "target": "claude_pool"}],
         )
+        self.assertEqual(app["launcher"]["workspace_scope"], "app")
 
     def test_launch_app_session_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -90,7 +92,44 @@ class AppLauncherTests(unittest.TestCase):
                 stored["launcher_service_targets"],
                 [{"mode": "pool", "provider": "claude", "target": "claude_pool"}],
             )
-            self.assertEqual(launched["launch_plan"]["initial_prompt"], "Start by outlining the research plan.")
+            self.assertEqual(stored["launcher_workspace_scope"], "app")
+            workspace_path = Path(stored["launcher_workspace_path"])
+            self.assertTrue(workspace_path.exists())
+            self.assertTrue(workspace_path.is_dir())
+            self.assertEqual(
+                workspace_path,
+                runtime_root / ".aize-state" / "apps" / "repyt" / "research_launcher" / "workspace",
+            )
+            self.assertEqual(launched["launch_plan"]["workspace_scope"], "app")
+            self.assertEqual(launched["launch_plan"]["workspace_path"], str(workspace_path))
+            self.assertIn(str(workspace_path), launched["launch_plan"]["initial_prompt"])
+            self.assertIn("durable code, scripts, notes, and stock", launched["launch_plan"]["initial_prompt"])
+
+    def test_launch_app_session_reuses_app_workspace_across_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                app = get_launchable_app("research_launcher", default_provider="codex")
+                first = launch_app_session(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=app,
+                )
+                second = launch_app_session(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=app,
+                    label="Second Launch",
+                )
+
+            self.assertEqual(
+                first["launch_plan"]["workspace_path"],
+                second["launch_plan"]["workspace_path"],
+            )
 
 
 class AppLauncherSourceTests(unittest.TestCase):

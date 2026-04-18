@@ -42,6 +42,7 @@ In practice:
 
 - `service.json` defines executable service kinds.
 - `app.json` defines launch surfaces for humans or the HTTP bridge UI.
+- `app.json` may also declare app-level persistence policy such as `"workspace_scope": "app"` for durable app-local files.
 - `spawn_requests` stays the runtime mechanism for creating new session processes.
 - The current minimum `app.json` contract is documented in `./src/runtime/schemas/plugin_app_v1.json`.
 

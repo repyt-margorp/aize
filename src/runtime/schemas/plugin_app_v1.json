@@ -50,6 +50,10 @@
         "session_permissions": {
           "type": "object"
         },
+        "workspace_scope": {
+          "type": "string",
+          "enum": ["none", "app"]
+        },
         "auto_select_session": {
           "type": "boolean"
         },

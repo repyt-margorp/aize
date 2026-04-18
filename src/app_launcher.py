@@ -7,6 +7,7 @@ from runtime.persistent_state import (
     SESSION_GROUP_DEFAULT_PERMISSIONS,
     create_child_conversation_session,
     create_conversation_session,
+    ensure_app_workspace,
     get_session_settings,
     normalize_username,
     update_session_goal,
@@ -17,6 +18,7 @@ from runtime.persistent_state import (
 
 VALID_PROVIDERS = {"codex", "claude", "gemini"}
 POOL_TOKENS = {"codex_pool": "codex", "claude_pool": "claude", "gemini_pool": "gemini"}
+WORKSPACE_SCOPES = {"none", "app"}
 
 
 def _normalize_provider(value: Any, *, default_provider: str) -> str:
@@ -53,6 +55,11 @@ def _service_targets(selected_agents: list[str], *, preferred_provider: str) -> 
     return targets or [{"mode": "pool", "provider": preferred_provider, "target": f"{preferred_provider}_pool"}]
 
 
+def _normalize_workspace_scope(value: Any) -> str:
+    scope = str(value or "").strip().lower()
+    return scope if scope in WORKSPACE_SCOPES else "none"
+
+
 def normalize_app_descriptor(descriptor: dict[str, Any], *, default_provider: str) -> dict[str, Any]:
     app_id = str(descriptor.get("app_id") or "").strip()
     if not app_id:
@@ -87,6 +94,7 @@ def normalize_app_descriptor(descriptor: dict[str, Any], *, default_provider: st
             "service_targets": _service_targets(selected_agents, preferred_provider=preferred_provider),
             "session_group": session_group,
             "session_permissions": session_permissions,
+            "workspace_scope": _normalize_workspace_scope(launcher.get("workspace_scope")),
             "auto_select_session": bool(launcher.get("auto_select_session", True)),
             "auto_send_initial_prompt": bool(launcher.get("auto_send_initial_prompt", bool(initial_prompt))),
         },
@@ -140,6 +148,7 @@ def launch_app_session(
     mode = str(launcher.get("mode") or "create_child_session").strip().lower()
     session_group = str(launcher.get("session_group") or "user").strip().lower() or "user"
     session_permissions = dict(launcher.get("session_permissions") or {})
+    workspace_scope = _normalize_workspace_scope(launcher.get("workspace_scope"))
 
     if mode == "create_session":
         session = create_conversation_session(
@@ -181,6 +190,26 @@ def launch_app_session(
     session_id = str(session.get("session_id") or "").strip()
     if not session_id:
         raise RuntimeError("session_launch_failed")
+    workspace_path = ""
+    if workspace_scope == "app":
+        workspace_path = str(
+            ensure_app_workspace(
+                runtime_root,
+                username=normalized_username,
+                app_id=str(app.get("app_id") or ""),
+                display_name=str(app.get("display_name") or ""),
+                plugin_id=str(app.get("plugin_id") or ""),
+                session_id=session_id,
+            )
+        )
+        workspace_note = (
+            "Persistent app workspace directory: "
+            f"{workspace_path}\n"
+            "Use this directory for durable code, scripts, notes, and stock that should survive across launches of this app."
+        )
+        effective_initial_prompt = (
+            f"{workspace_note}\n\n{effective_initial_prompt}" if effective_initial_prompt else workspace_note
+        )
     update_session_goal_flags(
         runtime_root,
         username=normalized_username,
@@ -202,6 +231,8 @@ def launch_app_session(
         preferred_provider=effective_provider,
         selected_agents=effective_agents,
         service_targets=_service_targets(effective_agents, preferred_provider=effective_provider),
+        workspace_scope=workspace_scope,
+        workspace_path=workspace_path,
     )
     updated_session = get_session_settings(runtime_root, username=normalized_username, session_id=session_id) or session
     return {
@@ -212,6 +243,8 @@ def launch_app_session(
             "selected_agents": effective_agents,
             "service_targets": _service_targets(effective_agents, preferred_provider=effective_provider),
             "initial_prompt": effective_initial_prompt,
+            "workspace_scope": workspace_scope,
+            "workspace_path": workspace_path,
             "auto_send_initial_prompt": bool(launcher.get("auto_send_initial_prompt", bool(effective_initial_prompt))),
         },
     }
