@@ -7,9 +7,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 from http.server import BaseHTTPRequestHandler
-from typing import Any
+from typing import Any, Callable
 
 from app_launcher import get_launchable_app, launch_app_session, list_launchable_apps
 from kernel.auth import bootstrap_root_user, create_user, has_users, issue_auth_context, verify_user_password
@@ -28,6 +29,7 @@ from runtime.persistent_state import (
     clear_session_service_runtime,
     create_child_conversation_session,
     create_session,
+    consume_session_due_auto_resume,
     consume_session_due_user_response_wait,
     delete_session,
     get_session_service,
@@ -58,6 +60,7 @@ from runtime.persistent_state import (
     update_session_selected_agents,
     write_agent_file,
     read_agent_file,
+    release_session_service,
     list_agent_files,
     delete_agent_file,
     get_agent_file_dir_acl,
@@ -65,6 +68,7 @@ from runtime.persistent_state import (
     check_agent_file_acl,
     list_goal_attachments,
     save_goal_attachment,
+    schedule_session_auto_resume,
 )
 from runtime.session_view import (
     build_worker_count_summary,
@@ -84,6 +88,209 @@ DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 HTTP_EVENT_TEXT_LIMIT = 4000
 INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT = 40
+
+
+def _normalize_session_preferred_provider(
+    session_settings: dict[str, Any] | None,
+    *,
+    default_provider: str,
+) -> str:
+    provider = str((session_settings or {}).get("preferred_provider", default_provider)).strip().lower()
+    return provider or default_provider
+
+
+def _resolve_dispatch_service_for_session(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    preferred_provider: str,
+    default_provider: str,
+    current_llm_service_topology: Callable[[], tuple[list[str], list[str], list[str], Any]],
+) -> str:
+    current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
+        current_llm_service_topology()
+    )
+    pool_service_ids = (
+        current_claude_service_pool
+        if preferred_provider == "claude"
+        else (current_gemini_service_pool if preferred_provider == "gemini" else current_codex_service_pool)
+    )
+    available_service_ids = {
+        *current_codex_service_pool,
+        *current_claude_service_pool,
+        *current_gemini_service_pool,
+    }
+    target_service_id = get_session_service(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    )
+    if target_service_id and target_service_id not in available_service_ids:
+        release_session_service(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+        )
+        target_service_id = ""
+    if not target_service_id and pool_service_ids:
+        target_service_id = lease_session_service(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            pool_service_ids=pool_service_ids,
+        )
+    return str(target_service_id or "").strip()
+
+
+def _build_scheduled_auto_resume_xml(
+    *,
+    dispatch_service_id: str,
+    session_id: str,
+) -> str:
+    return "\n".join(
+        [
+            "<aize_restart_resume>",
+            "  <reason>scheduled_resume</reason>",
+            f"  <service_id>{html.escape(dispatch_service_id)}</service_id>",
+            f"  <session_id>{html.escape(session_id)}</session_id>",
+            "  <instruction>Scheduled auto resume time has arrived. Resume the latest goal immediately, continue the concrete work, and do not consume this turn with a status-only acknowledgment or a plan-only reply.</instruction>",
+            "  <history_instruction>Read the session files directly for detailed prior events and pending work instead of relying on inline excerpts.</history_instruction>",
+            "</aize_restart_resume>",
+        ]
+    )
+
+
+def _process_due_auto_resume_session(
+    *,
+    runtime_root: Path,
+    manifest: dict[str, Any],
+    self_service_id: str,
+    process_id: str,
+    log_path: Path,
+    default_provider: str,
+    current_llm_service_topology: Callable[[], tuple[list[str], list[str], list[str], Any]],
+    append_history: Callable[[str, str, dict[str, Any]], None],
+    send_router_control: Callable[[dict[str, Any]], None],
+    username: str,
+    session_id: str,
+) -> dict[str, Any] | None:
+    due_resume = consume_session_due_auto_resume(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    )
+    if not isinstance(due_resume, dict):
+        return None
+    preferred_provider = _normalize_session_preferred_provider(
+        due_resume,
+        default_provider=default_provider,
+    )
+    target_service_id = _resolve_dispatch_service_for_session(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        preferred_provider=preferred_provider,
+        default_provider=default_provider,
+        current_llm_service_topology=current_llm_service_topology,
+    )
+    if not target_service_id:
+        schedule_session_auto_resume(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            reason="scheduled_resume_retry_no_worker",
+            error_text="scheduled auto resume became due but no worker was available",
+            retry_after_seconds=60,
+            mark_completed=True,
+        )
+        write_jsonl(
+            log_path,
+            {
+                "type": "service.auto_resume_due_deferred",
+                "ts": utc_ts(),
+                "service_id": self_service_id,
+                "process_id": process_id,
+                "username": username,
+                "session_id": session_id,
+                "preferred_provider": preferred_provider,
+                "reason": "no_available_worker",
+            },
+        )
+        return None
+
+    append_pending_input(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        entry=make_aize_pending_input(
+            kind="scheduled_resume",
+            role="system",
+            text=_build_scheduled_auto_resume_xml(
+                dispatch_service_id=target_service_id,
+                session_id=session_id,
+            ),
+        ),
+    )
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "event",
+            "ts": utc_ts(),
+            "service_id": self_service_id,
+            "event_type": "service.auto_resume_triggered",
+            "text": "Scheduled auto resume triggered; the latest goal was resumed automatically.",
+            "event": {
+                "type": "service.auto_resume_triggered",
+                "dispatch_service_id": target_service_id,
+                "preferred_provider": preferred_provider,
+            },
+        },
+    )
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "session_input",
+            "kind": "scheduled_resume",
+            "ts": utc_ts(),
+            "service_id": self_service_id,
+            "to": target_service_id,
+            "text": "自動再開時刻に到達したため、最新 Goal を再開する指示を自分のFIFOへ送りました。",
+        },
+    )
+    send_router_control(
+        make_dispatch_pending_message(
+            manifest=manifest,
+            from_service_id=self_service_id,
+            to_service_id=target_service_id,
+            process_id=process_id,
+            run_id=f"auto-resume-{int(time.time())}",
+            username=username,
+            session_id=session_id,
+            auth_context=None,
+            reason="scheduled_auto_resume",
+        )
+    )
+    write_jsonl(
+        log_path,
+        {
+            "type": "service.auto_resume_processed",
+            "ts": utc_ts(),
+            "service_id": self_service_id,
+            "process_id": process_id,
+            "username": username,
+            "session_id": session_id,
+            "dispatch_service_id": target_service_id,
+            "preferred_provider": preferred_provider,
+        },
+    )
+    return {
+        "session": due_resume,
+        "dispatch_service_id": target_service_id,
+        "preferred_provider": preferred_provider,
+    }
 
 
 def _parse_multipart_bytes(raw: bytes, boundary: str) -> list[dict]:
@@ -3149,30 +3356,18 @@ def make_handler(
                 )
                 if not isinstance(due_wait, dict):
                     continue
-                preferred_provider = (
-                    str(due_wait.get("preferred_provider", default_provider)).strip().lower()
-                    or default_provider
+                preferred_provider = _normalize_session_preferred_provider(
+                    due_wait,
+                    default_provider=default_provider,
                 )
-                current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
-                    current_llm_service_topology()
-                )
-                pool_service_ids = (
-                    current_claude_service_pool
-                    if preferred_provider == "claude"
-                    else (current_gemini_service_pool if preferred_provider == "gemini" else current_codex_service_pool)
-                )
-                target_service_id = get_session_service(
-                    runtime_root,
+                target_service_id = _resolve_dispatch_service_for_session(
+                    runtime_root=runtime_root,
                     username=username,
                     session_id=session_id,
+                    preferred_provider=preferred_provider,
+                    default_provider=default_provider,
+                    current_llm_service_topology=current_llm_service_topology,
                 )
-                if not target_service_id and pool_service_ids:
-                    target_service_id = lease_session_service(
-                        runtime_root,
-                        username=username,
-                        session_id=session_id,
-                        pool_service_ids=pool_service_ids,
-                    )
                 append_pending_input(
                     runtime_root,
                     username=username,
@@ -3230,7 +3425,49 @@ def make_handler(
                     },
                 )
 
+    def _auto_resume_watcher() -> None:
+        while not stopped.wait(timeout=3.5):
+            try:
+                sessions = list_all_sessions_with_users(runtime_root)
+            except Exception:
+                continue
+            for talk in sessions:
+                if not isinstance(talk, dict):
+                    continue
+                username = str(talk.get("username") or "").strip()
+                session_id = str(talk.get("session_id") or "").strip()
+                if not username or not session_id:
+                    continue
+                try:
+                    _process_due_auto_resume_session(
+                        runtime_root=runtime_root,
+                        manifest=manifest,
+                        self_service_id=self_service["service_id"],
+                        process_id=process_id,
+                        log_path=log_path,
+                        default_provider=default_provider,
+                        current_llm_service_topology=current_llm_service_topology,
+                        append_history=append_history,
+                        send_router_control=send_router_control,
+                        username=username,
+                        session_id=session_id,
+                    )
+                except Exception as exc:
+                    write_jsonl(
+                        log_path,
+                        {
+                            "type": "service.auto_resume_watcher_failed",
+                            "ts": utc_ts(),
+                            "service_id": self_service["service_id"],
+                            "process_id": process_id,
+                            "username": username,
+                            "session_id": session_id,
+                            "error": repr(exc),
+                        },
+                    )
+
     threading.Thread(target=_overview_cache_warmer, daemon=True).start()
+    threading.Thread(target=_auto_resume_watcher, daemon=True).start()
     threading.Thread(target=_user_response_wait_watcher, daemon=True).start()
 
     return Handler

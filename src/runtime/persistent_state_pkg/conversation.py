@@ -1064,13 +1064,21 @@ def consume_session_due_auto_resume(
             due_at = _parse_utc_ts(talk.get("auto_resume_next_at"))
             if due_at is None or due_at > now:
                 return None
+            target_revision = _active_goal_revision_unlocked(talk)
+            if isinstance(target_revision, dict):
+                target_revision["goal_completed"] = False
+                target_revision["goal_progress_state"] = "in_progress"
+                target_revision["updated_at"] = utc_ts()
             talk["goal_completed"] = False
             talk["goal_progress_state"] = "in_progress"
             talk["auto_resume_last_started_at"] = utc_ts()
             talk["auto_resume_next_at"] = ""
             talk["auto_resume_reason"] = ""
+            _apply_active_goal_snapshot_unlocked(talk)
             talk["updated_at"] = utc_ts()
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+            if isinstance(target_revision, dict):
+                write_goal_dir(runtime_root, username=normalized, session_id=session_id, revision=target_revision)
             return dict(talk)
         return None
 

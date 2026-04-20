@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from io import StringIO
+from typing import Any
 from unittest.mock import patch
 
 
@@ -54,6 +55,7 @@ from runtime.agent_service import (  # noqa: E402
     _extract_user_response_wait_control,
     _should_defer_dispatch_for_completed_goal,
 )
+from runtime.http_handler import _process_due_auto_resume_session  # noqa: E402
 from runtime.ui_history import build_session_ui_history  # noqa: E402
 from runtime.ws_peer_client import _remote_session_entry_to_dispatch  # noqa: E402
 from runtime.persistent_state import (  # noqa: E402
@@ -532,6 +534,109 @@ class GoalManagerCompactTests(unittest.TestCase):
                     {"kind": "goal_feedback"},
                     {"kind": "user_message"},
                 ],
+            )
+        )
+
+    def test_completed_goal_dispatch_is_not_deferred_for_scheduled_resume(self) -> None:
+        self.assertFalse(
+            _should_defer_dispatch_for_completed_goal(
+                session_settings={
+                    "goal_active": True,
+                    "goal_completed": True,
+                    "goal_progress_state": "complete",
+                },
+                pending_inputs=[
+                    {"kind": "goal_feedback"},
+                    {"kind": "scheduled_resume"},
+                ],
+            )
+        )
+
+    def test_process_due_auto_resume_session_dispatches_due_goal(self) -> None:
+        updated = update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Re-open the nightly Meet session.",
+            updated_by_username=TEST_USERNAME,
+            updated_by_type="user",
+            origin_session_id=self.session_id,
+        )
+        assert updated is not None
+        updated = update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            preferred_provider="codex",
+            auto_resume_enabled=True,
+            auto_resume_interval_seconds=86400,
+            goal_completed=True,
+            goal_progress_state="complete",
+        )
+        assert updated is not None
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["auto_resume_next_at"] = "2026-03-20T12:00:00Z"
+        stored["auto_resume_reason"] = "goal_completed_interval"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+
+        sent_messages: list[dict[str, Any]] = []
+
+        def _append_history(username: str, session_id: str, entry: dict[str, Any]) -> None:
+            append_history(
+                self.runtime_root,
+                username=username,
+                session_id=session_id,
+                entry=entry,
+                limit=200,
+            )
+
+        result = _process_due_auto_resume_session(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test"},
+            self_service_id="service-http-001",
+            process_id="proc-http-001",
+            log_path=self.runtime_root / "logs" / "service-http-001.jsonl",
+            default_provider="codex",
+            current_llm_service_topology=lambda: (["service-codex-001"], [], [], {}),
+            append_history=_append_history,
+            send_router_control=sent_messages.append,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        assert result is not None
+        self.assertEqual(result["dispatch_service_id"], "service-codex-001")
+        self.assertEqual(result["preferred_provider"], "codex")
+        self.assertEqual(len(sent_messages), 1)
+        self.assertEqual(sent_messages[0]["to"], "service-codex-001")
+        self.assertEqual(sent_messages[0]["payload"], {"reason": "scheduled_auto_resume"})
+
+        pending_inputs = load_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(pending_inputs[-1]["kind"], "scheduled_resume")
+        self.assertIn("<reason>scheduled_resume</reason>", pending_inputs[-1]["text"])
+
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertFalse(bool(stored["goal_completed"]))
+        self.assertEqual(stored["goal_progress_state"], "in_progress")
+        self.assertEqual(str(stored["auto_resume_next_at"]), "")
+
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        event_types = [str(entry.get("event_type") or "") for entry in history]
+        self.assertIn("service.auto_resume_triggered", event_types)
+        self.assertTrue(
+            any(
+                str(entry.get("direction") or "") == "session_input"
+                and str(entry.get("kind") or "") == "scheduled_resume"
+                for entry in history
             )
         )
 

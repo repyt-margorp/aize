@@ -346,7 +346,7 @@ def _should_defer_dispatch_for_completed_goal(
     if not (goal_active and goal_progress_state == "complete"):
         return False
     for entry in pending_inputs or []:
-        if str((entry or {}).get("kind", "")).strip().lower() in {"user_message", "restart_resume"}:
+        if str((entry or {}).get("kind", "")).strip().lower() in {"user_message", "restart_resume", "scheduled_resume"}:
             return False
     return True
 
@@ -1746,7 +1746,7 @@ def run_agent_service(
                     batch_instruction = (
                         "Respond to the queued talk inputs in order, prioritizing the latest user-visible requirement while preserving relevant pending system context."
                     )
-                    if batch_has_input_kind(pending_inputs, "restart_resume"):
+                    if batch_has_input_kind(pending_inputs, "restart_resume") or batch_has_input_kind(pending_inputs, "scheduled_resume"):
                         batch_instruction += (
                             " If a restart-resume input is present, treat it as an execution-resume directive: continue the interrupted work immediately and do not consume the turn with a status-only acknowledgment."
                         )
@@ -2406,6 +2406,7 @@ def run_agent_service(
                             batch_has_input_kind(incoming_text, "goal_update")
                             or batch_has_input_kind(incoming_text, "goal_feedback")
                             or batch_has_input_kind(incoming_text, "restart_resume")
+                            or batch_has_input_kind(incoming_text, "scheduled_resume")
                         )
                         goal_should_continue = bool(
                             turn_completed_input_present

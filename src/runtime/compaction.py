@@ -591,7 +591,7 @@ def maybe_resume_after_restart(
             runtime_root,
             username=scope_username,
             session_id=scope_session_id,
-            run_id=str(manifest.get("run_id") or ""),
+            run_id=run_id,
             service_id=service_id,
         ):
             write_jsonl(
