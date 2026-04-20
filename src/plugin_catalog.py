@@ -82,15 +82,25 @@ def list_plugin_service_descriptors() -> list[dict]:
     return descriptors
 
 
-def list_plugin_app_descriptors() -> list[dict]:
+def list_plugin_session_template_descriptors() -> list[dict]:
     descriptors: list[dict] = []
     for plugin_dir in list_plugin_dirs():
         plugin_manifest = load_plugin_manifest(plugin_dir)
-        apps_dir = plugin_dir / "apps"
-        if not apps_dir.exists():
-            continue
-        for descriptor_path in sorted(apps_dir.glob("*/app.json")):
-            descriptor = _descriptor_with_defaults(descriptor_path, descriptor_type="app")
-            descriptor.setdefault("plugin_id", plugin_manifest["plugin_id"])
-            descriptors.append(descriptor)
+        descriptor_roots = [
+            plugin_dir / "session-templates",
+            plugin_dir / "apps",
+        ]
+        for descriptors_dir in descriptor_roots:
+            if not descriptors_dir.exists():
+                continue
+            for pattern in ("*/session-template.json", "*/app.json"):
+                for descriptor_path in sorted(descriptors_dir.glob(pattern)):
+                    descriptor = _descriptor_with_defaults(descriptor_path, descriptor_type="app")
+                    descriptor.setdefault("plugin_id", plugin_manifest["plugin_id"])
+                    descriptors.append(descriptor)
     return descriptors
+
+
+def list_plugin_app_descriptors() -> list[dict]:
+    # Backward-compatible alias for older callers.
+    return list_plugin_session_template_descriptors()

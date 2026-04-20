@@ -14,12 +14,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from app_launcher import (
+from session_template import (
     describe_app_schedule,
-    get_launchable_app,
-    launch_app_session,
-    list_launchable_apps,
-    list_registered_app_states,
+    get_launchable_session_template,
+    launch_session_template,
+    list_launchable_session_templates,
+    list_registered_session_template_states,
 )
 from runtime.persistent_state import create_conversation_session, ensure_state, get_session_settings
 
@@ -31,12 +31,12 @@ class AppLauncherTests(unittest.TestCase):
             json.dumps({"plugin_id": self.plugin_dir.name, "display_name": "Launcher Plugin"}) + "\n",
             encoding="utf-8",
         )
-        app_dir = self.plugin_dir / "apps" / "research_launcher"
-        app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.json").write_text(
+        session_template_dir = self.plugin_dir / "apps" / "research_launcher"
+        session_template_dir.mkdir(parents=True, exist_ok=True)
+        (session_template_dir / "session-template.json").write_text(
             json.dumps(
                 {
-                    "app_id": "research_launcher",
+                    "template_id": "research_launcher",
                     "display_name": "Research Launcher",
                     "description": "Spawn a research session",
                     "launcher": {
@@ -65,10 +65,10 @@ class AppLauncherTests(unittest.TestCase):
 
     def test_catalog_returns_launch_plan(self) -> None:
         with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-            apps = list_launchable_apps(default_provider="codex")
-            app = get_launchable_app("research_launcher", default_provider="codex")
+            apps = list_launchable_session_templates(default_provider="codex")
+            app = get_launchable_session_template("research_launcher", default_provider="codex")
 
-        self.assertTrue(any(item["app_id"] == "research_launcher" for item in apps))
+        self.assertTrue(any(item["template_id"] == "research_launcher" for item in apps))
         self.assertEqual(app["launcher"]["preferred_provider"], "claude")
         self.assertEqual(app["launcher"]["selected_agents"], ["claude_pool"])
         self.assertEqual(
@@ -80,14 +80,14 @@ class AppLauncherTests(unittest.TestCase):
         self.assertEqual(app["launcher"]["schedule"]["daily_time"], "05:42")
         self.assertTrue(bool(app["launcher"]["schedule"]["enabled"]))
 
-    def test_launch_app_session_creates_configured_child_session(self) -> None:
+    def test_launch_session_template_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
             with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-                app = get_launchable_app("research_launcher", default_provider="codex")
-                launched = launch_app_session(
+                app = get_launchable_session_template("research_launcher", default_provider="codex")
+                launched = launch_session_template(
                     runtime_root,
                     username="repyt",
                     parent_session_id=str(parent["session_id"]),
@@ -103,7 +103,7 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(stored["goal_text"], "Collect private feature requirements")
             self.assertEqual(stored["preferred_provider"], "claude")
             self.assertEqual(stored["selected_agents"], ["claude_pool"])
-            self.assertEqual(stored["launcher_app_id"], "research_launcher")
+            self.assertEqual(stored["launcher_template_id"], "research_launcher")
             self.assertEqual(
                 stored["launcher_service_targets"],
                 [{"mode": "pool", "provider": "claude", "target": "claude_pool"}],
@@ -120,25 +120,25 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(launched["launch_plan"]["workspace_path"], str(workspace_path))
             self.assertIn(str(workspace_path), launched["launch_plan"]["initial_prompt"])
             self.assertIn("durable code, scripts, notes, and stock", launched["launch_plan"]["initial_prompt"])
-            registered_apps = list_registered_app_states(runtime_root)
-            app_state = next(item for item in registered_apps if item["app_id"] == "research_launcher")
+            registered_apps = list_registered_session_template_states(runtime_root)
+            app_state = next(item for item in registered_apps if item["template_id"] == "research_launcher")
             self.assertEqual(app_state["last_session_id"], str(session["session_id"]))
             self.assertEqual(app_state["last_parent_session_id"], str(parent["session_id"]))
 
-    def test_launch_app_session_reuses_app_workspace_across_sessions(self) -> None:
+    def test_launch_session_template_reuses_app_workspace_across_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
             with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-                app = get_launchable_app("research_launcher", default_provider="codex")
-                first = launch_app_session(
+                app = get_launchable_session_template("research_launcher", default_provider="codex")
+                first = launch_session_template(
                     runtime_root,
                     username="repyt",
                     parent_session_id=str(parent["session_id"]),
                     app=app,
                 )
-                second = launch_app_session(
+                second = launch_session_template(
                     runtime_root,
                     username="repyt",
                     parent_session_id=str(parent["session_id"]),
@@ -157,8 +157,8 @@ class AppLauncherTests(unittest.TestCase):
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
             with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-                app = get_launchable_app("research_launcher", default_provider="codex")
-                launched = launch_app_session(
+                app = get_launchable_session_template("research_launcher", default_provider="codex")
+                launched = launch_session_template(
                     runtime_root,
                     username="repyt",
                     parent_session_id=str(parent["session_id"]),
@@ -166,8 +166,8 @@ class AppLauncherTests(unittest.TestCase):
                 )
 
             now = datetime(2026, 4, 20, 9, 42, tzinfo=UTC)
-            registered_apps = list_registered_app_states(runtime_root)
-            app_state = next(item for item in registered_apps if item["app_id"] == "research_launcher")
+            registered_apps = list_registered_session_template_states(runtime_root)
+            app_state = next(item for item in registered_apps if item["template_id"] == "research_launcher")
             schedule_info = describe_app_schedule(app, app_state=app_state, now=now)
             self.assertTrue(bool(schedule_info["due"]))
             self.assertEqual(schedule_info["scheduled_for_utc"], "2026-04-20T09:42:00Z")
@@ -182,12 +182,12 @@ class AppLauncherSourceTests(unittest.TestCase):
     def test_http_and_ui_sources_expose_launcher_flow(self) -> None:
         http_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
         html_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn('if path == "/apps":', http_source)
-        self.assertIn('if path == "/apps/launch":', http_source)
+        self.assertIn('if path == "/session-templates":', http_source)
+        self.assertIn('if path == "/session-templates/launch":', http_source)
         self.assertIn('"schedule_status": describe_app_schedule(app, app_state=app_state)', http_source)
         self.assertIn('"viewer_username": viewer_username', http_source)
-        self.assertIn("fetch(`/apps?", html_source)
-        self.assertIn("fetch('/apps/launch'", html_source)
+        self.assertIn("fetch(`/session-templates?", html_source)
+        self.assertIn("fetch('/session-templates/launch'", html_source)
         self.assertIn("app-launcher-list", html_source)
         self.assertIn("view-manage", html_source)
         self.assertIn("view-apps", html_source)

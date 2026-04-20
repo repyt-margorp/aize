@@ -278,28 +278,28 @@ def session_agent_files_dir(runtime_root: Path, *, username: str, session_id: st
     return session_dir(runtime_root, username=username, session_id=session_id) / "agent_files"
 
 
-def safe_app_id_for_path(app_id: str) -> str:
-    return str(app_id or "").replace("/", "_").replace("\\", "_").replace("..", "_").strip() or "app"
+def safe_template_id_for_path(template_id: str) -> str:
+    return str(template_id or "").replace("/", "_").replace("\\", "_").replace("..", "_").strip() or "app"
 
 
-def apps_dir(runtime_root: Path) -> Path:
+def session_templates_dir(runtime_root: Path) -> Path:
     return state_dir(runtime_root) / "apps"
 
 
-def app_user_dir(runtime_root: Path, *, username: str) -> Path:
-    return apps_dir(runtime_root) / normalize_username(username)
+def session_template_user_dir(runtime_root: Path, *, username: str) -> Path:
+    return session_templates_dir(runtime_root) / normalize_username(username)
 
 
-def app_dir(runtime_root: Path, *, username: str, app_id: str) -> Path:
-    return app_user_dir(runtime_root, username=username) / safe_app_id_for_path(app_id)
+def session_template_dir(runtime_root: Path, *, username: str, template_id: str) -> Path:
+    return session_template_user_dir(runtime_root, username=username) / safe_template_id_for_path(template_id)
 
 
-def app_workspace_dir(runtime_root: Path, *, username: str, app_id: str) -> Path:
-    return app_dir(runtime_root, username=username, app_id=app_id) / "workspace"
+def session_template_workspace_dir(runtime_root: Path, *, username: str, template_id: str) -> Path:
+    return session_template_dir(runtime_root, username=username, template_id=template_id) / "workspace"
 
 
-def app_metadata_path(runtime_root: Path, *, username: str, app_id: str) -> Path:
-    return app_dir(runtime_root, username=username, app_id=app_id) / "app.json"
+def session_template_metadata_path(runtime_root: Path, *, username: str, template_id: str) -> Path:
+    return session_template_dir(runtime_root, username=username, template_id=template_id) / "app.json"
 
 
 def session_agent_entry_files_dir(
@@ -428,28 +428,28 @@ def read_json_file(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def ensure_app_workspace(
+def ensure_session_template_workspace(
     runtime_root: Path,
     *,
     username: str,
-    app_id: str,
+    template_id: str,
     display_name: str = "",
     plugin_id: str = "",
     session_id: str = "",
 ) -> Path:
     normalized_username = normalize_username(username)
-    normalized_app_id = str(app_id or "").strip()
-    target_dir = app_workspace_dir(runtime_root, username=normalized_username, app_id=normalized_app_id)
+    normalized_template_id = str(template_id or "").strip()
+    target_dir = session_template_workspace_dir(runtime_root, username=normalized_username, template_id=normalized_template_id)
     target_dir.mkdir(parents=True, exist_ok=True)
-    metadata_path = app_metadata_path(runtime_root, username=normalized_username, app_id=normalized_app_id)
+    metadata_path = session_template_metadata_path(runtime_root, username=normalized_username, template_id=normalized_template_id)
     current = read_json_file(metadata_path) or {}
     created_at = str(current.get("created_at") or utc_ts())
     payload = dict(current)
     payload.update(
         {
-            "app_id": normalized_app_id,
+            "template_id": normalized_template_id,
             "username": normalized_username,
-            "display_name": str(display_name or normalized_app_id).strip(),
+            "display_name": str(display_name or normalized_template_id).strip(),
             "plugin_id": str(plugin_id or "").strip(),
             "workspace_path": str(target_dir),
             "created_at": created_at,
@@ -826,7 +826,7 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("user_response_wait_source_service_id", "")
     session.setdefault("user_response_wait_last_cleared_at", "")
     session.setdefault("user_response_wait_last_timeout_at", "")
-    session.setdefault("launcher_app_id", "")
+    session.setdefault("launcher_template_id", "")
     session.setdefault("launcher_display_name", "")
     session.setdefault("launcher_preferred_provider", "")
     session.setdefault("launcher_workspace_scope", "none")

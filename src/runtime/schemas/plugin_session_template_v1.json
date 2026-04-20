@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "plugin_session_template_v1.json",
+  "title": "Aize Plugin Session Template",
+  "type": "object",
+  "required": ["template_id", "launcher"],
+  "properties": {
+    "template_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "launcher": {
+      "type": "object",
+      "properties": {
+        "create_as_child": {
+          "type": "boolean"
+        },
+        "default_label": {
+          "type": "string"
+        },
+        "goal_text": {
+          "type": "string"
+        },
+        "initial_prompt": {
+          "type": "string"
+        },
+        "preferred_provider": {
+          "type": "string",
+          "enum": ["codex", "claude", "gemini"]
+        },
+        "selected_agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_group": {
+          "type": "string",
+          "enum": ["root", "user", "error"]
+        },
+        "session_permissions": {
+          "type": "object"
+        },
+        "workspace_scope": {
+          "type": "string",
+          "enum": ["none", "app"]
+        },
+        "auto_select_session": {
+          "type": "boolean"
+        },
+        "auto_send_initial_prompt": {
+          "type": "boolean"
+        },
+        "schedule": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "enum": ["daily"]
+            },
+            "timezone": {
+              "type": "string"
+            },
+            "daily_time": {
+              "type": "string",
+              "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

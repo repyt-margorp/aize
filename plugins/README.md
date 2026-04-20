@@ -15,7 +15,7 @@ plugins/
           service.json
       apps/
         launcher/
-          app.json
+          session-template.json
 ```
 
 Notes:
@@ -23,7 +23,7 @@ Notes:
 - Private or non-public work should live under `./plugins/private/`; that subtree is gitignored.
 - Each plugin must include a `plugin.json`.
 - Service modules are auto-discovered from `./plugins/**/services/*/service.json`.
-- App descriptors are auto-discovered from `./plugins/**/apps/*/app.json`.
-- App descriptor shape is documented in `./src/runtime/schemas/plugin_app_v1.json`.
-- Launcher apps may set `"workspace_scope": "app"` when they need a durable app-level workspace across launches.
+- Session Template descriptors are auto-discovered from `./plugins/**/session-templates/*/session-template.json`.
+- Session Template descriptor shape is documented in `./src/runtime/schemas/plugin_session_template_v1.json`.
+- Launcher apps may set `"workspace_scope": "app"` when they need a durable template-level workspace across launches.
 - If a service directory is importable from the repo root, its Python module path is derived automatically.

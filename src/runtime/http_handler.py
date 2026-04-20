@@ -13,17 +13,17 @@ from urllib.parse import parse_qs, urlencode
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable
 
-from app_launcher import (
+from session_template import (
     build_scheduled_app_initial_prompt,
     build_scheduled_app_session_label,
     describe_app_schedule,
-    get_launchable_app,
-    get_registered_app_state,
-    launch_app_session,
-    list_launchable_apps,
-    list_registered_app_states,
+    get_launchable_session_template,
+    get_registered_session_template_state,
+    launch_session_template,
+    list_launchable_session_templates,
+    list_registered_session_template_states,
     resolve_app_launch_parent_session_id,
-    update_registered_app_state,
+    update_registered_session_template_state,
 )
 from kernel.auth import bootstrap_root_user, create_user, has_users, issue_auth_context, verify_user_password
 from kernel.auth import auth_context_allows
@@ -371,11 +371,11 @@ def _process_due_scheduled_app_launch(
     app: dict[str, Any],
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    app_id = str(app.get("app_id") or "").strip()
-    if not app_id:
+    template_id = str(app.get("template_id") or "").strip()
+    if not template_id:
         return None
     effective_now = (now or datetime.now(UTC)).astimezone(UTC)
-    app_state = get_registered_app_state(runtime_root, username=username, app_id=app_id)
+    app_state = get_registered_session_template_state(runtime_root, username=username, template_id=template_id)
     if not isinstance(app_state, dict):
         return None
     schedule_info = describe_app_schedule(app, app_state=app_state, now=effective_now)
@@ -383,12 +383,12 @@ def _process_due_scheduled_app_launch(
         return None
 
     def _update_schedule_state(**updates: Any) -> dict[str, Any]:
-        return update_registered_app_state(
+        return update_registered_session_template_state(
             runtime_root,
             username=username,
-            app_id=app_id,
+            template_id=template_id,
             updates={
-                "display_name": str(app.get("display_name") or app_id).strip() or app_id,
+                "display_name": str(app.get("display_name") or template_id).strip() or template_id,
                 "plugin_id": str(app.get("plugin_id") or "").strip(),
                 "schedule_state": {
                     "last_checked_at": utc_ts(),
@@ -418,7 +418,7 @@ def _process_due_scheduled_app_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "app_id": app_id,
+                "template_id": template_id,
                 "error": "parent_session_not_found",
             },
         )
@@ -444,7 +444,7 @@ def _process_due_scheduled_app_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "app_id": app_id,
+                "template_id": template_id,
                 "preferred_provider": preferred_provider,
                 "reason": "no_running_worker",
                 "retry_not_before_at": retry_not_before_at,
@@ -455,7 +455,7 @@ def _process_due_scheduled_app_launch(
     launch_label = build_scheduled_app_session_label(app, schedule_info)
     scheduled_prompt = build_scheduled_app_initial_prompt(app, schedule_info)
     try:
-        launched = launch_app_session(
+        launched = launch_session_template(
             runtime_root,
             username=username,
             parent_session_id=parent_session_id,
@@ -477,7 +477,7 @@ def _process_due_scheduled_app_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "app_id": app_id,
+                "template_id": template_id,
                 "error": str(exc),
             },
         )
@@ -520,7 +520,7 @@ def _process_due_scheduled_app_launch(
             "text": "Launcher app schedule created a fresh session and queued its scheduled instructions.",
             "event": {
                 "type": "service.app_schedule_triggered",
-                "app_id": app_id,
+                "template_id": template_id,
                 "scheduled_for_utc": str(schedule_info.get("scheduled_for_utc") or ""),
                 "dispatch_service_id": target_service_id or "",
             },
@@ -535,7 +535,7 @@ def _process_due_scheduled_app_launch(
             "ts": utc_ts(),
             "service_id": self_service_id,
             "to": target_service_id or "",
-            "text": f"Launcher app schedule for {app_id} created this session and queued the scheduled instructions automatically.",
+            "text": f"Launcher app schedule for {template_id} created this session and queued the scheduled instructions automatically.",
         },
     )
 
@@ -570,7 +570,7 @@ def _process_due_scheduled_app_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "app_id": app_id,
+                "template_id": template_id,
                 "session_id": session_id,
                 "dispatch_service_id": target_service_id,
                 "preferred_provider": preferred_provider,
@@ -594,7 +594,7 @@ def _process_due_scheduled_app_launch(
             "service_id": self_service_id,
             "process_id": process_id,
             "username": username,
-            "app_id": app_id,
+            "template_id": template_id,
             "session_id": session_id,
             "preferred_provider": preferred_provider,
         },
@@ -1240,15 +1240,15 @@ def make_handler(
         return _result
 
     def _app_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
-        apps = list_launchable_apps(default_provider=default_provider)
+        apps = list_launchable_session_templates(default_provider=default_provider)
         registered_states = {
-            str(state.get("app_id") or "").strip(): state
-            for state in list_registered_app_states(runtime_root)
+            str(state.get("template_id") or "").strip(): state
+            for state in list_registered_session_template_states(runtime_root)
             if str(state.get("username") or "").strip() == str(viewer_username or "").strip()
         }
         merged_apps: list[dict[str, Any]] = []
         for app in apps:
-            app_state = registered_states.get(str(app.get("app_id") or "").strip())
+            app_state = registered_states.get(str(app.get("template_id") or "").strip())
             state_payload = {
                 "registered": bool(app_state),
                 "workspace_path": str((app_state or {}).get("workspace_path") or "").strip(),
@@ -1654,7 +1654,7 @@ def make_handler(
                 return self._do_GET_session_goal_state(path, query)
             if path == "/messages":
                 return self._do_GET_messages(path, query)
-            if path == "/apps":
+            if path == "/session-templates":
                 return self._do_GET_apps(path, query)
             if path == "/sessions":
                 return self._do_GET_sessions(path, query)
@@ -2185,7 +2185,7 @@ def make_handler(
                 return self._do_POST_logout(content_type)
             if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
-            if path == "/apps/launch":
+            if path == "/session-templates/launch":
                 return self._do_POST_apps_launch(payload)
             if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
@@ -2428,25 +2428,25 @@ def make_handler(
             context = self._require_user(payload=payload)
             if not context:
                 return
-            app_id = str(payload.get("app_id") or "").strip()
-            if not app_id:
-                self._json(400, {"error": "app_id_required"})
+            template_id = str(payload.get("template_id") or "").strip()
+            if not template_id:
+                self._json(400, {"error": "template_id_required"})
                 return
             parent_session_id = str(payload.get("parent_session_id") or context["session_id"] or "").strip()
             if not parent_session_id:
                 self._json(400, {"error": "parent_session_id_required"})
                 return
             try:
-                app = get_launchable_app(app_id, default_provider=default_provider)
+                app = get_launchable_session_template(template_id, default_provider=default_provider)
             except KeyError:
-                self._json(404, {"error": "app_not_found", "app_id": app_id})
+                self._json(404, {"error": "app_not_found", "template_id": template_id})
                 return
             selected_agents = payload.get("selected_agents")
             if selected_agents is not None and not isinstance(selected_agents, list):
                 self._json(400, {"error": "selected_agents_list_required"})
                 return
             try:
-                launched = launch_app_session(
+                launched = launch_session_template(
                     runtime_root,
                     username=context["username"],
                     parent_session_id=parent_session_id,
@@ -2458,7 +2458,7 @@ def make_handler(
                     selected_agents=selected_agents,
                 )
             except RuntimeError as exc:
-                self._json(400, {"error": str(exc), "app_id": app_id})
+                self._json(400, {"error": str(exc), "template_id": template_id})
                 return
             session = launched.get("session") if isinstance(launched, dict) else {}
             session_id = str((session or {}).get("session_id") or "").strip()
@@ -3811,20 +3811,20 @@ def make_handler(
         while not stopped.wait(timeout=3.5):
             try:
                 apps = {
-                    str(app.get("app_id") or "").strip(): app
-                    for app in list_launchable_apps(default_provider=default_provider)
+                    str(app.get("template_id") or "").strip(): app
+                    for app in list_launchable_session_templates(default_provider=default_provider)
                 }
-                registered_apps = list_registered_app_states(runtime_root)
+                registered_apps = list_registered_session_template_states(runtime_root)
             except Exception:
                 continue
             for app_state in registered_apps:
                 if not isinstance(app_state, dict):
                     continue
                 username = str(app_state.get("username") or "").strip()
-                app_id = str(app_state.get("app_id") or "").strip()
-                if not username or not app_id:
+                template_id = str(app_state.get("template_id") or "").strip()
+                if not username or not template_id:
                     continue
-                app = apps.get(app_id)
+                app = apps.get(template_id)
                 if not isinstance(app, dict) or not bool(app.get("enabled", True)):
                     continue
                 try:
@@ -3850,7 +3850,7 @@ def make_handler(
                             "service_id": self_service["service_id"],
                             "process_id": process_id,
                             "username": username,
-                            "app_id": app_id,
+                            "template_id": template_id,
                             "error": repr(exc),
                         },
                     )

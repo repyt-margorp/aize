@@ -1695,7 +1695,7 @@ def update_session_launcher_profile(
     *,
     username: str,
     session_id: str,
-    launcher_app_id: str,
+    launcher_template_id: str,
     launcher_display_name: str,
     preferred_provider: str,
     selected_agents: list[str],
@@ -1711,7 +1711,7 @@ def update_session_launcher_profile(
         for talk in _conversation_sessions(state).get(normalized, []):
             if isinstance(talk, dict) and str(talk.get("session_id")) == session_id:
                 _ensure_session_defaults_unlocked(talk)
-                talk["launcher_app_id"] = str(launcher_app_id or "").strip()
+                talk["launcher_template_id"] = str(launcher_template_id or "").strip()
                 talk["launcher_display_name"] = str(launcher_display_name or "").strip()
                 talk["launcher_preferred_provider"] = str(preferred_provider or "").strip().lower()
                 talk["launcher_selected_agents"] = [str(agent) for agent in selected_agents if str(agent).strip()]

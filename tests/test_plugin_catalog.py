@@ -49,8 +49,8 @@ class PluginCatalogTests(unittest.TestCase):
         )
         app_dir = self.plugin_dir / "apps" / "launcher"
         app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / "app.json").write_text(
-            json.dumps({"app_id": "launcher", "display_name": "Launcher"}) + "\n",
+        (app_dir / "session-template.json").write_text(
+            json.dumps({"template_id": "launcher", "display_name": "Launcher"}) + "\n",
             encoding="utf-8",
         )
 
@@ -67,7 +67,7 @@ class PluginCatalogTests(unittest.TestCase):
         service = next(item for item in services if item["kind"] == "secret_worker")
         self.assertEqual(service["plugin_id"], self.plugin_dir.name)
         self.assertEqual(service["module"], f"plugins.{self.plugin_dir.name}.services.secret_worker")
-        app = next(item for item in apps if item["app_id"] == "launcher")
+        app = next(item for item in apps if item["template_id"] == "launcher")
         self.assertEqual(app["plugin_id"], self.plugin_dir.name)
 
     def test_service_loader_uses_plugin_module(self) -> None:

@@ -59,7 +59,7 @@ from runtime.agent_service import (  # noqa: E402
 from runtime.http_handler import _process_due_auto_resume_session, _process_due_scheduled_app_launch  # noqa: E402
 from runtime.ui_history import build_session_ui_history  # noqa: E402
 from runtime.ws_peer_client import _remote_session_entry_to_dispatch  # noqa: E402
-from app_launcher import get_registered_app_state, launch_app_session, normalize_app_descriptor  # noqa: E402
+from session_template import get_registered_session_template_state, launch_session_template, normalize_session_template_descriptor  # noqa: E402
 from runtime.persistent_state import (  # noqa: E402
     add_session_child,
     append_history,
@@ -678,9 +678,9 @@ class GoalManagerCompactTests(unittest.TestCase):
 
     def test_process_due_scheduled_app_launch_creates_fresh_session(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
-        app = normalize_app_descriptor(
+        app = normalize_session_template_descriptor(
             {
-                "app_id": "nightly_launcher",
+                "template_id": "nightly_launcher",
                 "display_name": "Nightly Launcher",
                 "launcher": {
                     "default_label": "Nightly Run",
@@ -700,7 +700,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             },
             default_provider="codex",
         )
-        bootstrapped = launch_app_session(
+        bootstrapped = launch_session_template(
             self.runtime_root,
             username=TEST_USERNAME,
             parent_session_id=self.session_id,
@@ -751,7 +751,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(pending_inputs[-1]["kind"], "scheduled_launch")
         self.assertIn("<aize_scheduled_app_launch>", pending_inputs[-1]["text"])
 
-        app_state = get_registered_app_state(self.runtime_root, username=TEST_USERNAME, app_id="nightly_launcher")
+        app_state = get_registered_session_template_state(self.runtime_root, username=TEST_USERNAME, template_id="nightly_launcher")
         assert app_state is not None
         schedule_state = dict(app_state.get("schedule_state") or {})
         self.assertEqual(schedule_state["last_triggered_occurrence_at"], "2026-03-20T12:00:00Z")
@@ -761,9 +761,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("service.app_schedule_triggered", [str(entry.get("event_type") or "") for entry in history])
 
     def test_process_due_scheduled_app_launch_defers_until_worker_running(self) -> None:
-        app = normalize_app_descriptor(
+        app = normalize_session_template_descriptor(
             {
-                "app_id": "nightly_launcher",
+                "template_id": "nightly_launcher",
                 "display_name": "Nightly Launcher",
                 "launcher": {
                     "default_label": "Nightly Run",
@@ -783,7 +783,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             },
             default_provider="codex",
         )
-        bootstrapped = launch_app_session(
+        bootstrapped = launch_session_template(
             self.runtime_root,
             username=TEST_USERNAME,
             parent_session_id=self.session_id,
@@ -820,7 +820,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(sent_messages, [])
-        app_state = get_registered_app_state(self.runtime_root, username=TEST_USERNAME, app_id="nightly_launcher")
+        app_state = get_registered_session_template_state(self.runtime_root, username=TEST_USERNAME, template_id="nightly_launcher")
         assert app_state is not None
         self.assertEqual(str(app_state.get("last_session_id") or ""), bootstrap_session_id)
         schedule_state = dict(app_state.get("schedule_state") or {})
