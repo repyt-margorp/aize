@@ -444,8 +444,8 @@ def ensure_app_workspace(
     metadata_path = app_metadata_path(runtime_root, username=normalized_username, app_id=normalized_app_id)
     current = read_json_file(metadata_path) or {}
     created_at = str(current.get("created_at") or utc_ts())
-    write_json_file(
-        metadata_path,
+    payload = dict(current)
+    payload.update(
         {
             "app_id": normalized_app_id,
             "username": normalized_username,
@@ -455,7 +455,11 @@ def ensure_app_workspace(
             "created_at": created_at,
             "updated_at": utc_ts(),
             "last_session_id": str(session_id or "").strip(),
-        },
+        }
+    )
+    write_json_file(
+        metadata_path,
+        payload,
     )
     return target_dir
 

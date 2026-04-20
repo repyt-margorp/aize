@@ -168,8 +168,16 @@ def build_session_runtime_summary(
     session_id = str(talk.get("session_id") or "")
     preferred_provider = str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
     bound_service_id = str(talk.get("service_id") or "").strip()
+    active_turn = active_agent_turn_state(history_entries)
+    active_service_id = str((active_turn or {}).get("service_id") or "").strip()
+    active_started_ts = str((active_turn or {}).get("started_ts") or "").strip()
+    has_followup_activity = bool(
+        active_started_ts
+        and any(str(entry.get("ts") or "").strip() > active_started_ts for entry in history_entries)
+    )
+    agent_running = bool(active_turn) and has_followup_activity
     visible_worker = worker_slot_badge(
-        bound_service_id,
+        active_service_id if agent_running else bound_service_id,
         codex_service_pool=codex_service_pool,
         claude_service_pool=claude_service_pool,
         gemini_service_pool=gemini_service_pool,
@@ -211,7 +219,7 @@ def build_session_runtime_summary(
         "preferred_provider": preferred_provider,
         "bound_service_id": bound_service_id,
         "worker": visible_worker,
-        "agent_running": False,
+        "agent_running": agent_running,
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
         "goal_manager_provider": goal_manager_provider,
         "goal_manager_worker": goal_manager_worker,

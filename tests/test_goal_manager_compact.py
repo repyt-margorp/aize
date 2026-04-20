@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from io import StringIO
 from typing import Any
@@ -55,9 +56,10 @@ from runtime.agent_service import (  # noqa: E402
     _extract_user_response_wait_control,
     _should_defer_dispatch_for_completed_goal,
 )
-from runtime.http_handler import _process_due_auto_resume_session  # noqa: E402
+from runtime.http_handler import _process_due_auto_resume_session, _process_due_scheduled_app_launch  # noqa: E402
 from runtime.ui_history import build_session_ui_history  # noqa: E402
 from runtime.ws_peer_client import _remote_session_entry_to_dispatch  # noqa: E402
+from app_launcher import get_registered_app_state, launch_app_session, normalize_app_descriptor  # noqa: E402
 from runtime.persistent_state import (  # noqa: E402
     add_session_child,
     append_history,
@@ -639,6 +641,89 @@ class GoalManagerCompactTests(unittest.TestCase):
                 for entry in history
             )
         )
+
+    def test_process_due_scheduled_app_launch_creates_fresh_session(self) -> None:
+        app = normalize_app_descriptor(
+            {
+                "app_id": "nightly_launcher",
+                "display_name": "Nightly Launcher",
+                "launcher": {
+                    "default_label": "Nightly Run",
+                    "goal_text": "Run the nightly task.",
+                    "initial_prompt": "Open the target page and verify it is ready.",
+                    "preferred_provider": "codex",
+                    "selected_agents": ["codex_pool"],
+                    "session_group": "user",
+                    "workspace_scope": "none",
+                    "schedule": {
+                        "enabled": True,
+                        "kind": "daily",
+                        "timezone": "UTC",
+                        "daily_time": "12:00",
+                    },
+                },
+            },
+            default_provider="codex",
+        )
+        bootstrapped = launch_app_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            app=app,
+            label="Bootstrap Launcher",
+        )
+        self.assertTrue(str(bootstrapped["session"]["session_id"]))
+
+        sent_messages: list[dict[str, Any]] = []
+
+        def _append_history(username: str, session_id: str, entry: dict[str, Any]) -> None:
+            append_history(
+                self.runtime_root,
+                username=username,
+                session_id=session_id,
+                entry=entry,
+                limit=200,
+            )
+
+        result = _process_due_scheduled_app_launch(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test"},
+            self_service_id="service-http-001",
+            process_id="proc-http-001",
+            log_path=self.runtime_root / "logs" / "service-http-001.jsonl",
+            default_provider="codex",
+            current_llm_service_topology=lambda: (["service-codex-001"], [], [], {}),
+            append_history=_append_history,
+            send_router_control=sent_messages.append,
+            username=TEST_USERNAME,
+            app=app,
+            now=datetime(2026, 3, 20, 12, 0, tzinfo=UTC),
+        )
+
+        assert result is not None
+        launched_session_id = str(result["session"]["session_id"])
+        self.assertNotEqual(launched_session_id, str(bootstrapped["session"]["session_id"]))
+        self.assertEqual(result["dispatch_service_id"], "service-codex-001")
+        self.assertEqual(len(sent_messages), 1)
+        self.assertEqual(sent_messages[0]["to"], "service-codex-001")
+        self.assertEqual(sent_messages[0]["payload"], {"reason": "scheduled_app_launch"})
+
+        pending_inputs = load_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=launched_session_id,
+        )
+        self.assertEqual(pending_inputs[-1]["kind"], "scheduled_launch")
+        self.assertIn("<aize_scheduled_app_launch>", pending_inputs[-1]["text"])
+
+        app_state = get_registered_app_state(self.runtime_root, username=TEST_USERNAME, app_id="nightly_launcher")
+        assert app_state is not None
+        schedule_state = dict(app_state.get("schedule_state") or {})
+        self.assertEqual(schedule_state["last_triggered_occurrence_at"], "2026-03-20T12:00:00Z")
+        self.assertEqual(schedule_state["last_launched_session_id"], launched_session_id)
+
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=launched_session_id)
+        self.assertIn("service.app_schedule_triggered", [str(entry.get("event_type") or "") for entry in history])
 
     def test_build_prompt_mentions_user_response_wait_control(self) -> None:
         prompt = build_prompt(

@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -13,7 +14,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from app_launcher import get_launchable_app, launch_app_session, list_launchable_apps
+from app_launcher import (
+    describe_app_schedule,
+    get_launchable_app,
+    launch_app_session,
+    list_launchable_apps,
+    list_registered_app_states,
+)
 from runtime.persistent_state import create_conversation_session, ensure_state, get_session_settings
 
 
@@ -40,6 +47,12 @@ class AppLauncherTests(unittest.TestCase):
                         "selected_agents": ["claude_pool"],
                         "session_group": "user",
                         "workspace_scope": "app",
+                        "schedule": {
+                            "enabled": True,
+                            "kind": "daily",
+                            "timezone": "America/New_York",
+                            "daily_time": "05:42",
+                        },
                     },
                 }
             )
@@ -63,6 +76,9 @@ class AppLauncherTests(unittest.TestCase):
             [{"mode": "pool", "provider": "claude", "target": "claude_pool"}],
         )
         self.assertEqual(app["launcher"]["workspace_scope"], "app")
+        self.assertEqual(app["launcher"]["schedule"]["timezone"], "America/New_York")
+        self.assertEqual(app["launcher"]["schedule"]["daily_time"], "05:42")
+        self.assertTrue(bool(app["launcher"]["schedule"]["enabled"]))
 
     def test_launch_app_session_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -104,6 +120,10 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(launched["launch_plan"]["workspace_path"], str(workspace_path))
             self.assertIn(str(workspace_path), launched["launch_plan"]["initial_prompt"])
             self.assertIn("durable code, scripts, notes, and stock", launched["launch_plan"]["initial_prompt"])
+            registered_apps = list_registered_app_states(runtime_root)
+            app_state = next(item for item in registered_apps if item["app_id"] == "research_launcher")
+            self.assertEqual(app_state["last_session_id"], str(session["session_id"]))
+            self.assertEqual(app_state["last_parent_session_id"], str(parent["session_id"]))
 
     def test_launch_app_session_reuses_app_workspace_across_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -130,6 +150,32 @@ class AppLauncherTests(unittest.TestCase):
                 first["launch_plan"]["workspace_path"],
                 second["launch_plan"]["workspace_path"],
             )
+
+    def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                app = get_launchable_app("research_launcher", default_provider="codex")
+                launched = launch_app_session(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=app,
+                )
+
+            now = datetime(2026, 4, 20, 9, 42, tzinfo=UTC)
+            registered_apps = list_registered_app_states(runtime_root)
+            app_state = next(item for item in registered_apps if item["app_id"] == "research_launcher")
+            schedule_info = describe_app_schedule(app, app_state=app_state, now=now)
+            self.assertTrue(bool(schedule_info["due"]))
+            self.assertEqual(schedule_info["scheduled_for_utc"], "2026-04-20T09:42:00Z")
+            self.assertEqual(schedule_info["next_due_at"], "2026-04-21T09:42:00Z")
+
+            app_state["schedule_state"] = {"last_triggered_occurrence_at": "2026-04-20T09:42:00Z"}
+            schedule_info = describe_app_schedule(app, app_state=app_state, now=now)
+            self.assertFalse(bool(schedule_info["due"]))
 
 
 class AppLauncherSourceTests(unittest.TestCase):

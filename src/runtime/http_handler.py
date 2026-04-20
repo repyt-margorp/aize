@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import html
 import json
 import queue
@@ -12,7 +13,18 @@ from urllib.parse import parse_qs, urlencode
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable
 
-from app_launcher import get_launchable_app, launch_app_session, list_launchable_apps
+from app_launcher import (
+    build_scheduled_app_initial_prompt,
+    build_scheduled_app_session_label,
+    describe_app_schedule,
+    get_launchable_app,
+    get_registered_app_state,
+    launch_app_session,
+    list_launchable_apps,
+    list_registered_app_states,
+    resolve_app_launch_parent_session_id,
+    update_registered_app_state,
+)
 from kernel.auth import bootstrap_root_user, create_user, has_users, issue_auth_context, verify_user_password
 from kernel.auth import auth_context_allows
 from kernel.lifecycle import load_lifecycle_state
@@ -290,6 +302,230 @@ def _process_due_auto_resume_session(
         "session": due_resume,
         "dispatch_service_id": target_service_id,
         "preferred_provider": preferred_provider,
+    }
+
+
+def _process_due_scheduled_app_launch(
+    *,
+    runtime_root: Path,
+    manifest: dict[str, Any],
+    self_service_id: str,
+    process_id: str,
+    log_path: Path,
+    default_provider: str,
+    current_llm_service_topology: Callable[[], tuple[list[str], list[str], list[str], Any]],
+    append_history: Callable[[str, str, dict[str, Any]], None],
+    send_router_control: Callable[[dict[str, Any]], None],
+    username: str,
+    app: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    app_id = str(app.get("app_id") or "").strip()
+    if not app_id:
+        return None
+    effective_now = (now or datetime.now(UTC)).astimezone(UTC)
+    app_state = get_registered_app_state(runtime_root, username=username, app_id=app_id)
+    if not isinstance(app_state, dict):
+        return None
+    schedule_info = describe_app_schedule(app, app_state=app_state, now=effective_now)
+    if not bool(schedule_info.get("due")):
+        return None
+
+    def _update_schedule_state(**updates: Any) -> dict[str, Any]:
+        return update_registered_app_state(
+            runtime_root,
+            username=username,
+            app_id=app_id,
+            updates={
+                "display_name": str(app.get("display_name") or app_id).strip() or app_id,
+                "plugin_id": str(app.get("plugin_id") or "").strip(),
+                "schedule_state": {
+                    "last_checked_at": utc_ts(),
+                    "last_due_at": str(schedule_info.get("scheduled_for_utc") or "").strip(),
+                    "next_due_at": str(schedule_info.get("next_due_at") or "").strip(),
+                    **updates,
+                },
+            },
+        )
+
+    parent_session_id = resolve_app_launch_parent_session_id(
+        runtime_root,
+        username=username,
+        app_state=app_state,
+    )
+    if not parent_session_id:
+        retry_not_before_at = (effective_now + timedelta(seconds=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        _update_schedule_state(
+            last_error="scheduled app launch could not find a parent session",
+            retry_not_before_at=retry_not_before_at,
+        )
+        write_jsonl(
+            log_path,
+            {
+                "type": "service.app_schedule_launch_failed",
+                "ts": utc_ts(),
+                "service_id": self_service_id,
+                "process_id": process_id,
+                "username": username,
+                "app_id": app_id,
+                "error": "parent_session_not_found",
+            },
+        )
+        return None
+
+    launch_label = build_scheduled_app_session_label(app, schedule_info)
+    scheduled_prompt = build_scheduled_app_initial_prompt(app, schedule_info)
+    try:
+        launched = launch_app_session(
+            runtime_root,
+            username=username,
+            parent_session_id=parent_session_id,
+            app=app,
+            label=launch_label,
+            initial_prompt=scheduled_prompt,
+        )
+    except RuntimeError as exc:
+        retry_not_before_at = (effective_now + timedelta(seconds=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        _update_schedule_state(
+            last_error=str(exc),
+            retry_not_before_at=retry_not_before_at,
+        )
+        write_jsonl(
+            log_path,
+            {
+                "type": "service.app_schedule_launch_failed",
+                "ts": utc_ts(),
+                "service_id": self_service_id,
+                "process_id": process_id,
+                "username": username,
+                "app_id": app_id,
+                "error": str(exc),
+            },
+        )
+        return None
+
+    session = launched.get("session") if isinstance(launched, dict) else {}
+    launch_plan = launched.get("launch_plan") if isinstance(launched, dict) else {}
+    session_id = str((session or {}).get("session_id") or "").strip()
+    if not session_id:
+        return None
+
+    scheduled_input_text = str((launch_plan or {}).get("initial_prompt") or scheduled_prompt).strip()
+    append_pending_input(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        entry=make_aize_pending_input(
+            kind="scheduled_launch",
+            role="system",
+            text=scheduled_input_text,
+        ),
+    )
+    preferred_provider = str((launch_plan or {}).get("preferred_provider") or ((app.get("launcher") or {}).get("preferred_provider") or default_provider)).strip().lower() or default_provider
+    target_service_id = _resolve_dispatch_service_for_session(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        preferred_provider=preferred_provider,
+        default_provider=default_provider,
+        current_llm_service_topology=current_llm_service_topology,
+    )
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "event",
+            "ts": utc_ts(),
+            "service_id": self_service_id,
+            "event_type": "service.app_schedule_triggered",
+            "text": "Launcher app schedule created a fresh session and queued its scheduled instructions.",
+            "event": {
+                "type": "service.app_schedule_triggered",
+                "app_id": app_id,
+                "scheduled_for_utc": str(schedule_info.get("scheduled_for_utc") or ""),
+                "dispatch_service_id": target_service_id or "",
+            },
+        },
+    )
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "session_input",
+            "kind": "scheduled_launch",
+            "ts": utc_ts(),
+            "service_id": self_service_id,
+            "to": target_service_id or "",
+            "text": f"Launcher app schedule for {app_id} created this session and queued the scheduled instructions automatically.",
+        },
+    )
+
+    schedule_state_updates: dict[str, Any] = {
+        "last_triggered_occurrence_at": str(schedule_info.get("scheduled_for_utc") or "").strip(),
+        "last_launched_at": utc_ts(),
+        "last_launched_session_id": session_id,
+        "last_launched_label": launch_label,
+        "last_error": "",
+        "retry_not_before_at": "",
+    }
+    if isinstance(target_service_id, str) and target_service_id:
+        send_router_control(
+            make_dispatch_pending_message(
+                manifest=manifest,
+                from_service_id=self_service_id,
+                to_service_id=target_service_id,
+                process_id=process_id,
+                run_id=f"app-schedule-{int(time.time())}",
+                username=username,
+                session_id=session_id,
+                auth_context=None,
+                reason="scheduled_app_launch",
+            )
+        )
+        _update_schedule_state(**schedule_state_updates)
+        write_jsonl(
+            log_path,
+            {
+                "type": "service.app_schedule_processed",
+                "ts": utc_ts(),
+                "service_id": self_service_id,
+                "process_id": process_id,
+                "username": username,
+                "app_id": app_id,
+                "session_id": session_id,
+                "dispatch_service_id": target_service_id,
+                "preferred_provider": preferred_provider,
+            },
+        )
+        return {
+            "app": app,
+            "session": session,
+            "dispatch_service_id": target_service_id,
+            "preferred_provider": preferred_provider,
+            "schedule": schedule_info,
+        }
+
+    schedule_state_updates["last_error"] = "scheduled app session was created but no worker was available"
+    _update_schedule_state(**schedule_state_updates)
+    write_jsonl(
+        log_path,
+        {
+            "type": "service.app_schedule_created_without_worker",
+            "ts": utc_ts(),
+            "service_id": self_service_id,
+            "process_id": process_id,
+            "username": username,
+            "app_id": app_id,
+            "session_id": session_id,
+            "preferred_provider": preferred_provider,
+        },
+    )
+    return {
+        "app": app,
+        "session": session,
+        "dispatch_service_id": "",
+        "preferred_provider": preferred_provider,
+        "schedule": schedule_info,
     }
 
 
@@ -3466,7 +3702,56 @@ def make_handler(
                         },
                     )
 
+    def _app_schedule_watcher() -> None:
+        while not stopped.wait(timeout=3.5):
+            try:
+                apps = {
+                    str(app.get("app_id") or "").strip(): app
+                    for app in list_launchable_apps(default_provider=default_provider)
+                }
+                registered_apps = list_registered_app_states(runtime_root)
+            except Exception:
+                continue
+            for app_state in registered_apps:
+                if not isinstance(app_state, dict):
+                    continue
+                username = str(app_state.get("username") or "").strip()
+                app_id = str(app_state.get("app_id") or "").strip()
+                if not username or not app_id:
+                    continue
+                app = apps.get(app_id)
+                if not isinstance(app, dict) or not bool(app.get("enabled", True)):
+                    continue
+                try:
+                    _process_due_scheduled_app_launch(
+                        runtime_root=runtime_root,
+                        manifest=manifest,
+                        self_service_id=self_service["service_id"],
+                        process_id=process_id,
+                        log_path=log_path,
+                        default_provider=default_provider,
+                        current_llm_service_topology=current_llm_service_topology,
+                        append_history=append_history,
+                        send_router_control=send_router_control,
+                        username=username,
+                        app=app,
+                    )
+                except Exception as exc:
+                    write_jsonl(
+                        log_path,
+                        {
+                            "type": "service.app_schedule_watcher_failed",
+                            "ts": utc_ts(),
+                            "service_id": self_service["service_id"],
+                            "process_id": process_id,
+                            "username": username,
+                            "app_id": app_id,
+                            "error": repr(exc),
+                        },
+                    )
+
     threading.Thread(target=_overview_cache_warmer, daemon=True).start()
+    threading.Thread(target=_app_schedule_watcher, daemon=True).start()
     threading.Thread(target=_auto_resume_watcher, daemon=True).start()
     threading.Thread(target=_user_response_wait_watcher, daemon=True).start()
 
