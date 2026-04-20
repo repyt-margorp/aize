@@ -111,6 +111,51 @@ def _normalize_session_preferred_provider(
     return provider or default_provider
 
 
+def _running_service_ids(
+    runtime_root: Path,
+    *,
+    candidate_service_ids: list[str] | set[str] | tuple[str, ...],
+) -> list[str]:
+    lifecycle_processes = load_lifecycle_state(runtime_root).get("processes", {})
+    running: list[str] = []
+    for service_id in candidate_service_ids:
+        normalized_service_id = str(service_id or "").strip()
+        if not normalized_service_id:
+            continue
+        try:
+            service_record = get_service_record(runtime_root, normalized_service_id)
+        except KeyError:
+            continue
+        process_id = str(service_record.get("current_process_id") or "").strip()
+        if not process_id:
+            continue
+        process_record = lifecycle_processes.get(process_id)
+        if not isinstance(process_record, dict):
+            continue
+        service_status = str(service_record.get("status") or "").strip().lower()
+        process_status = str(process_record.get("status") or "").strip().lower()
+        if service_status == "running" and process_status == "running":
+            running.append(normalized_service_id)
+    return running
+
+
+def _running_provider_service_pool(
+    runtime_root: Path,
+    *,
+    preferred_provider: str,
+    current_llm_service_topology: Callable[[], tuple[list[str], list[str], list[str], Any]],
+) -> list[str]:
+    current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
+        current_llm_service_topology()
+    )
+    pool_service_ids = (
+        current_claude_service_pool
+        if preferred_provider == "claude"
+        else (current_gemini_service_pool if preferred_provider == "gemini" else current_codex_service_pool)
+    )
+    return _running_service_ids(runtime_root, candidate_service_ids=pool_service_ids)
+
+
 def _resolve_dispatch_service_for_session(
     *,
     runtime_root: Path,
@@ -123,16 +168,22 @@ def _resolve_dispatch_service_for_session(
     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
         current_llm_service_topology()
     )
-    pool_service_ids = (
+    requested_pool_service_ids = (
         current_claude_service_pool
         if preferred_provider == "claude"
         else (current_gemini_service_pool if preferred_provider == "gemini" else current_codex_service_pool)
     )
-    available_service_ids = {
-        *current_codex_service_pool,
-        *current_claude_service_pool,
-        *current_gemini_service_pool,
-    }
+    available_service_ids = set(
+        _running_service_ids(
+            runtime_root,
+            candidate_service_ids={
+                *current_codex_service_pool,
+                *current_claude_service_pool,
+                *current_gemini_service_pool,
+            },
+        )
+    )
+    pool_service_ids = [service_id for service_id in requested_pool_service_ids if service_id in available_service_ids]
     target_service_id = get_session_service(
         runtime_root,
         username=username,
@@ -373,6 +424,34 @@ def _process_due_scheduled_app_launch(
         )
         return None
 
+    preferred_provider = str(((app.get("launcher") or {}).get("preferred_provider") or default_provider)).strip().lower() or default_provider
+    running_pool_service_ids = _running_provider_service_pool(
+        runtime_root,
+        preferred_provider=preferred_provider,
+        current_llm_service_topology=current_llm_service_topology,
+    )
+    if not running_pool_service_ids:
+        retry_not_before_at = (effective_now + timedelta(seconds=15)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        _update_schedule_state(
+            last_error=f"scheduled app launch for provider {preferred_provider} became due before any running worker was ready",
+            retry_not_before_at=retry_not_before_at,
+        )
+        write_jsonl(
+            log_path,
+            {
+                "type": "service.app_schedule_due_deferred",
+                "ts": utc_ts(),
+                "service_id": self_service_id,
+                "process_id": process_id,
+                "username": username,
+                "app_id": app_id,
+                "preferred_provider": preferred_provider,
+                "reason": "no_running_worker",
+                "retry_not_before_at": retry_not_before_at,
+            },
+        )
+        return None
+
     launch_label = build_scheduled_app_session_label(app, schedule_info)
     scheduled_prompt = build_scheduled_app_initial_prompt(app, schedule_info)
     try:
@@ -421,15 +500,15 @@ def _process_due_scheduled_app_launch(
             text=scheduled_input_text,
         ),
     )
-    preferred_provider = str((launch_plan or {}).get("preferred_provider") or ((app.get("launcher") or {}).get("preferred_provider") or default_provider)).strip().lower() or default_provider
-    target_service_id = _resolve_dispatch_service_for_session(
-        runtime_root=runtime_root,
+    preferred_provider = str((launch_plan or {}).get("preferred_provider") or preferred_provider).strip().lower() or default_provider
+    target_service_id = lease_session_service(
+        runtime_root,
         username=username,
         session_id=session_id,
-        preferred_provider=preferred_provider,
-        default_provider=default_provider,
-        current_llm_service_topology=current_llm_service_topology,
+        pool_service_ids=running_pool_service_ids,
     )
+    if not target_service_id:
+        target_service_id = running_pool_service_ids[0]
     append_history(
         username,
         session_id,
