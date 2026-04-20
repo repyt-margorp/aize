@@ -184,9 +184,15 @@ class AppLauncherSourceTests(unittest.TestCase):
         html_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
         self.assertIn('if path == "/apps":', http_source)
         self.assertIn('if path == "/apps/launch":', http_source)
+        self.assertIn('"schedule_status": describe_app_schedule(app, app_state=app_state)', http_source)
+        self.assertIn('"viewer_username": viewer_username', http_source)
         self.assertIn("fetch(`/apps?", html_source)
         self.assertIn("fetch('/apps/launch'", html_source)
         self.assertIn("app-launcher-list", html_source)
+        self.assertIn("view-manage", html_source)
+        self.assertIn("view-apps", html_source)
+        self.assertIn("apps-pane", html_source)
+        self.assertIn("app-launcher-open-last-session", html_source)
 
 
 if __name__ == "__main__":

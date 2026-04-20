@@ -1239,10 +1239,34 @@ def make_handler(
             _ov_cache_state[2] = _cache_key
         return _result
 
-    def _app_catalog_payload() -> dict[str, Any]:
+    def _app_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
         apps = list_launchable_apps(default_provider=default_provider)
+        registered_states = {
+            str(state.get("app_id") or "").strip(): state
+            for state in list_registered_app_states(runtime_root)
+            if str(state.get("username") or "").strip() == str(viewer_username or "").strip()
+        }
+        merged_apps: list[dict[str, Any]] = []
+        for app in apps:
+            app_state = registered_states.get(str(app.get("app_id") or "").strip())
+            state_payload = {
+                "registered": bool(app_state),
+                "workspace_path": str((app_state or {}).get("workspace_path") or "").strip(),
+                "last_session_id": str((app_state or {}).get("last_session_id") or "").strip(),
+                "last_parent_session_id": str((app_state or {}).get("last_parent_session_id") or "").strip(),
+                "created_at": str((app_state or {}).get("created_at") or "").strip(),
+                "updated_at": str((app_state or {}).get("updated_at") or "").strip(),
+                "schedule_state": dict((app_state or {}).get("schedule_state") or {}),
+            }
+            merged_apps.append(
+                {
+                    **app,
+                    "state": state_payload,
+                    "schedule_status": describe_app_schedule(app, app_state=app_state),
+                }
+            )
         return {
-            "apps": apps,
+            "apps": merged_apps,
             "default_provider": default_provider,
             "ts": utc_ts(),
         }
@@ -2041,11 +2065,13 @@ def make_handler(
             context = self._require_user(query=query)
             if not context:
                 return
+            viewer_username = str(context.get("viewer_username") or context["username"])
             self._json(
                 200,
                 {
-                    **_app_catalog_payload(),
+                    **_app_catalog_payload(viewer_username=viewer_username),
                     "username": context["username"],
+                    "viewer_username": viewer_username,
                     "active_session_id": context["session_id"],
                 },
             )

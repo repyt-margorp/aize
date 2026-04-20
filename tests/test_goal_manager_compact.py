@@ -3798,12 +3798,16 @@ exit 1
         self.assertIn("worker_service_id", source)
         self.assertIn("goal_worker_service_id", source)
 
-    def test_httpbridge_session_panels_include_sessions_talk_toggle(self) -> None:
+    def test_httpbridge_session_panels_include_manage_sessions_and_apps_views(self) -> None:
         source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
+        self.assertIn("id='view-manage'", source)
         self.assertIn("id='view-session-map'", source)
-        self.assertIn("viewSessionMapButton.textContent = sessionMapOpen ? 'Talk' : 'Sessions';", source)
+        self.assertIn("id='view-apps'", source)
+        self.assertIn("viewManageButton.onclick = (event) => { event.preventDefault(); openManagePane(); };", source)
+        self.assertIn("viewSessionMapButton.textContent = 'Sessions';", source)
         self.assertIn("viewSessionMapButton.setAttribute('aria-pressed', sessionMapOpen ? 'true' : 'false');", source)
         self.assertIn("viewSessionMapButton.onclick = (event) => { event.preventDefault(); toggleSessionMap(); };", source)
+        self.assertIn("viewAppsButton.onclick = (event) => { event.preventDefault(); if (appsPaneOpen) openManagePane(); else openAppsPane(); };", source)
 
     def test_httpbridge_session_title_rename_defers_during_ime_composition(self) -> None:
         source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
@@ -3818,7 +3822,7 @@ exit 1
         handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
         goal_persist_source = (SRC / "runtime" / "goal_persist.py").read_text(encoding="utf-8")
         self.assertIn("const sessionUsesMapOnlyUI = () => String(sessionUiMode || 'standard').trim().toLowerCase() === 'map_only';", renderer_source)
-        self.assertIn("viewSessionMapButton.classList.toggle('is-hidden', mapOnly || accountRegisterOpen);", renderer_source)
+        self.assertIn("viewManageButton.classList.toggle('is-hidden', mapOnly || accountRegisterOpen);", renderer_source)
         self.assertIn("const nextOpen = sessionUsesMapOnlyUI() ? true : Boolean(open);", renderer_source)
         self.assertIn("initial_session_map_open = bool(initial_session_map_open or initial_session_ui_mode == \"map_only\")", handler_source)
         self.assertIn('"session_ui_mode": session_ui_mode(talk),', goal_persist_source)
