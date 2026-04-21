@@ -182,6 +182,16 @@ from runtime.ws_peer_client import start_ws_peer_clients
 DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 
+
+def _resolve_bind_specs(requested_host: str) -> list[tuple[str, int]]:
+    # Prefer an IPv4-only wildcard for the default host. The previous
+    # implicit IPv6 listener could hang during TLS handshakes on ::1 and on
+    # AAAA-resolved public hostnames, which broke localhost/browser access.
+    if requested_host == "0.0.0.0":
+        return [("0.0.0.0", socket.AF_INET)]
+    family = socket.AF_INET6 if ":" in requested_host else socket.AF_INET
+    return [(requested_host, family)]
+
 # Source-compat snippets for HTTPBridge UI tests.
 # The concrete renderer lives in runtime.html_renderer, but these pinned excerpts
 # are kept here so the adapter source still advertises the expected UI contract.
@@ -1301,19 +1311,11 @@ def run_http_service(
 
         return FamilyThreadingHTTPServer((bind_host, port), Handler)
 
+    bind_specs = _resolve_bind_specs(host)
     bind_hosts: list[str] = []
-    if host == "0.0.0.0":
-        servers.append(_build_server("0.0.0.0", family=socket.AF_INET))
-        bind_hosts.append("0.0.0.0")
-        try:
-            servers.append(_build_server("::", family=socket.AF_INET6))
-            bind_hosts.append("::")
-        except OSError:
-            pass
-    else:
-        family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        servers.append(_build_server(host, family=family))
-        bind_hosts.append(host)
+    for bind_host, family in bind_specs:
+        servers.append(_build_server(bind_host, family=family))
+        bind_hosts.append(bind_host)
 
     if tls_enabled:
         if not tls_cert.exists() or not tls_key.exists():
