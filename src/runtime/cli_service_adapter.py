@@ -320,6 +320,8 @@ def run_http_service(
             tls_hosts = []
     else:
         tls_hosts = [part.strip() for part in _tls_hosts_raw.split(",") if part.strip()]
+    _tls_auto_hosts_raw = str(os.environ.get("AIZE_TLS_AUTO_HOSTS", str(config.get("tls_auto_hosts", "true")))).strip()
+    tls_auto_hosts = _tls_auto_hosts_raw.lower() not in ("0", "false", "no", "off")
     default_target = str(config.get("default_target", "service-codex-001"))
     default_provider = str(config.get("default_provider", "codex")).strip().lower() or "codex"
     history_limit = int(config.get("history_limit", 500))
@@ -1318,9 +1320,17 @@ def run_http_service(
         bind_hosts.append(bind_host)
 
     if tls_enabled:
-        if not tls_cert.exists() or not tls_key.exists():
-            from tls.gen_self_signed_cert import generate_self_signed_cert
-            generate_self_signed_cert(tls_cert, tls_key, cn=tls_cn, extra_hosts=tls_hosts)
+        from tls.gen_self_signed_cert import (
+            certificate_needs_regeneration,
+            discover_local_tls_hosts,
+            generate_self_signed_cert,
+        )
+
+        effective_tls_hosts = list(tls_hosts)
+        if tls_auto_hosts:
+            effective_tls_hosts.extend(discover_local_tls_hosts(bind_hosts=bind_hosts))
+        if certificate_needs_regeneration(tls_cert, tls_key, required_hosts=effective_tls_hosts):
+            generate_self_signed_cert(tls_cert, tls_key, cn=tls_cn, extra_hosts=effective_tls_hosts)
         tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_ctx.load_cert_chain(certfile=str(tls_cert), keyfile=str(tls_key))
         for server in servers:

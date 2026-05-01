@@ -39,8 +39,8 @@ Passwords are never passed as command-line arguments and do not appear in proces
 
 ## HTTPS / TLS Setup
 
-The HTTP mesh runs on **HTTPS by default** using a self-signed certificate (オレオレ認証).
-Cert generation is handled automatically on first start, but can also be run manually.
+The HTTP mesh runs on **HTTPS by default** using a self-signed certificate (オレオレ認証)
+for the Web UI. Cert generation is handled automatically on start, but can also be run manually.
 
 ### Certificate location
 
@@ -65,12 +65,16 @@ Optional flags:
 |---|---|---|
 | `--cert PATH` | `$AIZE_RUNTIME_ROOT/tls/server.crt` | Output certificate path |
 | `--key PATH` | `$AIZE_RUNTIME_ROOT/tls/server.key` | Output private key path |
-| `--days N` | `3650` | Certificate validity in days |
+| `--days N` | `397` | Certificate validity in days, capped at 397 for browser compatibility |
 | `--cn NAME` | `localhost` | Common Name (CN) field |
+| `--no-auto-hosts` | unset | Do not add local interface IPv4/IPv6 addresses and host names to the SAN |
+| `--hosts HOST...` | auto-discovered local hosts | Additional DNS names or IP addresses to add to the SAN |
 
-The script adds a Subject Alternative Name (SAN) covering `DNS:localhost` and `IP:127.0.0.1`
-so the cert is accepted by Python's `ssl` module and modern browsers.
-If the cert/key are absent at startup the adapter generates them automatically.
+The script adds a Subject Alternative Name (SAN) covering `DNS:localhost`, `IP:127.0.0.1`,
+local host names, and usable local interface IPv4/IPv6 addresses. This lets the same Web UI
+certificate work for loopback, LAN access, and direct IPv6 access when the browser permits
+self-signed certificates. If the cert/key are absent, too long-lived, or missing required SANs
+at startup, the adapter regenerates them automatically.
 
 ### Implementation
 
@@ -93,6 +97,14 @@ Or add `"tls_enabled": false` to the `config` block of `service-http-001` in `ma
 ```bash
 AIZE_TLS_CERT=/path/to/server.crt AIZE_TLS_KEY=/path/to/server.key ./restart_codex_http_mesh.sh
 ```
+
+### Custom SAN hosts
+
+```bash
+AIZE_TLS_HOSTS=example.local,2001:db8::10 ./restart_codex_http_mesh.sh
+```
+
+Set `AIZE_TLS_AUTO_HOSTS=false` to disable automatic local IPv4/IPv6 and hostname discovery.
 
 ### Trusting the self-signed cert in a browser
 
