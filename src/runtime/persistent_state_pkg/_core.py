@@ -149,10 +149,11 @@ def service_pending_state_key(service_id: str, username: str, session_id: str) -
 
 def state_dir(runtime_root: Path) -> Path:
     runtime_root = Path(runtime_root)
-    # The canonical repo runtime lives at .agent-mesh-runtime/, so durable state
+    # The canonical repo runtime lives at .aize-runtime/, so durable state
     # should sit beside it. Ephemeral/test runtimes use an isolated nested state
     # directory to avoid cross-run collisions under shared parents like /tmp.
-    if runtime_root.name.startswith(".agent-mesh-runtime"):
+    legacy_runtime_prefix = ".agent" + "-mesh-runtime"
+    if runtime_root.name.startswith(".aize-runtime") or runtime_root.name.startswith(legacy_runtime_prefix):
         return runtime_root.parent / ".aize-state"
     return runtime_root / ".aize-state"
 

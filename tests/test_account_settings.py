@@ -16,7 +16,7 @@ from kernel.auth import create_user, update_user_password, verify_user_password
 class AccountSettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.runtime_root = Path(self._tmp.name) / ".agent-mesh-runtime"
+        self.runtime_root = Path(self._tmp.name) / ".aize-runtime"
         self.runtime_root.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self) -> None:

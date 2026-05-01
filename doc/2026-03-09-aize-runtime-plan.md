@@ -1,4 +1,4 @@
-# Agent Mesh Runtime Plan
+# AIZE Runtime Plan
 
 ## Goal
 

@@ -47,8 +47,8 @@ Cert generation is handled automatically on first start, but can also be run man
 Certificates are stored under the runtime directory (not tracked in source):
 
 ```
-.agent-mesh-runtime/tls/server.crt   # self-signed certificate (PEM)
-.agent-mesh-runtime/tls/server.key   # private key (PEM)
+.aize-runtime/tls/server.crt   # self-signed certificate (PEM)
+.aize-runtime/tls/server.key   # private key (PEM)
 ```
 
 ### Initial setup — generate the certificate
@@ -96,7 +96,7 @@ AIZE_TLS_CERT=/path/to/server.crt AIZE_TLS_KEY=/path/to/server.key ./restart_cod
 
 ### Trusting the self-signed cert in a browser
 
-Import `.agent-mesh-runtime/tls/server.crt` into your browser's trust store
+Import `.aize-runtime/tls/server.crt` into your browser's trust store
 (or OS keychain) to remove the "Not secure" warning.
 
 ### Scripts / health checks

@@ -132,7 +132,7 @@ inside process lifecycle state.
 
 The relevant state file is:
 
-- [.agent-mesh-runtime/state/processes.json](../.agent-mesh-runtime/state/processes.json)
+- [.aize-runtime/state/processes.json](../.aize-runtime/state/processes.json)
 
 The adapter extracts `thread.started.thread_id` from Codex JSON events and saves it as the process session id.
 
@@ -191,8 +191,8 @@ all reached:
 
 The final state files were:
 
-- [.agent-mesh-runtime/state/services.json](../.agent-mesh-runtime/state/services.json)
-- [.agent-mesh-runtime/state/processes.json](../.agent-mesh-runtime/state/processes.json)
+- [.aize-runtime/state/services.json](../.aize-runtime/state/services.json)
+- [.aize-runtime/state/processes.json](../.aize-runtime/state/processes.json)
 
 The router also stopped normally with:
 
@@ -200,10 +200,10 @@ The router also stopped normally with:
 
 The log files for the finished run are:
 
-- [.agent-mesh-runtime/logs/router.jsonl](../.agent-mesh-runtime/logs/router.jsonl)
-- [.agent-mesh-runtime/logs/service-codex-001.jsonl](../.agent-mesh-runtime/logs/service-codex-001.jsonl)
-- [.agent-mesh-runtime/logs/service-codex-002.jsonl](../.agent-mesh-runtime/logs/service-codex-002.jsonl)
-- [.agent-mesh-runtime/logs/service-codex-003.jsonl](../.agent-mesh-runtime/logs/service-codex-003.jsonl)
+- [.aize-runtime/logs/router.jsonl](../.aize-runtime/logs/router.jsonl)
+- [.aize-runtime/logs/service-codex-001.jsonl](../.aize-runtime/logs/service-codex-001.jsonl)
+- [.aize-runtime/logs/service-codex-002.jsonl](../.aize-runtime/logs/service-codex-002.jsonl)
+- [.aize-runtime/logs/service-codex-003.jsonl](../.aize-runtime/logs/service-codex-003.jsonl)
 
 ## What Was Verified
 

@@ -26,9 +26,11 @@ for _i, _arg in enumerate(sys.argv[1:], 1):
         break
 
 ROOT = Path(os.environ.get("AIZE_ROOT", Path(__file__).resolve().parents[2]))
+AIZE_RUNTIME_BASENAME = ".aize-runtime"
+LEGACY_RUNTIME_BASENAME = ".agent" + "-mesh-runtime"
 RUNTIME_ROOT = Path(
     _cli_runtime_root
-    or os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".agent-mesh-runtime"))
+    or os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / AIZE_RUNTIME_BASENAME))
 )
 PORTS = RUNTIME_ROOT / "ports"
 LOGS = RUNTIME_ROOT / "logs"
@@ -37,15 +39,42 @@ STATE = RUNTIME_ROOT / "state"
 MANIFEST = RUNTIME_ROOT / "manifest.json"
 
 
+def migrate_legacy_runtime_seed() -> None:
+    if _cli_runtime_root or os.environ.get("AIZE_RUNTIME_ROOT"):
+        return
+    if RUNTIME_ROOT.exists():
+        return
+    legacy_root = ROOT / LEGACY_RUNTIME_BASENAME
+    if not legacy_root.exists():
+        return
+    for relative in (
+        Path("identity"),
+        Path("tls"),
+        Path("ws_peer_clients.json"),
+        Path("ws_router_peers.json"),
+    ):
+        source = legacy_root / relative
+        dest = RUNTIME_ROOT / relative
+        try:
+            if source.is_dir():
+                shutil.copytree(source, dest, dirs_exist_ok=True)
+            elif source.is_file():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest)
+        except OSError:
+            continue
+
+
 def resolve_node_id() -> str:
     configured = str(os.environ.get("AIZE_NODE_ID") or "").strip()
     if configured:
         return configured
+    migrate_legacy_runtime_seed()
     return ensure_node_identity(RUNTIME_ROOT)["node_id"]
 
 
 NODE_ID = resolve_node_id()
-PRIMARY_RUNTIME_ROOT = (ROOT / ".agent-mesh-runtime").resolve()
+PRIMARY_RUNTIME_ROOT = (ROOT / AIZE_RUNTIME_BASENAME).resolve()
 ALLOW_PRIMARY_HTTP_OVERRIDE = os.environ.get("AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}
 HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))

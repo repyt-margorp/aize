@@ -5,7 +5,7 @@ Usage (standalone):
     python3 -m tls.gen_self_signed_cert [--cert CERT_PATH] [--key KEY_PATH] [--days DAYS] [--hosts HOSTNAME ...]
 
 Defaults:
-    cert:  $AIZE_RUNTIME_ROOT/tls/server.crt  (fallback: ./.agent-mesh-runtime/tls/server.crt)
+    cert:  $AIZE_RUNTIME_ROOT/tls/server.crt  (fallback: ./.aize-runtime/tls/server.crt)
     key:   $AIZE_RUNTIME_ROOT/tls/server.key
     days:  3650
     hosts: localhost 127.0.0.1 (always included; extra hosts added via --hosts)
@@ -29,7 +29,7 @@ def _default_runtime_root() -> Path:
     runtime = os.environ.get("AIZE_RUNTIME_ROOT")
     if runtime:
         return Path(runtime)
-    return base / ".agent-mesh-runtime"
+    return base / ".aize-runtime"
 
 
 def _build_san(extra_hosts: list[str] | None = None) -> str:

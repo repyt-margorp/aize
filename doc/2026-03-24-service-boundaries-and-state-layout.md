@@ -14,14 +14,14 @@ This refactor keeps the MINIX-style boot model introduced on 2026-03-23 and tigh
 
 The persistent state helpers had been changed to write durable state to a sibling `.aize-state/` directory beside the runtime root. That is correct for the canonical runtime:
 
-- runtime root: `./.agent-mesh-runtime/`
+- runtime root: `./.aize-runtime/`
 - persistent state root: `./.aize-state/`
 
 But that same rule caused collisions for temporary runtimes created under shared parents such as `/tmp`, because multiple ad hoc runs could converge on `/tmp/.aize-state/`.
 
 The layout rule is now:
 
-- if the runtime root is a canonical `.agent-mesh-runtime*` directory, use the sibling `.aize-state/`
+- if the runtime root is a canonical `.aize-runtime*` directory, use the sibling `.aize-state/`
 - otherwise, place persistent state under `<runtime-root>/.aize-state/`
 
 That keeps the production/runtime split intact while making tests, probes, and scratch runtimes self-contained.
@@ -29,7 +29,7 @@ That keeps the production/runtime split intact while making tests, probes, and s
 ## Code Impact
 
 - `src/runtime/persistent_state_pkg/_core.py`
-  - `state_dir(runtime_root)` now selects canonical sibling state only for `.agent-mesh-runtime*`
+  - `state_dir(runtime_root)` now selects canonical sibling state only for `.aize-runtime*`
   - other runtimes get a colocated nested `.aize-state/`
 - `src/runtime/persistent_state_pkg/conversation.py`
   - session scans now use `sessions_dir(runtime_root)` instead of rebuilding `.aize-state` paths by hand

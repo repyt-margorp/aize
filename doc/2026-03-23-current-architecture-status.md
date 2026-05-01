@@ -6,7 +6,7 @@ This note describes the current implemented architecture of Aize as it exists in
 It is not a proposal document. It is a snapshot of what is actually wired together now, which parts are stable,
 and which design directions are already visible in the implementation.
 
-The repository currently implements a local multi-service agent mesh with these major properties:
+The repository currently implements a local multi-service AIZE runtime with these major properties:
 
 - A local microkernel-style message router
 - Dynamically spawned service workers for Codex, Claude, HTTP, and service management
@@ -35,7 +35,7 @@ The implemented system is split into five layers:
 
 This is not a purely in-memory actor system. It is a hybrid:
 
-- Runtime orchestration state lives under `.agent-mesh-runtime/`
+- Runtime orchestration state lives under `.aize-runtime/`
 - Durable user/session state lives under `.aize-state/`
 - Source-tracked service definitions live under `src/services/`
 
@@ -55,13 +55,13 @@ At startup it does the following:
    - peer metadata
    - only the Service Manager (`service-svcmgr-001`) as a boot-time service
    - `svcmgr` restart/restore metadata for descriptor-managed and dynamically restored services
-5. Rebuilds `.agent-mesh-runtime/`
+5. Rebuilds `.aize-runtime/`
    It preserves TLS material and outbound WS peer client config across restart
 6. Starts the kernel router
 7. Starts the bootstrap service adapters
 8. Lets `service-svcmgr-001` discover descriptors and spawn `HttpBridge`, Codex, Claude, and restored dynamic services
 
-The runtime manifest is generated at boot and lives under `.agent-mesh-runtime/manifest.json`.
+The runtime manifest is generated at boot and lives under `.aize-runtime/manifest.json`.
 It is a bootstrap manifest, not the full long-term service inventory, and is not treated as a source-of-truth file checked into the repository.
 
 ## Service Model
@@ -163,7 +163,7 @@ This is an important design stabilization point:
 
 ### Registry
 
-`src/kernel/registry.py` stores runtime service records in `.agent-mesh-runtime/state/services.json`.
+`src/kernel/registry.py` stores runtime service records in `.aize-runtime/state/services.json`.
 
 It tracks:
 
@@ -197,7 +197,7 @@ This means the runtime is already able to grow beyond the static core pool.
 
 The codebase now clearly separates two kinds of state.
 
-### `.agent-mesh-runtime/`
+### `.aize-runtime/`
 
 Used for runtime-local process state:
 
@@ -227,7 +227,7 @@ Used for durable user/session state:
 
 This split is implemented in `src/runtime/persistent_state_pkg/_core.py`:
 
-- Canonical repo runtime roots named `.agent-mesh-runtime*` store durable state at the sibling path `runtime_root.parent / ".aize-state"`
+- Canonical repo runtime roots named `.aize-runtime*` store durable state at the sibling path `runtime_root.parent / ".aize-state"`
 - Ephemeral/test runtime roots store durable state under `runtime_root / ".aize-state"` to avoid collisions under shared scratch parents
 
 That is a strong design signal:
@@ -272,7 +272,7 @@ Passwords and auth sessions are not stored in source-controlled files.
 They live under runtime state and durable state only:
 
 - `.aize-state/`
-- `.agent-mesh-runtime/`
+- `.aize-runtime/`
 
 This is now consistent with the public-repo requirement:
 
@@ -553,7 +553,7 @@ As of the current implementation, these are safe assumptions to design around:
 - The runtime is booted from generated service descriptors, not a checked-in manifest
 - The kernel routes over a UNIX router socket
 - Durable user/session state lives in `.aize-state`
-- Runtime process state lives in `.agent-mesh-runtime`
+- Runtime process state lives in `.aize-runtime`
 - HTTPBridge is the canonical browser control plane
 - Root bootstrap and cookie-based auth are part of the normal product path
 - Goal state, compaction state, and session scheduling are persisted

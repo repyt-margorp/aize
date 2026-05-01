@@ -8,7 +8,7 @@ This note records:
 - what concepts are now stable
 - what still needs to be implemented next
 
-It is a companion to `2026-03-09-agent-mesh-runtime-plan.md`, but focuses on current state rather than broad direction.
+It is a companion to `2026-03-09-aize-runtime-plan.md`, but focuses on current state rather than broad direction.
 
 ## Current Architectural Position
 
@@ -64,7 +64,7 @@ The manifest now has:
 
 Current manifest output:
 
-- [manifest.json](../.agent-mesh-runtime/manifest.json)
+- [manifest.json](../.aize-runtime/manifest.json)
 
 ### 3. Process Model
 
@@ -111,11 +111,11 @@ Each service has:
 
 Current local runtime layout:
 
-- `.agent-mesh-runtime/ports/router.control`
-- `.agent-mesh-runtime/ports/service-codex-001.rx`
-- `.agent-mesh-runtime/ports/service-codex-001.tx`
-- `.agent-mesh-runtime/ports/service-claude-001.rx`
-- `.agent-mesh-runtime/ports/service-claude-001.tx`
+- `.aize-runtime/ports/router.control`
+- `.aize-runtime/ports/service-codex-001.rx`
+- `.aize-runtime/ports/service-codex-001.tx`
+- `.aize-runtime/ports/service-claude-001.rx`
+- `.aize-runtime/ports/service-claude-001.tx`
 
 Transport is currently FIFO-based.
 
@@ -179,7 +179,7 @@ Current default:
 
 If a message body is larger than the threshold, the text is stored under:
 
-- `.agent-mesh-runtime/objects/`
+- `.aize-runtime/objects/`
 
 and the message carries only `payload_ref`.
 
@@ -193,9 +193,9 @@ The runtime already logs at three important levels:
 
 Current files:
 
-- [router.jsonl](../.agent-mesh-runtime/logs/router.jsonl)
-- [service-codex-001.jsonl](../.agent-mesh-runtime/logs/service-codex-001.jsonl)
-- [service-claude-001.jsonl](../.agent-mesh-runtime/logs/service-claude-001.jsonl)
+- [router.jsonl](../.aize-runtime/logs/router.jsonl)
+- [service-codex-001.jsonl](../.aize-runtime/logs/service-codex-001.jsonl)
+- [service-claude-001.jsonl](../.aize-runtime/logs/service-claude-001.jsonl)
 
 ## What Is Philosophically Stable Now
 

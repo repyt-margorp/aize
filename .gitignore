@@ -1,12 +1,12 @@
 # Runtime state — never commit
 .aize-state/
-.agent-mesh-runtime/
+.aize-runtime/
 .temp/
 temp/
 .tmp-agent-test/
 .tmux-agent-chat/
 .tmux-agent-chat-loop/
-.tmux-agent-mesh/
+.tmux-aize/
 plugins/private/*
 !plugins/private/.gitkeep
 

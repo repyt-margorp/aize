@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$SCRIPT_DIR}"
-RUNTIME_ROOT="${AIZE_RUNTIME_ROOT:-$ROOT/.agent-mesh-runtime}"
+RUNTIME_ROOT="${AIZE_RUNTIME_ROOT:-$ROOT/.aize-runtime}"
+LEGACY_RUNTIME_ROOT="$ROOT/.agent""-mesh-runtime"
 PYTHON="${PYTHON:-/usr/bin/python3}"
 HTTP_HOST="${AIZE_HTTP_HOST:-0.0.0.0}"
 if [[ -n "${AIZE_HTTP_PORT:-}" ]]; then
@@ -56,7 +57,7 @@ HEALTH_HOST="$HTTP_HOST"
 if [[ "$HEALTH_HOST" == "0.0.0.0" || "$HEALTH_HOST" == "::" ]]; then
   HEALTH_HOST="127.0.0.1"
 fi
-PRIMARY_RUNTIME_ROOT="$ROOT/.agent-mesh-runtime"
+PRIMARY_RUNTIME_ROOT="$ROOT/.aize-runtime"
 ALLOW_PRIMARY_HTTP_OVERRIDE_RAW="${AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE:-}"
 TLS_ENABLED_RAW="${AIZE_TLS:-true}"
 if [[ "$RUNTIME_ROOT" == "$PRIMARY_RUNTIME_ROOT" && ! "$ALLOW_PRIMARY_HTTP_OVERRIDE_RAW" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
@@ -73,6 +74,9 @@ START_TIMEOUT_SECONDS="20"
 parent_pattern="cli.run_codex_http_mesh --runtime-root $RUNTIME_ROOT"
 router_pattern="python3 -m kernel.router --manifest $RUNTIME_ROOT/manifest.json"
 adapter_pattern="python3 -m runtime.cli_service_adapter --manifest $RUNTIME_ROOT/manifest.json"
+legacy_parent_pattern="cli.run_codex_http_mesh --runtime-root $LEGACY_RUNTIME_ROOT"
+legacy_router_pattern="python3 -m kernel.router --manifest $LEGACY_RUNTIME_ROOT/manifest.json"
+legacy_adapter_pattern="python3 -m runtime.cli_service_adapter --manifest $LEGACY_RUNTIME_ROOT/manifest.json"
 
 kill_matching_groups() {
   local signal_name="$1"
@@ -204,6 +208,14 @@ terminate_matches "$router_pattern"
 log "router processes terminated"
 terminate_matches "$adapter_pattern"
 log "adapter processes terminated"
+if [[ -z "${AIZE_RUNTIME_ROOT:-}" && "$RUNTIME_ROOT" != "$LEGACY_RUNTIME_ROOT" ]]; then
+  terminate_matches "$legacy_parent_pattern"
+  log "legacy parent processes terminated"
+  terminate_matches "$legacy_router_pattern"
+  log "legacy router processes terminated"
+  terminate_matches "$legacy_adapter_pattern"
+  log "legacy adapter processes terminated"
+fi
 
 cd "$ROOT"
 if command -v setsid >/dev/null 2>&1; then

@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(os.environ.get("AIZE_ROOT", Path(__file__).resolve().parents[2]))
-RUNTIME_ROOT = Path(os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".agent-mesh-runtime")))
+RUNTIME_ROOT = Path(os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".aize-runtime")))
 HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = os.environ.get("AIZE_HTTP_PORT", "4123")
 

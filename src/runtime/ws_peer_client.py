@@ -15,7 +15,7 @@ Flow per connection
    - pong / error → log and continue
 6. On any disconnect: exponential back-off reconnect, then restart from step 1
 
-Config dict keys (from .agent-mesh-runtime/ws_peer_clients.json)
+Config dict keys (from .aize-runtime/ws_peer_clients.json)
 -----------------------------------------------------------------
 enabled            bool   default True
 target_ws_url      str    wss://host:port/path
