@@ -40,7 +40,8 @@ MANIFEST = RUNTIME_ROOT / "manifest.json"
 
 
 def migrate_legacy_runtime_seed() -> None:
-    if _cli_runtime_root or os.environ.get("AIZE_RUNTIME_ROOT"):
+    explicit_runtime = Path(_cli_runtime_root or os.environ.get("AIZE_RUNTIME_ROOT", "") or "")
+    if explicit_runtime and explicit_runtime.resolve() != (ROOT / AIZE_RUNTIME_BASENAME).resolve():
         return
     if RUNTIME_ROOT.exists():
         return
