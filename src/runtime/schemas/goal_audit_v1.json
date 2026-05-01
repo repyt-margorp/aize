@@ -78,13 +78,15 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "service_id",
-          "label",
           "goal_text"
         ],
         "properties": {
           "service_id": {
             "type": "string"
+          },
+          "provider": {
+            "type": "string",
+            "enum": ["codex", "claude", "gemini"]
           },
           "label": {
             "type": "string"

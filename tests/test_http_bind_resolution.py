@@ -14,10 +14,10 @@ from runtime import cli_service_adapter
 
 
 class HttpBindResolutionTests(unittest.TestCase):
-    def test_wildcard_host_binds_ipv4_only(self) -> None:
+    def test_wildcard_host_binds_ipv4_and_ipv6(self) -> None:
         self.assertEqual(
             cli_service_adapter._resolve_bind_specs("0.0.0.0"),
-            [("0.0.0.0", socket.AF_INET)],
+            [("0.0.0.0", socket.AF_INET), ("::", socket.AF_INET6)],
         )
 
     def test_ipv6_host_preserves_ipv6_bind(self) -> None:

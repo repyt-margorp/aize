@@ -4,13 +4,64 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$SCRIPT_DIR}"
 RUNTIME_ROOT="${AIZE_RUNTIME_ROOT:-$ROOT/.agent-mesh-runtime}"
+PYTHON="${PYTHON:-/usr/bin/python3}"
 HTTP_HOST="${AIZE_HTTP_HOST:-0.0.0.0}"
-HTTP_PORT="${AIZE_HTTP_PORT:-4123}"
+if [[ -n "${AIZE_HTTP_PORT:-}" ]]; then
+  HTTP_PORT="$AIZE_HTTP_PORT"
+else
+  HTTP_PORT="$(
+    "$PYTHON" - "$RUNTIME_ROOT" <<'PY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+
+runtime_root = Path(sys.argv[1])
+for path in (
+    runtime_root / "state" / "services.json",
+    runtime_root / "manifest.json",
+):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        continue
+    services = data.get("services", {})
+    if isinstance(services, dict):
+        service = services.get("service-http-001")
+    elif isinstance(services, list):
+        service = next(
+            (
+                item
+                for item in services
+                if isinstance(item, dict)
+                and item.get("service_id") == "service-http-001"
+            ),
+            None,
+        )
+    else:
+        service = None
+    if not isinstance(service, dict):
+        continue
+    port = (service.get("config") or {}).get("port")
+    if isinstance(port, int) or (isinstance(port, str) and port.isdigit()):
+        print(port)
+        raise SystemExit(0)
+PY
+  )"
+  HTTP_PORT="${HTTP_PORT:-4123}"
+fi
 LOG_PATH="$ROOT/.temp/restart-debug/launcher.log"
 SUPERVISOR_LOG_PATH="$ROOT/.temp/restart-debug/restart-supervisor.log"
 RESTART_LOCK_PATH="$ROOT/.temp/restart-debug/restart.lock"
-PYTHON="${PYTHON:-/usr/bin/python3}"
-HEALTH_URL="https://$HTTP_HOST:$HTTP_PORT/health"
+HEALTH_HOST="$HTTP_HOST"
+if [[ "$HEALTH_HOST" == "0.0.0.0" || "$HEALTH_HOST" == "::" ]]; then
+  HEALTH_HOST="127.0.0.1"
+fi
+TLS_ENABLED_RAW="${AIZE_TLS:-true}"
+case "${TLS_ENABLED_RAW,,}" in
+  0|false|no|off) HEALTH_SCHEME="http" ;;
+  *) HEALTH_SCHEME="https" ;;
+esac
+HEALTH_URL="$HEALTH_SCHEME://$HEALTH_HOST:$HTTP_PORT/health"
 START_TIMEOUT_SECONDS="20"
 
 parent_pattern="cli.run_codex_http_mesh --runtime-root $RUNTIME_ROOT"
@@ -60,6 +111,25 @@ log() {
   printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$SUPERVISOR_LOG_PATH"
 }
 
+health_check() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSk "$HEALTH_URL" >/dev/null 2>&1
+    return $?
+  fi
+  "$PYTHON" - "$HEALTH_URL" <<'PY' >/dev/null 2>&1
+import ssl
+import sys
+import urllib.request
+
+url = sys.argv[1]
+kwargs = {"timeout": 2}
+if url.startswith("https://"):
+    kwargs["context"] = ssl._create_unverified_context()
+with urllib.request.urlopen(url, **kwargs) as response:
+    raise SystemExit(0 if 200 <= response.status < 300 else 1)
+PY
+}
+
 mkdir -p "$(dirname "$LOG_PATH")"
 mkdir -p "$(dirname "$SUPERVISOR_LOG_PATH")"
 
@@ -76,6 +146,7 @@ if [[ "${SYNC_RESTART:-0}" != "1" && "${DETACHED_RESTART:-0}" != "1" ]]; then
       AIZE_HTTP_HOST="$HTTP_HOST" \
       AIZE_HTTP_PORT="$HTTP_PORT" \
       AIZE_TLS="${AIZE_TLS:-}" \
+      AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE=true \
       AIZE_TLS_CERT="$TLS_CERT" \
       AIZE_TLS_KEY="$TLS_KEY" \
       AIZE_TLS_CN="$TLS_CN" \
@@ -95,6 +166,7 @@ if [[ "${SYNC_RESTART:-0}" != "1" && "${DETACHED_RESTART:-0}" != "1" ]]; then
       AIZE_HTTP_HOST="$HTTP_HOST" \
       AIZE_HTTP_PORT="$HTTP_PORT" \
       AIZE_TLS="${AIZE_TLS:-}" \
+      AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE=true \
       AIZE_TLS_CERT="$TLS_CERT" \
       AIZE_TLS_KEY="$TLS_KEY" \
       AIZE_TLS_CN="$TLS_CN" \
@@ -129,9 +201,9 @@ log "adapter processes terminated"
 
 cd "$ROOT"
 if command -v setsid >/dev/null 2>&1; then
-  nohup setsid /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' AIZE_TLS='${AIZE_TLS:-}' AIZE_TLS_CERT='${AIZE_TLS_CERT:-}' AIZE_TLS_KEY='${AIZE_TLS_KEY:-}' AIZE_TLS_CN='${AIZE_TLS_CN:-}' AIZE_TLS_HOSTS='${AIZE_TLS_HOSTS:-}' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
+  nohup setsid /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' AIZE_TLS='${AIZE_TLS:-}' AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE=true AIZE_TLS_CERT='${AIZE_TLS_CERT:-}' AIZE_TLS_KEY='${AIZE_TLS_KEY:-}' AIZE_TLS_CN='${AIZE_TLS_CN:-}' AIZE_TLS_HOSTS='${AIZE_TLS_HOSTS:-}' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
 else
-  nohup /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' AIZE_TLS='${AIZE_TLS:-}' AIZE_TLS_CERT='${AIZE_TLS_CERT:-}' AIZE_TLS_KEY='${AIZE_TLS_KEY:-}' AIZE_TLS_CN='${AIZE_TLS_CN:-}' AIZE_TLS_HOSTS='${AIZE_TLS_HOSTS:-}' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
+  nohup /bin/bash -lc "exec 9>&-; cd '$ROOT' && env -i PATH='$PATH' HOME='$HOME' PYTHONPATH='$ROOT/src' AIZE_ROOT='$ROOT' AIZE_RUNTIME_ROOT='$RUNTIME_ROOT' AIZE_HTTP_HOST='$HTTP_HOST' AIZE_HTTP_PORT='$HTTP_PORT' AIZE_TLS='${AIZE_TLS:-}' AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE=true AIZE_TLS_CERT='${AIZE_TLS_CERT:-}' AIZE_TLS_KEY='${AIZE_TLS_KEY:-}' AIZE_TLS_CN='${AIZE_TLS_CN:-}' AIZE_TLS_HOSTS='${AIZE_TLS_HOSTS:-}' '$PYTHON' -m cli.run_codex_http_mesh --runtime-root '$RUNTIME_ROOT'" >"$LOG_PATH" 2>&1 </dev/null &
 fi
 new_pid=$!
 log "launched new parent pid=$new_pid"
@@ -142,7 +214,7 @@ for _ in $(seq 1 "$START_TIMEOUT_SECONDS"); do
     tail -n 80 "$LOG_PATH" >&2 || true
     exit 1
   fi
-  if curl -fsSk "$HEALTH_URL" >/dev/null 2>&1; then
+  if health_check; then
     log "health check recovered for pid=$new_pid"
     echo "$new_pid"
     exit 0

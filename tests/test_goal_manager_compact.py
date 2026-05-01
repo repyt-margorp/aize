@@ -280,7 +280,8 @@ class GoalManagerCompactTests(unittest.TestCase):
         child_goal_requests_schema = schema["properties"]["child_goal_requests"]
         self.assertEqual(child_goal_requests_schema["type"], "array")
         self.assertNotIn("anyOf", child_goal_requests_schema)
-        self.assertEqual(child_goal_requests_schema["items"]["required"], ["service_id", "label", "goal_text"])
+        self.assertEqual(child_goal_requests_schema["items"]["required"], ["goal_text"])
+        self.assertIn("provider", child_goal_requests_schema["items"]["properties"])
 
     def test_run_goal_audit_parses_markdown_fenced_json(self) -> None:
         with patch(
@@ -1412,8 +1413,8 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         self.assertEqual(talk["goal_mode"], "no_goal")
         self.assertFalse(talk["goal_active"])
-        self.assertFalse(talk["goal_completed"])
-        self.assertEqual(talk["goal_progress_state"], "in_progress")
+        self.assertTrue(talk["goal_completed"])
+        self.assertEqual(talk["goal_progress_state"], "complete")
         # goal_audit_state is agent-side; it must not appear on the session talk record
         self.assertNotIn("goal_audit_state", talk)
         # The response payload still returns all_clear as the safe default
@@ -1661,13 +1662,13 @@ class GoalManagerCompactTests(unittest.TestCase):
             goal_manager_service_id="service-codex-001",
             child_goal_requests=[
                 {
-                    "service_id": "service-codex-001",
                     "label": "Implement",
+                    "provider": "codex",
                     "goal_text": "Write code",
                 },
                 {
-                    "service_id": "service-claude-001",
                     "label": "Verify",
+                    "provider": "claude",
                     "goal_text": "Review code",
                 },
             ],
@@ -1685,11 +1686,12 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(first_child.get("origin_session_id"), self.session_id)
         self.assertEqual(first_child.get("origin_goal_id"), "goal-123")
         self.assertEqual(first_child.get("goal_history", [])[-1].get("updated_by_username"), "goalmanager")
+        self.assertEqual(first_child.get("preferred_provider"), "codex")
         self.assertEqual(created[0].get("dispatch_service_id"), "service-codex-001")
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertTrue(any(entry.get("event_type") == "service.goal_child_sessions_created" for entry in history))
 
-    def test_materialize_goal_child_sessions_rejects_fewer_than_two_valid_parallel_goals(self) -> None:
+    def test_materialize_goal_child_sessions_keeps_single_valid_child_goal(self) -> None:
         update_session_goal(
             self.runtime_root,
             username=TEST_USERNAME,
@@ -1705,29 +1707,25 @@ class GoalManagerCompactTests(unittest.TestCase):
             goal_manager_service_id="service-codex-001",
             child_goal_requests=[
                 {
-                    "service_id": "service-codex-001",
                     "label": "Incomplete",
                     "goal_text": "",
                 },
                 {
-                    "service_id": "service-claude-001",
                     "label": "Only one valid",
+                    "provider": "claude",
                     "goal_text": "Review code",
                 },
             ],
         )
 
-        self.assertEqual(created, [])
-        self.assertEqual(
-            list_session_children(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
-            [],
-        )
+        self.assertEqual(len(created), 1)
+        children = list_session_children(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual(len(children), 1)
+        child = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=children[0])
+        assert child is not None
+        self.assertEqual(child.get("preferred_provider"), "claude")
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
-        rejected_events = [
-            entry for entry in history if entry.get("event_type") == "service.goal_child_sessions_rejected"
-        ]
-        self.assertEqual(len(rejected_events), 1)
-        self.assertEqual(rejected_events[0].get("event", {}).get("valid_children"), 1)
+        self.assertTrue(any(entry.get("event_type") == "service.goal_child_sessions_created" for entry in history))
 
     def test_session_goal_context_includes_root_two_and_current_two_without_duplicates(self) -> None:
         root_first = update_session_goal(
@@ -2543,7 +2541,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(audit["child_goal_requests"][1]["service_id"], "service-claude-001")
         self.assertEqual(audit["child_goal_requests"][1]["goal_text"], "Verify child task")
 
-    def test_run_goal_audit_keeps_single_child_goal_request_with_rejection_summary(self) -> None:
+    def test_run_goal_audit_keeps_single_child_goal_request(self) -> None:
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
@@ -2558,8 +2556,8 @@ class GoalManagerCompactTests(unittest.TestCase):
                         "agent_directives": [],
                         "child_goal_requests": [
                             {
-                                "service_id": "service-codex-001",
                                 "label": "Subgoal",
+                                "provider": "codex",
                                 "goal_text": "Implement child task",
                             }
                         ],
@@ -2577,11 +2575,11 @@ class GoalManagerCompactTests(unittest.TestCase):
                 history_entries=[],
             )
 
-        self.assertIn("Rejected child-session split", audit["summary"])
         self.assertEqual(len(audit["child_goal_requests"]), 1)
         self.assertEqual(audit["child_goal_requests"][0]["goal_text"], "Implement child task")
+        self.assertEqual(audit["child_goal_requests"][0]["provider"], "codex")
 
-    def test_run_goal_audit_reports_rejected_partial_child_goal_split(self) -> None:
+    def test_run_goal_audit_drops_invalid_partial_child_goal_split(self) -> None:
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
@@ -2620,7 +2618,6 @@ class GoalManagerCompactTests(unittest.TestCase):
                 history_entries=[],
             )
 
-        self.assertIn("Rejected child-session split", audit["summary"])
         self.assertEqual(len(audit["child_goal_requests"]), 1)
         self.assertEqual(audit["child_goal_requests"][0]["goal_text"], "Review child task")
 
@@ -3758,10 +3755,11 @@ exit 1
         source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
         self.assertIn('audit.get("child_goal_requests")', source)
         self.assertIn("created_by_username=GOAL_MANAGER_USERNAME", source)
-        self.assertIn("dispatch_child_session=kickoff_goal_child_session", source)
+        self.assertIn('kind="goal_child_session_request"', source)
+        self.assertIn('reason="goal_child_session_request"', source)
         self.assertIn('reason="goal_child_session_created"', source)
         self.assertIn('event_type": "service.goal_child_sessions_created"', source)
-        self.assertIn('event_type": "service.goal_child_sessions_rejected"', source)
+        self.assertIn('event_type": "service.goal_child_session_requests_queued"', source)
 
     def test_goal_manager_source_only_enqueues_followup_when_agent_directives_exist(self) -> None:
         source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
@@ -3822,7 +3820,7 @@ exit 1
         handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
         goal_persist_source = (SRC / "runtime" / "goal_persist.py").read_text(encoding="utf-8")
         self.assertIn("const sessionUsesMapOnlyUI = () => String(sessionUiMode || 'standard').trim().toLowerCase() === 'map_only';", renderer_source)
-        self.assertIn("viewManageButton.classList.toggle('is-hidden', mapOnly || accountRegisterOpen);", renderer_source)
+        self.assertIn("viewManageButton.classList.toggle('is-hidden', mapOnly || accountRegisterOpen || accountSettingsOpen);", renderer_source)
         self.assertIn("const nextOpen = sessionUsesMapOnlyUI() ? true : Boolean(open);", renderer_source)
         self.assertIn("initial_session_map_open = bool(initial_session_map_open or initial_session_ui_mode == \"map_only\")", handler_source)
         self.assertIn('"session_ui_mode": session_ui_mode(talk),', goal_persist_source)

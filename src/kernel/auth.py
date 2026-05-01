@@ -165,6 +165,43 @@ def verify_user_password(runtime_root, *, username: str, password: str) -> bool:
     return secrets.compare_digest(actual, expected)
 
 
+def update_user_password(
+    runtime_root,
+    *,
+    username: str,
+    current_password: str,
+    new_password: str,
+) -> tuple[bool, str]:
+    normalized = normalize_username(username)
+    if not normalized:
+        return False, "username_required"
+    if not verify_user_password(runtime_root, username=normalized, password=current_password):
+        return False, "current_password_incorrect"
+    if not new_password:
+        return False, "new_password_required"
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        record = state["users"].get(normalized)
+        if not isinstance(record, dict):
+            return False, "user_not_found"
+        if bool(record.get("login_disabled")):
+            return False, "login_disabled"
+        import secrets
+        import hashlib
+
+        salt = secrets.token_bytes(16)
+        record["password_salt"] = salt.hex()
+        record["password_hash"] = hashlib.pbkdf2_hmac(
+            "sha256",
+            new_password.encode("utf-8"),
+            salt,
+            200_000,
+        ).hex()
+        state["users"][normalized] = record
+        write_state(runtime_root, state)
+    return True, normalized
+
+
 def issue_auth_context(runtime_root, *, username: str) -> dict[str, Any] | None:
     record = resolve_user_record(runtime_root, username=username)
     if not record:

@@ -414,7 +414,8 @@ def build_goal_audit_prompt(
             "Emit agent_directive records only for agents that should actively continue now.",
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}',
             "Optional additional lines are child_goal_request records:",
-            '  {"kind": "child_goal_request", "service_id": "...", "goal_text": "...", "label": ""}',
+            '  {"kind": "child_goal_request", "goal_text": "...", "label": "", "provider": "codex" | "claude" | "gemini"}',
+            "These are GoalManager-owned system signals, not agent actions: GoalManager will later materialize them into child sessions.",
             "Emit child_goal_request records whenever splitting the remaining work into child sessions is useful, including a single child goal when that best matches the work decomposition.",
             "Each child goal remains subordinate to the current goal: the spawned child session inherits parent-goal lineage/context and continues the broader parent objective while focusing on its own subgoal.",
             "CRITICAL: When progress_state is 'complete', output ONLY the goal_state line. Do NOT output any agent_directive or child_goal_request records.",
@@ -546,37 +547,23 @@ def _normalize_child_goal_requests(
         for item in raw_requests:
             if not isinstance(item, dict):
                 continue
-            child_service_id = str(item.get("service_id") or "").strip()
             child_goal_text = str(item.get("goal_text") or "").strip()
-            if not child_service_id or not child_goal_text:
+            if not child_goal_text:
                 continue
             child_goal_request = {
-                "service_id": child_service_id,
                 "goal_text": child_goal_text,
             }
             child_label = str(item.get("label") or "").strip()
             if child_label:
                 child_goal_request["label"] = child_label
+            child_provider = str(item.get("provider") or "").strip().lower()
+            if child_provider in {"codex", "claude", "gemini"}:
+                child_goal_request["provider"] = child_provider
+            child_service_id = str(item.get("service_id") or "").strip()
+            if child_service_id:
+                child_goal_request["service_id"] = child_service_id
             child_goal_requests.append(child_goal_request)
     return child_goal_requests
-
-
-def _summarize_rejected_child_goal_split(
-    summary: str,
-    *,
-    child_goal_requests: list[dict[str, str]],
-) -> str:
-    if len(child_goal_requests) >= 2:
-        return summary
-    rejection_note = "Rejected child-session split: fewer than two valid child goals remained after normalization."
-    normalized_summary = str(summary).strip()
-    if rejection_note in normalized_summary:
-        return normalized_summary
-    if not child_goal_requests:
-        return normalized_summary
-    if not normalized_summary:
-        return rejection_note
-    return f"{normalized_summary} {rejection_note}"
 
 
 def goal_audit_should_enqueue_agent_followup(
@@ -802,10 +789,6 @@ def run_goal_audit(
         child_goal_requests: list[dict[str, str]] = []
         if not goal_satisfied:
             child_goal_requests = _normalize_child_goal_requests(raw_child_goal_recs)
-            summary = _summarize_rejected_child_goal_split(
-                summary,
-                child_goal_requests=child_goal_requests,
-            )
         return {
             "goal_audit_session_id": str(audit_session_id or ""),
             "goal_audit_provider_session_id": str(audit_session_id or ""),
@@ -883,11 +866,6 @@ def run_goal_audit(
     child_goal_requests = _normalize_child_goal_requests(
         raw_child_goal_requests if not goal_satisfied else []
     )
-    if not goal_satisfied:
-        summary = _summarize_rejected_child_goal_split(
-            summary,
-            child_goal_requests=child_goal_requests,
-        )
     return {
         "goal_audit_session_id": str(audit_session_id or ""),
         "goal_audit_provider_session_id": str(audit_session_id or ""),

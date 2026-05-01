@@ -184,11 +184,11 @@ MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 
 
 def _resolve_bind_specs(requested_host: str) -> list[tuple[str, int]]:
-    # Prefer an IPv4-only wildcard for the default host. The previous
-    # implicit IPv6 listener could hang during TLS handshakes on ::1 and on
-    # AAAA-resolved public hostnames, which broke localhost/browser access.
+    # Bind both wildcard families for the default host. Some environments only
+    # receive a routable IPv6 address, while local health checks still use IPv4.
+    # Keep IPv6 sockets v6-only so the IPv4 listener remains predictable.
     if requested_host == "0.0.0.0":
-        return [("0.0.0.0", socket.AF_INET)]
+        return [("0.0.0.0", socket.AF_INET), ("::", socket.AF_INET6)]
     family = socket.AF_INET6 if ":" in requested_host else socket.AF_INET
     return [(requested_host, family)]
 

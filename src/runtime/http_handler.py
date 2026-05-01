@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import errno
 import html
 import json
 import queue
+import ssl
 import threading
 import time
 import urllib.error
@@ -25,7 +27,14 @@ from session_template import (
     resolve_app_launch_parent_session_id,
     update_registered_session_template_state,
 )
-from kernel.auth import bootstrap_root_user, create_user, has_users, issue_auth_context, verify_user_password
+from kernel.auth import (
+    bootstrap_root_user,
+    create_user,
+    has_users,
+    issue_auth_context,
+    update_user_password,
+    verify_user_password,
+)
 from kernel.auth import auth_context_allows
 from kernel.lifecycle import load_lifecycle_state
 from kernel.peers import list_peers, register_peer
@@ -1097,6 +1106,35 @@ def _history_tail_with_latest_goal_cluster(
     return merged
 
 
+_CLIENT_DISCONNECT_ERRNOS = {
+    errno.EPIPE,
+    errno.ECONNRESET,
+    errno.ECONNABORTED,
+    errno.EHOSTUNREACH,
+    errno.ENETUNREACH,
+}
+
+
+def _is_client_disconnect_error(error: BaseException) -> bool:
+    if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+        return True
+    if isinstance(error, OSError) and getattr(error, "errno", None) in _CLIENT_DISCONNECT_ERRNOS:
+        return True
+    if isinstance(error, ssl.SSLError):
+        message = str(error).lower()
+        return (
+            "unexpected eof" in message
+            or "eof occurred" in message
+            or "connection reset" in message
+        )
+    return False
+
+
+def _raise_unless_client_disconnect(error: BaseException) -> None:
+    if not _is_client_disconnect_error(error):
+        raise error
+
+
 def make_handler(
     *,
     # State variables
@@ -1937,8 +1975,8 @@ def make_handler(
                     except queue.Empty:
                         self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError, OSError, ssl.SSLError) as exc:
+                _raise_unless_client_disconnect(exc)
             finally:
                 unregister_history_subscriber(username=username, session_id=session_id, subscriber=subscriber)
             return
@@ -2183,6 +2221,8 @@ def make_handler(
                 return self._do_POST_login(payload, content_type)
             if path == "/logout":
                 return self._do_POST_logout(content_type)
+            if path == "/account/password":
+                return self._do_POST_account_password(payload)
             if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
             if path == "/session-templates/launch":
@@ -2382,6 +2422,24 @@ def make_handler(
                 self._json_with_cookie(200, {"ok": True}, None)
                 return
             self._redirect("/", token=None)
+            return
+
+        def _do_POST_account_password(self, payload: dict) -> None:
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            current_password = str(payload.get("current_password", ""))
+            new_password = str(payload.get("new_password", ""))
+            ok, result = update_user_password(
+                runtime_root,
+                username=context["username"],
+                current_password=current_password,
+                new_password=new_password,
+            )
+            if not ok:
+                self._json(400, {"error": result})
+                return
+            self._json(200, {"ok": True, "username": result})
             return
 
         def _do_POST_sessions(self, payload: dict, content_type: str) -> None:

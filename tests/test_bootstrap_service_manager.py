@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from cli.run_codex_http_mesh import build_core_manifest
+from kernel.lifecycle import load_lifecycle_state, update_process_fields
 from kernel.registry import get_service_record, init_registry
 from kernel.router import register_delivery_socket, remove_delivery_socket, resolve_repo_root
 from kernel.spawn import SpawnManager
@@ -46,6 +47,21 @@ class BootstrapManifestTests(unittest.TestCase):
         descriptor = json.loads((ROOT / "src" / "services" / "gemini" / "service.json").read_text(encoding="utf-8"))
         self.assertEqual(descriptor["kind"], "gemini")
         self.assertEqual(descriptor["pool_size_default"], 5)
+
+    def test_update_process_fields_tolerates_missing_restart_process_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            runtime_root = Path(tempdir)
+            process = update_process_fields(
+                runtime_root,
+                process_id="proc-service-codex-001-restarted",
+                fields={"codex_session_id": "thread-123"},
+            )
+
+            self.assertEqual(process["process_id"], "proc-service-codex-001-restarted")
+            self.assertEqual(process["status"], "unknown")
+            self.assertEqual(process["codex_session_id"], "thread-123")
+            state = load_lifecycle_state(runtime_root)
+            self.assertIn("proc-service-codex-001-restarted", state["processes"])
 
 
 class ServiceManagerSpawnTests(unittest.TestCase):

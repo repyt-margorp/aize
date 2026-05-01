@@ -112,7 +112,15 @@ def update_process_fields(
 ) -> dict:
     with lifecycle_lock(runtime_root):
         state = _load_lifecycle_state_unlocked(runtime_root)
-        process = state["processes"][process_id]
+        processes = state.setdefault("processes", {})
+        process = processes.get(process_id)
+        if not isinstance(process, dict):
+            process = {
+                "process_id": process_id,
+                "status": "unknown",
+                "created_at": utc_ts(),
+            }
+            processes[process_id] = process
         process.update(fields)
         process["updated_at"] = utc_ts()
         write_lifecycle_state(runtime_root, state)

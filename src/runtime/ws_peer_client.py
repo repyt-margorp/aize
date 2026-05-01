@@ -58,6 +58,45 @@ RECONNECT_BACKOFF_BASE = 5  # initial reconnect wait (seconds)
 RECONNECT_BACKOFF_MAX = 120 # cap on reconnect wait
 
 
+def _provider_pool_from_runtime_state(runtime_root: Path, *, provider: str) -> list[str]:
+    state_path = runtime_root / "state" / "services.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    services = state.get("services") if isinstance(state, dict) else None
+    if isinstance(services, dict):
+        service_items = services.values()
+    elif isinstance(services, list):
+        service_items = services
+    else:
+        return []
+    pool: list[str] = []
+    for service in service_items:
+        if not isinstance(service, dict):
+            continue
+        if str(service.get("kind", "")).strip().lower() != provider:
+            continue
+        if str(service.get("status", "")).strip().lower() != "running":
+            continue
+        service_id = service.get("service_id")
+        if isinstance(service_id, str) and service_id:
+            pool.append(service_id)
+    return sorted(dict.fromkeys(pool))
+
+
+def _resolve_provider_pool(
+    runtime_root: Path,
+    *,
+    provider: str,
+    configured_pool: list[str],
+) -> list[str]:
+    state_pool = _provider_pool_from_runtime_state(runtime_root, provider=provider)
+    if state_pool:
+        return state_pool
+    return [service_id for service_id in configured_pool if isinstance(service_id, str) and service_id]
+
+
 def ws_proxy_goal_text(
     *,
     name: str,
@@ -290,6 +329,7 @@ def _dispatch_to_local_llm(
     local_username: str,
     local_session_id: str,
     pending_inputs: list[dict[str, Any]],
+    provider: str,
     provider_pool: list[str],
     log_path: Path,
     append_history: Any,
@@ -315,25 +355,33 @@ def _dispatch_to_local_llm(
 
     auth_context = issue_auth_context(runtime_root, username=local_username)
     dispatch_ts = utc_ts()
+    resolved_provider_pool = _resolve_provider_pool(
+        runtime_root,
+        provider=provider,
+        configured_pool=provider_pool,
+    )
 
     # Lease a local LLM service for the proxy session.
     leased_service_id = get_session_service(
         runtime_root, username=local_username, session_id=local_session_id
     )
-    if leased_service_id and provider_pool and leased_service_id not in provider_pool:
+    if leased_service_id and resolved_provider_pool and leased_service_id not in resolved_provider_pool:
         leased_service_id = None
     if not leased_service_id:
         leased_service_id = lease_session_service(
             runtime_root,
             username=local_username,
             session_id=local_session_id,
-            pool_service_ids=provider_pool,
+            pool_service_ids=resolved_provider_pool,
         )
     if not leased_service_id:
         write_jsonl_fn(log_path, {
             "type": "ws_peer_client.dispatch_failed",
             "ts": utc_ts(),
             "reason": "no_available_provider_worker",
+            "provider": provider,
+            "configured_pool_len": len(provider_pool),
+            "resolved_pool_len": len(resolved_provider_pool),
             "local_session_id": local_session_id,
         })
         return None
@@ -646,6 +694,7 @@ def run_ws_peer_client(
                                     "date": utc_ts(),
                                 }
                             ],
+                            provider=provider,
                             provider_pool=provider_pool,
                             log_path=log_path,
                             append_history=append_history,
@@ -755,6 +804,7 @@ def run_ws_peer_client(
                             local_username=local_username,
                             local_session_id=local_session_id,
                             pending_inputs=list(request["pending_inputs"]),
+                            provider=provider,
                             provider_pool=provider_pool,
                             log_path=log_path,
                             append_history=append_history,

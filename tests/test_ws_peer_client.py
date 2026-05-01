@@ -11,7 +11,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from runtime.persistent_state_pkg import create_conversation_session, get_session_settings, list_sessions
-from runtime.ws_peer_client import ensure_local_proxy_session, run_ws_peer_client, ws_proxy_goal_text
+from runtime.ws_peer_client import (
+    _resolve_provider_pool,
+    ensure_local_proxy_session,
+    run_ws_peer_client,
+    ws_proxy_goal_text,
+)
 
 
 class WsPeerClientProxySessionTests(unittest.TestCase):
@@ -147,6 +152,39 @@ class WsPeerClientProxySessionTests(unittest.TestCase):
         source = Path(ROOT / "src" / "runtime" / "ws_peer_client.py").read_text(encoding="utf-8")
         self.assertIn('provider           str    "claude" | "codex" | "gemini"  (default "claude")', source)
         self.assertIn('"gemini": gemini_service_pool', source)
+
+    def test_resolve_provider_pool_uses_running_services_from_runtime_state(self) -> None:
+        state_dir = self.runtime_root / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "services.json").write_text(
+            """{
+              "services": {
+                "service-codex-001": {"service_id": "service-codex-001", "kind": "codex", "status": "running"},
+                "service-codex-002": {"service_id": "service-codex-002", "kind": "codex", "status": "stopped"},
+                "service-claude-001": {"service_id": "service-claude-001", "kind": "claude", "status": "running"}
+              }
+            }""",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            _resolve_provider_pool(
+                self.runtime_root,
+                provider="codex",
+                configured_pool=[],
+            ),
+            ["service-codex-001"],
+        )
+
+    def test_resolve_provider_pool_falls_back_to_configured_pool_without_state(self) -> None:
+        self.assertEqual(
+            _resolve_provider_pool(
+                self.runtime_root,
+                provider="codex",
+                configured_pool=["service-codex-002"],
+            ),
+            ["service-codex-002"],
+        )
 
 
 if __name__ == "__main__":

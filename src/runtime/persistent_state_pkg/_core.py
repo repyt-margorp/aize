@@ -651,8 +651,8 @@ def _apply_active_goal_snapshot_unlocked(session: dict[str, Any]) -> None:
         session["goal_text"] = ""
         session["goal_mode"] = "no_goal"
         session["goal_active"] = False
-        session["goal_completed"] = False
-        session["goal_progress_state"] = "in_progress"
+        session["goal_completed"] = True
+        session["goal_progress_state"] = "complete"
         session["goal_updated_at"] = session.get("updated_at", utc_ts())
         session.pop("goal_audit_state", None)
         return
@@ -675,8 +675,6 @@ def _ensure_goal_history_unlocked(session: dict[str, Any]) -> None:
             if isinstance(raw_revision, dict):
                 history.append(_normalize_goal_revision_unlocked(raw_revision, fallback_ts=fallback_ts))
     should_migrate_legacy_goal = bool(str(session.get("goal_text", "") or "").strip()) or bool(
-        session.get("goal_completed", False)
-    ) or str(session.get("goal_progress_state", "")).strip().lower() == "complete" or bool(
         str(session.get("goal_id") or session.get("active_goal_id") or "").strip()
     )
     if not history and should_migrate_legacy_goal:
@@ -712,8 +710,8 @@ def _normalize_goal_mode_unlocked(session: dict[str, Any]) -> None:
         session["goal_text"] = ""
         session["goal_mode"] = "no_goal"
         session["goal_active"] = False
-        session["goal_completed"] = False
-        session["goal_progress_state"] = "in_progress"
+        session["goal_completed"] = True
+        session["goal_progress_state"] = "complete"
         # goal_audit_state is now agent-side; remove stale session-level value when goal is cleared
         session.pop("goal_audit_state", None)
         return
@@ -735,12 +733,13 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
         session.get("auto_compact_threshold_left_percent", DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT)
     )
     session.setdefault("goal_text", "")
-    session.setdefault("goal_active", bool(session.get("goal_text")))
-    session.setdefault("goal_mode", "active" if bool(session.get("goal_text")) else "no_goal")
+    has_goal_text = bool(str(session.get("goal_text") or "").strip())
+    session.setdefault("goal_active", has_goal_text)
+    session.setdefault("goal_mode", "active" if has_goal_text else "no_goal")
+    session.setdefault("goal_completed", not has_goal_text)
     session.setdefault("goal_progress_state", "complete" if bool(session.get("goal_completed", False)) else "in_progress")
     # goal_audit_state is now agent-side; evict any stale field from pre-migration records
     session.pop("goal_audit_state", None)
-    session.setdefault("goal_completed", False)
     session.setdefault("goal_reset_completed_on_prompt", True)
     session.setdefault("goal_auto_compact_enabled", True)
     session.setdefault("agent_welcome_enabled", False)

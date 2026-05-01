@@ -136,34 +136,17 @@ def _materialize_goal_child_sessions(
         for item in child_goal_requests
         if isinstance(item, dict) and str(item.get("goal_text") or "").strip()
     ]
-    if 0 < len(normalized_requests) < 2:
-        append_user_history(
-            runtime_root,
-            username=username,
-            session_id=session_id,
-            limit=GOAL_AUDIT_HISTORY_LIMIT,
-            entry={
-                "direction": "agent",
-                "ts": utc_ts(),
-                "from": goal_manager_service_id,
-                "session_id": session_id,
-                "event_type": "service.goal_child_sessions_rejected",
-                "text": "GoalManager rejected child-session creation because fewer than two valid child goals remained.",
-                "event": {
-                    "type": "service.goal_child_sessions_rejected",
-                    "goal_id": goal_id,
-                    "requested_children": len(child_goal_requests),
-                    "valid_children": len(normalized_requests),
-                },
-            },
-        )
-        return []
     created_child_sessions: list[dict[str, str]] = []
     for child_request in normalized_requests:
         child_label = str(child_request.get("label") or "").strip() or "Subgoal"
         child_goal_text = str(child_request.get("goal_text") or "").strip()
         requested_service_id = str(child_request.get("service_id") or "").strip()
-        preferred_provider = _provider_from_service_id(requested_service_id)
+        requested_provider = str(child_request.get("provider") or "").strip().lower()
+        preferred_provider = (
+            requested_provider
+            if requested_provider in {"codex", "claude", "gemini"}
+            else _provider_from_service_id(requested_service_id)
+        )
         child_session = create_child_conversation_session(
             runtime_root,
             username=username,
@@ -233,6 +216,57 @@ def _materialize_goal_child_sessions(
             },
         )
     return created_child_sessions
+
+
+def _enqueue_goal_child_session_requests(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    goal_manager_service_id: str,
+    goal_audit_job_id: str,
+    goal_id: str,
+    goal_text: str,
+    child_goal_requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    queued: list[dict[str, Any]] = []
+    for child_request in child_goal_requests:
+        if not isinstance(child_request, dict):
+            continue
+        child_goal_text = str(child_request.get("goal_text") or "").strip()
+        if not child_goal_text:
+            continue
+        signal_payload = {
+            "kind": "goal_child_session_request",
+            "goal_audit_job_id": goal_audit_job_id,
+            "goal_id": goal_id,
+            "goal_text": goal_text,
+            "request": {
+                "label": str(child_request.get("label") or "").strip() or "Subgoal",
+                "goal_text": child_goal_text,
+                "provider": str(child_request.get("provider") or "").strip().lower(),
+                "service_id": str(child_request.get("service_id") or "").strip(),
+            },
+        }
+        append_service_pending_input(
+            runtime_root,
+            service_id=goal_manager_service_id,
+            agent_id=resolve_session_agent_id(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=goal_manager_service_id,
+            ),
+            username=username,
+            session_id=session_id,
+            entry=make_aize_pending_input(
+                kind="goal_child_session_request",
+                role="system",
+                text=json.dumps(signal_payload, ensure_ascii=False),
+            ),
+        )
+        queued.append(signal_payload)
+    return queued
 
 
 def _is_usage_limit_error_text(text: str) -> bool:
@@ -710,6 +744,90 @@ def run_agent_service(
             pool_service_ids=pool,
         )
 
+    def kickoff_goal_child_session_for_dispatch(
+        *,
+        username: str,
+        parent_session_id: str,
+        child_session_id: str,
+        goal_manager_service_id: str,
+    ) -> str:
+        child_settings = get_session_settings(
+            runtime_root,
+            username=username,
+            session_id=child_session_id,
+        ) or {}
+        child_goal_id = str(
+            child_settings.get("active_goal_id")
+            or child_settings.get("goal_id")
+            or ""
+        ).strip()
+        child_goal_text = str(child_settings.get("goal_text") or "").strip()
+        if not child_goal_text:
+            return ""
+        dispatch_service_id = resolve_goal_manager_dispatch_service(
+            username=username,
+            session_id=child_session_id,
+        )
+        if not dispatch_service_id:
+            return ""
+        append_pending_input(
+            runtime_root,
+            username=username,
+            session_id=child_session_id,
+            entry=make_aize_pending_input(
+                kind="goal_update",
+                role="system",
+                text=_goal_update_xml(
+                    goal_id=child_goal_id,
+                    goal_text=child_goal_text,
+                    goal_context=session_goal_context(
+                        runtime_root,
+                        username=username,
+                        session_id=child_session_id,
+                    ),
+                ),
+            ),
+        )
+        send_tx(
+            make_dispatch_pending_message(
+                manifest=manifest,
+                from_service_id=goal_manager_service_id,
+                to_service_id=dispatch_service_id,
+                process_id=process_id,
+                run_id=f"goal-child-{uuid.uuid4().hex[:8]}",
+                username=username,
+                session_id=child_session_id,
+                auth_context=None,
+                reason="goal_child_session_created",
+                session_agent_id=resolve_session_agent_id(
+                    runtime_root,
+                    username=username,
+                    session_id=child_session_id,
+                    service_id=dispatch_service_id,
+                ),
+            )
+        )
+        append_user_history(
+            runtime_root,
+            username=username,
+            session_id=parent_session_id,
+            limit=GOAL_AUDIT_HISTORY_LIMIT,
+            entry={
+                "direction": "agent",
+                "ts": utc_ts(),
+                "from": goal_manager_service_id,
+                "session_id": parent_session_id,
+                "event_type": "service.goal_child_session_dispatched",
+                "text": f"GoalManager dispatched child session {child_session_id} to {dispatch_service_id}.",
+                "event": {
+                    "type": "service.goal_child_session_dispatched",
+                    "child_session_id": child_session_id,
+                    "dispatch_service_id": dispatch_service_id,
+                },
+            },
+        )
+        return dispatch_service_id
+
     def maybe_spawn_failure_recovery(
         *,
         username: str | None,
@@ -1022,6 +1140,24 @@ def run_agent_service(
                 decoded.append(parsed)
         return decoded
 
+    def decode_goal_child_session_request_inputs(
+        pending_inputs: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        decoded: list[dict[str, Any]] = []
+        for item in pending_inputs or []:
+            if str((item or {}).get("kind") or "").strip().lower() != "goal_child_session_request":
+                continue
+            raw_text = str((item or {}).get("text") or "").strip()
+            if not raw_text:
+                continue
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                decoded.append(parsed)
+        return decoded
+
     def run_goal_manager_review(
         *,
         username: str,
@@ -1044,65 +1180,6 @@ def run_agent_service(
 
         def goal_history_sink(entry: dict[str, Any]) -> None:
             append_scoped_history(entry, limit=GOAL_AUDIT_HISTORY_LIMIT)
-
-        def kickoff_goal_child_session(child_session_id: str) -> str:
-            child_settings = get_session_settings(
-                runtime_root,
-                username=username,
-                session_id=child_session_id,
-            ) or {}
-            child_goal_id = str(
-                child_settings.get("active_goal_id")
-                or child_settings.get("goal_id")
-                or ""
-            ).strip()
-            child_goal_text = str(child_settings.get("goal_text") or "").strip()
-            if not child_goal_text:
-                return ""
-            dispatch_service_id = resolve_goal_manager_dispatch_service(
-                username=username,
-                session_id=child_session_id,
-            )
-            if not dispatch_service_id:
-                return ""
-            append_pending_input(
-                runtime_root,
-                username=username,
-                session_id=child_session_id,
-                entry=make_aize_pending_input(
-                    kind="goal_update",
-                    role="system",
-                    text=_goal_update_xml(
-                        goal_id=child_goal_id,
-                        goal_text=child_goal_text,
-                        goal_context=session_goal_context(
-                            runtime_root,
-                            username=username,
-                            session_id=child_session_id,
-                        ),
-                    ),
-                ),
-            )
-            send_tx(
-                make_dispatch_pending_message(
-                    manifest=manifest,
-                    from_service_id=goal_manager_service_id,
-                    to_service_id=dispatch_service_id,
-                    process_id=process_id,
-                    run_id=f"goal-child-{uuid.uuid4().hex[:8]}",
-                    username=username,
-                    session_id=child_session_id,
-                    auth_context=None,
-                    reason="goal_child_session_created",
-                    session_agent_id=resolve_session_agent_id(
-                        runtime_root,
-                        username=username,
-                        session_id=child_session_id,
-                        service_id=dispatch_service_id,
-                    ),
-                )
-            )
-            return dispatch_service_id
 
         def goal_provider_event_sink(event: dict[str, Any]) -> None:
             provider_event_type = str(event.get("type") or "event").strip() or "event"
@@ -1299,16 +1376,51 @@ def run_agent_service(
                             last_turn_completed_at=max(reviewed_ts),
                         )
             if audit is not None and isinstance(audit.get("child_goal_requests"), list):
-                _materialize_goal_child_sessions(
+                queued_child_signals = _enqueue_goal_child_session_requests(
                     runtime_root=runtime_root,
                     username=username,
                     session_id=session_id,
+                    goal_manager_service_id=goal_manager_service_id,
+                    goal_audit_job_id=goal_audit_job_id,
                     goal_id=goal_id,
                     goal_text=goal_text,
-                    goal_manager_service_id=goal_manager_service_id,
                     child_goal_requests=list(audit.get("child_goal_requests", [])),
-                    dispatch_child_session=kickoff_goal_child_session,
                 )
+                if queued_child_signals:
+                    goal_history_sink(
+                        {
+                            "direction": "agent",
+                            "ts": utc_ts(),
+                            "from": goal_manager_service_id,
+                            "session_id": session_id,
+                            "event_type": "service.goal_child_session_requests_queued",
+                            "text": f"GoalManager queued {len(queued_child_signals)} child-session signal(s).",
+                            "event": {
+                                "type": "service.goal_child_session_requests_queued",
+                                "goal_audit_job_id": goal_audit_job_id,
+                                "requests": queued_child_signals,
+                            },
+                        }
+                    )
+                    send_tx(
+                        make_dispatch_pending_message(
+                            manifest=manifest,
+                            from_service_id=goal_manager_service_id,
+                            to_service_id=goal_manager_service_id,
+                            process_id=process_id,
+                            run_id=f"goal-child-signal-{uuid.uuid4().hex[:8]}",
+                            username=username,
+                            session_id=session_id,
+                            auth_context=None,
+                            reason="goal_child_session_request",
+                            session_agent_id=resolve_session_agent_id(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                service_id=goal_manager_service_id,
+                            ),
+                        )
+                    )
             if audit_progress_state == "complete":
                 update_session_goal_flags(
                     runtime_root,
@@ -1678,6 +1790,7 @@ def run_agent_service(
         try:
             with scope_lock_for(scope_username, scope_session_id):
                 goal_manager_review_items: list[dict[str, Any]] = []
+                goal_child_session_request_items: list[dict[str, Any]] = []
                 # Drain pending inputs inside the scope lock to prevent a race where two
                 # dispatch_pending messages both see a non-empty queue and each launch Codex.
                 if dispatch_pending:
@@ -1729,6 +1842,7 @@ def run_agent_service(
                         session_id=scope_session_id,
                     )
                     goal_manager_review_items = decode_goal_manager_review_inputs(service_pending_inputs)
+                    goal_child_session_request_items = decode_goal_child_session_request_inputs(service_pending_inputs)
                     pending_inputs.extend(service_pending_inputs)
                     if not pending_inputs:
                         write_jsonl(
@@ -1775,6 +1889,19 @@ def run_agent_service(
                 )
 
                 if dispatch_pending and goal_manager_review_items and scope_username and scope_session_id:
+                    for child_signal in goal_child_session_request_items:
+                        append_service_pending_input(
+                            runtime_root,
+                            service_id=service_id,
+                            agent_id=target_agent_id,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            entry=make_aize_pending_input(
+                                kind="goal_child_session_request",
+                                role="system",
+                                text=json.dumps(child_signal, ensure_ascii=False),
+                            ),
+                        )
                     goal_review_settings = get_session_settings(
                         runtime_root,
                         username=scope_username,
@@ -1790,6 +1917,33 @@ def run_agent_service(
                         gm_work_items=goal_manager_review_items,
                         append_scoped_history=append_scoped_history,
                     )
+                    return
+
+                if dispatch_pending and goal_child_session_request_items and scope_username and scope_session_id:
+                    latest_signal = goal_child_session_request_items[-1]
+                    child_requests = [
+                        dict(item.get("request") or {})
+                        for item in goal_child_session_request_items
+                        if isinstance(item, dict) and isinstance(item.get("request"), dict)
+                    ]
+                    if child_requests:
+                        _materialize_goal_child_sessions(
+                            runtime_root=runtime_root,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            goal_id=str(latest_signal.get("goal_id") or "").strip(),
+                            goal_text=str(latest_signal.get("goal_text") or "").strip(),
+                            goal_manager_service_id=service_id,
+                            child_goal_requests=child_requests,
+                            dispatch_child_session=lambda child_session_id: (
+                                kickoff_goal_child_session_for_dispatch(
+                                    username=scope_username,
+                                    parent_session_id=scope_session_id,
+                                    child_session_id=child_session_id,
+                                    goal_manager_service_id=service_id,
+                                )
+                            ),
+                        )
                     return
 
                 prompt = build_prompt(self_service, peer_service, incoming_text, reply_index)
@@ -1894,7 +2048,10 @@ def run_agent_service(
                         send_tx(event_message)
 
                 if self_service["kind"] == "codex":
-                    process_record = get_process_record(runtime_root, process_id)
+                    try:
+                        process_record = get_process_record(runtime_root, process_id)
+                    except KeyError:
+                        process_record = {}
                     scoped_session_id = load_codex_session(
                         runtime_root,
                         service_id=service_id,
