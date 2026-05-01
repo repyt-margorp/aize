@@ -56,14 +56,13 @@ def resolve_node_id() -> str:
 NODE_ID = resolve_node_id()
 PRIMARY_RUNTIME_ROOT = (ROOT / ".agent-mesh-runtime").resolve()
 ALLOW_PRIMARY_HTTP_OVERRIDE = os.environ.get("AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}
+HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))
+_requested_tls = os.environ.get("AIZE_TLS", "true").strip().lower() not in {"false", "0", "no", "off"}
 if RUNTIME_ROOT.resolve() == PRIMARY_RUNTIME_ROOT and not ALLOW_PRIMARY_HTTP_OVERRIDE:
-    HTTP_HOST = "0.0.0.0"
-    HTTP_PORT = 4123
     HTTP_TLS = True
 else:
-    HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
-    HTTP_PORT = int(os.environ.get("AIZE_HTTP_PORT", "4123"))
-    HTTP_TLS = os.environ.get("AIZE_TLS", "true").strip().lower() not in {"false", "0", "no", "off"}
+    HTTP_TLS = _requested_tls
 BOOTSTRAP_SERVICE_IDS = {"service-svcmgr-001"}
 DESCRIPTOR_MANAGED_SERVICE_IDS = {
     str(service["service_id"])
