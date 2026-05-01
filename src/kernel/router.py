@@ -13,6 +13,7 @@ from pathlib import Path
 
 from kernel.ipc import HANDSHAKE_TYPE, SYSTEM_SENDERS, create_router_socket, router_socket_path
 from kernel.lifecycle import init_lifecycle_state
+from kernel.network import normalize_network_message
 from kernel.peers import get_peer
 from kernel.registry import get_service_record, init_registry, list_service_records, load_manifest, update_service_process
 from kernel.spawn import SpawnManager
@@ -388,7 +389,7 @@ def main() -> int:
                                     )
                     continue
 
-                message = decode_line(line)
+                message = normalize_network_message(manifest, decode_line(line))
 
                 if conn.is_system:
                     # System sender path (user.local, kernel.local)
@@ -419,12 +420,6 @@ def main() -> int:
                             },
                         )
                         continue
-                    if route_kernel_message(
-                        router_log=router_log,
-                        spawn_manager=spawn_manager,
-                        message=message,
-                    ):
-                        continue
                     if not is_local_message(manifest, message):
                         delivered, detail = forward_remote_message(runtime_root, message)
                         write_jsonl(
@@ -438,6 +433,12 @@ def main() -> int:
                                 "message": message,
                             },
                         )
+                        continue
+                    if route_kernel_message(
+                        router_log=router_log,
+                        spawn_manager=spawn_manager,
+                        message=message,
+                    ):
                         continue
                     recipient_id = message["to"]
                     deliver_local_message(
@@ -491,13 +492,6 @@ def main() -> int:
                     )
                     continue
 
-                if route_kernel_message(
-                    router_log=router_log,
-                    spawn_manager=spawn_manager,
-                    message=message,
-                ):
-                    continue
-
                 sender_id = message["from"]
                 recipient_id = message["to"]
                 allowed, _reason = authorize_control_injection(
@@ -541,6 +535,12 @@ def main() -> int:
                             "message": message,
                         },
                     )
+                    continue
+                if route_kernel_message(
+                    router_log=router_log,
+                    spawn_manager=spawn_manager,
+                    message=message,
+                ):
                     continue
                 deliver_local_message(
                     router_log=router_log,

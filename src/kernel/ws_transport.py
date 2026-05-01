@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from kernel.network import prepare_outbound_network_message
 from kernel.peers import get_peer, load_peers
 from runtime.ws_bridge import OP_CLOSE, OP_PING, OP_TEXT, read_frame, write_masked_text_frame
 from wire.protocol import message_meta_get, message_set_meta
@@ -62,7 +63,14 @@ def ws_url_from_peer_record(record: dict[str, Any]) -> str:
 def router_peer_config(runtime_root: Path, node_id: str) -> dict[str, Any] | None:
     configs = load_ws_router_peer_configs(runtime_root)
     if node_id in configs:
-        return configs[node_id]
+        config = dict(configs[node_id])
+        via_node = str(config.get("via_node") or "").strip()
+        if via_node and via_node in configs:
+            via_config = dict(configs[via_node])
+            via_config.setdefault("route_destination_node", node_id)
+            via_config.setdefault("node_id", via_node)
+            return via_config
+        return config
     peer = get_peer(runtime_root, node_id)
     if peer:
         return dict(peer)
@@ -87,9 +95,8 @@ def authorize_inbound_kernel_message(
     to_node = str(message_meta_get(message, "to_node", "")).strip()
     if not from_node or not to_node:
         return False, "missing_node_metadata"
-    if to_node != str(manifest.get("node_id") or ""):
-        return False, "not_addressed_to_this_node"
-    if from_node == str(manifest.get("node_id") or ""):
+    local_node = str(manifest.get("node_id") or "")
+    if from_node == local_node:
         return False, "remote_transport_cannot_claim_local_node"
     auth_node = str((auth_context or {}).get("node_id") or "").strip()
     if auth_node and auth_node != from_node:
@@ -101,6 +108,13 @@ def authorize_inbound_kernel_message(
         if not isinstance(peer, dict) or not bool(peer.get("trusted")):
             return False, "untrusted_node"
         config = peer
+
+    if to_node != local_node:
+        if not bool(config.get("allow_transit", False)):
+            return False, "not_addressed_to_this_node"
+        allowed_to_nodes = _as_list(config.get("accept_to_nodes") or config.get("transit_to_nodes"))
+        if allowed_to_nodes and not _matches_policy(to_node, allowed_to_nodes):
+            return False, "to_node_not_allowed"
 
     allowed_from_nodes = _as_list(config.get("accept_from_nodes") or config.get("trusted_from_nodes"))
     if allowed_from_nodes and not _matches_policy(from_node, allowed_from_nodes):
@@ -183,6 +197,9 @@ def forward_message_via_ws(
     ws_url = ws_url_from_peer_record(config)
     if not ws_url:
         return False, f"missing_ws_url:{to_node}"
+    outbound, route_detail = prepare_outbound_network_message(manifest, message)
+    if outbound is None:
+        return False, route_detail
 
     sock = None
     try:
@@ -210,7 +227,6 @@ def forward_message_via_ws(
             if not isinstance(auth_reply, dict) or auth_reply.get("type") != "auth_ok":
                 return False, f"auth_failed:{auth_reply}"
 
-        outbound = dict(message)
         message_set_meta(outbound, "transport", KERNEL_WS_TRANSPORT)
         write_masked_text_frame(
             wfile,
