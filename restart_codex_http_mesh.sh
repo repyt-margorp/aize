@@ -11,41 +11,41 @@ if [[ -n "${AIZE_HTTP_PORT:-}" ]]; then
   HTTP_PORT="$AIZE_HTTP_PORT"
 else
   HTTP_PORT="$(
-    "$PYTHON" - "$RUNTIME_ROOT" <<'PY' 2>/dev/null || true
+    "$PYTHON" - "$RUNTIME_ROOT" "$LEGACY_RUNTIME_ROOT" <<'PY' 2>/dev/null || true
 import json
 import sys
 from pathlib import Path
 
-runtime_root = Path(sys.argv[1])
-for path in (
-    runtime_root / "state" / "services.json",
-    runtime_root / "manifest.json",
-):
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        continue
-    services = data.get("services", {})
-    if isinstance(services, dict):
-        service = services.get("service-http-001")
-    elif isinstance(services, list):
-        service = next(
-            (
-                item
-                for item in services
-                if isinstance(item, dict)
-                and item.get("service_id") == "service-http-001"
-            ),
-            None,
-        )
-    else:
-        service = None
-    if not isinstance(service, dict):
-        continue
-    port = (service.get("config") or {}).get("port")
-    if isinstance(port, int) or (isinstance(port, str) and port.isdigit()):
-        print(port)
-        raise SystemExit(0)
+for runtime_root in [Path(arg) for arg in sys.argv[1:]]:
+    for path in (
+        runtime_root / "state" / "services.json",
+        runtime_root / "manifest.json",
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        services = data.get("services", {})
+        if isinstance(services, dict):
+            service = services.get("service-http-001")
+        elif isinstance(services, list):
+            service = next(
+                (
+                    item
+                    for item in services
+                    if isinstance(item, dict)
+                    and item.get("service_id") == "service-http-001"
+                ),
+                None,
+            )
+        else:
+            service = None
+        if not isinstance(service, dict):
+            continue
+        port = (service.get("config") or {}).get("port")
+        if isinstance(port, int) or (isinstance(port, str) and port.isdigit()):
+            print(port)
+            raise SystemExit(0)
 PY
   )"
   HTTP_PORT="${HTTP_PORT:-4123}"
@@ -208,7 +208,7 @@ terminate_matches "$router_pattern"
 log "router processes terminated"
 terminate_matches "$adapter_pattern"
 log "adapter processes terminated"
-if [[ -z "${AIZE_RUNTIME_ROOT:-}" && "$RUNTIME_ROOT" != "$LEGACY_RUNTIME_ROOT" ]]; then
+if [[ "$RUNTIME_ROOT" != "$LEGACY_RUNTIME_ROOT" ]]; then
   terminate_matches "$legacy_parent_pattern"
   log "legacy parent processes terminated"
   terminate_matches "$legacy_router_pattern"
