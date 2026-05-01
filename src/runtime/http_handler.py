@@ -2182,6 +2182,7 @@ def make_handler(
                 unregister_history_subscriber=unregister_history_subscriber,
                 record_session_agent_contact=record_session_agent_contact,
                 write_jsonl=write_jsonl,
+                send_router_control=send_router_control,
             )
 
         def do_POST(self) -> None:

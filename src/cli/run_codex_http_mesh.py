@@ -9,7 +9,6 @@ import sys
 import time
 import uuid
 from pathlib import Path
-import re
 from collections import defaultdict
 
 from services.svcmgr.loader import build_service_plan, build_service_plan_for_kinds, get_service_descriptor
@@ -35,7 +34,26 @@ LOGS = RUNTIME_ROOT / "logs"
 OBJECTS = RUNTIME_ROOT / "objects"
 STATE = RUNTIME_ROOT / "state"
 MANIFEST = RUNTIME_ROOT / "manifest.json"
-NODE_ID = os.environ.get("AIZE_NODE_ID") or f"node-{re.sub(r'[^a-z0-9]+', '-', ROOT.name.lower()).strip('-') or 'local'}"
+
+
+def resolve_node_id() -> str:
+    configured = str(os.environ.get("AIZE_NODE_ID") or "").strip()
+    if configured:
+        return configured
+    node_id_path = STATE / "node_id"
+    try:
+        existing = node_id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if existing:
+        return existing
+    generated = f"node-{uuid.uuid4().hex[:12]}"
+    node_id_path.parent.mkdir(parents=True, exist_ok=True)
+    node_id_path.write_text(generated + "\n", encoding="utf-8")
+    return generated
+
+
+NODE_ID = resolve_node_id()
 PRIMARY_RUNTIME_ROOT = (ROOT / ".agent-mesh-runtime").resolve()
 ALLOW_PRIMARY_HTTP_OVERRIDE = os.environ.get("AIZE_ALLOW_PRIMARY_RUNTIME_HTTP_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}
 if RUNTIME_ROOT.resolve() == PRIMARY_RUNTIME_ROOT and not ALLOW_PRIMARY_HTTP_OVERRIDE:
@@ -214,6 +232,7 @@ def write_manifest(
 
 def bootstrap_runtime() -> dict:
     extra_services, extra_routes, restart_resume = capture_restorable_runtime()
+    saved_node_id = NODE_ID.encode("utf-8") + b"\n"
     if RUNTIME_ROOT.exists():
         # Preserve TLS certificates across restarts so manually-generated certs survive.
         tls_dir = RUNTIME_ROOT / "tls"
@@ -227,14 +246,20 @@ def bootstrap_runtime() -> dict:
         saved_ws_peer_clients: bytes | None = (
             ws_peer_clients_path.read_bytes() if ws_peer_clients_path.exists() else None
         )
+        ws_router_peers_path = RUNTIME_ROOT / "ws_router_peers.json"
+        saved_ws_router_peers: bytes | None = (
+            ws_router_peers_path.read_bytes() if ws_router_peers_path.exists() else None
+        )
         shutil.rmtree(RUNTIME_ROOT)
     else:
         saved_tls = {}
         saved_ws_peer_clients = None
+        saved_ws_router_peers = None
     PORTS.mkdir(parents=True)
     LOGS.mkdir(parents=True)
     OBJECTS.mkdir(parents=True)
     STATE.mkdir(parents=True)
+    (STATE / "node_id").write_bytes(saved_node_id)
     if saved_tls:
         tls_restore = RUNTIME_ROOT / "tls"
         tls_restore.mkdir(parents=True, exist_ok=True)
@@ -244,6 +269,8 @@ def bootstrap_runtime() -> dict:
             dest.chmod(0o600 if name.endswith(".key") else 0o644)
     if saved_ws_peer_clients is not None:
         (RUNTIME_ROOT / "ws_peer_clients.json").write_bytes(saved_ws_peer_clients)
+    if saved_ws_router_peers is not None:
+        (RUNTIME_ROOT / "ws_router_peers.json").write_bytes(saved_ws_router_peers)
     for service in extra_services:
         if not isinstance(service, dict):
             continue

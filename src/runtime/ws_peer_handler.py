@@ -51,6 +51,12 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from kernel.ws_transport import (
+    KERNEL_WS_ACCEPTED_TYPE,
+    KERNEL_WS_MESSAGE_TYPE,
+    authorize_inbound_kernel_message,
+    mark_inbound_kernel_transport,
+)
 from runtime.persistent_state import (
     write_agent_file,
     read_agent_file,
@@ -87,6 +93,7 @@ def handle_peer_connection(
     unregister_history_subscriber: Callable,
     record_session_agent_contact: Callable,
     write_jsonl: Callable,
+    send_router_control: Callable[[dict[str, Any]], bool] | None = None,
 ) -> None:
     """Run the WebSocket peer session loop until the connection closes."""
     _lock = threading.Lock()          # guards _subscriptions
@@ -341,6 +348,52 @@ def handle_peer_connection(
         })
         _send({"type": "message_accepted", "username": username, "session_id": session_id})
 
+    def _handle_kernel_message(msg: dict[str, Any]) -> None:
+        if _auth_context is None:
+            _send({"type": "error", "message": "not_authenticated"})
+            return
+        if send_router_control is None:
+            _send({"type": "error", "message": "kernel_router_unavailable"})
+            return
+        message = msg.get("message")
+        if not isinstance(message, dict):
+            _send({"type": "error", "message": "message_required"})
+            return
+        allowed, detail = authorize_inbound_kernel_message(
+            runtime_root,
+            manifest=manifest,
+            auth_context=_auth_context,
+            message=message,
+        )
+        if not allowed:
+            write_jsonl(log_path, {
+                "type": "ws_kernel.message_rejected",
+                "ts": utc_ts(),
+                "reason": detail,
+                "peer_username": str(_auth_context.get("username", "")),
+                "peer_node_id": str(_auth_context.get("node_id", "")),
+            })
+            _send({"type": KERNEL_WS_ACCEPTED_TYPE, "accepted": False, "detail": detail})
+            return
+        peer_username = str(_auth_context.get("username", "")).strip()
+        marked = mark_inbound_kernel_transport(message, peer_username=peer_username)
+        accepted = bool(send_router_control(marked))
+        write_jsonl(log_path, {
+            "type": "ws_kernel.message_received",
+            "ts": utc_ts(),
+            "accepted": accepted,
+            "detail": detail if accepted else "router_control_injection_failed",
+            "from_node": str(marked.get("from_node") or (marked.get("meta") or {}).get("from_node") or ""),
+            "to_node": str(marked.get("to_node") or (marked.get("meta") or {}).get("to_node") or ""),
+            "from": str(marked.get("from", "")),
+            "to": str(marked.get("to", "")),
+        })
+        _send({
+            "type": KERNEL_WS_ACCEPTED_TYPE,
+            "accepted": accepted,
+            "detail": detail if accepted else "router_control_injection_failed",
+        })
+
     # ----------------------------------------------------------------- file handlers
 
     def _peer_service_id_for_file(msg: dict[str, Any]) -> str | None:
@@ -538,6 +591,7 @@ def handle_peer_connection(
         "join_session": _handle_join_session,
         "leave_session": _handle_leave_session,
         "message": _handle_message,
+        KERNEL_WS_MESSAGE_TYPE: _handle_kernel_message,
         "file_write": _handle_file_write,
         "file_read": _handle_file_read,
         "file_list": _handle_file_list,

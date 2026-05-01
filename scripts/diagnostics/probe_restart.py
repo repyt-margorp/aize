@@ -10,14 +10,25 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-import re
 
 
 ROOT = Path(os.environ.get("AIZE_ROOT", Path(__file__).resolve().parents[2]))
 RUNTIME_ROOT = Path(os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".agent-mesh-runtime")))
 HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = os.environ.get("AIZE_HTTP_PORT", "4123")
-NODE_ID = os.environ.get("AIZE_NODE_ID") or f"node-{re.sub(r'[^a-z0-9]+', '-', ROOT.name.lower()).strip('-') or 'local'}"
+
+
+def resolve_node_id() -> str:
+    configured = str(os.environ.get("AIZE_NODE_ID") or "").strip()
+    if configured:
+        return configured
+    node_id_path = RUNTIME_ROOT / "state" / "node_id"
+    if node_id_path.exists():
+        return node_id_path.read_text(encoding="utf-8").strip()
+    return "node-local"
+
+
+NODE_ID = resolve_node_id()
 RESTART_SCRIPT = ROOT / "restart_codex_http_mesh.sh"
 LOG_DIR = ROOT / ".temp" / "restart-debug" / "logs"
 HEALTH_URL = f"https://{HTTP_HOST}:{HTTP_PORT}/health"

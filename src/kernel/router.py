@@ -16,6 +16,7 @@ from kernel.lifecycle import init_lifecycle_state
 from kernel.peers import get_peer
 from kernel.registry import get_service_record, init_registry, list_service_records, load_manifest, update_service_process
 from kernel.spawn import SpawnManager
+from kernel.ws_transport import forward_message_via_ws, is_ws_kernel_ingress
 from wire.protocol import decode_line, encode_line, message_meta_get, utc_ts, write_jsonl
 
 
@@ -138,6 +139,8 @@ def authorize_control_injection(
     recipient_id = str(message.get("to", ""))
     from_node = str(message_meta_get(message, "from_node", manifest["node_id"]))
     if from_node != str(manifest["node_id"]):
+        if is_ws_kernel_ingress(message):
+            return True, "trusted_ws_kernel_ingress"
         return False, "remote_control_injection_disabled"
 
     if sender_id in {"user.local", "kernel.local"}:
@@ -162,6 +165,17 @@ def authorize_control_injection(
 
 
 def forward_remote_message(runtime_root: Path, message: dict) -> tuple[bool, str]:
+    manifest_path = runtime_root / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = load_manifest(manifest_path)
+        except Exception:
+            manifest = {}
+        if manifest:
+            delivered, detail = forward_message_via_ws(runtime_root, manifest=manifest, message=message)
+            if delivered:
+                return True, detail
+
     to_node = str(message_meta_get(message, "to_node", ""))
     peer = get_peer(runtime_root, to_node)
     if not peer:
