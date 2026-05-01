@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from collections import defaultdict
 
+from kernel.identity import ensure_node_identity
 from services.svcmgr.loader import build_service_plan, build_service_plan_for_kinds, get_service_descriptor
 
 # Accept --runtime-root as a CLI arg so the runtime root appears in the process
@@ -40,17 +41,7 @@ def resolve_node_id() -> str:
     configured = str(os.environ.get("AIZE_NODE_ID") or "").strip()
     if configured:
         return configured
-    node_id_path = STATE / "node_id"
-    try:
-        existing = node_id_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        existing = ""
-    if existing:
-        return existing
-    generated = f"node-{uuid.uuid4().hex[:12]}"
-    node_id_path.parent.mkdir(parents=True, exist_ok=True)
-    node_id_path.write_text(generated + "\n", encoding="utf-8")
-    return generated
+    return ensure_node_identity(RUNTIME_ROOT)["node_id"]
 
 
 NODE_ID = resolve_node_id()
@@ -240,6 +231,12 @@ def bootstrap_runtime() -> dict:
             for f in tls_dir.iterdir():
                 if f.is_file():
                     saved_tls[f.name] = f.read_bytes()
+        identity_dir = RUNTIME_ROOT / "identity"
+        saved_identity: dict[str, bytes] = {}
+        if identity_dir.exists():
+            for f in identity_dir.iterdir():
+                if f.is_file():
+                    saved_identity[f.name] = f.read_bytes()
         # Preserve ws_peer_clients.json (outbound peer client config).
         ws_peer_clients_path = RUNTIME_ROOT / "ws_peer_clients.json"
         saved_ws_peer_clients: bytes | None = (
@@ -252,6 +249,7 @@ def bootstrap_runtime() -> dict:
         shutil.rmtree(RUNTIME_ROOT)
     else:
         saved_tls = {}
+        saved_identity = {}
         saved_ws_peer_clients = None
         saved_ws_router_peers = None
     PORTS.mkdir(parents=True)
@@ -266,6 +264,13 @@ def bootstrap_runtime() -> dict:
             dest = tls_restore / name
             dest.write_bytes(data)
             dest.chmod(0o600 if name.endswith(".key") else 0o644)
+    if saved_identity:
+        identity_restore = RUNTIME_ROOT / "identity"
+        identity_restore.mkdir(parents=True, exist_ok=True)
+        for name, data in saved_identity.items():
+            dest = identity_restore / name
+            dest.write_bytes(data)
+            dest.chmod(0o600 if name.endswith("_private.pem") else 0o644)
     if saved_ws_peer_clients is not None:
         (RUNTIME_ROOT / "ws_peer_clients.json").write_bytes(saved_ws_peer_clients)
     if saved_ws_router_peers is not None:

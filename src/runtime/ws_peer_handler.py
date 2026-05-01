@@ -51,10 +51,21 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from kernel.identity import (
+    client_auth_payload,
+    ensure_node_identity,
+    node_id_from_public_key_b64,
+    normalize_public_key_b64,
+    random_challenge,
+    server_auth_payload,
+    sign_payload,
+    verify_signature,
+)
 from kernel.ws_transport import (
     KERNEL_WS_ACCEPTED_TYPE,
     KERNEL_WS_MESSAGE_TYPE,
     authorize_inbound_kernel_message,
+    load_ws_router_peer_configs,
     mark_inbound_kernel_transport,
 )
 from runtime.persistent_state import (
@@ -100,6 +111,7 @@ def handle_peer_connection(
     _write_lock = threading.Lock()    # guards wfile writes (main loop + event pumps)
     _closed = threading.Event()
     _auth_context: dict[str, Any] | None = None
+    _pending_auth: dict[str, Any] | None = None
     # key → subscriber queue  (key = "username::session_id")
     _subscriptions: dict[str, queue.Queue[dict[str, Any]]] = {}
 
@@ -160,8 +172,132 @@ def handle_peer_connection(
 
     # ----------------------------------------------------------------- handlers
 
+    def _public_key_trusted_for_node(node_id: str, public_key: str) -> bool:
+        configs = load_ws_router_peer_configs(runtime_root)
+        config = configs.get(node_id)
+        if not config:
+            return False
+        expected = str(
+            config.get("public_key")
+            or config.get("peer_public_key")
+            or config.get("public_key_der_b64")
+            or ""
+        ).strip()
+        if not expected:
+            return True
+        try:
+            return normalize_public_key_b64(expected) == normalize_public_key_b64(public_key)
+        except Exception:
+            return False
+
+    def _handle_auth_init(msg: dict[str, Any]) -> None:
+        nonlocal _pending_auth
+        if str(msg.get("auth_type") or "").strip().lower() != "ed25519":
+            _send({"type": "auth_error", "message": "unsupported_auth_type"})
+            return
+        client_node_id = str(msg.get("node_id") or "").strip()
+        client_public_key = str(msg.get("public_key") or "").strip()
+        client_challenge = str(msg.get("client_challenge") or "").strip()
+        if not client_node_id or not client_public_key or not client_challenge:
+            _send({"type": "auth_error", "message": "ed25519_auth_init_fields_required"})
+            return
+        try:
+            client_public_key = normalize_public_key_b64(client_public_key)
+            derived_node_id = node_id_from_public_key_b64(client_public_key)
+        except Exception:
+            _send({"type": "auth_error", "message": "invalid_public_key"})
+            return
+        if client_node_id != derived_node_id:
+            _send({"type": "auth_error", "message": "node_id_public_key_mismatch"})
+            return
+        if not _public_key_trusted_for_node(client_node_id, client_public_key):
+            _send({"type": "auth_error", "message": "untrusted_public_key"})
+            return
+
+        server_identity = ensure_node_identity(runtime_root)
+        server_node_id = str(server_identity["node_id"])
+        server_public_key = str(server_identity["public_key"])
+        server_challenge = random_challenge()
+        payload = server_auth_payload(
+            client_node_id=client_node_id,
+            client_public_key=client_public_key,
+            client_challenge=client_challenge,
+            server_node_id=server_node_id,
+            server_public_key=server_public_key,
+            server_challenge=server_challenge,
+        )
+        server_signature = sign_payload(runtime_root, payload)
+        _pending_auth = {
+            "client_node_id": client_node_id,
+            "client_public_key": client_public_key,
+            "client_challenge": client_challenge,
+            "server_node_id": server_node_id,
+            "server_public_key": server_public_key,
+            "server_challenge": server_challenge,
+        }
+        _send({
+            "type": "auth_challenge",
+            "auth_type": "ed25519",
+            "node_id": server_node_id,
+            "public_key": server_public_key,
+            "server_challenge": server_challenge,
+            "server_signature": server_signature,
+        })
+
+    def _handle_ed25519_auth(msg: dict[str, Any]) -> None:
+        nonlocal _auth_context, _pending_auth
+        if not _pending_auth:
+            _send({"type": "auth_error", "message": "auth_init_required"})
+            return
+        client_node_id = str(_pending_auth.get("client_node_id") or "")
+        client_public_key = str(_pending_auth.get("client_public_key") or "")
+        signature = str(msg.get("signature") or "").strip()
+        if not signature:
+            _send({"type": "auth_error", "message": "signature_required"})
+            return
+        payload = client_auth_payload(
+            client_node_id=client_node_id,
+            client_public_key=client_public_key,
+            client_challenge=str(_pending_auth.get("client_challenge") or ""),
+            server_node_id=str(_pending_auth.get("server_node_id") or ""),
+            server_public_key=str(_pending_auth.get("server_public_key") or ""),
+            server_challenge=str(_pending_auth.get("server_challenge") or ""),
+        )
+        if not verify_signature(client_public_key, payload, signature):
+            _send({"type": "auth_error", "message": "invalid_signature"})
+            return
+        username = str(msg.get("username") or client_node_id).strip()
+        server_public_key = str(_pending_auth.get("server_public_key") or "")
+        _auth_context = {
+            "username": username,
+            "node_id": client_node_id,
+            "public_key": client_public_key,
+            "auth_type": "ed25519",
+        }
+        _pending_auth = None
+        peer_meta = manifest.get("peer") or {}
+        write_jsonl(log_path, {
+            "type": "ws_peer.auth_ok",
+            "ts": utc_ts(),
+            "service_id": self_service["service_id"],
+            "peer_username": username,
+            "peer_node_id": client_node_id,
+            "auth_type": "ed25519",
+        })
+        _send({
+            "type": "auth_ok",
+            "auth_type": "ed25519",
+            "node_id": str(manifest.get("node_id") or ""),
+            "public_key": server_public_key,
+            "peer_id": str(peer_meta.get("peer_id") or ""),
+            "run_id": str(manifest.get("run_id") or ""),
+        })
+
     def _handle_auth(msg: dict[str, Any]) -> None:
         nonlocal _auth_context
+        if str(msg.get("auth_type") or "").strip().lower() == "ed25519":
+            _handle_ed25519_auth(msg)
+            return
         username = str(msg.get("username", "")).strip()
         password = str(msg.get("password", "")).strip()
         if not username or not password:
@@ -586,6 +722,7 @@ def handle_peer_connection(
     # ----------------------------------------------------------------- main loop
 
     _DISPATCH: dict[str, Callable[[dict[str, Any]], None]] = {
+        "auth_init": _handle_auth_init,
         "auth": _handle_auth,
         "list_open_sessions": _handle_list_open_sessions,
         "join_session": _handle_join_session,

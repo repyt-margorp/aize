@@ -6,9 +6,9 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
+from kernel.identity import ensure_node_identity
 from wire.protocol import encode_line, make_message, utc_ts
 
 
@@ -25,17 +25,7 @@ def resolve_node_id() -> str:
     configured = str(os.environ.get("AIZE_NODE_ID") or "").strip()
     if configured:
         return configured
-    node_id_path = STATE / "node_id"
-    try:
-        existing = node_id_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        existing = ""
-    if existing:
-        return existing
-    generated = f"node-{uuid.uuid4().hex[:12]}"
-    node_id_path.parent.mkdir(parents=True, exist_ok=True)
-    node_id_path.write_text(generated + "\n", encoding="utf-8")
-    return generated
+    return ensure_node_identity(RUNTIME_ROOT)["node_id"]
 
 
 NODE_ID = resolve_node_id()
@@ -72,13 +62,26 @@ def write_manifest() -> dict:
 
 def bootstrap_runtime() -> dict:
     saved_node_id = NODE_ID.encode("utf-8") + b"\n"
+    saved_identity: dict[str, bytes] = {}
     if RUNTIME_ROOT.exists():
+        identity_dir = RUNTIME_ROOT / "identity"
+        if identity_dir.exists():
+            for f in identity_dir.iterdir():
+                if f.is_file():
+                    saved_identity[f.name] = f.read_bytes()
         shutil.rmtree(RUNTIME_ROOT)
     PORTS.mkdir(parents=True)
     LOGS.mkdir(parents=True)
     OBJECTS.mkdir(parents=True)
     STATE.mkdir(parents=True)
     (STATE / "node_id").write_bytes(saved_node_id)
+    if saved_identity:
+        identity_restore = RUNTIME_ROOT / "identity"
+        identity_restore.mkdir(parents=True, exist_ok=True)
+        for name, data in saved_identity.items():
+            dest = identity_restore / name
+            dest.write_bytes(data)
+            dest.chmod(0o600 if name.endswith("_private.pem") else 0o644)
     make_fifo(PORTS / "router.control")
     for service_id in ("service-codex-001",):
         make_fifo(PORTS / f"{service_id}.rx")

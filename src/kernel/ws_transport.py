@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from kernel.identity import (
+    client_auth_payload,
+    ensure_node_identity,
+    node_id_from_public_key_b64,
+    normalize_public_key_b64,
+    random_challenge,
+    server_auth_payload,
+    sign_payload,
+    verify_signature,
+)
 from kernel.network import prepare_outbound_network_message
 from kernel.peers import get_peer, load_peers
 from runtime.ws_bridge import OP_CLOSE, OP_PING, OP_TEXT, read_frame, write_masked_text_frame
@@ -184,6 +194,121 @@ def _open_ws(url: str, *, timeout: float = 8.0, verify_tls: bool = False):
     return raw_sock, rfile, wfile
 
 
+def _read_text_message(rfile: Any, *, phase: str) -> dict[str, Any]:
+    for _ in range(20):
+        frame = read_frame(rfile)
+        if frame is None:
+            raise OSError(f"connection_closed_during_{phase}")
+        opcode, payload = frame
+        if opcode == OP_CLOSE:
+            raise OSError(f"connection_closed_during_{phase}")
+        if opcode != OP_TEXT:
+            continue
+        msg = json.loads(payload.decode("utf-8"))
+        if isinstance(msg, dict):
+            return msg
+    raise OSError(f"no_text_response_during_{phase}")
+
+
+def _authenticate_ws_peer(
+    runtime_root: Path,
+    *,
+    manifest: dict[str, Any],
+    config: dict[str, Any],
+    rfile: Any,
+    wfile: Any,
+) -> None:
+    auth_type = str(config.get("auth_type") or "").strip().lower()
+    auth_username = str(config.get("auth_username") or "").strip()
+    auth_password = str(config.get("auth_password") or "").strip()
+    use_ed25519 = auth_type == "ed25519" or (not auth_password and auth_type != "password")
+    if not use_ed25519:
+        if not (auth_username or auth_password):
+            return
+        write_masked_text_frame(
+            wfile,
+            json.dumps(
+                {
+                    "type": "auth",
+                    "username": auth_username,
+                    "password": auth_password,
+                    "node_id": str(manifest.get("node_id") or ""),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        auth_reply = _read_text_message(rfile, phase="auth")
+        if auth_reply.get("type") != "auth_ok":
+            raise OSError(f"auth_failed:{auth_reply}")
+        return
+
+    identity = ensure_node_identity(runtime_root)
+    client_node_id = str(identity["node_id"])
+    client_public_key = str(identity["public_key"])
+    client_challenge = random_challenge()
+    write_masked_text_frame(
+        wfile,
+        json.dumps(
+            {
+                "type": "auth_init",
+                "auth_type": "ed25519",
+                "node_id": client_node_id,
+                "public_key": client_public_key,
+                "client_challenge": client_challenge,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    challenge = _read_text_message(rfile, phase="auth_challenge")
+    if challenge.get("type") != "auth_challenge":
+        raise OSError(f"auth_failed:{challenge}")
+    server_node_id = str(challenge.get("node_id") or "").strip()
+    server_public_key = normalize_public_key_b64(str(challenge.get("public_key") or ""))
+    server_challenge = str(challenge.get("server_challenge") or "").strip()
+    server_signature = str(challenge.get("server_signature") or "").strip()
+    if node_id_from_public_key_b64(server_public_key) != server_node_id:
+        raise OSError("server_node_id_public_key_mismatch")
+    expected_node_id = str(config.get("peer_node_id") or config.get("expected_node_id") or config.get("node_id") or "").strip()
+    if expected_node_id and expected_node_id != server_node_id:
+        raise OSError("server_node_id_not_expected")
+    expected_public_key = str(config.get("peer_public_key") or config.get("public_key") or "").strip()
+    if expected_public_key and normalize_public_key_b64(expected_public_key) != server_public_key:
+        raise OSError("server_public_key_not_expected")
+    server_payload = server_auth_payload(
+        client_node_id=client_node_id,
+        client_public_key=client_public_key,
+        client_challenge=client_challenge,
+        server_node_id=server_node_id,
+        server_public_key=server_public_key,
+        server_challenge=server_challenge,
+    )
+    if not verify_signature(server_public_key, server_payload, server_signature):
+        raise OSError("invalid_server_signature")
+    client_payload = client_auth_payload(
+        client_node_id=client_node_id,
+        client_public_key=client_public_key,
+        client_challenge=client_challenge,
+        server_node_id=server_node_id,
+        server_public_key=server_public_key,
+        server_challenge=server_challenge,
+    )
+    write_masked_text_frame(
+        wfile,
+        json.dumps(
+            {
+                "type": "auth",
+                "auth_type": "ed25519",
+                "username": auth_username or client_node_id,
+                "signature": sign_payload(runtime_root, client_payload),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    auth_reply = _read_text_message(rfile, phase="auth_ok")
+    if auth_reply.get("type") != "auth_ok":
+        raise OSError(f"auth_failed:{auth_reply}")
+
+
 def forward_message_via_ws(
     runtime_root: Path,
     *,
@@ -205,27 +330,7 @@ def forward_message_via_ws(
     try:
         verify_tls = bool(config.get("tls_verify", False))
         sock, rfile, wfile = _open_ws(ws_url, verify_tls=verify_tls)
-        auth_username = str(config.get("auth_username") or "").strip()
-        auth_password = str(config.get("auth_password") or "").strip()
-        if auth_username or auth_password:
-            write_masked_text_frame(
-                wfile,
-                json.dumps(
-                    {
-                        "type": "auth",
-                        "username": auth_username,
-                        "password": auth_password,
-                        "node_id": str(manifest.get("node_id") or ""),
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            opcode, payload = read_frame(rfile) or (OP_CLOSE, b"")
-            if opcode != OP_TEXT:
-                return False, "auth_failed:no_text_response"
-            auth_reply = json.loads(payload.decode("utf-8"))
-            if not isinstance(auth_reply, dict) or auth_reply.get("type") != "auth_ok":
-                return False, f"auth_failed:{auth_reply}"
+        _authenticate_ws_peer(runtime_root, manifest=manifest, config=config, rfile=rfile, wfile=wfile)
 
         message_set_meta(outbound, "transport", KERNEL_WS_TRANSPORT)
         write_masked_text_frame(

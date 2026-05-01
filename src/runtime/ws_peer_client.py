@@ -41,6 +41,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from kernel.identity import (
+    client_auth_payload,
+    ensure_node_identity,
+    node_id_from_public_key_b64,
+    normalize_public_key_b64,
+    random_challenge,
+    server_auth_payload,
+    sign_payload,
+    verify_signature,
+)
 from runtime.ws_bridge import (
     OP_CLOSE,
     OP_PING,
@@ -252,6 +262,114 @@ def _send(wfile: Any, msg: dict[str, Any], write_lock: threading.Lock) -> bool:
         return True
     except Exception:
         return False
+
+
+def _wait_for_text_message(rfile: Any, *, phase: str, attempts: int = 20) -> dict[str, Any]:
+    for _ in range(attempts):
+        frame = read_frame(rfile)
+        if frame is None:
+            raise ConnectionError(f"Connection closed during {phase}")
+        opcode, payload = frame
+        if opcode == OP_CLOSE:
+            raise ConnectionError(f"Server closed during {phase}")
+        if opcode != OP_TEXT:
+            continue
+        msg = json.loads(payload.decode("utf-8"))
+        if isinstance(msg, dict):
+            return msg
+    raise ConnectionError(f"text message not received during {phase}")
+
+
+def _authenticate_ws_peer(
+    *,
+    config: dict[str, Any],
+    runtime_root: Path,
+    manifest: dict[str, Any],
+    rfile: Any,
+    wfile: Any,
+    write_lock: threading.Lock,
+) -> None:
+    auth_type = str(config.get("auth_type") or "").strip().lower()
+    auth_username = str(config.get("auth_username", "")).strip()
+    auth_password = str(config.get("auth_password", "")).strip()
+    use_ed25519 = auth_type == "ed25519" or (not auth_password and auth_type != "password")
+    if not use_ed25519:
+        _send(wfile, {
+            "type": "auth",
+            "username": auth_username,
+            "password": auth_password,
+            "node_id": str(manifest.get("node_id") or ""),
+        }, write_lock)
+        for _ in range(20):
+            msg = _wait_for_text_message(rfile, phase="auth")
+            if msg.get("type") == "auth_ok":
+                return
+            if msg.get("type") == "auth_error":
+                raise PermissionError(f"auth_error: {msg.get('message')}")
+        raise ConnectionError("auth_ok not received")
+
+    identity = ensure_node_identity(runtime_root)
+    client_node_id = str(identity["node_id"])
+    client_public_key = str(identity["public_key"])
+    client_challenge = random_challenge()
+    _send(wfile, {
+        "type": "auth_init",
+        "auth_type": "ed25519",
+        "node_id": client_node_id,
+        "public_key": client_public_key,
+        "client_challenge": client_challenge,
+    }, write_lock)
+    challenge = _wait_for_text_message(rfile, phase="auth_challenge")
+    if challenge.get("type") == "auth_error":
+        raise PermissionError(f"auth_error: {challenge.get('message')}")
+    if challenge.get("type") != "auth_challenge":
+        raise PermissionError(f"auth_failed:{challenge}")
+    server_node_id = str(challenge.get("node_id") or "").strip()
+    server_public_key = str(challenge.get("public_key") or "").strip()
+    server_challenge = str(challenge.get("server_challenge") or "").strip()
+    server_signature = str(challenge.get("server_signature") or "").strip()
+    if not server_node_id or not server_public_key or not server_challenge or not server_signature:
+        raise PermissionError("auth_challenge_fields_required")
+    server_public_key = normalize_public_key_b64(server_public_key)
+    if node_id_from_public_key_b64(server_public_key) != server_node_id:
+        raise PermissionError("server_node_id_public_key_mismatch")
+    expected_node_id = str(config.get("peer_node_id") or config.get("expected_node_id") or config.get("node_id") or "").strip()
+    if expected_node_id and expected_node_id != server_node_id:
+        raise PermissionError("server_node_id_not_expected")
+    expected_public_key = str(config.get("peer_public_key") or config.get("public_key") or "").strip()
+    if expected_public_key and normalize_public_key_b64(expected_public_key) != server_public_key:
+        raise PermissionError("server_public_key_not_expected")
+    server_payload = server_auth_payload(
+        client_node_id=client_node_id,
+        client_public_key=client_public_key,
+        client_challenge=client_challenge,
+        server_node_id=server_node_id,
+        server_public_key=server_public_key,
+        server_challenge=server_challenge,
+    )
+    if not verify_signature(server_public_key, server_payload, server_signature):
+        raise PermissionError("invalid_server_signature")
+    client_payload = client_auth_payload(
+        client_node_id=client_node_id,
+        client_public_key=client_public_key,
+        client_challenge=client_challenge,
+        server_node_id=server_node_id,
+        server_public_key=server_public_key,
+        server_challenge=server_challenge,
+    )
+    _send(wfile, {
+        "type": "auth",
+        "auth_type": "ed25519",
+        "username": auth_username or client_node_id,
+        "signature": sign_payload(runtime_root, client_payload),
+    }, write_lock)
+    for _ in range(20):
+        msg = _wait_for_text_message(rfile, phase="auth_ok")
+        if msg.get("type") == "auth_ok":
+            return
+        if msg.get("type") == "auth_error":
+            raise PermissionError(f"auth_error: {msg.get('message')}")
+    raise ConnectionError("auth_ok not received")
 
 
 def _ws_upgrade(host: str, port: int, path: str, use_tls: bool) -> tuple[socket.socket, Any, Any]:
@@ -486,11 +604,13 @@ def run_ws_peer_client(
     auth_password = str(config.get("auth_password", "")).strip()
     remote_username = str(config.get("remote_username", "")).strip()
     remote_session_id = str(config.get("remote_session_id", "")).strip()
-    local_username = str(config.get("local_username", auth_username)).strip()
+    local_username = str(config.get("local_username", auth_username or "ws-peer")).strip()
     local_session_id = str(config.get("local_session_id", "")).strip()
     provider = str(config.get("provider", "claude")).strip().lower()
+    auth_type = str(config.get("auth_type") or "").strip().lower()
+    has_auth = auth_type == "ed25519" or bool(auth_username and auth_password)
 
-    if not all([target_ws_url, auth_username, auth_password, remote_username, remote_session_id]):
+    if not all([target_ws_url, has_auth, remote_username, remote_session_id]):
         write_jsonl(log_path, {
             "type": "ws_peer_client.config_invalid",
             "ts": utc_ts(),
@@ -556,32 +676,14 @@ def run_ws_peer_client(
             backoff = RECONNECT_BACKOFF_BASE  # reset on success
 
             # --- Authenticate ---
-            _send(wfile, {
-                "type": "auth",
-                "username": auth_username,
-                "password": auth_password,
-                "node_id": str(manifest.get("node_id") or ""),
-            }, write_lock)
-
-            # Wait for auth_ok (drain until we get it or error)
-            auth_ok = False
-            for _ in range(20):
-                frame = read_frame(rfile)
-                if frame is None:
-                    raise ConnectionError("Connection closed during auth")
-                opcode, payload = frame
-                if opcode == OP_CLOSE:
-                    raise ConnectionError("Server closed during auth")
-                if opcode != OP_TEXT:
-                    continue
-                msg = json.loads(payload.decode("utf-8"))
-                if msg.get("type") == "auth_ok":
-                    auth_ok = True
-                    break
-                if msg.get("type") == "auth_error":
-                    raise PermissionError(f"auth_error: {msg.get('message')}")
-            if not auth_ok:
-                raise ConnectionError("auth_ok not received")
+            _authenticate_ws_peer(
+                config=config,
+                runtime_root=runtime_root,
+                manifest=manifest,
+                rfile=rfile,
+                wfile=wfile,
+                write_lock=write_lock,
+            )
 
             # --- Join session ---
             _send(wfile, {
