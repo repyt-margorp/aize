@@ -190,16 +190,16 @@ def forward_message_via_ws(
     manifest: dict[str, Any],
     message: dict[str, Any],
 ) -> tuple[bool, str]:
-    to_node = str(message_meta_get(message, "to_node", "")).strip()
+    outbound, route_detail = prepare_outbound_network_message(manifest, message)
+    if outbound is None:
+        return False, route_detail
+    to_node = str(message_meta_get(outbound, "to_node", "")).strip()
     config = router_peer_config(runtime_root, to_node)
     if not config:
         return False, f"unknown_peer:{to_node}"
     ws_url = ws_url_from_peer_record(config)
     if not ws_url:
         return False, f"missing_ws_url:{to_node}"
-    outbound, route_detail = prepare_outbound_network_message(manifest, message)
-    if outbound is None:
-        return False, route_detail
 
     sock = None
     try:

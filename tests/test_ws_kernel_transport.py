@@ -17,6 +17,7 @@ from kernel.router import authorize_control_injection
 from kernel.ws_transport import (
     KERNEL_WS_TRANSPORT,
     authorize_inbound_kernel_message,
+    forward_message_via_ws,
     mark_inbound_kernel_transport,
     router_peer_config,
     ws_url_from_peer_record,
@@ -267,6 +268,32 @@ class WsKernelTransportPolicyTests(unittest.TestCase):
         self.assertEqual(config["node_id"], "node-gateway")
         self.assertEqual(config["target_ws_url"], "ws://gateway.example/ws")
         self.assertEqual(config["route_destination_node"], "node-third")
+
+    def test_forward_message_via_ws_resolves_node_address_before_peer_lookup(self) -> None:
+        (self.runtime_root / "ws_router_peers.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "node_id": "node-remote",
+                        "target_ws_url": "ws://remote.example/ws",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        ok, detail = forward_message_via_ws(
+            self.runtime_root,
+            manifest=self.manifest,
+            message={
+                "from": "service-http-001",
+                "to": "node-remote/service-codex-001",
+                "type": "network.ping",
+            },
+        )
+
+        self.assertFalse(ok)
+        self.assertNotEqual(detail, "unknown_peer:")
 
 
 if __name__ == "__main__":
