@@ -340,6 +340,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
     )
     initial_prompt = str(launcher.get("initial_prompt") or "").strip()
     goal_text = str(launcher.get("goal_text") or "").strip()
+    session_ui_mode = str(launcher.get("session_ui_mode") or descriptor.get("session_ui_mode") or "standard").strip().lower() or "standard"
     default_label = str(launcher.get("default_label") or descriptor.get("display_name") or template_id).strip() or template_id
     unit_kind = str(descriptor.get("unit_kind") or descriptor.get("kind") or "session").strip().lower() or "session"
     instance_policy = str(descriptor.get("instance_policy") or launcher.get("instance_policy") or "multi").strip().lower() or "multi"
@@ -359,6 +360,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
         "restart_policy": str(descriptor.get("restart_policy") or launcher.get("restart_policy") or "never").strip().lower() or "never",
         "interfaces": interfaces,
         "endpoints": dict(descriptor.get("endpoints") or {}),
+        "communication": dict(descriptor.get("communication") or {}),
         "display_name": str(descriptor.get("display_name") or template_id).strip() or template_id,
         "description": str(descriptor.get("description") or "").strip(),
         "enabled": bool(descriptor.get("enabled", True)),
@@ -371,6 +373,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
             "selected_agents": selected_agents,
             "service_targets": _service_targets(selected_agents, preferred_provider=preferred_provider),
             "session_group": session_group,
+            "session_ui_mode": session_ui_mode,
             "session_permissions": session_permissions,
             "workspace_scope": _normalize_workspace_scope(launcher.get("workspace_scope")),
             "ui_url": str(launcher.get("ui_url") or interfaces.get("web") or "").strip(),
@@ -435,6 +438,7 @@ def launch_session_template(
     effective_initial_prompt = str(initial_prompt if initial_prompt is not None else launcher.get("initial_prompt") or "").strip()
     mode = str(launcher.get("mode") or "create_child_session").strip().lower()
     session_group = str(launcher.get("session_group") or "user").strip().lower() or "user"
+    session_ui_mode = str(launcher.get("session_ui_mode") or "standard").strip().lower() or "standard"
     session_permissions = dict(launcher.get("session_permissions") or {})
     workspace_scope = _normalize_workspace_scope(launcher.get("workspace_scope"))
 
@@ -448,6 +452,7 @@ def launch_session_template(
             created_by_username=normalized_username,
             created_by_type="unit",
             origin_session_id=parent_session_id,
+            session_ui_mode=session_ui_mode,
         )
         if effective_goal_text:
             session = update_session_goal(
@@ -471,6 +476,7 @@ def launch_session_template(
             created_by_username=normalized_username,
             created_by_type="unit",
             origin_session_id=parent_session_id,
+            session_ui_mode=session_ui_mode,
         )
         if not session:
             raise RuntimeError("parent_session_not_found")

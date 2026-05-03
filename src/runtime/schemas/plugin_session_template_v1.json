@@ -34,6 +34,9 @@
     "endpoints": {
       "type": "object"
     },
+    "communication": {
+      "type": "object"
+    },
     "display_name": {
       "type": "string"
     },
@@ -71,6 +74,10 @@
         "session_group": {
           "type": "string",
           "enum": ["root", "user", "error"]
+        },
+        "session_ui_mode": {
+          "type": "string",
+          "enum": ["standard", "map_only", "communication"]
         },
         "session_permissions": {
           "type": "object"

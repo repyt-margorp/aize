@@ -27,7 +27,7 @@ DEFAULT_AGENT_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
 DEFAULT_GOAL_MANAGER_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
 GOAL_MANAGER_USERNAME = "goalmanager"
 DEFAULT_SESSION_UI_MODE = "standard"
-SESSION_UI_MODES = {"standard", "map_only"}
+SESSION_UI_MODES = {"standard", "map_only", "communication"}
 SESSION_GROUP_DEFAULT_PERMISSIONS = {
     "root": {
         "create_child_session": True,

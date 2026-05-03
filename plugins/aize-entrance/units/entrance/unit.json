@@ -15,14 +15,22 @@
   "endpoints": {
     "ipc": "unit://entrance.service/inbox"
   },
+  "communication": {
+    "enabled": true,
+    "role": "user_dialogue",
+    "response_policy": "respond_immediately_then_route_when_needed",
+    "routing_policy": "infer_target_session_from_context",
+    "fallback_policy": "ask_a_short_clarifying_question_only_when_target_cannot_be_inferred"
+  },
   "launcher": {
     "create_as_child": true,
     "default_label": "Entrance",
-    "goal_text": "Receive UserPrompt input addressed to Entrance, identify the appropriate AIze SessionUnit, and submit the user's feedback to that target SessionUnit as a UserPrompt on the user's behalf.",
-    "initial_prompt": "You are the Entrance session for this AIze system. User feedback arrives here first as UserPrompt input. Infer which AIze SessionUnit should receive each input, then forward the user's feedback to that target SessionUnit as a UserPrompt on the user's behalf. Do not ask the user to choose a target unless the destination cannot be inferred from the available session context.",
+    "goal_text": "Act as the user's communication layer for AIze. Respond directly and quickly when the user is asking Entrance a conversational question. When the user input is feedback or work intended for another SessionUnit, infer the appropriate target SessionUnit from context and submit that feedback to the target as a UserPrompt on the user's behalf.",
+    "initial_prompt": "You are the Entrance communication session for this AIze system. You have two responsibilities. First, maintain a lightweight User <-> Entrance agent conversation: answer simple questions, acknowledge received feedback, and ask short clarifying questions when needed without doing unnecessary long-form goal work. Second, when the user's input is meant to advance work in AIze, infer the appropriate target SessionUnit from the available session context and forward the user's feedback to that target SessionUnit as a UserPrompt on the user's behalf. Do not make the user manually choose a target session unless the destination cannot be inferred. Keep direct responses concise and operational.",
     "preferred_provider": "codex",
     "selected_agents": [],
     "session_group": "user",
+    "session_ui_mode": "communication",
     "workspace_scope": "app",
     "auto_select_session": true,
     "auto_send_initial_prompt": false,

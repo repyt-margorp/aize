@@ -437,6 +437,7 @@ def create_conversation_session(
     origin_session_id: str | None = None,
     origin_goal_id: str | None = None,
     origin_goal_text: str | None = None,
+    session_ui_mode: str | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
@@ -462,6 +463,7 @@ def create_conversation_session(
             "session_id": secrets.token_hex(8),
             "label": (label or "").strip() or f"Session {len(sessions) + 1}",
             "session_group": normalized_group,
+            "session_ui_mode": str(session_ui_mode or "").strip().lower(),
             "session_permissions": normalized_permissions,
             "auto_resume_enabled": False,
             "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
@@ -1596,6 +1598,7 @@ def create_child_conversation_session(
     origin_session_id: str | None = None,
     origin_goal_id: str | None = None,
     origin_goal_text: str | None = None,
+    session_ui_mode: str | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
     parent = get_session_settings(runtime_root, username=username, session_id=parent_session_id)
@@ -1614,6 +1617,7 @@ def create_child_conversation_session(
         origin_session_id=origin_session_id or parent_session_id,
         origin_goal_id=origin_goal_id or str(parent.get("active_goal_id") or parent.get("goal_id") or "").strip(),
         origin_goal_text=origin_goal_text if origin_goal_text is not None else str(parent.get("goal_text") or ""),
+        session_ui_mode=session_ui_mode,
     )
     if goal_text:
         update_session_goal(
