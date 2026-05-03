@@ -1082,7 +1082,7 @@ def render_main_page(
     "if (goalBoardCreateStatus && !canCreateChildSession) goalBoardCreateStatus.textContent = 'Child session creation is disabled for this session';"
     "else if (goalBoardCreateStatus && !goalBoardCreateStatus.dataset.busy && !goalBoardCreateStatus.dataset.lastState) goalBoardCreateStatus.textContent = 'Creates a child session under the active session.';"
     "if (appLauncherStatus && !canCreateChildSession && !appLauncherStatus.dataset.busy) appLauncherStatus.textContent = 'Session Template launch is disabled from this session. You can still inspect app state and reopen prior sessions.';"
-    "if (sessionUsesMapOnlyUI() && !sessionMapOpen && !appsPaneOpen && !accountRegisterOpen) setSessionMapOpen(true);"
+    "if (sessionUsesMapOnlyUI() && !sessionMapOpen && !appsPaneOpen && !nodesPaneOpen && !requestsPaneOpen && !entrancePaneOpen && !accountRegisterOpen && !accountSettingsOpen) setSessionMapOpen(true);"
     "};"
     "const setSettingsPopoverOpen = (open) => {"
     "const settingsButton = document.getElementById('view-settings');"
