@@ -832,6 +832,22 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("launcher_preferred_provider", "")
     session.setdefault("launcher_workspace_scope", "none")
     session.setdefault("launcher_workspace_path", "")
+    if "session_interactive" in session:
+        session["session_interactive"] = bool(session.get("session_interactive", False))
+    else:
+        session["session_interactive"] = session["session_ui_mode"] == "communication"
+    if "communication_agent_enabled" in session:
+        session["communication_agent_enabled"] = bool(session.get("communication_agent_enabled", False))
+    else:
+        session["communication_agent_enabled"] = bool(session.get("session_interactive", False))
+    communication_agent_priority = session.get("communication_agent_priority")
+    if not isinstance(communication_agent_priority, list):
+        communication_agent_priority = []
+    session["communication_agent_priority"] = [
+        str(item).strip()
+        for item in communication_agent_priority
+        if str(item).strip()
+    ]
     welcomed_agents = session.get("welcomed_agents")
     if not isinstance(welcomed_agents, list):
         welcomed_agents = []

@@ -79,6 +79,18 @@
           "type": "string",
           "enum": ["standard", "map_only", "communication"]
         },
+        "session_interactive": {
+          "type": "boolean"
+        },
+        "communication_agent_enabled": {
+          "type": "boolean"
+        },
+        "communication_agent_priority": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "session_permissions": {
           "type": "object"
         },

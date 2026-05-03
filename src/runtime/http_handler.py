@@ -3575,6 +3575,26 @@ def make_handler(
                         str(session_settings.get("preferred_provider", default_provider)).strip().lower()
                         or default_provider
                     )
+                    is_interactive_session = bool(
+                        session_settings.get("session_interactive", False)
+                        or session_settings.get("communication_agent_enabled", False)
+                        or session_ui_mode(session_settings) == "communication"
+                    )
+                    communication_agent_enabled = bool(
+                        session_settings.get("communication_agent_enabled", is_interactive_session)
+                    )
+                    prompt_kind = "user_dialogue" if communication_agent_enabled else "user_message"
+                    dispatch_reason = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
+                    agent_role = "communication_agent" if communication_agent_enabled else "agent"
+                    agent_transport = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
+                    if communication_agent_enabled:
+                        communication_agent_priority = session_settings.get("communication_agent_priority")
+                        if isinstance(communication_agent_priority, list):
+                            for provider_candidate in communication_agent_priority:
+                                normalized_provider = str(provider_candidate or "").strip().lower()
+                                if normalized_provider in {"codex", "claude", "gemini"}:
+                                    preferred_provider = normalized_provider
+                                    break
                     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
@@ -3636,8 +3656,8 @@ def make_handler(
                                 session_id=session_id,
                                 service_id=leased_service_id,
                                 provider=str(llm_service_kinds.get(leased_service_id) or preferred_provider),
-                                role="agent",
-                                transport="http_prompt",
+                                role=agent_role,
+                                transport=agent_transport,
                             )
                         else:
                             dispatch_error = "no_available_provider_worker"
@@ -3679,6 +3699,8 @@ def make_handler(
                             "session_id": session_id,
                             "text": prompt_text,
                             "submitted_by_username": username,
+                            "message_kind": prompt_kind,
+                            "communication_agent": communication_agent_enabled,
                             "user_response_request_ids": response_request_ids,
                         },
                     )
@@ -3710,7 +3732,7 @@ def make_handler(
                         username=username,
                         session_id=session_id,
                         entry=make_aize_pending_input(
-                            kind="user_message",
+                            kind=prompt_kind,
                             role="user",
                             text=prompt_text,
                             submitted_by_username=username,
@@ -3724,7 +3746,7 @@ def make_handler(
                         process_id=process_id,
                         username=username,
                         session_id=session_id,
-                        source_kind="user_message",
+                        source_kind=prompt_kind,
                         source_text=prompt_text,
                         provider=str(target_kind or preferred_provider),
                     )
@@ -3739,7 +3761,7 @@ def make_handler(
                                 username=username,
                                 session_id=session_id,
                                 auth_context=auth_context,
-                                reason="http_prompt",
+                                reason=dispatch_reason,
                             )
                         ):
                             dispatch_error = dispatch_error or "router_control_injection_failed"
@@ -3755,6 +3777,8 @@ def make_handler(
                             "session_id": session_id,
                             "to": to_service,
                             "dispatch_error": dispatch_error,
+                            "prompt_kind": prompt_kind,
+                            "communication_agent": communication_agent_enabled,
                             "user_response_request_ids": response_request_ids,
                         },
                     )

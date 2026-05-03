@@ -17,9 +17,16 @@ Entrance adds a communication layer:
 
 This keeps the user-facing entrypoint responsive. Entrance should acknowledge, answer simple operational questions, or ask a short clarifying question without forcing every user input through the slower goal-completion loop. When the input is intended to advance work elsewhere in AIze, Entrance infers the target SessionUnit and submits the feedback there on the user's behalf.
 
-The `communication` session UI mode marks this intent while remaining compatible with the existing standard session renderer. Future work should split the runtime dispatch roles more explicitly:
+The `communication` session UI mode marks this intent while remaining compatible with the existing standard session renderer. Runtime behavior is controlled by:
 
+- `session_interactive`: marks that the session has a user-facing communication layer.
+- `communication_agent_enabled`: turns the quick-response communication agent route on or off.
 - `communication_agent_priority`
+
+When `communication_agent_enabled` is true, normal user prompts are queued as `user_dialogue` and dispatched to the existing AgentService pool with the session role `communication_agent`. This does not introduce a separate process type; Codex, Claude Code, and Gemini workers can all serve as communication agents according to provider priority and normal session agent selection.
+
+Future work should split the remaining runtime dispatch roles more explicitly:
+
 - `goal_completer_agent_priority`
 - `goal_manager_priority`
-- explicit message kinds for `user_dialogue`, `route_user_prompt`, and `forwarded_user_prompt`
+- explicit message kinds for `route_user_prompt` and `forwarded_user_prompt`

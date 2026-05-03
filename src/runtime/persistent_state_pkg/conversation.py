@@ -438,6 +438,9 @@ def create_conversation_session(
     origin_goal_id: str | None = None,
     origin_goal_text: str | None = None,
     session_ui_mode: str | None = None,
+    session_interactive: bool = False,
+    communication_agent_enabled: bool = False,
+    communication_agent_priority: list[str] | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
@@ -464,6 +467,13 @@ def create_conversation_session(
             "label": (label or "").strip() or f"Session {len(sessions) + 1}",
             "session_group": normalized_group,
             "session_ui_mode": str(session_ui_mode or "").strip().lower(),
+            "session_interactive": bool(session_interactive),
+            "communication_agent_enabled": bool(communication_agent_enabled),
+            "communication_agent_priority": [
+                str(item).strip()
+                for item in (communication_agent_priority or [])
+                if str(item).strip()
+            ],
             "session_permissions": normalized_permissions,
             "auto_resume_enabled": False,
             "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
@@ -1599,6 +1609,9 @@ def create_child_conversation_session(
     origin_goal_id: str | None = None,
     origin_goal_text: str | None = None,
     session_ui_mode: str | None = None,
+    session_interactive: bool = False,
+    communication_agent_enabled: bool = False,
+    communication_agent_priority: list[str] | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
     parent = get_session_settings(runtime_root, username=username, session_id=parent_session_id)
@@ -1618,6 +1631,9 @@ def create_child_conversation_session(
         origin_goal_id=origin_goal_id or str(parent.get("active_goal_id") or parent.get("goal_id") or "").strip(),
         origin_goal_text=origin_goal_text if origin_goal_text is not None else str(parent.get("goal_text") or ""),
         session_ui_mode=session_ui_mode,
+        session_interactive=session_interactive,
+        communication_agent_enabled=communication_agent_enabled,
+        communication_agent_priority=communication_agent_priority,
     )
     if goal_text:
         update_session_goal(

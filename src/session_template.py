@@ -145,6 +145,20 @@ def _normalize_schedule(value: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_provider_priority(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        provider = str(item or "").strip().lower()
+        if provider not in VALID_PROVIDERS or provider in seen:
+            continue
+        seen.add(provider)
+        normalized.append(provider)
+    return normalized
+
+
 def _schedule_occurrence_windows(schedule: dict[str, Any], *, now: datetime) -> dict[str, Any]:
     timezone_name = str(schedule.get("timezone") or "UTC").strip() or "UTC"
     local_zone = ZoneInfo(timezone_name)
@@ -341,6 +355,17 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
     initial_prompt = str(launcher.get("initial_prompt") or "").strip()
     goal_text = str(launcher.get("goal_text") or "").strip()
     session_ui_mode = str(launcher.get("session_ui_mode") or descriptor.get("session_ui_mode") or "standard").strip().lower() or "standard"
+    session_interactive = bool(launcher.get("session_interactive", descriptor.get("session_interactive", session_ui_mode == "communication")))
+    communication = dict(descriptor.get("communication") or {})
+    communication_agent_enabled = bool(
+        launcher.get(
+            "communication_agent_enabled",
+            communication.get("enabled", session_interactive),
+        )
+    )
+    communication_agent_priority = _normalize_provider_priority(
+        launcher.get("communication_agent_priority") or communication.get("agent_priority")
+    )
     default_label = str(launcher.get("default_label") or descriptor.get("display_name") or template_id).strip() or template_id
     unit_kind = str(descriptor.get("unit_kind") or descriptor.get("kind") or "session").strip().lower() or "session"
     instance_policy = str(descriptor.get("instance_policy") or launcher.get("instance_policy") or "multi").strip().lower() or "multi"
@@ -374,6 +399,9 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
             "service_targets": _service_targets(selected_agents, preferred_provider=preferred_provider),
             "session_group": session_group,
             "session_ui_mode": session_ui_mode,
+            "session_interactive": session_interactive,
+            "communication_agent_enabled": communication_agent_enabled,
+            "communication_agent_priority": communication_agent_priority,
             "session_permissions": session_permissions,
             "workspace_scope": _normalize_workspace_scope(launcher.get("workspace_scope")),
             "ui_url": str(launcher.get("ui_url") or interfaces.get("web") or "").strip(),
@@ -439,6 +467,9 @@ def launch_session_template(
     mode = str(launcher.get("mode") or "create_child_session").strip().lower()
     session_group = str(launcher.get("session_group") or "user").strip().lower() or "user"
     session_ui_mode = str(launcher.get("session_ui_mode") or "standard").strip().lower() or "standard"
+    session_interactive = bool(launcher.get("session_interactive", session_ui_mode == "communication"))
+    communication_agent_enabled = bool(launcher.get("communication_agent_enabled", session_interactive))
+    communication_agent_priority = _normalize_provider_priority(launcher.get("communication_agent_priority"))
     session_permissions = dict(launcher.get("session_permissions") or {})
     workspace_scope = _normalize_workspace_scope(launcher.get("workspace_scope"))
 
@@ -453,6 +484,9 @@ def launch_session_template(
             created_by_type="unit",
             origin_session_id=parent_session_id,
             session_ui_mode=session_ui_mode,
+            session_interactive=session_interactive,
+            communication_agent_enabled=communication_agent_enabled,
+            communication_agent_priority=communication_agent_priority,
         )
         if effective_goal_text:
             session = update_session_goal(
@@ -477,6 +511,9 @@ def launch_session_template(
             created_by_type="unit",
             origin_session_id=parent_session_id,
             session_ui_mode=session_ui_mode,
+            session_interactive=session_interactive,
+            communication_agent_enabled=communication_agent_enabled,
+            communication_agent_priority=communication_agent_priority,
         )
         if not session:
             raise RuntimeError("parent_session_not_found")

@@ -59,6 +59,34 @@ class AppLauncherTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        communication_template_dir = self.plugin_dir / "apps" / "communication_launcher"
+        communication_template_dir.mkdir(parents=True, exist_ok=True)
+        (communication_template_dir / "session-template.json").write_text(
+            json.dumps(
+                {
+                    "template_id": "communication_launcher",
+                    "display_name": "Communication Launcher",
+                    "description": "Spawn an interactive communication session",
+                    "communication": {
+                        "enabled": True,
+                        "agent_priority": ["gemini", "codex"],
+                    },
+                    "launcher": {
+                        "default_label": "Communication",
+                        "goal_text": "Route user dialogue.",
+                        "initial_prompt": "Respond quickly to the user and route work when needed.",
+                        "preferred_provider": "claude",
+                        "selected_agents": ["claude_pool"],
+                        "session_group": "user",
+                        "session_ui_mode": "communication",
+                        "session_interactive": True,
+                        "communication_agent_enabled": True,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         shutil.rmtree(self.plugin_dir)
@@ -150,6 +178,32 @@ class AppLauncherTests(unittest.TestCase):
                 first["launch_plan"]["workspace_path"],
                 second["launch_plan"]["workspace_path"],
             )
+
+    def test_launch_session_template_persists_interactive_communication_config(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                app = get_launchable_session_template("communication_launcher", default_provider="codex")
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=app,
+                )
+
+            self.assertEqual(app["launcher"]["session_ui_mode"], "communication")
+            self.assertTrue(app["launcher"]["session_interactive"])
+            self.assertTrue(app["launcher"]["communication_agent_enabled"])
+            self.assertEqual(app["launcher"]["communication_agent_priority"], ["gemini", "codex"])
+            session = launched["session"]
+            stored = get_session_settings(runtime_root, username="repyt", session_id=str(session["session_id"]))
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored["session_ui_mode"], "communication")
+            self.assertTrue(stored["session_interactive"])
+            self.assertTrue(stored["communication_agent_enabled"])
+            self.assertEqual(stored["communication_agent_priority"], ["gemini", "codex"])
 
     def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
