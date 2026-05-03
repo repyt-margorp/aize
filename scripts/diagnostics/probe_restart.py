@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("AIZE_ROOT", Path(__file__).resolve().parents[2]))
 RUNTIME_ROOT = Path(os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".aize-runtime")))
-HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "127.0.0.1")
+HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
 HTTP_PORT = os.environ.get("AIZE_HTTP_PORT", "4123")
 
 
@@ -31,7 +31,8 @@ def resolve_node_id() -> str:
 NODE_ID = resolve_node_id()
 RESTART_SCRIPT = ROOT / "restart_codex_http_mesh.sh"
 LOG_DIR = ROOT / ".temp" / "restart-debug" / "logs"
-HEALTH_URL = f"https://{HTTP_HOST}:{HTTP_PORT}/health"
+HEALTH_HOST = "127.0.0.1" if HTTP_HOST in {"0.0.0.0", "::"} else HTTP_HOST
+HEALTH_URL = f"https://{HEALTH_HOST}:{HTTP_PORT}/health"
 _TLS_CTX = ssl.create_default_context()
 _TLS_CTX.check_hostname = False
 _TLS_CTX.verify_mode = ssl.CERT_NONE
