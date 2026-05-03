@@ -1,1 +1,1 @@
-"""Kernel layer for the local service mesh runtime."""
+"""Kernel layer for the local AIze Unit runtime."""

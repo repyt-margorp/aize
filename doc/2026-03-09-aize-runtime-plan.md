@@ -358,7 +358,7 @@ Plan:
 - write them to stdout as JSONL
 - wrap OpenClaw like the other CLI services
 
-That makes OpenClaw another process in the mesh rather than a special control plane.
+That makes OpenClaw another process in the Unit runtime rather than a special control plane.
 
 ## Layering Summary
 
@@ -454,7 +454,7 @@ Question:
 Current answer:
 
 - allow adapters to keep provider-specific session state
-- but keep the mesh message format session-agnostic at first
+- but keep the Unit runtime message format session-agnostic at first
 
 ## Minimal Implementation Plan
 

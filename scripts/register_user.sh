@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# register_user.sh — Securely register a new user in the Aize HTTP mesh.
+# register_user.sh — Securely register a new user in the AIze Unit runtime.
 #
 # Usage: ./scripts/register_user.sh [new-username]
 #
@@ -7,7 +7,7 @@
 # prompted interactively via read -s — they are never passed as command-line
 # arguments, preventing exposure in process listings and shell history.
 #
-# The script requires a running mesh at AIZE_HTTP_HOST:AIZE_HTTP_PORT.
+# The script requires a running Unit runtime at AIZE_HTTP_HOST:AIZE_HTTP_PORT.
 # The admin account must have the "superuser" role.
 
 set -euo pipefail
@@ -82,7 +82,7 @@ LOGIN_RESPONSE=$(curl -sf -X POST "${BASE_URL}/login" \
     -H 'Content-Type: application/json' \
     -c "$COOKIE_JAR" \
     --data-binary "@${LOGIN_JSON}") || {
-    echo "Error: admin login failed (check credentials or that the mesh is running at ${BASE_URL})." >&2
+    echo "Error: admin login failed (check credentials or that the Unit runtime is running at ${BASE_URL})." >&2
     exit 1
 }
 

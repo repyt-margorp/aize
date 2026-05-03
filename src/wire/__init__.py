@@ -1,1 +1,1 @@
-"""Wire layer for the local service mesh runtime."""
+"""Wire layer for the local AIze Unit runtime."""

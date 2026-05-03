@@ -271,7 +271,7 @@ class _Conn:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Local mesh router")
+    parser = argparse.ArgumentParser(description="Local AIze Unit runtime router")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--runtime-root", required=True)
     args = parser.parse_args()

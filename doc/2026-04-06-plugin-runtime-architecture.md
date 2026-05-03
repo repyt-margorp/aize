@@ -2,7 +2,7 @@
 
 ## Goal
 
-Keep the core mesh publishable while allowing non-public userland units to live outside `src/services/`.
+Keep the core Unit runtime publishable while allowing non-public userland units to live outside `src/services/`.
 
 ## Directory policy
 
@@ -30,7 +30,7 @@ plugins/
 
 ## Runtime model
 
-The mesh already treats each service session as a process-like unit. This maps cleanly to a MINIX-style model:
+The Unit runtime already treats each service session as a process-like unit. This maps cleanly to a MINIX-style model:
 
 1. `kernel` layer
    The kernel keeps the unit registry, process registry, message router, capability checks, identity, restart policy, and durable state indexes.

@@ -25,7 +25,7 @@ def run_service(
     router_conn: RouterConnection,
     **_kwargs: object,
 ) -> int:
-    """Service Manager: discover, spawn, and supervise all mesh services."""
+    """Service Manager: discover, spawn, and supervise all Unit runtime services."""
     node_id = manifest["node_id"]
     run_id = manifest["run_id"]
     service_id = self_service["service_id"]

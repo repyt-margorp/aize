@@ -2,7 +2,7 @@
   "kind": "http",
   "id": "service-http-001",
   "display_name": "HttpBridge",
-  "persona": "Bridge HTTP requests into the local service mesh.",
+  "persona": "Bridge HTTP requests into the local AIze Unit runtime.",
   "max_turns": 1000000,
   "spawn_order": 10,
   "config_env": {

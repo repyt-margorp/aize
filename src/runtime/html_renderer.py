@@ -31,7 +31,7 @@ def render_login_page(
     "@media (max-width: 920px){.auth-shell{grid-template-columns:1fr;padding:18px}.hero,.auth-card{border-radius:24px;padding:24px}}"
     "</style></head><body>"
     "<main class='auth-shell'>"
-    f"<section class='hero'><div class='eyebrow'>AIze HTTP Mesh</div><h1>{html.escape(str(display_name))}</h1><p>Workspace view のUIトーンに合わせて、認証画面も同じ余白・色・カード表現でまとめた入口に揃えています。</p><div class='hero-notes'><div class='hero-note'><strong>Workspace</strong><span>個別Workspaceと同じく、会話ごとに状態を持ったセッションへ入ります。</span></div><div class='hero-note'><strong>Access</strong><span>最初の起動時は <code>root</code> を bootstrap し、その後は通常ログインで入ります。</span></div></div></section>"
+    f"<section class='hero'><div class='eyebrow'>AIze Unit Runtime</div><h1>{html.escape(str(display_name))}</h1><p>Workspace view のUIトーンに合わせて、認証画面も同じ余白・色・カード表現でまとめた入口に揃えています。</p><div class='hero-notes'><div class='hero-note'><strong>Workspace</strong><span>個別Workspaceと同じく、会話ごとに状態を持ったセッションへ入ります。</span></div><div class='hero-note'><strong>Access</strong><span>最初の起動時は <code>root</code> を bootstrap し、その後は通常ログインで入ります。</span></div></div></section>"
     "<section class='auth-card'>"
     + (
         "<div class='auth-copy'><h2>Bootstrap Root</h2><p>No accounts exist yet. Create the initial <code>root</code> account with the <code>superuser</code> role to unlock the rest of the UI.</p></div>"

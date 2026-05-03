@@ -2,7 +2,7 @@
 
 ## Summary
 
-This note records the restart-related fixes made while stabilizing the AIze HTTP mesh.
+This note records the restart-related fixes made while stabilizing the AIze HTTP Unit runtime.
 
 ## What Was Changed
 

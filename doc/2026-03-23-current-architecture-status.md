@@ -16,14 +16,14 @@ The repository currently implements a local multi-service AIze runtime with thes
 - Local and remote peer/federation hooks
 
 The current code is substantially beyond the earlier design memos. The important shift is that the system is now
-an actual runnable service mesh with persistent user/session state, not just a planned service decomposition.
+an actual runnable Unit runtime with persistent user/session state, not just a planned service decomposition.
 
 ## Top-Level Shape
 
 The implemented system is split into five layers:
 
 1. `src/cli/`
-   Bootstraps a runtime instance, writes a manifest, and launches the mesh.
+   Bootstraps a runtime instance, writes a manifest, and launches the Unit runtime.
 2. `src/kernel/`
    Owns service registry, process lifecycle records, service authorization, IPC transport, and routing.
 3. `src/services/`
@@ -41,7 +41,7 @@ This is not a purely in-memory actor system. It is a hybrid:
 
 ## Boot Sequence
 
-The canonical entrypoint for the current HTTP mesh is `src/cli/run_codex_http_mesh.py`.
+The canonical entrypoint for the current HTTP Unit runtime is `src/cli/run_codex_http_mesh.py`.
 
 At startup it does the following:
 
@@ -232,7 +232,7 @@ This split is implemented in `src/runtime/persistent_state_pkg/_core.py`:
 
 That is a strong design signal:
 
-- The durable conversation model is intentionally outside the disposable mesh runtime directory
+- The durable conversation model is intentionally outside the disposable Unit runtime directory
 
 ## Authentication and User Model
 
@@ -489,7 +489,7 @@ Current pieces:
 - `/federation/message`
 - websocket peer client/handler
 
-This is still less central than the local mesh, but the architecture is already prepared for multiple nodes and remote delivery.
+This is still less central than the local Unit runtime, but the architecture is already prepared for multiple nodes and remote delivery.
 
 ## Service Adapter Role
 
@@ -529,7 +529,7 @@ Reading the implementation as a whole, the current design direction is clear:
 
 The dominant architectural theme is:
 
-"persistent multi-session work orchestration over a local service mesh"
+"persistent multi-session work orchestration over a local Unit runtime"
 
 not:
 
@@ -565,7 +565,7 @@ As of the current implementation, these are safe assumptions to design around:
 The codebase is no longer in an exploratory architecture phase.
 It already implements a coherent system with these concrete characteristics:
 
-- local service mesh kernel
+- local Unit runtime kernel
 - authenticated multi-user HTTP UI
 - persistent sessions as workspaces
 - pooled provider workers

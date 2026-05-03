@@ -3,7 +3,7 @@
 ## Restart Debug
 - Use `./restart_codex_http_mesh.sh` for normal restarts. This is the repo-root entrypoint for the synchronous restart flow.
 - `./scripts/restart_codex_http_mesh.sh` remains as the script wrapper variant, but the root script should be treated as canonical when operating from the repo root.
-- Normal restart calls self-detach into a supervisor so restart can continue after the old mesh is terminated.
+- Normal restart calls self-detach into a supervisor so restart can continue after the old Unit runtime is terminated.
 - Restart diagnostics logs live under `.temp/restart-debug/` (runtime state — not tracked in source).
 - Run `python3 scripts/diagnostics/probe_restart.py` from the repo root to capture a restart report.
 - The report records launcher/router/adapter PID transitions, `https://127.0.0.1:4123/health`, restart script stdout/stderr, and the tail of `.temp/restart-debug/launcher.log`.
@@ -35,11 +35,11 @@ The script will prompt for:
 
 Passwords are never passed as command-line arguments and do not appear in process listings. The script authenticates the admin first, then registers the new user using that session — so both the admin credential and new-user credential are verified before any account is created.
 
-**Prerequisites:** the mesh must be running (`https://127.0.0.1:4123/health` should be reachable) and the admin account must have the `superuser` role.
+**Prerequisites:** the Unit runtime must be running (`https://127.0.0.1:4123/health` should be reachable) and the admin account must have the `superuser` role.
 
 ## HTTPS / TLS Setup
 
-The HTTP mesh runs on **HTTPS by default** using a self-signed certificate (オレオレ認証)
+The HTTP Unit runtime runs on **HTTPS by default** using a self-signed certificate (オレオレ認証)
 for the Web UI. Cert generation is handled automatically on start, but can also be run manually.
 
 ### Certificate location

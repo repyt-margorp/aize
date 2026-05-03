@@ -1,1 +1,1 @@
-"""CLI layer for the local service mesh runtime."""
+"""CLI layer for the local AIze Unit runtime."""
