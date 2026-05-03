@@ -75,7 +75,7 @@ class AppLauncherTests(unittest.TestCase):
                                 "profile": "interactive-fast",
                                 "model": "gpt-5.5",
                                 "config": {
-                                    "model_reasoning_effort": "minimal",
+                                    "model_reasoning_effort": "low",
                                 },
                             },
                             "gemini",
@@ -215,7 +215,7 @@ class AppLauncherTests(unittest.TestCase):
             self.assertTrue(stored["session_interactive"])
             self.assertTrue(stored["communication_agent_enabled"])
             self.assertEqual(stored["communication_agent_priority"][0]["provider"], "codex")
-            self.assertEqual(stored["communication_agent_priority"][0]["config"]["model_reasoning_effort"], "minimal")
+            self.assertEqual(stored["communication_agent_priority"][0]["config"]["model_reasoning_effort"], "low")
 
     def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:

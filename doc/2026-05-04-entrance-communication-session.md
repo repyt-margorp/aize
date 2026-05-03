@@ -33,7 +33,7 @@ Entrance defaults to the `interactive-fast` Codex profile:
   "profile": "interactive-fast",
   "model": "gpt-5.5",
   "config": {
-    "model_reasoning_effort": "minimal",
+    "model_reasoning_effort": "low",
     "model_verbosity": "low"
   }
 }

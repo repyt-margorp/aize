@@ -31,7 +31,7 @@ DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
         "profile": "interactive-fast",
         "model": "gpt-5.5",
         "config": {
-            "model_reasoning_effort": "minimal",
+            "model_reasoning_effort": "low",
             "model_verbosity": "low",
         },
     },
@@ -941,6 +941,12 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
         communication_agent_priority,
         default_priority=DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY,
     )
+    for item in session["communication_agent_priority"]:
+        if not isinstance(item, dict):
+            continue
+        config = item.get("config")
+        if isinstance(config, dict) and config.get("model_reasoning_effort") == "minimal":
+            config["model_reasoning_effort"] = "low"
     welcomed_agents = session.get("welcomed_agents")
     if not isinstance(welcomed_agents, list):
         welcomed_agents = []
