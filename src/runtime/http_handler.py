@@ -1246,7 +1246,9 @@ def make_handler(
                 "user_response_wait_status": _wait_status,
                 "user_response_wait_active": bool(_talk.get("user_response_wait_active", False)),
                 "user_response_wait_started_at": _wait_started_at,
+                "user_response_wait_request_id": str(_talk.get("user_response_wait_request_id", "") or ""),
                 "user_response_wait_prompt_text": _wait_prompt_text,
+                "user_response_wait_reason": str(_talk.get("user_response_wait_reason", "") or "").strip(),
                 "parent_session_id": str(_talk.get("parent_session_id") or "").strip(),
                 "created_by_username": str(_talk.get("created_by_username") or "").strip(),
                 "created_by_type": str(_talk.get("created_by_type") or "").strip(),
@@ -1408,6 +1410,9 @@ def make_handler(
                     "user_response_wait_status": wait_status,
                     "user_response_wait_active": bool(talk.get("user_response_wait_active", False)),
                     "user_response_wait_started_at": wait_started_at,
+                    "user_response_wait_request_id": str(talk.get("user_response_wait_request_id", "") or ""),
+                    "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),
+                    "user_response_wait_reason": str(talk.get("user_response_wait_reason", "") or "").strip(),
                     "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
                     "created_by_username": str(talk.get("created_by_username") or "").strip(),
                     "created_by_type": str(talk.get("created_by_type") or "").strip(),
@@ -1813,7 +1818,9 @@ def make_handler(
             )
             initial_user_response_wait_started_at = str(session_settings.get("user_response_wait_started_at", "") or "")
             initial_user_response_wait_until_at = str(session_settings.get("user_response_wait_until_at", "") or "")
+            initial_user_response_wait_request_id = str(session_settings.get("user_response_wait_request_id", "") or "")
             initial_user_response_wait_prompt_text = str(session_settings.get("user_response_wait_prompt_text", "") or "")
+            initial_user_response_wait_reason = str(session_settings.get("user_response_wait_reason", "") or "")
             initial_user_response_wait_last_cleared_at = str(session_settings.get("user_response_wait_last_cleared_at", "") or "")
             initial_user_response_wait_last_timeout_at = str(session_settings.get("user_response_wait_last_timeout_at", "") or "")
             initial_session_group = str(session_settings.get("session_group", "user") or "user")
@@ -1924,7 +1931,9 @@ def make_handler(
                     initial_user_response_wait_effective_timeout_seconds=initial_user_response_wait_effective_timeout_seconds,
                     initial_user_response_wait_started_at=initial_user_response_wait_started_at,
                     initial_user_response_wait_until_at=initial_user_response_wait_until_at,
+                    initial_user_response_wait_request_id=initial_user_response_wait_request_id,
                     initial_user_response_wait_prompt_text=initial_user_response_wait_prompt_text,
+                    initial_user_response_wait_reason=initial_user_response_wait_reason,
                     initial_user_response_wait_last_cleared_at=initial_user_response_wait_last_cleared_at,
                     initial_user_response_wait_last_timeout_at=initial_user_response_wait_last_timeout_at,
                     initial_session_group=initial_session_group,
@@ -3351,6 +3360,20 @@ def make_handler(
             if not isinstance(text, str) or not text.strip():
                 self._json(400, {"error": "text_required"})
                 return
+            raw_response_request_ids = payload.get("user_response_request_ids")
+            response_request_ids: list[str] = []
+            if isinstance(raw_response_request_ids, list):
+                response_request_ids = [
+                    str(value).strip()
+                    for value in raw_response_request_ids
+                    if str(value).strip()
+                ]
+            elif isinstance(raw_response_request_ids, str):
+                response_request_ids = [
+                    item.strip()
+                    for item in raw_response_request_ids.replace("\n", ",").split(",")
+                    if item.strip()
+                ]
             if mode == "goal":
                 if not session_operation_allowed(talk, "update_goal"):
                     self._json(403, {"error": "goal_update_disabled"})
@@ -3487,12 +3510,13 @@ def make_handler(
                         username=username,
                         session_id=session_id,
                     ) or {}
-                    if bool(previous_session_settings.get("user_response_wait_active", False)):
+                    if bool(previous_session_settings.get("user_response_wait_active", False)) or response_request_ids:
                         update_session_user_response_wait(
                             runtime_root,
                             username=username,
                             session_id=session_id,
                             active=False,
+                            response_request_ids=response_request_ids,
                             cleared_reason="user_reply",
                         )
                         append_history(
@@ -3507,6 +3531,7 @@ def make_handler(
                                 "event": {
                                     "type": "service.user_response_wait_cleared",
                                     "reason": "user_reply",
+                                    "response_request_ids": response_request_ids,
                                 },
                             },
                         )
@@ -3630,6 +3655,7 @@ def make_handler(
                             "session_id": session_id,
                             "text": prompt_text,
                             "submitted_by_username": username,
+                            "user_response_request_ids": response_request_ids,
                         },
                     )
                     # When WS-only, write a degraded-state event if no WS peer is
@@ -3664,6 +3690,7 @@ def make_handler(
                             role="user",
                             text=prompt_text,
                             submitted_by_username=username,
+                            user_response_request_ids=response_request_ids,
                         ),
                     )
                     maybe_enqueue_mid_turn_progress_inquiry(
@@ -3704,6 +3731,7 @@ def make_handler(
                             "session_id": session_id,
                             "to": to_service,
                             "dispatch_error": dispatch_error,
+                            "user_response_request_ids": response_request_ids,
                         },
                     )
                 except Exception as exc:

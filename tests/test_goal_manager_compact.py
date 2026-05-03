@@ -527,7 +527,9 @@ class GoalManagerCompactTests(unittest.TestCase):
             active=True,
             timeout_seconds=600,
             prompt_text="Need the deployment region.",
+            request_reason="Deployment cannot proceed without a region.",
             source_service_id="service-codex-001",
+            requested_by_role="goal_manager",
         )
         assert talk is not None
 
@@ -536,8 +538,12 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(payload["user_response_wait_active"])
         self.assertEqual(payload["user_response_wait_timeout_seconds"], 600)
         self.assertEqual(payload["user_response_wait_effective_timeout_seconds"], 300)
+        self.assertTrue(payload["user_response_wait_request_id"].startswith("user-response-"))
         self.assertEqual(payload["user_response_wait_prompt_text"], "Need the deployment region.")
+        self.assertEqual(payload["user_response_wait_reason"], "Deployment cannot proceed without a region.")
         self.assertEqual(payload["user_response_wait_source_service_id"], "service-codex-001")
+        self.assertEqual(payload["user_response_wait_requested_by_role"], "goal_manager")
+        self.assertEqual(len(payload["user_response_wait_requests"]), 1)
         self.assertTrue(payload["user_response_wait_until_at"])
 
     def test_consume_session_due_user_response_wait_clears_wait_state(self) -> None:
@@ -549,6 +555,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             timeout_seconds=600,
             prompt_text="Need the deployment region.",
             source_service_id="service-codex-001",
+            requested_by_role="goal_manager",
         )
         assert talk is not None
         stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
@@ -570,6 +577,48 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(cleared["user_response_wait_started_at"], talk["user_response_wait_started_at"])
         self.assertEqual(cleared["user_response_wait_timeout_seconds"], 600)
         self.assertTrue(cleared["user_response_wait_last_timeout_at"])
+        self.assertEqual(cleared["user_response_wait_requests"][-1]["status"], "timed_out")
+
+    def test_user_response_wait_can_mark_multiple_request_ids_answered(self) -> None:
+        first = update_session_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            active=True,
+            request_id="req-a",
+            prompt_text="First question?",
+            source_service_id="service-gm-001",
+            requested_by_role="goal_manager",
+        )
+        assert first is not None
+        second = update_session_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            active=True,
+            request_id="req-b",
+            prompt_text="Second question?",
+            source_service_id="service-gm-001",
+            requested_by_role="goal_manager",
+        )
+        assert second is not None
+
+        answered = update_session_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            active=False,
+            response_request_ids=["req-a", "req-b"],
+            cleared_reason="user_reply",
+        )
+
+        assert answered is not None
+        statuses = {
+            item["request_id"]: item["status"]
+            for item in answered["user_response_wait_requests"]
+            if item.get("request_id") in {"req-a", "req-b"}
+        }
+        self.assertEqual(statuses, {"req-a": "answered", "req-b": "answered"})
 
     def test_extract_user_response_wait_control_strips_hidden_xml(self) -> None:
         visible_text, control = _extract_user_response_wait_control(
@@ -866,7 +915,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(schedule_state["retry_not_before_at"], "2026-03-20T12:00:15Z")
         self.assertIn("before any running worker was ready", str(schedule_state.get("last_error") or ""))
 
-    def test_build_prompt_mentions_user_response_wait_control(self) -> None:
+    def test_build_prompt_reserves_user_response_wait_for_goal_manager(self) -> None:
         prompt = build_prompt(
             {
                 "persona": "Test persona",
@@ -878,8 +927,8 @@ class GoalManagerCompactTests(unittest.TestCase):
             8,
         )
 
-        self.assertIn("aize_user_response_wait", prompt)
-        self.assertIn("300", prompt)
+        self.assertNotIn("aize_user_response_wait", prompt)
+        self.assertIn("GoalManager is the only role allowed", prompt)
 
     def test_http_handler_source_renders_wait_signal_in_nav_and_session_map(self) -> None:
         source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
@@ -2487,6 +2536,31 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(len(audit["agent_directives"]), 1)
         self.assertEqual(audit["agent_directives"][0]["service_id"], "service-codex-001")
         self.assertIn("<aize_goal_feedback>", audit["agent_directives"][0]["continue_xml"])
+
+    def test_run_goal_audit_parses_user_response_request(self) -> None:
+        with patch(
+            "runtime.cli_service_adapter.run_codex",
+            return_value=(
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "Need user input"},
+                    {"kind": "user_response_request", "question": "Which deployment region should I use?", "reason": "The goal requires a deployment target.", "timeout_seconds": 180},
+                ),
+                [],
+                "audit-session",
+            ),
+        ):
+            audit = run_goal_audit(
+                runtime_root=self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                goal_text="Ship it",
+                history_entries=[],
+            )
+
+        self.assertEqual(len(audit["user_response_requests"]), 1)
+        self.assertEqual(audit["user_response_requests"][0]["question"], "Which deployment region should I use?")
+        self.assertEqual(audit["user_response_requests"][0]["reason"], "The goal requires a deployment target.")
+        self.assertEqual(audit["user_response_requests"][0]["timeout_seconds"], 180)
 
     def test_run_goal_audit_requires_top_level_jsonl_records(self) -> None:
         with patch(

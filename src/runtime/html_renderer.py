@@ -91,7 +91,9 @@ def render_main_page(
     initial_user_response_wait_effective_timeout_seconds: int,
     initial_user_response_wait_started_at: str,
     initial_user_response_wait_until_at: str,
+    initial_user_response_wait_request_id: str,
     initial_user_response_wait_prompt_text: str,
+    initial_user_response_wait_reason: str,
     initial_user_response_wait_last_cleared_at: str,
     initial_user_response_wait_last_timeout_at: str,
     initial_session_group: str,
@@ -896,7 +898,9 @@ def render_main_page(
     f"let userResponseWaitEffectiveTimeoutSeconds = {json.dumps(initial_user_response_wait_effective_timeout_seconds)};"
     f"let userResponseWaitStartedAt = {json.dumps(initial_user_response_wait_started_at)};"
     f"let userResponseWaitUntilAt = {json.dumps(initial_user_response_wait_until_at)};"
+    f"let userResponseWaitRequestId = {json.dumps(initial_user_response_wait_request_id)};"
     f"let userResponseWaitPromptText = {json.dumps(initial_user_response_wait_prompt_text)};"
+    f"let userResponseWaitReason = {json.dumps(initial_user_response_wait_reason)};"
     f"let userResponseWaitLastClearedAt = {json.dumps(initial_user_response_wait_last_cleared_at)};"
     f"let userResponseWaitLastTimeoutAt = {json.dumps(initial_user_response_wait_last_timeout_at)};"
     f"let agentWelcomeEnabled = {json.dumps(initial_agent_welcome_enabled)};"
@@ -1383,7 +1387,9 @@ def render_main_page(
     "userResponseWaitEffectiveTimeoutSeconds = Number.parseInt(String(payload?.user_response_wait_effective_timeout_seconds ?? userResponseWaitEffectiveTimeoutSeconds), 10) || userResponseWaitEffectiveTimeoutSeconds || 300;"
     "userResponseWaitStartedAt = String(payload?.user_response_wait_started_at || userResponseWaitStartedAt || '');"
     "userResponseWaitUntilAt = String(payload?.user_response_wait_until_at || userResponseWaitUntilAt || '');"
+    "userResponseWaitRequestId = String(payload?.user_response_wait_request_id || userResponseWaitRequestId || '');"
     "userResponseWaitPromptText = String(payload?.user_response_wait_prompt_text || userResponseWaitPromptText || '');"
+    "userResponseWaitReason = String(payload?.user_response_wait_reason || userResponseWaitReason || '');"
     "userResponseWaitLastClearedAt = String(payload?.user_response_wait_last_cleared_at || userResponseWaitLastClearedAt || '');"
     "userResponseWaitLastTimeoutAt = String(payload?.user_response_wait_last_timeout_at || userResponseWaitLastTimeoutAt || '');"
     "agentWelcomeEnabled = Boolean(payload?.agent_welcome_enabled ?? agentWelcomeEnabled);"
@@ -2733,7 +2739,7 @@ def render_main_page(
     "} else if (goalCompleted) {"
     "talkGoalStateMeta.textContent = goalActive ? `${revisionMetaPrefix}GoalManager marked this session completed. SendPrompt reset is ${goalResetCompletedOnPrompt ? 'ON' : 'OFF'}. Auto compact is ${goalAutoCompactEnabled ? 'ON' : 'OFF'}.`.trim() : `${revisionMetaPrefix}Completed goal kept inactive until you update it.`.trim();"
     "} else if (goalActive) {"
-    "const waitMeta = userResponseWaitStartedAt ? ` User wait: status=${userResponseWaitStatus || (userResponseWaitActive ? 'waiting' : 'recorded')}, started=${userResponseWaitStartedAt}, requested=${userResponseWaitTimeoutSeconds}s, effective=${userResponseWaitEffectiveTimeoutSeconds}s, until=${userResponseWaitUntilAt || 'n/a'}${userResponseWaitLastClearedAt ? `, cleared=${userResponseWaitLastClearedAt}` : ''}${userResponseWaitLastTimeoutAt ? `, timeout=${userResponseWaitLastTimeoutAt}` : ''}${userResponseWaitPromptText ? `, prompt=${userResponseWaitPromptText}` : ''}.` : '';"
+    "const waitMeta = userResponseWaitStartedAt ? ` User wait: status=${userResponseWaitStatus || (userResponseWaitActive ? 'waiting' : 'recorded')}, id=${userResponseWaitRequestId || 'n/a'}, started=${userResponseWaitStartedAt}, requested=${userResponseWaitTimeoutSeconds}s, effective=${userResponseWaitEffectiveTimeoutSeconds}s, until=${userResponseWaitUntilAt || 'n/a'}${userResponseWaitLastClearedAt ? `, cleared=${userResponseWaitLastClearedAt}` : ''}${userResponseWaitLastTimeoutAt ? `, timeout=${userResponseWaitLastTimeoutAt}` : ''}${userResponseWaitPromptText ? `, prompt=${userResponseWaitPromptText}` : ''}${userResponseWaitReason ? `, reason=${userResponseWaitReason}` : ''}.` : '';"
     "talkGoalStateMeta.textContent = `${revisionMetaPrefix}GoalManager is checking new turns for this session. SendPrompt reset is ${goalResetCompletedOnPrompt ? 'ON' : 'OFF'}. Auto compact is ${goalAutoCompactEnabled ? 'ON' : 'OFF'}.${waitMeta}`.trim();"
     "} else {"
     "talkGoalStateMeta.textContent = `${revisionMetaPrefix}Goal exists but is inactive, so GoalManager feedback is paused.`.trim();"
@@ -3687,7 +3693,8 @@ def render_main_page(
     "goalCompleted = false;"
     "renderGoalState();"
     "}"
-    "const response = await fetch('/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: activeSessionId, text, mode: 'prompt', provider: preferredProvider }) });"
+    "const responseRequestIds = userResponseWaitActive && userResponseWaitRequestId ? [userResponseWaitRequestId] : [];"
+    "const response = await fetch('/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: activeSessionId, text, mode: 'prompt', provider: preferredProvider, user_response_request_ids: responseRequestIds }) });"
     "const payload = await response.json().catch(() => ({}));"
     "if (!response.ok || !(payload.ok ?? payload.accepted)) {"
     "composerText.disabled = false;"

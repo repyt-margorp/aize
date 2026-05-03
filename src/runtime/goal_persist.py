@@ -124,12 +124,19 @@ def goal_state_response_payload(
         "user_response_wait_effective_timeout_seconds": int(
             talk.get("user_response_wait_effective_timeout_seconds", 300) or 300
         ),
+        "user_response_wait_request_id": str(talk.get("user_response_wait_request_id", "") or ""),
+        "user_response_wait_generated_at": str(talk.get("user_response_wait_generated_at", "") or ""),
         "user_response_wait_started_at": str(talk.get("user_response_wait_started_at", "") or ""),
         "user_response_wait_until_at": str(talk.get("user_response_wait_until_at", "") or ""),
         "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or ""),
+        "user_response_wait_reason": str(talk.get("user_response_wait_reason", "") or ""),
         "user_response_wait_source_service_id": str(talk.get("user_response_wait_source_service_id", "") or ""),
+        "user_response_wait_requested_by_role": str(talk.get("user_response_wait_requested_by_role", "") or ""),
         "user_response_wait_last_cleared_at": str(talk.get("user_response_wait_last_cleared_at", "") or ""),
         "user_response_wait_last_timeout_at": str(talk.get("user_response_wait_last_timeout_at", "") or ""),
+        "user_response_wait_requests": list(talk.get("user_response_wait_requests", []))
+        if isinstance(talk.get("user_response_wait_requests"), list)
+        else [],
         "goal_manager_state": str(goal_manager_state or "idle"),
         "goal_manager_service_id": str(goal_manager_service_id or ""),
         "goal_manager_provider": str(

@@ -816,10 +816,16 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     )
     session.setdefault("user_response_wait_started_at", "")
     session.setdefault("user_response_wait_until_at", "")
+    session.setdefault("user_response_wait_request_id", "")
+    session.setdefault("user_response_wait_generated_at", "")
     session.setdefault("user_response_wait_prompt_text", "")
+    session.setdefault("user_response_wait_reason", "")
     session.setdefault("user_response_wait_source_service_id", "")
+    session.setdefault("user_response_wait_requested_by_role", "")
     session.setdefault("user_response_wait_last_cleared_at", "")
     session.setdefault("user_response_wait_last_timeout_at", "")
+    if not isinstance(session.get("user_response_wait_requests"), list):
+        session["user_response_wait_requests"] = []
     session.setdefault("launcher_template_id", "")
     session.setdefault("launcher_display_name", "")
     session.setdefault("launcher_preferred_provider", "")

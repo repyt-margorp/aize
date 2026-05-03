@@ -413,6 +413,9 @@ def build_goal_audit_prompt(
             "Optional later lines are agent_directive records, one per agent that should receive a follow-up now (only when in_progress):",
             "Emit agent_directive records only for agents that should actively continue now.",
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}',
+            "Optional later line when GoalManager needs direct user feedback before the goal can continue:",
+            '  {"kind": "user_response_request", "question": "...", "reason": "...", "timeout_seconds": 300}',
+            "Only GoalManager may request direct user feedback. Emit at most one user_response_request record. When emitting one, omit agent_directive records unless an agent can do independent work that does not depend on the user answer.",
             "Optional additional lines are child_goal_request records:",
             '  {"kind": "child_goal_request", "goal_text": "...", "label": "", "provider": "codex" | "claude" | "gemini"}',
             "These are GoalManager-owned system signals, not agent actions: GoalManager will later materialize them into child sessions.",
@@ -659,6 +662,8 @@ def run_goal_audit(
             '  {"kind": "goal_state", "progress_state": "complete" or "in_progress", "goal_satisfied": true or false, "summary": "..."}\n'
             "Optional later lines (only when in_progress): agent_directive records for agents that should continue now:\n"
             '  {"kind": "agent_directive", "service_id": "...", "audit_state": "all_clear" | "needs_compact" | "panic", "continue_xml": "...", "request_compact": false, "request_compact_reason": "", "summary": ""}\n'
+            "Optional later line when GoalManager needs direct user feedback before continuing:\n"
+            '  {"kind": "user_response_request", "question": "...", "reason": "...", "timeout_seconds": 300}\n'
             "These lines are optional. Omit them when no agent should receive immediate follow-up.\n"
             "When progress_state is 'complete', output ONLY the goal_state line."
         )
@@ -687,6 +692,7 @@ def run_goal_audit(
     goal_state_rec = next((r for r in parsed_records if str(r.get("kind", "")).strip() == "goal_state"), {})
     raw_agent_directive_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "agent_directive"]
     raw_child_goal_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "child_goal_request"]
+    raw_user_response_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "user_response_request"]
     progress_state = str(goal_state_rec.get("progress_state", "")).strip().lower()
     if progress_state not in {"complete", "in_progress"}:
         _gs = goal_state_rec.get("goal_satisfied")
@@ -724,6 +730,24 @@ def run_goal_audit(
                 "summary": str(item.get("summary", "")).strip(),
             })
     child_goal_requests = _normalize_child_goal_requests(raw_child_goal_recs if not goal_satisfied else [])
+    user_response_requests: list[dict[str, Any]] = []
+    if not goal_satisfied and progress_state == "in_progress":
+        for item in raw_user_response_recs:
+            question = str(item.get("question") or "").strip()
+            if not question:
+                continue
+            try:
+                timeout_seconds = int(item.get("timeout_seconds", 300) or 300)
+            except (TypeError, ValueError):
+                timeout_seconds = 300
+            user_response_requests.append(
+                {
+                    "question": question,
+                    "reason": str(item.get("reason") or "").strip(),
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            break
     return {
         "goal_audit_session_id": str(audit_session_id or ""),
         "goal_audit_provider_session_id": str(audit_session_id or ""),
@@ -737,6 +761,7 @@ def run_goal_audit(
         "request_compact_reason": request_compact_reason if request_compact else "",
         "agent_directives": agent_directives,
         "child_goal_requests": child_goal_requests,
+        "user_response_requests": user_response_requests,
         "pending_turn_completed_events": pending_turn_completed_events,
         "last_reviewed_turn_completed_at": last_reviewed_turn_completed_at,
         "verified_artifacts": verified_artifacts,

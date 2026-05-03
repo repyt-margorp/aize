@@ -1528,6 +1528,55 @@ def run_agent_service(
                             ),
                         )
                     )
+            user_response_requests = (
+                list(audit.get("user_response_requests", []))
+                if audit is not None and isinstance(audit.get("user_response_requests"), list)
+                else []
+            )
+            if user_response_requests:
+                request = next((item for item in user_response_requests if isinstance(item, dict)), None)
+                if request is not None:
+                    wait_record = update_session_user_response_wait(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        active=True,
+                        timeout_seconds=request.get("timeout_seconds"),
+                        prompt_text=request.get("question"),
+                        request_reason=request.get("reason"),
+                        source_service_id=goal_manager_service_id,
+                        requested_by_role="goal_manager",
+                    )
+                    request_id = str((wait_record or {}).get("user_response_wait_request_id") or "").strip()
+                    generated_at = str((wait_record or {}).get("user_response_wait_generated_at") or "")
+                    goal_history_sink(
+                        {
+                            "direction": "agent",
+                            "ts": utc_ts(),
+                            "from": goal_manager_service_id,
+                            "session_id": session_id,
+                            "event_type": "service.user_response_wait_started",
+                            "text": str(request.get("question") or "").strip(),
+                            "event": {
+                                "type": "service.user_response_wait_started",
+                                "request_id": request_id,
+                                "generated_at": generated_at,
+                                "timeout_seconds": int(request.get("timeout_seconds", 300) or 300),
+                                "prompt_text": str(request.get("question") or "").strip(),
+                                "reason": str(request.get("reason") or "").strip(),
+                                "source_service_id": goal_manager_service_id,
+                                "requested_by_role": "goal_manager",
+                            },
+                        }
+                    )
+                    update_session_goal_flags(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        goal_completed=False,
+                        goal_progress_state="in_progress",
+                    )
+                    return
             if audit_progress_state == "complete":
                 update_session_goal_flags(
                     runtime_root,
@@ -2306,15 +2355,6 @@ def run_agent_service(
             visible_text, user_response_wait = _extract_user_response_wait_control(visible_text)
             if scope_username and scope_session_id:
                 if isinstance(user_response_wait, dict):
-                    update_session_user_response_wait(
-                        runtime_root,
-                        username=scope_username,
-                        session_id=scope_session_id,
-                        active=True,
-                        timeout_seconds=user_response_wait.get("timeout_seconds"),
-                        prompt_text=visible_text,
-                        source_service_id=service_id,
-                    )
                     append_user_history(
                         runtime_root,
                         username=scope_username,
@@ -2323,23 +2363,17 @@ def run_agent_service(
                             "direction": "event",
                             "ts": utc_ts(),
                             "service_id": service_id,
-                            "event_type": "service.user_response_wait_started",
-                            "text": "Agent requested a user reply before continuing the goal.",
+                            "event_type": "service.user_response_wait_ignored",
+                            "text": "Agent attempted to request a user reply, but only GoalManager may start a user response wait.",
                             "event": {
-                                "type": "service.user_response_wait_started",
+                                "type": "service.user_response_wait_ignored",
                                 "timeout_seconds": int(user_response_wait.get("timeout_seconds", 300) or 300),
                                 "prompt_text": visible_text,
                                 "source_service_id": service_id,
+                                "reason": "agent_not_authorized",
                             },
                         },
                         limit=GOAL_AUDIT_HISTORY_LIMIT,
-                    )
-                    update_session_goal_flags(
-                        runtime_root,
-                        username=scope_username,
-                        session_id=scope_session_id,
-                        goal_completed=False,
-                        goal_progress_state="in_progress",
                     )
             write_jsonl(
                 log_path,

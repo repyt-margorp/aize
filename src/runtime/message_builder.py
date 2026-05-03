@@ -213,6 +213,7 @@ def build_aize_input_batch_xml(
         text = html.escape(str(item.get("text", "")))
         date_attr = ""
         submitted_by_attr = ""
+        request_id_lines: list[str] = []
         raw_date = item.get("date")
         if isinstance(raw_date, str) and raw_date.strip():
             date_attr = f' date="{html.escape(raw_date.strip(), quote=True)}"'
@@ -221,11 +222,24 @@ def build_aize_input_batch_xml(
             submitted_by_attr = (
                 f' submitted_by_username="{html.escape(raw_submitted_by_username.strip(), quote=True)}"'
             )
+        raw_request_ids = item.get("user_response_request_ids")
+        if isinstance(raw_request_ids, list):
+            request_ids = [str(value).strip() for value in raw_request_ids if str(value).strip()]
+            if request_ids:
+                request_id_lines = [
+                    "      <user_response_request_ids>",
+                    *[
+                        f"        <request_id>{html.escape(request_id)}</request_id>"
+                        for request_id in request_ids
+                    ],
+                    "      </user_response_request_ids>",
+                ]
         lines.extend(
             [
                 f"    <input index=\"{index}\" kind=\"{kind}\"{date_attr}{submitted_by_attr}>",
                 f"      <role>{role}</role>",
                 f"      <text>{text}</text>",
+                *request_id_lines,
                 "    </input>",
             ]
         )
@@ -279,7 +293,8 @@ def make_aize_pending_input(
     text: str,
     date: str | None = None,
     submitted_by_username: str | None = None,
-) -> dict[str, str]:
+    user_response_request_ids: list[str] | None = None,
+) -> dict[str, Any]:
     date_value = date.strip() if isinstance(date, str) and date.strip() else utc_ts()
     entry = {
         "kind": kind,
@@ -289,6 +304,10 @@ def make_aize_pending_input(
     }
     if isinstance(submitted_by_username, str) and submitted_by_username.strip():
         entry["submitted_by_username"] = submitted_by_username.strip()
+    if isinstance(user_response_request_ids, list):
+        request_ids = [str(value).strip() for value in user_response_request_ids if str(value).strip()]
+        if request_ids:
+            entry["user_response_request_ids"] = request_ids
     return entry
 
 

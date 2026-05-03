@@ -10,7 +10,8 @@
     "request_compact",
     "request_compact_reason",
     "agent_directives",
-    "child_goal_requests"
+    "child_goal_requests",
+    "user_response_requests"
   ],
   "properties": {
     "progress_state": {
@@ -93,6 +94,29 @@
           },
           "goal_text": {
             "type": "string"
+          }
+        }
+      }
+    },
+    "user_response_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "question",
+          "reason",
+          "timeout_seconds"
+        ],
+        "properties": {
+          "question": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "type": "integer"
           }
         }
       }

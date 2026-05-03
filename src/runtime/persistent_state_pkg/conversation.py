@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import tempfile
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -910,7 +911,11 @@ def update_session_user_response_wait(
     active: Any,
     timeout_seconds: Any | None = None,
     prompt_text: Any | None = None,
+    request_id: Any | None = None,
+    request_reason: Any | None = None,
     source_service_id: Any | None = None,
+    requested_by_role: Any | None = None,
+    response_request_ids: list[str] | None = None,
     cleared_reason: str | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
@@ -940,21 +945,82 @@ def update_session_user_response_wait(
                     min(DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS, requested_timeout_seconds),
                 )
                 started_at = utc_ts()
+                normalized_request_id = str(request_id or "").strip() or f"user-response-{uuid.uuid4().hex[:12]}"
+                prompt = str(prompt_text or "").strip()
+                reason = str(request_reason or "").strip()
+                source = str(source_service_id or "").strip()
+                role = str(requested_by_role or "").strip() or "goal_manager"
                 talk["user_response_wait_active"] = True
+                talk["user_response_wait_request_id"] = normalized_request_id
                 talk["user_response_wait_timeout_seconds"] = requested_timeout_seconds
                 talk["user_response_wait_effective_timeout_seconds"] = effective_timeout_seconds
                 talk["user_response_wait_started_at"] = started_at
+                talk["user_response_wait_generated_at"] = started_at
                 talk["user_response_wait_until_at"] = _utc_ts_after_seconds(effective_timeout_seconds)
-                talk["user_response_wait_prompt_text"] = str(prompt_text or "").strip()
-                talk["user_response_wait_source_service_id"] = str(source_service_id or "").strip()
+                talk["user_response_wait_prompt_text"] = prompt
+                talk["user_response_wait_reason"] = reason
+                talk["user_response_wait_source_service_id"] = source
+                talk["user_response_wait_requested_by_role"] = role
+                requests = talk.get("user_response_wait_requests")
+                if not isinstance(requests, list):
+                    requests = []
+                requests.append(
+                    {
+                        "request_id": normalized_request_id,
+                        "generated_at": started_at,
+                        "started_at": started_at,
+                        "until_at": talk["user_response_wait_until_at"],
+                        "timeout_seconds": requested_timeout_seconds,
+                        "effective_timeout_seconds": effective_timeout_seconds,
+                        "question": prompt,
+                        "reason": reason,
+                        "source_service_id": source,
+                        "requested_by_role": role,
+                        "status": "waiting",
+                    }
+                )
+                talk["user_response_wait_requests"] = requests[-50:]
             else:
                 was_active = bool(talk.get("user_response_wait_active", False))
+                active_request_id = str(talk.get("user_response_wait_request_id") or "").strip()
+                answered_request_ids = {
+                    str(value).strip()
+                    for value in (response_request_ids or [])
+                    if str(value).strip()
+                }
+                if not answered_request_ids and active_request_id:
+                    answered_request_ids.add(active_request_id)
                 talk["user_response_wait_active"] = False
                 if was_active:
                     cleared_at = utc_ts()
                     talk["user_response_wait_last_cleared_at"] = cleared_at
+                    status = "answered"
                     if str(cleared_reason or "").strip() == "timeout":
                         talk["user_response_wait_last_timeout_at"] = cleared_at
+                        status = "timed_out"
+                    requests = talk.get("user_response_wait_requests")
+                    if isinstance(requests, list) and answered_request_ids:
+                        for item in reversed(requests):
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("request_id") or "").strip() not in answered_request_ids:
+                                continue
+                            item["status"] = status
+                            item["cleared_at"] = cleared_at
+                            if status == "answered":
+                                item["answered_by_user"] = True
+                elif answered_request_ids:
+                    cleared_at = utc_ts()
+                    requests = talk.get("user_response_wait_requests")
+                    if isinstance(requests, list):
+                        for item in requests:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("request_id") or "").strip() not in answered_request_ids:
+                                continue
+                            item["status"] = "answered"
+                            item["cleared_at"] = cleared_at
+                            item["answered_by_user"] = True
             talk["updated_at"] = utc_ts()
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
             return dict(talk)
@@ -986,6 +1052,17 @@ def consume_session_due_user_response_wait(
             cleared_at = utc_ts()
             talk["user_response_wait_last_cleared_at"] = cleared_at
             talk["user_response_wait_last_timeout_at"] = cleared_at
+            active_request_id = str(talk.get("user_response_wait_request_id") or "").strip()
+            requests = talk.get("user_response_wait_requests")
+            if isinstance(requests, list) and active_request_id:
+                for item in reversed(requests):
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("request_id") or "").strip() != active_request_id:
+                        continue
+                    item["status"] = "timed_out"
+                    item["cleared_at"] = cleared_at
+                    break
             talk["updated_at"] = utc_ts()
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
             return dict(talk)
