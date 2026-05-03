@@ -50,12 +50,14 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
         priority = normalize_agent_profile_priority(
             [
                 {
-                "provider": "codex",
-                "profile": "interactive-fast",
-                "model": "gpt-5.5",
-                "session_slot": "interactive_agent",
-                "reasoning_effort": "low",
-                "verbosity": "low",
+                    "provider": "codex",
+                    "profile": "interactive-fast",
+                    "model": "gpt-5.4-mini",
+                    "session_slot": "interactive_agent",
+                    "session_mode": "ephemeral",
+                    "ephemeral": True,
+                    "reasoning_effort": "low",
+                    "verbosity": "low",
                 },
                 "border",
                 "claude",
@@ -66,8 +68,10 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
             {
                 "provider": "codex",
                 "profile": "interactive-fast",
-                "model": "gpt-5.5",
+                "model": "gpt-5.4-mini",
                 "session_slot": "interactive_agent",
+                "session_mode": "ephemeral",
+                "ephemeral": True,
                 "config": {
                     "model_reasoning_effort": "low",
                     "model_verbosity": "low",
@@ -79,8 +83,10 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
     def test_interactive_profile_default_uses_low_codex_reasoning(self) -> None:
         priority = normalize_agent_profile_priority(DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY)
         self.assertEqual(priority[0]["provider"], "codex")
-        self.assertEqual(priority[0]["model"], "gpt-5.5")
+        self.assertEqual(priority[0]["model"], "gpt-5.4-mini")
         self.assertEqual(priority[0]["session_slot"], "interactive_agent")
+        self.assertEqual(priority[0]["session_mode"], "ephemeral")
+        self.assertTrue(priority[0]["ephemeral"])
         self.assertEqual(priority[0]["config"]["model_reasoning_effort"], "low")
 
 

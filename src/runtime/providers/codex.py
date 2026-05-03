@@ -46,6 +46,7 @@ def run_codex(
     response_schema_id: str | None,
     model: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    ephemeral: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, list[dict[str, Any]], str | None]:
     sanitized_config_overrides = _sanitize_config_overrides(config_overrides)
@@ -75,6 +76,8 @@ def run_codex(
                 cmd.extend(["--model", str(attempt_model)])
             for key, value in sanitized_config_overrides.items():
                 cmd.extend(["-c", f"{key}={json.dumps(str(value))}"])
+            if ephemeral:
+                cmd.append("--ephemeral")
             if response_schema_id:
                 cmd.extend(["--output-schema", str(schema_path(response_schema_id))])
             cmd.append(prompt)

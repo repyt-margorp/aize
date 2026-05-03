@@ -73,7 +73,9 @@ class AppLauncherTests(unittest.TestCase):
                             {
                                 "provider": "codex",
                                 "profile": "interactive-fast",
-                                "model": "gpt-5.5",
+                                "model": "gpt-5.4-mini",
+                                "session_mode": "ephemeral",
+                                "ephemeral": True,
                                 "config": {
                                     "model_reasoning_effort": "low",
                                 },
@@ -209,6 +211,8 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(app["launcher"]["communication_agent_priority"][0]["provider"], "codex")
             self.assertEqual(app["launcher"]["communication_agent_priority"][0]["profile"], "interactive-fast")
             self.assertEqual(app["launcher"]["communication_agent_priority"][0]["session_slot"], "interactive_agent")
+            self.assertEqual(app["launcher"]["communication_agent_priority"][0]["session_mode"], "ephemeral")
+            self.assertTrue(app["launcher"]["communication_agent_priority"][0]["ephemeral"])
             session = launched["session"]
             stored = get_session_settings(runtime_root, username="repyt", session_id=str(session["session_id"]))
             self.assertIsNotNone(stored)
@@ -217,6 +221,8 @@ class AppLauncherTests(unittest.TestCase):
             self.assertTrue(stored["communication_agent_enabled"])
             self.assertEqual(stored["communication_agent_priority"][0]["provider"], "codex")
             self.assertEqual(stored["communication_agent_priority"][0]["session_slot"], "interactive_agent")
+            self.assertEqual(stored["communication_agent_priority"][0]["session_mode"], "ephemeral")
+            self.assertTrue(stored["communication_agent_priority"][0]["ephemeral"])
             self.assertEqual(stored["communication_agent_priority"][0]["config"]["model_reasoning_effort"], "low")
 
     def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:

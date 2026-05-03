@@ -37,8 +37,10 @@
       {
         "provider": "codex",
         "profile": "interactive-fast",
-        "model": "gpt-5.5",
+        "model": "gpt-5.4-mini",
         "session_slot": "interactive_agent",
+        "session_mode": "ephemeral",
+        "ephemeral": true,
         "config": {
           "model_reasoning_effort": "low",
           "model_verbosity": "low"

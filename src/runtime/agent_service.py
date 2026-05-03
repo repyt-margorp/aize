@@ -2313,6 +2313,7 @@ def run_agent_service(
                         response_schema_id=self_service.get("response_schema_id"),
                         model=profile_model or str((self_service.get("config") or {}).get("model") or "").strip() or None,
                         config_overrides=profile_config,
+                        ephemeral=profile_ephemeral,
                         on_event=emit_provider_event,
                     )
                     if not profile_ephemeral:

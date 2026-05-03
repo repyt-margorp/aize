@@ -29,8 +29,10 @@ DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
     {
         "provider": "codex",
         "profile": "interactive-fast",
-        "model": "gpt-5.5",
+        "model": "gpt-5.4-mini",
         "session_slot": "interactive_agent",
+        "session_mode": "ephemeral",
+        "ephemeral": True,
         "config": {
             "model_reasoning_effort": "low",
             "model_verbosity": "low",
