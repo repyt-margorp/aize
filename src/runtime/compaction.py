@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from kernel.registry import get_service_record
+from kernel.registry import get_service_record, list_service_records
 from runtime.event_log import make_history_event_entry
 from runtime.message_builder import (
     make_aize_pending_input,
@@ -24,6 +24,7 @@ from runtime.persistent_state import (
     consume_session_due_auto_resume,
     get_history as get_user_history,
     get_session_settings,
+    lease_session_service,
     load_agent_audit_state,
     load_codex_session,
     load_claude_session,
@@ -31,8 +32,10 @@ from runtime.persistent_state import (
     load_pending_inputs,
     read_json_file,
     load_service_pending_inputs,
+    list_all_sessions_with_users,
     list_codex_sessions,
     list_claude_sessions,
+    list_gemini_sessions,
     list_sessions_bound_to_service,
     normalize_auto_compact_threshold_left_percent,
     resolve_session_agent_id,
@@ -216,6 +219,94 @@ def maybe_resume_after_restart(
             }
         )
     candidate_entries = session_entries + fallback_entries
+    registry_service_ids = [
+        str(service.get("service_id"))
+        for service in list_service_records(runtime_root)
+        if isinstance(service, dict)
+        and str(service.get("kind") or "").strip().lower() == service_kind
+        and isinstance(service.get("service_id"), str)
+    ]
+    manifest_service_ids = [
+        str(service.get("service_id"))
+        for service in manifest.get("services", [])
+        if isinstance(service, dict)
+        and str(service.get("kind") or "").strip().lower() == service_kind
+        and isinstance(service.get("service_id"), str)
+    ]
+    provider_scopes_for_kind: set[tuple[str, str]] = set()
+    for provider_service_id in sorted({*registry_service_ids, *manifest_service_ids, service_id}):
+        if service_kind == "claude":
+            provider_entries = list_claude_sessions(runtime_root, service_id=provider_service_id)
+        elif service_kind == "gemini":
+            provider_entries = list_gemini_sessions(runtime_root, service_id=provider_service_id)
+        else:
+            provider_entries = list_codex_sessions(runtime_root, service_id=provider_service_id)
+        for provider_entry in provider_entries:
+            provider_username = provider_entry.get("username")
+            provider_session_id = provider_entry.get("conversation_session_id") or provider_entry.get("session_id")
+            if isinstance(provider_username, str) and isinstance(provider_session_id, str):
+                provider_scopes_for_kind.add((provider_username, provider_session_id))
+
+    for talk in list_all_sessions_with_users(runtime_root):
+        username = str(talk.get("username") or "").strip()
+        session_id = str(talk.get("session_id") or "").strip()
+        if not username or not session_id or (username, session_id) in session_entry_map:
+            continue
+        if (username, session_id) in provider_scopes_for_kind:
+            continue
+        preferred_provider = str(talk.get("preferred_provider") or service_kind).strip().lower() or service_kind
+        bound_service_id = str(talk.get("service_id") or "").strip()
+        if preferred_provider != service_kind:
+            continue
+        if bound_service_id and bound_service_id != service_id:
+            continue
+        goal_active = bool(talk.get("goal_active", False))
+        goal_completed = bool(talk.get("goal_completed", False))
+        goal_progress_state = str(
+            talk.get("goal_progress_state", "complete" if goal_completed else "in_progress")
+        ).strip().lower()
+        if not goal_active or goal_completed or goal_progress_state != "in_progress":
+            continue
+        provider_session_id = None
+        if service_kind == "claude":
+            provider_session_id = load_claude_session(
+                runtime_root,
+                service_id=service_id,
+                username=username,
+                session_id=session_id,
+            )
+        elif service_kind == "gemini":
+            provider_session_id = load_gemini_session(
+                runtime_root,
+                service_id=service_id,
+                username=username,
+                session_id=session_id,
+            )
+        else:
+            provider_session_id = load_codex_session(
+                runtime_root,
+                service_id=service_id,
+                username=username,
+                session_id=session_id,
+            )
+        if provider_session_id:
+            continue
+        leased_service_id = lease_session_service(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            pool_service_ids=[service_id],
+        )
+        if leased_service_id != service_id:
+            continue
+        session_entry_map[(username, session_id)] = {
+            "username": username,
+            "conversation_session_id": session_id,
+            "service_id": service_id,
+            "recovery_mode": "reconstruct_without_session",
+            "orphan_in_progress_session": "true",
+        }
+        candidate_entries.append(session_entry_map[(username, session_id)])
     if not candidate_entries:
         return
 

@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from kernel.auth import GOAL_MANAGER_USERNAME
 from kernel.lifecycle import get_process_record, register_process, update_process_fields
-from kernel.registry import update_service_process
+from kernel.registry import list_service_records, update_service_process
 from runtime.compaction import (
     GOAL_AUDIT_HISTORY_LIMIT,
     maybe_auto_compact_claude_session,
@@ -686,7 +686,17 @@ def run_agent_service(
         return recovery_session
 
     def _pool_for_kind_from_manifest(kind: str) -> list[str]:
-        """Derive service pool for a provider kind from the manifest."""
+        """Derive service pool for a provider kind from live registry, falling back to the manifest."""
+        registry_pool = [
+            str(service.get("service_id"))
+            for service in list_service_records(runtime_root)
+            if isinstance(service, dict)
+            and isinstance(service.get("service_id"), str)
+            and str(service.get("kind") or "") == kind
+            and str(service.get("status") or "").strip().lower() == "running"
+        ]
+        if registry_pool:
+            return sorted(registry_pool)
         return [
             s["service_id"]
             for s in manifest.get("services", [])

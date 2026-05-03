@@ -79,6 +79,7 @@ from runtime.persistent_state import (  # noqa: E402
     get_session_settings,
     load_goal_manager_pending_inputs,
     lease_session_service,
+    load_service_pending_inputs,
     list_codex_sessions,
     load_pending_inputs,
     record_session_agent_contact,
@@ -3484,6 +3485,68 @@ exit 1
         self.assertEqual([item["kind"] for item in pending], ["goal_feedback"])
         self.assertIn("resume work", pending[0]["text"])
         self.assertEqual(len(router.writes), 1)
+
+    def test_maybe_resume_after_restart_recovers_orphan_in_progress_child_session(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="create-pr",
+            goal_text="Create the pull request.",
+            created_by_username="goalmanager",
+            created_by_type="system",
+        )
+        assert child is not None
+        child_session_id = str(child["session_id"])
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=child_session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=child_session_id)
+        assert stored is not None
+        self.assertEqual(stored.get("service_id"), "service-codex-001")
+        agent_id = f"service-codex-001@@{child_session_id}"
+        pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=agent_id,
+            username=TEST_USERNAME,
+            session_id=child_session_id,
+        )
+        self.assertEqual([item["kind"] for item in pending], ["restart_resume"])
+        self.assertIn("<recovery_mode>reconstruct_without_session</recovery_mode>", pending[0]["text"])
+        self.assertEqual(len(router.writes), 1)
+
+    def test_agent_service_pool_resolution_reads_live_registry(self) -> None:
+        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
+        self.assertIn("list_service_records(runtime_root)", source)
+        self.assertIn("if registry_pool:", source)
 
     def test_ui_source_mentions_agent_status_and_turn_cluster(self) -> None:
         source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
