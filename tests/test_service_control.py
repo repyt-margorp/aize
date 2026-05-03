@@ -14,7 +14,7 @@ from runtime.agent_service import (
     maybe_dispatch_panic_recovery_parent_resume,
 )
 from runtime.panic_recovery import ensure_panic_recovery_session
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     create_conversation_session,
     create_child_conversation_session,
     get_session_settings,

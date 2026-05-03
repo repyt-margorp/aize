@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from runtime.persistent_state import _load_state_unlocked, normalize_username, state_lock, write_state
+from runtime.persistent_state_pkg import _load_state_unlocked, normalize_username, state_lock, write_state
 from wire.protocol import utc_ts
 
 
@@ -49,20 +49,21 @@ def _normalize_user_record(username: str, record: dict[str, Any]) -> dict[str, A
     normalized = normalize_username(username)
     roles = record.get("roles")
     if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
-        legacy_role = str(record.get("role", "user"))
-        roles = ["root", "superuser"] if legacy_role == "superuser" and normalized == "root" else [legacy_role]
+        roles = ["user"]
     capabilities = record.get("capabilities")
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         derived: set[str] = set()
         for role in roles:
             derived.update(ROLE_CAPABILITIES.get(role, set()))
         capabilities = sorted(derived)
-    return {
+    normalized_record = {
         **record,
         "username": normalized,
         "roles": roles,
         "capabilities": capabilities,
     }
+    normalized_record.pop("role", None)
+    return normalized_record
 
 
 def _write_user_record(runtime_root, *, username: str, record: dict[str, Any]) -> None:

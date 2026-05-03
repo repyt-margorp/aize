@@ -6,7 +6,7 @@ from typing import Any, Callable
 from kernel.registry import get_service_record
 from runtime.compaction import persist_session_context_status
 from runtime.event_log import make_history_event_entry
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_jsonl,
     normalize_agent_priority,

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel.auth import GOAL_MANAGER_USERNAME
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     add_session_child,
     create_conversation_session,
     get_session_settings,

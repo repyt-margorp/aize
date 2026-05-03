@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from runtime.persistent_state import release_session_service
+from runtime.persistent_state_pkg import release_session_service
 from wire.protocol import (
     load_text_object,
     make_message,

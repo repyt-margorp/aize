@@ -12,7 +12,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     get_session_settings,
     list_session_agent_contacts,
     session_dir,
@@ -475,29 +475,6 @@ def build_goal_audit_prompt(
     )
 
 
-def extract_json_object_candidate(text: str) -> str:
-    stripped = str(text or "").strip()
-    if not stripped:
-        return ""
-    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL | re.IGNORECASE)
-    if fenced_match:
-        return fenced_match.group(1).strip()
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(stripped):
-        if char != "{":
-            continue
-        try:
-            candidate, end_index = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(candidate, dict):
-            return stripped[index:index + end_index].strip()
-    trailing_match = re.search(r"\{.*\}\s*$", stripped, re.DOTALL)
-    if trailing_match:
-        return trailing_match.group(0).strip()
-    return stripped
-
-
 def extract_jsonl_records(text: str) -> list[dict[str, Any]]:
     """Extract a list of JSON objects from a JSONL-formatted string (one per non-empty line)."""
     records: list[dict[str, Any]] = []
@@ -512,21 +489,6 @@ def extract_jsonl_records(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             pass
     return records
-
-
-def _extract_embedded_goal_audit_records(candidate: Any) -> list[dict[str, Any]]:
-    """Recover JSONL goal-audit records nested inside a legacy wrapper payload.
-
-    Some providers can return a top-level JSON object that is schema-valid while
-    stuffing the actual JSONL goal_state/agent_directive lines into `summary`.
-    When that happens, the embedded records are the authoritative audit result.
-    """
-    if not isinstance(candidate, dict):
-        return []
-    embedded_records = extract_jsonl_records(str(candidate.get("summary", "")).strip())
-    if any(str(item.get("kind", "")).strip() == "goal_state" for item in embedded_records):
-        return embedded_records
-    return []
 
 
 def default_goal_continue_xml(*, summary: str) -> str:
@@ -670,9 +632,7 @@ def run_goal_audit(
     max_parse_retries = 2
     retry_final_text = final_text
     retry_session_id = audit_session_id
-    # parsed_records holds the JSONL records; parsed_legacy holds a single-JSON fallback
     parsed_records: list[dict[str, Any]] | None = None
-    parsed_legacy: dict[str, Any] | None = None
     parse_error_detail = ""
     for parse_attempt in range(max_parse_retries + 1):
         # Try JSONL first: look for a goal_state record among the lines
@@ -682,26 +642,7 @@ def run_goal_audit(
             parsed_records = jsonl_records
             audit_session_id = retry_session_id
             break
-        # Fall back: try to extract a single JSON object (old format or retry)
-        candidate = extract_json_object_candidate(retry_final_text)
-        parse_ok = False
-        try:
-            result = json.loads(candidate)
-            if isinstance(result, dict):
-                embedded_records = _extract_embedded_goal_audit_records(result)
-                if embedded_records:
-                    parsed_records = embedded_records
-                    parsed_legacy = None
-                else:
-                    parsed_legacy = result
-                audit_session_id = retry_session_id
-                parse_ok = True
-            else:
-                parse_error_detail = f"Expected JSON object or JSONL, got {type(result).__name__}"
-        except json.JSONDecodeError as exc:
-            parse_error_detail = str(exc)
-        if parse_ok:
-            break
+        parse_error_detail = "Expected JSONL with a goal_state record"
         if parse_attempt >= max_parse_retries:
             break
         if on_event:
@@ -740,98 +681,30 @@ def run_goal_audit(
                 retry_prompt,
                 request_session_id=retry_session_id,
             )
-    if parsed_records is None and parsed_legacy is None:
+    if parsed_records is None:
         raise RuntimeError(f"goal_audit_invalid_payload_after_retries: {parse_error_detail}")
 
-    # --- Normalize from JSONL records (new format) ---
-    if parsed_records is not None:
-        goal_state_rec = next((r for r in parsed_records if str(r.get("kind", "")).strip() == "goal_state"), {})
-        raw_agent_directive_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "agent_directive"]
-        raw_child_goal_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "child_goal_request"]
-        progress_state = str(goal_state_rec.get("progress_state", "")).strip().lower()
-        if progress_state not in {"complete", "in_progress"}:
-            _gs = goal_state_rec.get("goal_satisfied")
-            progress_state = "complete" if bool(_gs) else "in_progress"
-        goal_satisfied = progress_state == "complete"
-        summary = str(goal_state_rec.get("summary", "")).strip()
-        # Derive top-level audit_state and continue_xml from the first agent_directive (if any)
-        first_directive = raw_agent_directive_recs[0] if raw_agent_directive_recs else {}
-        audit_state = str(first_directive.get("audit_state", "")).strip().lower()
-        if audit_state not in {"all_clear", "needs_compact", "panic"}:
-            audit_state = "needs_compact" if bool(first_directive.get("request_compact", False)) else "all_clear"
-        if not first_directive:
-            # No agent directives: if goal complete → all_clear internally; if in_progress without directives → all_clear
-            audit_state = "all_clear"
-        continue_xml = str(first_directive.get("continue_xml", "")).strip() if audit_state == "all_clear" and not goal_satisfied else ""
-        request_compact = audit_state == "needs_compact" or bool(first_directive.get("request_compact", False))
-        request_compact_reason = str(first_directive.get("request_compact_reason", "")).strip() if request_compact else ""
-        # Build agent_directives list from records — when goal is complete, enforce no directives
-        agent_directives: list[dict[str, Any]] = []
-        if not goal_satisfied:
-            for item in raw_agent_directive_recs:
-                directive_service_id = str(item.get("service_id") or "").strip()
-                if not directive_service_id:
-                    continue
-                directive_audit_state = str(item.get("audit_state", "")).strip().lower()
-                if directive_audit_state not in {"all_clear", "needs_compact", "panic"}:
-                    directive_audit_state = "needs_compact" if bool(item.get("request_compact", False)) else "all_clear"
-                directive_request_compact = directive_audit_state == "needs_compact" or bool(item.get("request_compact", False))
-                directive_continue_xml = str(item.get("continue_xml", "")).strip()
-                agent_directives.append({
-                    "service_id": directive_service_id,
-                    "audit_state": directive_audit_state,
-                    "continue_xml": directive_continue_xml if directive_audit_state == "all_clear" else "",
-                    "request_compact": directive_request_compact,
-                    "request_compact_reason": str(item.get("request_compact_reason", "")).strip() if directive_request_compact else "",
-                    "summary": str(item.get("summary", "")).strip(),
-                })
-        # Build child_goal_requests list
-        child_goal_requests: list[dict[str, str]] = []
-        if not goal_satisfied:
-            child_goal_requests = _normalize_child_goal_requests(raw_child_goal_recs)
-        return {
-            "goal_audit_session_id": str(audit_session_id or ""),
-            "goal_audit_provider_session_id": str(audit_session_id or ""),
-            "goal_audit_conversation_session_id": "",
-            "progress_state": progress_state,
-            "audit_state": audit_state,
-            "goal_satisfied": goal_satisfied,
-            "summary": summary,
-            "continue_xml": continue_xml,
-            "request_compact": request_compact,
-            "request_compact_reason": request_compact_reason,
-            "agent_directives": agent_directives,
-            "child_goal_requests": child_goal_requests,
-            "pending_turn_completed_events": pending_turn_completed_events,
-            "last_reviewed_turn_completed_at": last_reviewed_turn_completed_at,
-            "verified_artifacts": verified_artifacts,
-            "log_bundle_path": str(log_bundle_path),
-            "log_record_count": log_record_count,
-        }
-
-    # --- Legacy single-JSON path (fallback) ---
-    parsed = parsed_legacy
-    assert parsed is not None
-    progress_state = str(parsed.get("progress_state", "")).strip().lower()
+    goal_state_rec = next((r for r in parsed_records if str(r.get("kind", "")).strip() == "goal_state"), {})
+    raw_agent_directive_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "agent_directive"]
+    raw_child_goal_recs = [r for r in parsed_records if str(r.get("kind", "")).strip() == "child_goal_request"]
+    progress_state = str(goal_state_rec.get("progress_state", "")).strip().lower()
     if progress_state not in {"complete", "in_progress"}:
-        goal_satisfied = parsed.get("goal_satisfied")
-        if goal_satisfied is None and "completed" in parsed:
-            goal_satisfied = parsed.get("completed")
-        progress_state = "complete" if bool(goal_satisfied) else "in_progress"
-    audit_state = str(parsed.get("audit_state", "")).strip().lower()
-    if audit_state not in {"all_clear", "needs_compact", "panic"}:
-        audit_state = "needs_compact" if bool(parsed.get("request_compact", False)) else "all_clear"
+        _gs = goal_state_rec.get("goal_satisfied")
+        progress_state = "complete" if bool(_gs) else "in_progress"
     goal_satisfied = progress_state == "complete"
-    summary = str(parsed.get("summary", "")).strip()
-    continue_xml = str(parsed.get("continue_xml", parsed.get("feedback_xml", ""))).strip()
-    request_compact = audit_state == "needs_compact" or bool(parsed.get("request_compact", False))
-    request_compact_reason = str(parsed.get("request_compact_reason", "")).strip()
-    raw_agent_directives = parsed.get("agent_directives", [])
+    summary = str(goal_state_rec.get("summary", "")).strip()
+    first_directive = raw_agent_directive_recs[0] if raw_agent_directive_recs else {}
+    audit_state = str(first_directive.get("audit_state", "")).strip().lower()
+    if audit_state not in {"all_clear", "needs_compact", "panic"}:
+        audit_state = "needs_compact" if bool(first_directive.get("request_compact", False)) else "all_clear"
+    if not first_directive:
+        audit_state = "all_clear"
+    continue_xml = str(first_directive.get("continue_xml", "")).strip() if audit_state == "all_clear" and not goal_satisfied else ""
+    request_compact = audit_state == "needs_compact" or bool(first_directive.get("request_compact", False))
+    request_compact_reason = str(first_directive.get("request_compact_reason", "")).strip() if request_compact else ""
     agent_directives: list[dict[str, Any]] = []
-    if isinstance(raw_agent_directives, list):
-        for item in raw_agent_directives:
-            if not isinstance(item, dict):
-                continue
+    if not goal_satisfied:
+        for item in raw_agent_directive_recs:
             directive_service_id = str(item.get("service_id") or "").strip()
             if not directive_service_id:
                 continue
@@ -840,32 +713,17 @@ def run_goal_audit(
                 directive_audit_state = (
                     "needs_compact" if bool(item.get("request_compact", False)) else "all_clear"
                 )
-            directive_request_compact = (
-                directive_audit_state == "needs_compact" or bool(item.get("request_compact", False))
-            )
+            directive_request_compact = directive_audit_state == "needs_compact" or bool(item.get("request_compact", False))
             directive_continue_xml = str(item.get("continue_xml", "")).strip()
-            agent_directives.append(
-                {
-                    "service_id": directive_service_id,
-                    "audit_state": directive_audit_state,
-                    "continue_xml": (
-                        directive_continue_xml
-                        if directive_audit_state == "all_clear" and not goal_satisfied
-                        else ""
-                    ),
-                    "request_compact": directive_request_compact,
-                    "request_compact_reason": (
-                        str(item.get("request_compact_reason", "")).strip()
-                        if directive_request_compact
-                        else ""
-                    ),
-                    "summary": str(item.get("summary", "")).strip(),
-                }
-            )
-    raw_child_goal_requests = parsed.get("child_goal_requests", [])
-    child_goal_requests = _normalize_child_goal_requests(
-        raw_child_goal_requests if not goal_satisfied else []
-    )
+            agent_directives.append({
+                "service_id": directive_service_id,
+                "audit_state": directive_audit_state,
+                "continue_xml": directive_continue_xml if directive_audit_state == "all_clear" else "",
+                "request_compact": directive_request_compact,
+                "request_compact_reason": str(item.get("request_compact_reason", "")).strip() if directive_request_compact else "",
+                "summary": str(item.get("summary", "")).strip(),
+            })
+    child_goal_requests = _normalize_child_goal_requests(raw_child_goal_recs if not goal_satisfied else [])
     return {
         "goal_audit_session_id": str(audit_session_id or ""),
         "goal_audit_provider_session_id": str(audit_session_id or ""),

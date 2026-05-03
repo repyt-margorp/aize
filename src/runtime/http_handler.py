@@ -45,7 +45,7 @@ from runtime.message_builder import (
     make_dispatch_pending_message,
     make_aize_pending_input,
 )
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     append_pending_input,
     clear_session_service_runtime,
     create_child_conversation_session,
@@ -66,7 +66,7 @@ from runtime.persistent_state import (
     normalize_agent_priority,
     normalize_goal_manager_priority,
     register_history_subscriber,
-    record_session_agent_contact,
+    join_session_agent,
     rename_session,
     resolve_session_context,
     reset_agent_audit_states_for_session,
@@ -2183,7 +2183,7 @@ def make_handler(
                 list_peer_joinable_sessions=list_peer_joinable_sessions,
                 register_history_subscriber=register_history_subscriber,
                 unregister_history_subscriber=unregister_history_subscriber,
-                record_session_agent_contact=record_session_agent_contact,
+                join_session_agent=join_session_agent,
                 write_jsonl=write_jsonl,
                 send_router_control=send_router_control,
             )
@@ -2276,7 +2276,7 @@ def make_handler(
                 return
             token = create_session(runtime_root, username=result)
             if "application/json" in content_type:
-                self._json_with_cookie(201, {"ok": True, "username": result, "role": "superuser"}, token)
+                self._json_with_cookie(201, {"ok": True, "username": result, "roles": ["root", "superuser"]}, token)
                 return
             self._redirect("/", token=token)
             return
@@ -2387,7 +2387,7 @@ def make_handler(
                 self._json(400, {"error": result})
                 return
             if "application/json" in content_type:
-                self._json(201, {"ok": True, "username": result, "role": "user"})
+                self._json(201, {"ok": True, "username": result, "roles": ["user"]})
                 return
             self._redirect("/")
             return
@@ -2845,12 +2845,14 @@ def make_handler(
                     pool_service_ids=provider_pool,
                 )
                 if leased_service_id:
-                    record_session_agent_contact(
+                    join_session_agent(
                         runtime_root,
                         username=context["username"],
                         session_id=context["session_id"],
                         service_id=leased_service_id,
                         provider=requested_provider,
+                        role="agent",
+                        transport="http_goal_state",
                     )
             dispatched_to, dispatch_error = enqueue_goal_dispatch(
                 username=context["username"],
@@ -3022,12 +3024,14 @@ def make_handler(
                 return
             service_record = get_service_record(runtime_root, service_id) or {}
             provider = str(service_record.get("kind", "")).strip()
-            result = record_session_agent_contact(
+            result = join_session_agent(
                 runtime_root,
                 username=context["username"],
                 session_id=context["session_id"],
                 service_id=service_id,
                 provider=provider,
+                role="agent",
+                transport="http_welcome",
             )
             if not result:
                 self._json(404, {"error": "session_not_found"})
@@ -3577,6 +3581,15 @@ def make_handler(
                             )
                         if leased_service_id:
                             to_service = leased_service_id
+                            join_session_agent(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                service_id=leased_service_id,
+                                provider=str(llm_service_kinds.get(leased_service_id) or preferred_provider),
+                                role="agent",
+                                transport="http_prompt",
+                            )
                         else:
                             dispatch_error = "no_available_provider_worker"
                     else:

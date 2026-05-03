@@ -21,7 +21,7 @@ from session_template import (
     list_launchable_session_templates,
     list_registered_session_template_states,
 )
-from runtime.persistent_state import create_conversation_session, ensure_state, get_session_settings
+from runtime.persistent_state_pkg import create_conversation_session, ensure_state, get_session_settings
 
 
 class AppLauncherTests(unittest.TestCase):

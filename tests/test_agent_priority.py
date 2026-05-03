@@ -24,10 +24,10 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
             ["codex", "claude", "border", "gemini"],
         )
 
-    def test_boarder_alias_preserves_divider_and_appends_missing_provider(self) -> None:
+    def test_unknown_priority_token_is_preserved_as_provider_kind(self) -> None:
         self.assertEqual(
-            normalize_agent_priority(["claude", "boarder"]),
-            ["claude", "border", "codex", "gemini"],
+            normalize_agent_priority(["claude", "external-typo"]),
+            ["claude", "external-typo", "border", "codex", "gemini"],
         )
 
     def test_agent_priority_can_activate_external_provider_when_available(self) -> None:

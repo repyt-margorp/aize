@@ -49,7 +49,7 @@ from runtime.providers import (
     run_gemini,
     run_gemini_compaction,
 )
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_pending_input,
     append_service_pending_input,
@@ -74,12 +74,12 @@ from runtime.persistent_state import (
     list_sessions_bound_to_service,
     list_codex_sessions,
     list_session_agent_contacts,
+    join_session_agent,
     load_claude_session,
     load_codex_session,
     load_gemini_session,
     active_agent_priority,
     normalize_auto_compact_threshold_left_percent,
-    record_session_agent_contact,
     resolve_session_agent_id,
     resolve_session,
     resolve_session_context,
@@ -544,6 +544,30 @@ def run_http_service(
         current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = current_llm_service_topology()
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+
+        def joined(service_id: str | None, *, provider: str = "") -> str | None:
+            normalized_service_id = str(service_id or "").strip()
+            if not normalized_service_id:
+                return None
+            resolved_provider = provider
+            if not resolved_provider:
+                if normalized_service_id in current_codex_service_pool:
+                    resolved_provider = "codex"
+                elif normalized_service_id in current_claude_service_pool:
+                    resolved_provider = "claude"
+                elif normalized_service_id in current_gemini_service_pool:
+                    resolved_provider = "gemini"
+            join_session_agent(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=normalized_service_id,
+                provider=resolved_provider,
+                role="agent",
+                transport="local_dispatch",
+            )
+            return normalized_service_id
+
         selected_agents_cfg = [
             str(item).strip()
             for item in list(session_settings.get("selected_agents", []))
@@ -570,49 +594,49 @@ def run_http_service(
                 }
                 for service_id in selected_agents_cfg:
                     if service_id in available_ws_service_ids:
-                        return service_id
+                        return joined(service_id, provider="ws_peer")
                 return None
 
             if leased_service_id and leased_service_id in all_local_service_ids:
                 if "codex_pool" in selected_agents_cfg and leased_service_id in current_codex_service_pool:
-                    return leased_service_id
+                    return joined(leased_service_id, provider="codex")
                 if "claude_pool" in selected_agents_cfg and leased_service_id in current_claude_service_pool:
-                    return leased_service_id
+                    return joined(leased_service_id, provider="claude")
                 if "gemini_pool" in selected_agents_cfg and leased_service_id in current_gemini_service_pool:
-                    return leased_service_id
+                    return joined(leased_service_id, provider="gemini")
                 if leased_service_id in selected_agents_cfg:
-                    return leased_service_id
+                    return joined(leased_service_id)
 
             if "codex_pool" in selected_agents_cfg:
-                return lease_session_service(
+                return joined(lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
                     pool_service_ids=current_codex_service_pool,
-                )
+                ), provider="codex")
             if "claude_pool" in selected_agents_cfg:
-                return lease_session_service(
+                return joined(lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
                     pool_service_ids=current_claude_service_pool,
-                )
+                ), provider="claude")
             if "gemini_pool" in selected_agents_cfg:
-                return lease_session_service(
+                return joined(lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
                     pool_service_ids=current_gemini_service_pool,
-                )
+                ), provider="gemini")
 
             selected_local = [service_id for service_id in selected_agents_cfg if service_id in all_local_service_ids]
             if selected_local:
-                return lease_session_service(
+                return joined(lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
                     pool_service_ids=selected_local,
-                )
+                ))
             return None
 
         # Build ordered provider list from agent_priority; fall back to preferred_provider
@@ -632,7 +656,7 @@ def run_http_service(
             for provider in agent_priority:
                 pool = pool_for_kind.get(provider, [])
                 if leased_service_id in pool:
-                    return leased_service_id
+                    return joined(leased_service_id, provider=provider)
 
         # Try to lease from pools in priority order.
         # lease_session_service handles session_priority-based preemption: if all slots are
@@ -649,10 +673,10 @@ def run_http_service(
                 pool_service_ids=pool,
             )
             if svc:
-                return svc
+                return joined(svc, provider=provider)
 
         if isinstance(default_target, str) and default_target:
-            return default_target
+            return joined(default_target)
         return None
 
     def codex_service_candidates_for_session(*, username: str, session_id: str) -> list[str]:
@@ -1219,6 +1243,7 @@ def run_http_service(
                 "username": base_context["username"],
                 "viewer_username": base_context["username"],
                 "session_id": base_context["session_id"],
+                "roles": list(base_context.get("roles") or ["user"]),
                 "role": base_context.get("role", "user"),
                 "is_superuser": is_superuser,
             }
@@ -1233,6 +1258,7 @@ def run_http_service(
                     "username": str(session.get("username") or "").strip(),
                     "viewer_username": base_context["username"],
                     "session_id": explicit_session_id,
+                    "roles": list(base_context.get("roles") or ["user"]),
                     "role": base_context.get("role", "user"),
                     "is_superuser": is_superuser,
                 }
@@ -1241,6 +1267,7 @@ def run_http_service(
             "username": base_context["username"],
             "viewer_username": base_context["username"],
             "session_id": explicit_session_id,
+            "roles": list(base_context.get("roles") or ["user"]),
             "role": base_context.get("role", "user"),
             "is_superuser": is_superuser,
         }

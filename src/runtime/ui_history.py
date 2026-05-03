@@ -7,7 +7,7 @@ from typing import Any
 from runtime.event_log import summarize_provider_event
 from runtime.goal_persist import goal_audit_history_text
 from runtime.message_builder import resolve_event_entry, resolve_payload_text
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     get_history as get_user_history,
     get_session_service,
     list_session_agent_contacts,

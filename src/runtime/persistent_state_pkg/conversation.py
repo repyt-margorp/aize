@@ -767,7 +767,6 @@ def update_session_goal_flags(
     goal_active: Any | None = None,
     goal_completed: Any | None = None,
     goal_progress_state: Any | None = None,
-    goal_audit_state: Any | None = None,
     goal_reset_completed_on_prompt: Any | None = None,
     goal_auto_compact_enabled: Any | None = None,
     agent_welcome_enabled: Any | None = None,
@@ -803,7 +802,6 @@ def update_session_goal_flags(
                         goal_active,
                         goal_completed,
                         goal_progress_state,
-                        goal_audit_state,
                     )
                 )
                 if target_revision is None and goal_status_updates:
@@ -855,8 +853,6 @@ def update_session_goal_flags(
                             target_revision["goal_progress_state"] == "complete"
                         )
                     target_revision["updated_at"] = utc_ts()
-                # goal_audit_state is now agent-side; the parameter is kept for call-site compatibility
-                # but no longer written to the session record
                 if goal_reset_completed_on_prompt is not None:
                     talk["goal_reset_completed_on_prompt"] = bool(goal_reset_completed_on_prompt)
                 if goal_auto_compact_enabled is not None:
@@ -1118,6 +1114,8 @@ def record_session_agent_contact(
     service_id: str,
     agent_id: str | None = None,
     provider: str | None = None,
+    join_role: str | None = None,
+    join_transport: str | None = None,
     turn_completed_at: str | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
@@ -1183,6 +1181,13 @@ def record_session_agent_contact(
                         existing["agent_id"] = normalized_agent_id or f"{normalized_service_id}@@{session_id}"
                 if normalized_provider:
                     existing["provider"] = normalized_provider
+                normalized_join_role = str(join_role or "").strip().lower()
+                if normalized_join_role:
+                    existing["join_role"] = normalized_join_role
+                normalized_join_transport = str(join_transport or "").strip().lower()
+                if normalized_join_transport:
+                    existing["join_transport"] = normalized_join_transport
+                existing.setdefault("joined_at", existing.get("welcomed_at") or now)
                 if isinstance(turn_completed_at, str) and turn_completed_at.strip():
                     existing["last_turn_completed_at"] = turn_completed_at.strip()
                 talk["welcomed_agents"] = welcomed_agents
@@ -1190,6 +1195,39 @@ def record_session_agent_contact(
                 ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
                 return dict(talk)
         return None
+
+
+def join_session_agent(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+    agent_id: str | None = None,
+    provider: str | None = None,
+    role: str = "agent",
+    transport: str = "local",
+    turn_completed_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Join a local or remote agent-like participant to a session.
+
+    This is the common session-membership primitive used by local LLM workers,
+    GoalManager workers, and WS peers.  ``record_session_agent_contact`` remains
+    the low-level persistence helper for compatibility with older call sites.
+    """
+    normalized_role = str(role or "agent").strip().lower() or "agent"
+    normalized_transport = str(transport or "local").strip().lower() or "local"
+    return record_session_agent_contact(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=service_id,
+        agent_id=agent_id,
+        provider=provider,
+        join_role=normalized_role,
+        join_transport=normalized_transport,
+        turn_completed_at=turn_completed_at,
+    )
 
 
 def resolve_session_agent_id(

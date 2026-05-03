@@ -38,7 +38,7 @@ def create_user(runtime_root: Path, *, username: str, password: str) -> tuple[bo
         salt = secrets.token_bytes(16)
         state["users"][normalized] = {
             "username": normalized,
-            "role": "user",
+            "roles": ["user"],
             "password_salt": salt.hex(),
             "password_hash": hash_password(password, salt),
             "created_at": utc_ts(),
@@ -66,7 +66,7 @@ def bootstrap_root_user(runtime_root: Path, *, password: str) -> tuple[bool, str
         salt = secrets.token_bytes(16)
         state["users"]["root"] = {
             "username": "root",
-            "role": "superuser",
+            "roles": ["root", "superuser"],
             "password_salt": salt.hex(),
             "password_hash": hash_password(password, salt),
             "created_at": utc_ts(),
@@ -168,8 +168,8 @@ def resolve_session_context(runtime_root: Path, token: str | None) -> dict[str, 
 
     user = resolve_user_record(runtime_root, username=username) or {}
     roles = user.get("roles")
-    role_name = str(roles[0]) if isinstance(roles, list) and roles else str(user.get("role", "user"))
-    return {"username": username, "session_id": session_id, "role": role_name}
+    normalized_roles = [str(role) for role in roles] if isinstance(roles, list) and roles else ["user"]
+    return {"username": username, "session_id": session_id, "roles": normalized_roles, "role": normalized_roles[0]}
 
 
 def delete_session(runtime_root: Path, token: str | None) -> None:

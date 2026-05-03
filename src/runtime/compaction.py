@@ -16,7 +16,7 @@ from runtime.panic_recovery import (
     ensure_panic_recovery_session,
     panic_recovery_bootstrap_xml,
 )
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_pending_input,
     append_service_pending_input,

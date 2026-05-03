@@ -68,7 +68,7 @@ from kernel.ws_transport import (
     load_ws_router_peer_configs,
     mark_inbound_kernel_transport,
 )
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     write_agent_file,
     read_agent_file,
     list_agent_files,
@@ -102,7 +102,7 @@ def handle_peer_connection(
     list_peer_joinable_sessions: Callable,
     register_history_subscriber: Callable,
     unregister_history_subscriber: Callable,
-    record_session_agent_contact: Callable,
+    join_session_agent: Callable,
     write_jsonl: Callable,
     send_router_control: Callable[[dict[str, Any]], bool] | None = None,
 ) -> None:
@@ -358,13 +358,15 @@ def handle_peer_connection(
         peer_node_id = str(_auth_context.get("node_id") or "").strip()
         # Derive a stable virtual service_id for this peer based on its node
         peer_service_id = f"ws-peer-{peer_node_id or peer_username}"
-        record_session_agent_contact(
+        join_session_agent(
             runtime_root,
             username=username,
             session_id=session_id,
             service_id=peer_service_id,
             agent_id=f"{peer_service_id}@@{session_id}",
             provider="ws_peer",
+            role="agent",
+            transport="ws",
         )
 
         write_jsonl(log_path, {

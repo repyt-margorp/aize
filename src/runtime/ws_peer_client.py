@@ -723,15 +723,17 @@ def run_ws_peer_client(
             })
 
             if peer_service_id and local_session_id:
-                from runtime.persistent_state_pkg import record_session_agent_contact
+                from runtime.persistent_state_pkg import join_session_agent
 
-                record_session_agent_contact(
+                join_session_agent(
                     runtime_root,
                     username=local_username,
                     session_id=local_session_id,
                     service_id=peer_service_id,
                     agent_id=f"{peer_service_id}@@{remote_session_id}",
                     provider="ws_peer",
+                    role="agent",
+                    transport="ws_peer_client",
                 )
 
             # --- Backlog recovery ---

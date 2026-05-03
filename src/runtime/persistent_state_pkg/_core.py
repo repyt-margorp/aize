@@ -73,8 +73,6 @@ def normalize_agent_priority(value: Any) -> list[str]:
         item = str(raw_item or "").strip().lower()
         if not item:
             continue
-        if item == "boarder":
-            item = AGENT_PRIORITY_BORDER
         if item in seen:
             continue
         seen.add(item)
@@ -171,8 +169,7 @@ def state_dir(runtime_root: Path) -> Path:
     # The canonical repo runtime lives at .aize-runtime/, so durable state
     # should sit beside it. Ephemeral/test runtimes use an isolated nested state
     # directory to avoid cross-run collisions under shared parents like /tmp.
-    legacy_runtime_prefix = ".agent" + "-mesh-runtime"
-    if runtime_root.name.startswith(".aize-runtime") or runtime_root.name.startswith(legacy_runtime_prefix):
+    if runtime_root.name.startswith(".aize-runtime"):
         return runtime_root.parent / ".aize-state"
     return runtime_root / ".aize-state"
 
@@ -674,7 +671,6 @@ def _apply_active_goal_snapshot_unlocked(session: dict[str, Any]) -> None:
         session["goal_completed"] = True
         session["goal_progress_state"] = "complete"
         session["goal_updated_at"] = session.get("updated_at", utc_ts())
-        session.pop("goal_audit_state", None)
         return
     session["goal_id"] = str(active_revision.get("goal_id") or "")
     session["goal_text"] = str(active_revision.get("goal_text", ""))
@@ -682,36 +678,17 @@ def _apply_active_goal_snapshot_unlocked(session: dict[str, Any]) -> None:
     session["goal_completed"] = bool(active_revision.get("goal_completed", False))
     session["goal_progress_state"] = str(active_revision.get("goal_progress_state", "in_progress"))
     session["goal_updated_at"] = str(active_revision.get("updated_at") or session.get("updated_at", utc_ts()))
-    session.pop("goal_audit_state", None)
     _normalize_goal_mode_unlocked(session)
 
 
 def _ensure_goal_history_unlocked(session: dict[str, Any]) -> None:
-    fallback_ts = str(session.get("goal_updated_at") or session.get("updated_at") or utc_ts())
     raw_history = session.get("goal_history")
     history: list[dict[str, Any]] = []
     if isinstance(raw_history, list):
+        fallback_ts = str(session.get("goal_updated_at") or session.get("updated_at") or utc_ts())
         for raw_revision in raw_history:
             if isinstance(raw_revision, dict):
                 history.append(_normalize_goal_revision_unlocked(raw_revision, fallback_ts=fallback_ts))
-    should_migrate_legacy_goal = bool(str(session.get("goal_text", "") or "").strip()) or bool(
-        str(session.get("goal_id") or session.get("active_goal_id") or "").strip()
-    )
-    if not history and should_migrate_legacy_goal:
-        history.append(
-            _normalize_goal_revision_unlocked(
-                {
-                    "goal_id": session.get("goal_id"),
-                    "goal_text": session.get("goal_text", ""),
-                    "goal_active": session.get("goal_active", False),
-                    "goal_completed": session.get("goal_completed", False),
-                    "goal_progress_state": session.get("goal_progress_state", "in_progress"),
-                    "created_at": session.get("goal_updated_at") or fallback_ts,
-                    "updated_at": session.get("goal_updated_at") or fallback_ts,
-                },
-                fallback_ts=fallback_ts,
-            )
-        )
     session["goal_history"] = history
     active_goal_id = str(session.get("active_goal_id") or session.get("goal_id") or "").strip()
     if history:
@@ -732,8 +709,6 @@ def _normalize_goal_mode_unlocked(session: dict[str, Any]) -> None:
         session["goal_active"] = False
         session["goal_completed"] = True
         session["goal_progress_state"] = "complete"
-        # goal_audit_state is now agent-side; remove stale session-level value when goal is cleared
-        session.pop("goal_audit_state", None)
         return
     goal_active = bool(session.get("goal_active", True))
     session["goal_mode"] = "active" if goal_active else "inactive"
@@ -741,7 +716,6 @@ def _normalize_goal_mode_unlocked(session: dict[str, Any]) -> None:
     progress_state = str(session.get("goal_progress_state", "complete" if bool(session.get("goal_completed", False)) else "in_progress")).strip().lower()
     session["goal_progress_state"] = progress_state if progress_state in {"complete", "in_progress"} else "in_progress"
     session["goal_completed"] = session["goal_progress_state"] == "complete"
-    # goal_audit_state is agent-side; do not normalize it at session level
 
 
 def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
@@ -758,8 +732,6 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("goal_mode", "active" if has_goal_text else "no_goal")
     session.setdefault("goal_completed", not has_goal_text)
     session.setdefault("goal_progress_state", "complete" if bool(session.get("goal_completed", False)) else "in_progress")
-    # goal_audit_state is now agent-side; evict any stale field from pre-migration records
-    session.pop("goal_audit_state", None)
     session.setdefault("goal_reset_completed_on_prompt", True)
     session.setdefault("goal_auto_compact_enabled", True)
     session.setdefault("agent_welcome_enabled", False)

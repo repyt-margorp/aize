@@ -50,7 +50,7 @@ from runtime.message_builder import (
     resolve_conversation_scope,
     resolve_payload_text,
 )
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_goal_manager_pending_input,
     append_pending_input,
@@ -64,6 +64,7 @@ from runtime.persistent_state import (
     get_session_settings,
     active_agent_priority,
     active_goal_manager_priority,
+    join_session_agent,
     lease_session_service,
     load_agent_audit_state,
     load_codex_session,
@@ -72,7 +73,6 @@ from runtime.persistent_state import (
     load_pending_inputs,
     load_service_pending_inputs,
     list_session_agent_contacts,
-    record_session_agent_contact,
     release_session_service,
     resolve_session_agent_id,
     read_json_file,
@@ -191,12 +191,14 @@ def _materialize_goal_child_sessions(
             preferred_provider=preferred_provider,
         )
         if requested_service_id:
-            record_session_agent_contact(
+            join_session_agent(
                 runtime_root,
                 username=username,
                 session_id=child_session_id,
                 service_id=requested_service_id,
                 provider=preferred_provider,
+                role="agent",
+                transport="goal_child_request",
             )
         dispatch_service_id = ""
         if dispatch_child_session is not None:
@@ -746,8 +748,6 @@ def run_agent_service(
             return False
         for raw_item in value:
             item = str(raw_item or "").strip().lower()
-            if item == "boarder":
-                item = "border"
             if item == "border":
                 return False
             if item and item not in {"codex", "claude", "gemini"}:
@@ -783,6 +783,21 @@ def run_agent_service(
                 pool_service_ids=pool,
             )
             if leased_service_id:
+                join_session_agent(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    service_id=leased_service_id,
+                    agent_id=resolve_session_agent_id(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        service_id=leased_service_id,
+                    ),
+                    provider=provider,
+                    role="agent",
+                    transport="local_dispatch",
+                )
                 return leased_service_id
         if isinstance(default_service_id, str) and default_service_id.strip():
             return default_service_id.strip()
@@ -818,6 +833,21 @@ def run_agent_service(
                 pool_service_ids=pool,
             )
             if leased_service_id:
+                join_session_agent(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    service_id=leased_service_id,
+                    agent_id=resolve_session_agent_id(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        service_id=leased_service_id,
+                    ),
+                    provider=provider,
+                    role="goal_manager",
+                    transport="local_dispatch",
+                )
                 return leased_service_id
         return None
 
@@ -1328,7 +1358,7 @@ def run_agent_service(
         write_jsonl(log_path, turn_started_event)
         write_json_file(goal_manager_state_path, goal_manager_state)
         write_jsonl(log_path, started_event)
-        record_session_agent_contact(
+        join_session_agent(
             runtime_root,
             username=username,
             session_id=session_id,
@@ -1340,6 +1370,8 @@ def run_agent_service(
                 service_id=goal_manager_service_id,
             ),
             provider=str(self_service.get("kind", "")),
+            role="goal_manager",
+            transport="goal_manager_review",
         )
         goal_history_sink(
             {
@@ -2053,7 +2085,7 @@ def run_agent_service(
                         },
                         limit=history_limit,
                     )
-                    record_session_agent_contact(
+                    join_session_agent(
                         runtime_root,
                         username=scope_username,
                         session_id=scope_session_id,
@@ -2065,6 +2097,8 @@ def run_agent_service(
                             service_id=service_id,
                         ),
                         provider=str(self_service.get("kind", "")),
+                        role="agent",
+                        transport="local_dispatch",
                     )
 
                 def emit_provider_event(event: dict[str, Any]) -> None:
@@ -2444,7 +2478,7 @@ def run_agent_service(
                                 ),
                             ),
                         )
-                        record_session_agent_contact(
+                        join_session_agent(
                             runtime_root,
                             username=scope_username,
                             session_id=scope_session_id,
@@ -2456,6 +2490,8 @@ def run_agent_service(
                                 service_id=service_id,
                             ),
                             provider=str(self_service.get("kind", "")),
+                            role="agent",
+                            transport="local_dispatch",
                             turn_completed_at=utc_ts(),
                         )
                         write_jsonl(

@@ -1575,7 +1575,7 @@ def render_main_page(
     "source.forEach((raw) => {"
     "const token = String(raw || '').trim().toLowerCase();"
     "if (!token) return;"
-    "const normalized = token === 'boarder' ? 'border' : token;"
+    "const normalized = token;"
     "if (seen.has(normalized)) return;"
     "seen.add(normalized);"
     "if (normalized === 'border') { borderSeen = true; return; }"

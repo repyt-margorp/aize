@@ -61,7 +61,7 @@ from runtime.http_handler import _process_due_auto_resume_session, _process_due_
 from runtime.ui_history import build_session_ui_history  # noqa: E402
 from runtime.ws_peer_client import _remote_session_entry_to_dispatch  # noqa: E402
 from session_template import get_registered_session_template_state, launch_session_template, normalize_session_template_descriptor  # noqa: E402
-from runtime.persistent_state import (  # noqa: E402
+from runtime.persistent_state_pkg import (  # noqa: E402
     add_session_child,
     append_history,
     append_goal_manager_pending_input,
@@ -83,6 +83,7 @@ from runtime.persistent_state import (  # noqa: E402
     load_service_pending_inputs,
     list_codex_sessions,
     load_pending_inputs,
+    join_session_agent,
     record_session_agent_contact,
     release_nonrunnable_session_services,
     save_codex_session,
@@ -111,6 +112,10 @@ from runtime.session_view import persisted_goal_manager_runtime_state  # noqa: E
 
 
 TEST_USERNAME = "test-user"
+
+
+def goal_audit_jsonl(*records: dict[str, Any]) -> str:
+    return "\n".join(json.dumps(record) for record in records)
 
 
 class GoalManagerCompactTests(unittest.TestCase):
@@ -285,7 +290,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(child_goal_requests_schema["items"]["required"], ["goal_text"])
         self.assertIn("provider", child_goal_requests_schema["items"]["properties"])
 
-    def test_run_goal_audit_parses_markdown_fenced_json(self) -> None:
+    def test_run_goal_audit_rejects_markdown_fenced_json(self) -> None:
         with patch(
             "runtime.cli_service_adapter.run_claude",
             return_value=(
@@ -304,22 +309,15 @@ class GoalManagerCompactTests(unittest.TestCase):
                 "audit-session-1",
             ),
         ):
-            audit = run_goal_audit(
-                runtime_root=self.runtime_root,
-                username=TEST_USERNAME,
-                session_id=self.session_id,
-                goal_text="Ship it",
-                history_entries=[],
-                provider_kind="claude",
-            )
-
-        self.assertEqual(audit["goal_audit_session_id"], "audit-session-1")
-        self.assertEqual(audit["goal_audit_provider_session_id"], "audit-session-1")
-        self.assertEqual(audit["goal_audit_conversation_session_id"], "")
-        self.assertEqual(audit["progress_state"], "in_progress")
-        self.assertEqual(audit["audit_state"], "all_clear")
-        self.assertEqual(audit["summary"], "still working")
-        self.assertEqual(audit["continue_xml"], "<aize_goal_feedback />")
+            with self.assertRaisesRegex(RuntimeError, "Expected JSONL with a goal_state record"):
+                run_goal_audit(
+                    runtime_root=self.runtime_root,
+                    username=TEST_USERNAME,
+                    session_id=self.session_id,
+                    goal_text="Ship it",
+                    history_entries=[],
+                    provider_kind="claude",
+                )
 
     def test_record_session_agent_contact_replaces_previous_native_in_single_slot(self) -> None:
         update_session_goal_flags(
@@ -359,6 +357,29 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         self.assertEqual([item["service_id"] for item in contacts], ["service-codex-001"])
         self.assertEqual(contacts[0]["last_turn_completed_at"], "2026-03-20T12:10:00Z")
+
+    def test_join_session_agent_records_common_join_metadata(self) -> None:
+        result = join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            provider="codex",
+            role="goal_manager",
+            transport="local_dispatch",
+        )
+        self.assertIsNotNone(result)
+
+        contacts = list_session_agent_contacts(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(contacts[0]["service_id"], "service-codex-001")
+        self.assertEqual(contacts[0]["join_role"], "goal_manager")
+        self.assertEqual(contacts[0]["join_transport"], "local_dispatch")
+        self.assertTrue(contacts[0]["joined_at"])
 
     def test_session_history_is_written_to_timeline_jsonl(self) -> None:
         append_history(
@@ -917,7 +938,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         artifact_source = self.runtime_root / "sample.json"
         artifact_source.write_text(json.dumps({"ok": True}), encoding="utf-8")
         artifact_url = artifact_source.resolve().as_uri()
-        from runtime.persistent_state import append_pending_input
+        from runtime.persistent_state_pkg import append_pending_input
 
         append_pending_input(
             self.runtime_root,
@@ -1131,7 +1152,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(history[-1]["event"]["reason"], "goal_updated")
 
     def test_goal_auto_compact_state_round_trip_payload(self) -> None:
-        from runtime.persistent_state import update_session_goal
+        from runtime.persistent_state_pkg import update_session_goal
 
         update_session_goal(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id, goal_text="Ship it")
         talk = update_session_goal_flags(
@@ -1155,7 +1176,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], self.session_id)
 
     def test_goal_updates_append_history_and_expose_active_goal_id(self) -> None:
-        from runtime.persistent_state import update_session_goal
+        from runtime.persistent_state_pkg import update_session_goal
 
         first = update_session_goal(
             self.runtime_root,
@@ -1377,7 +1398,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(stored["restart_resume_claim_service_id"], "service-codex-002")
 
     def test_old_goal_completion_does_not_overwrite_new_active_goal(self) -> None:
-        from runtime.persistent_state import update_session_goal
+        from runtime.persistent_state_pkg import update_session_goal
 
         first = update_session_goal(
             self.runtime_root,
@@ -1413,7 +1434,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertFalse(second_history["goal_completed"])
 
     def test_no_goal_mode_forces_inactive_state(self) -> None:
-        from runtime.persistent_state import update_session_goal
+        from runtime.persistent_state_pkg import update_session_goal
 
         update_session_goal(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id, goal_text="")
         talk = update_session_goal_flags(
@@ -1422,7 +1443,6 @@ class GoalManagerCompactTests(unittest.TestCase):
             session_id=self.session_id,
             goal_active=True,
             goal_progress_state="complete",
-            goal_audit_state="panic",  # no-op: audit_state is now agent-side only
         )
         assert talk is not None
 
@@ -1430,7 +1450,6 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertFalse(talk["goal_active"])
         self.assertTrue(talk["goal_completed"])
         self.assertEqual(talk["goal_progress_state"], "complete")
-        # goal_audit_state is agent-side; it must not appear on the session talk record
         self.assertNotIn("goal_audit_state", talk)
         # The response payload still returns all_clear as the safe default
         payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
@@ -2174,7 +2193,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertNotIn("talks", persisted)
 
     def test_source_no_longer_reinjects_legacy_state_aliases(self) -> None:
-        source = (SRC / "runtime" / "persistent_state.py").read_text(encoding="utf-8")
+        source = (SRC / "runtime" / "persistent_state_pkg" / "_core.py").read_text(encoding="utf-8")
         self.assertNotIn('state["sessions"] = state["auth_sessions"]', source)
         self.assertNotIn('state["talks"] = state["conversation_sessions"]', source)
 
@@ -2300,11 +2319,11 @@ class GoalManagerCompactTests(unittest.TestCase):
             process_id="proc-service-claude-001",
             status="running",
         )
+        update_session_goal(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id, goal_text="Ship it")
         session = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert session is not None
         session["service_id"] = "service-claude-001"
         session["preferred_provider"] = "claude"
-        session["goal_text"] = "Ship it"
         session["goal_active"] = True
         session["goal_progress_state"] = "in_progress"
         session["goal_completed"] = False
@@ -2349,11 +2368,11 @@ class GoalManagerCompactTests(unittest.TestCase):
             process_id="proc-service-claude-001",
             status="running",
         )
+        update_session_goal(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id, goal_text="Ship it")
         session = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert session is not None
         session["service_id"] = "service-claude-001"
         session["preferred_provider"] = "claude"
-        session["goal_text"] = "Ship it"
         session["goal_active"] = True
         session["goal_progress_state"] = "in_progress"
         session["goal_completed"] = False
@@ -2383,15 +2402,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "in_progress",
-                        "audit_state": "needs_compact",
-                        "summary": "Agent is stalling",
-                        "continue_xml": "<aize_goal_feedback></aize_goal_feedback>",
-                        "request_compact": True,
-                        "request_compact_reason": "Repeated sabotage",
-                    }
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "Agent is stalling"},
+                    {"kind": "agent_directive", "service_id": "service-codex-001", "audit_state": "needs_compact", "continue_xml": "", "request_compact": True, "request_compact_reason": "Repeated sabotage"},
                 ),
                 [],
                 "audit-session",
@@ -2454,24 +2467,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "in_progress",
-                        "audit_state": "all_clear",
-                        "summary": "Split work across agents",
-                        "continue_xml": "<aize_goal_feedback><summary>session</summary></aize_goal_feedback>",
-                        "request_compact": False,
-                        "request_compact_reason": "",
-                        "agent_directives": [
-                            {
-                                "service_id": "service-codex-001",
-                                "audit_state": "all_clear",
-                                "continue_xml": "<aize_goal_feedback><summary>agent</summary></aize_goal_feedback>",
-                                "request_compact": False,
-                                "request_compact_reason": "",
-                            }
-                        ],
-                    }
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "Split work across agents"},
+                    {"kind": "agent_directive", "service_id": "service-codex-001", "audit_state": "all_clear", "continue_xml": "<aize_goal_feedback><summary>agent</summary></aize_goal_feedback>", "request_compact": False, "request_compact_reason": ""},
                 ),
                 [],
                 "audit-session",
@@ -2490,85 +2488,28 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(audit["agent_directives"][0]["service_id"], "service-codex-001")
         self.assertIn("<aize_goal_feedback>", audit["agent_directives"][0]["continue_xml"])
 
-    def test_run_goal_audit_prefers_embedded_jsonl_over_wrapped_legacy_completion(self) -> None:
-        wrapped_payload = {
-            "progress_state": "complete",
-            "audit_state": "all_clear",
-            "goal_satisfied": True,
-            "summary": "\n".join(
-                [
-                    json.dumps(
-                        {
-                            "kind": "goal_state",
-                            "progress_state": "in_progress",
-                            "goal_satisfied": False,
-                            "summary": "Goal still in progress.",
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "kind": "agent_directive",
-                            "service_id": "service-codex-001",
-                            "audit_state": "all_clear",
-                            "continue_xml": "<aize_goal_feedback><assessment>keep going</assessment></aize_goal_feedback>",
-                            "request_compact": False,
-                            "request_compact_reason": "",
-                            "summary": "Need more work.",
-                        }
-                    ),
-                ]
-            ),
-            "continue_xml": "",
-            "request_compact": False,
-            "request_compact_reason": "",
-            "agent_directives": [],
-            "child_goal_requests": [],
-        }
+    def test_run_goal_audit_requires_top_level_jsonl_records(self) -> None:
         with patch(
             "runtime.cli_service_adapter.run_codex",
-            return_value=(json.dumps(wrapped_payload), [], "audit-session"),
+            return_value=(json.dumps({"progress_state": "complete", "goal_satisfied": True, "summary": "legacy"}), [], "audit-session"),
         ):
-            audit = run_goal_audit(
-                runtime_root=self.runtime_root,
-                username=TEST_USERNAME,
-                session_id=self.session_id,
-                goal_text="Ship it",
-                history_entries=[],
-            )
-
-        self.assertEqual(audit["progress_state"], "in_progress")
-        self.assertFalse(audit["goal_satisfied"])
-        self.assertEqual(audit["summary"], "Goal still in progress.")
-        self.assertEqual(len(audit["agent_directives"]), 1)
-        self.assertEqual(audit["agent_directives"][0]["service_id"], "service-codex-001")
-        self.assertIn("keep going", audit["agent_directives"][0]["continue_xml"])
+            with self.assertRaises(RuntimeError):
+                run_goal_audit(
+                    runtime_root=self.runtime_root,
+                    username=TEST_USERNAME,
+                    session_id=self.session_id,
+                    goal_text="Ship it",
+                    history_entries=[],
+                )
 
     def test_run_goal_audit_parses_child_goal_requests(self) -> None:
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "in_progress",
-                        "audit_state": "all_clear",
-                        "summary": "Need a child session",
-                        "continue_xml": "<aize_goal_feedback><summary>session</summary></aize_goal_feedback>",
-                        "request_compact": False,
-                        "request_compact_reason": "",
-                        "agent_directives": [],
-                        "child_goal_requests": [
-                            {
-                                "service_id": "service-codex-001",
-                                "label": "Subgoal",
-                                "goal_text": "Implement child task",
-                            },
-                            {
-                                "service_id": "service-claude-001",
-                                "label": "Subgoal",
-                                "goal_text": "Verify child task",
-                            }
-                        ],
-                    }
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "Need a child session"},
+                    {"kind": "child_goal_request", "service_id": "service-codex-001", "label": "Subgoal", "goal_text": "Implement child task"},
+                    {"kind": "child_goal_request", "service_id": "service-claude-001", "label": "Subgoal", "goal_text": "Verify child task"},
                 ),
                 [],
                 "audit-session",
@@ -2593,23 +2534,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "in_progress",
-                        "audit_state": "all_clear",
-                        "summary": "Only one split requested",
-                        "continue_xml": "<aize_goal_feedback><summary>session</summary></aize_goal_feedback>",
-                        "request_compact": False,
-                        "request_compact_reason": "",
-                        "agent_directives": [],
-                        "child_goal_requests": [
-                            {
-                                "label": "Subgoal",
-                                "provider": "codex",
-                                "goal_text": "Implement child task",
-                            }
-                        ],
-                    }
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "Only one split requested"},
+                    {"kind": "child_goal_request", "label": "Subgoal", "provider": "codex", "goal_text": "Implement child task"},
                 ),
                 [],
                 "audit-session",
@@ -2631,28 +2558,10 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch(
             "runtime.cli_service_adapter.run_codex",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "in_progress",
-                        "audit_state": "all_clear",
-                        "summary": "Split proposed",
-                        "continue_xml": "<aize_goal_feedback><summary>session</summary></aize_goal_feedback>",
-                        "request_compact": False,
-                        "request_compact_reason": "",
-                        "agent_directives": [],
-                        "child_goal_requests": [
-                            {
-                                "service_id": "service-codex-001",
-                                "label": "Bad child",
-                                "goal_text": "",
-                            },
-                            {
-                                "service_id": "service-claude-001",
-                                "label": "Only one valid",
-                                "goal_text": "Review child task",
-                            },
-                        ],
-                    }
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "Split proposed"},
+                    {"kind": "child_goal_request", "service_id": "service-codex-001", "label": "Bad child", "goal_text": ""},
+                    {"kind": "child_goal_request", "service_id": "service-claude-001", "label": "Only one valid", "goal_text": "Review child task"},
                 ),
                 [],
                 "audit-session",
@@ -2678,14 +2587,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             if on_event is not None:
                 on_event({"type": "item.started", "item": {"type": "reasoning"}})
             return (
-                json.dumps(
-                    {
-                        "progress_state": "complete",
-                        "audit_state": "all_clear",
-                        "summary": "done",
-                        "continue_xml": "",
-                    }
-                ),
+                goal_audit_jsonl({"kind": "goal_state", "progress_state": "complete", "goal_satisfied": True, "summary": "done"}),
                 [],
                 "audit-session",
             )
@@ -2714,18 +2616,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch(
             "runtime.cli_service_adapter.run_claude",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "complete",
-                        "audit_state": "all_clear",
-                        "summary": "done",
-                        "continue_xml": "",
-                        "request_compact": False,
-                        "request_compact_reason": "",
-                        "agent_directives": [],
-                        "child_goal_requests": [],
-                    }
-                ),
+                goal_audit_jsonl({"kind": "goal_state", "progress_state": "complete", "goal_satisfied": True, "summary": "done"}),
                 [],
                 "claude-audit-session",
             ),
@@ -2754,14 +2645,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             if len(calls) == 1:
                 return ("not json", [], "audit-session-1")
             return (
-                json.dumps(
-                    {
-                        "progress_state": "in_progress",
-                        "audit_state": "all_clear",
-                        "summary": "retry ok",
-                        "continue_xml": "",
-                    }
-                ),
+                goal_audit_jsonl({"kind": "goal_state", "progress_state": "in_progress", "goal_satisfied": False, "summary": "retry ok"}),
                 [],
                 "audit-session-1",
             )
@@ -2788,14 +2672,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         with patch(
             "runtime.cli_service_adapter.run_claude",
             return_value=(
-                json.dumps(
-                    {
-                        "progress_state": "complete",
-                        "audit_state": "all_clear",
-                        "summary": "done",
-                        "continue_xml": "",
-                    }
-                ),
+                goal_audit_jsonl({"kind": "goal_state", "progress_state": "complete", "goal_satisfied": True, "summary": "done"}),
                 [],
                 "claude-audit-session",
             ),
@@ -3502,7 +3379,8 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertIn('kind="goal_manager_review"', source)
         self.assertIn('reason="goal_manager_review"', source)
         self.assertIn("run_goal_manager_review(", source)
-        self.assertIn("record_session_agent_contact(", source)
+        self.assertIn("join_session_agent(", source)
+        self.assertIn('role="goal_manager"', source)
 
     def test_maybe_resume_after_restart_requeues_latest_goal_feedback(self) -> None:
         update_session_goal(
@@ -3824,6 +3702,7 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertIn('if str(item.get("provider") or "").strip() == "ws_peer"', function_source)
         self.assertIn("if selected_agents_cfg:", function_source)
         self.assertIn("if not has_local:", function_source)
+        self.assertIn("join_session_agent(", function_source)
         self.assertIn("return None", function_source)
 
     def test_source_goal_dispatch_routes_ws_peers_via_session_history_feedback_instead_of_router_only(self) -> None:

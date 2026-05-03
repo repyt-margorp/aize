@@ -6,7 +6,7 @@ from typing import Any
 
 from runtime.event_log import make_history_event_entry
 from runtime.message_builder import make_aize_pending_input
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_pending_input,
     get_history as get_user_history,

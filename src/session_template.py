@@ -6,7 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from plugin_catalog import list_plugin_session_template_descriptors
-from runtime.persistent_state import (
+from runtime.persistent_state_pkg import (
     SESSION_GROUP_DEFAULT_PERMISSIONS,
     session_template_metadata_path,
     session_templates_dir,
