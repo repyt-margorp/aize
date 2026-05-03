@@ -1884,6 +1884,8 @@ def run_agent_service(
                 "display_name": sender_service_id,
             }
         scope_username, scope_session_id = resolve_conversation_scope(message)
+        provider_session_slot = _dispatch_provider_session_slot(message)
+
         def append_scoped_history(entry: dict[str, Any], *, limit: int) -> None:
             if not (scope_username and scope_session_id):
                 return
@@ -2298,7 +2300,6 @@ def run_agent_service(
                             slot=provider_session_slot,
                         )
                 elif self_service["kind"] == "claude":
-                    provider_session_slot = _dispatch_provider_session_slot(message)
                     scoped_claude_session_id = load_claude_session(
                         runtime_root,
                         service_id=service_id,
@@ -2321,7 +2322,6 @@ def run_agent_service(
                         slot=provider_session_slot,
                     )
                 elif self_service["kind"] == "gemini":
-                    provider_session_slot = _dispatch_provider_session_slot(message)
                     scoped_gemini_session_id = load_gemini_session(
                         runtime_root,
                         service_id=service_id,
@@ -2539,6 +2539,19 @@ def run_agent_service(
                 status="success",
                 provider=str(self_service.get("kind", "")),
             )
+            if provider_session_slot == "interactive_agent":
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "service.interactive_post_turn_skipped",
+                        "ts": utc_ts(),
+                        "service_id": service_id,
+                        "process_id": process_id,
+                        "scope": {"username": scope_username, "session_id": scope_session_id},
+                        "reason": "interactive_agent_direct_reply",
+                    },
+                )
+                return
 
             if scope_username and scope_session_id:
                     try:
