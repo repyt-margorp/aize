@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "plugin_session_template_v1.json",
-  "title": "Aize Plugin Session Template",
+  "title": "AIze Plugin Session Template",
   "type": "object",
   "required": ["template_id", "launcher"],
   "properties": {

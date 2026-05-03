@@ -1,12 +1,12 @@
-# Aize Current Architecture Status
+# AIze Current Architecture Status
 
 ## Purpose
 
-This note describes the current implemented architecture of Aize as it exists in the codebase on 2026-03-23.
+This note describes the current implemented architecture of AIze as it exists in the codebase on 2026-03-23.
 It is not a proposal document. It is a snapshot of what is actually wired together now, which parts are stable,
 and which design directions are already visible in the implementation.
 
-The repository currently implements a local multi-service AIZE runtime with these major properties:
+The repository currently implements a local multi-service AIze runtime with these major properties:
 
 - A local microkernel-style message router
 - Dynamically spawned service workers for Codex, Claude, HTTP, and service management
@@ -475,7 +475,7 @@ Implemented concepts include:
 - session context status persistence
 - audit-state clearing after successful manual compact
 
-This is one of the clearest places where Aize behaves like an operating environment for long-running agent work rather than a conventional chat wrapper.
+This is one of the clearest places where AIze behaves like an operating environment for long-running agent work rather than a conventional chat wrapper.
 
 ## Federation and Peer Support
 
@@ -574,4 +574,4 @@ It already implements a coherent system with these concrete characteristics:
 - artifact-aware session state
 - early federation hooks
 
-The main design challenge now is not "what should Aize be?" but "how should the existing runtime be decomposed and cleaned up as it grows?"
+The main design challenge now is not "what should AIze be?" but "how should the existing runtime be decomposed and cleaned up as it grows?"

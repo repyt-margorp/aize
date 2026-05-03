@@ -1,5 +1,5 @@
 """
-UNIX domain socket IPC layer for the Aize kernel.
+UNIX domain socket IPC layer for the AIze kernel.
 
 Replaces the FIFO-based transport (router.control + {service_id}.rx/.tx)
 with a single bidirectional UNIX stream socket per connected service.

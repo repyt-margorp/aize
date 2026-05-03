@@ -1,4 +1,4 @@
-# AIZE Runtime Plan
+# AIze Runtime Plan
 
 ## Goal
 

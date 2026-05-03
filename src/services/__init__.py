@@ -1,5 +1,5 @@
 """
-Service plugin loader for Aize.
+Service plugin loader for AIze.
 
 A service plugin is a Python module that exports a run_service(**kwargs) -> int
 function. Builtins live under src/services/{kind}/ and repo-local plugin

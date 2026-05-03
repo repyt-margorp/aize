@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "plugin_app_v1.json",
-  "title": "Aize Plugin Launcher App",
+  "title": "AIze Plugin Launcher App",
   "type": "object",
   "required": ["app_id", "launcher"],
   "properties": {

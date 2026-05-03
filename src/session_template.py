@@ -345,6 +345,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
             "session_group": session_group,
             "session_permissions": session_permissions,
             "workspace_scope": _normalize_workspace_scope(launcher.get("workspace_scope")),
+            "ui_url": str(launcher.get("ui_url") or "").strip(),
             "auto_select_session": bool(launcher.get("auto_select_session", True)),
             "auto_send_initial_prompt": bool(launcher.get("auto_send_initial_prompt", bool(initial_prompt))),
             "schedule": _normalize_schedule(launcher.get("schedule")),

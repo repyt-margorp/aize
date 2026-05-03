@@ -2,7 +2,7 @@
 
 ## Background
 
-Current Aize persistence is centered on a single shared JSON state file under `.aize-state/persistent.json`.
+Current AIze persistence is centered on a single shared JSON state file under `.aize-state/persistent.json`.
 This is protected by file locking, so it is not an uncontrolled concurrent append model, but it remains a centralized state store with poor isolation and poor scaling characteristics.
 
 This becomes increasingly problematic as the system moves toward:

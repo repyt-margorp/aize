@@ -1,4 +1,4 @@
-# Aize Notes
+# AIze Notes
 
 ## Restart Debug
 - Use `./restart_codex_http_mesh.sh` for normal restarts. This is the repo-root entrypoint for the synchronous restart flow.

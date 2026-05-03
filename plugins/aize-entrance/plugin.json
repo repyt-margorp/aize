@@ -1,0 +1,5 @@
+{
+  "plugin_id": "aize-entrance",
+  "display_name": "AIze Entrance",
+  "description": "A plugin UI for routing user feedback into the appropriate AIze session."
+}

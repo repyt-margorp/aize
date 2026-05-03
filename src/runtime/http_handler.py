@@ -1651,7 +1651,7 @@ def make_handler(
                 "const parseJson=async (response)=>{const text=await response.text();try{return text?JSON.parse(text):{};}catch(_err){return {raw_text:text};}};"
                 "const postJson=async (path,body)=>{const response=await fetch(path,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:response.status,payload:await parseJson(response)};};"
                 "const getText=async (path)=>{const response=await fetch(path,{credentials:'include'});return {status:response.status,text:await response.text()};};"
-                "const hasUiMarkers=(html)=>({session_map:(html.includes('id=\"session-map-pane\"')||html.includes(\"id='session-map-pane'\")),workspace_history:(html.includes('id=\"messages\"')||html.includes(\"id='messages'\"))&&(html.includes('id=\"workspace-view\"')||html.includes(\"id='workspace-view'\")),nodes:(html.includes('id=\"nodes-pane\"')||html.includes(\"id='nodes-pane'\")),requests:(html.includes('id=\"requests-pane\"')||html.includes(\"id='requests-pane'\")),entrance:(html.includes('id=\"entrance-pane\"')||html.includes(\"id='entrance-pane'\")),goal_editor:(html.includes('id=\"view-goal\"')||html.includes(\"id='view-goal'\"))});"
+                "const hasUiMarkers=(html)=>({session_map:(html.includes('id=\"session-map-pane\"')||html.includes(\"id='session-map-pane'\")),workspace_history:(html.includes('id=\"messages\"')||html.includes(\"id='messages'\"))&&(html.includes('id=\"workspace-view\"')||html.includes(\"id='workspace-view'\")),nodes:(html.includes('id=\"nodes-pane\"')||html.includes(\"id='nodes-pane'\")),requests:(html.includes('id=\"requests-pane\"')||html.includes(\"id='requests-pane'\")),goal_editor:(html.includes('id=\"view-goal\"')||html.includes(\"id='view-goal'\"))});"
                 "(async()=>{"
                 "if(sessionToken){document.cookie=`bridge_session=${sessionToken}; path=/; SameSite=Lax`;}"
                 "else{"
@@ -1673,7 +1673,7 @@ def make_handler(
                 "const childMarkers=hasUiMarkers(childPage.text);"
                 "const effectiveProvider=String(providerUpdate.payload?.preferred_provider||provider||'').trim();"
                 "const promptProvider=String(promptSend.payload?.provider||'').trim();"
-                "result.textContent=JSON.stringify({ok:sessionMarkers.session_map&&sessionMarkers.talk_history&&childMarkers.session_map&&childMarkers.talk_history&&goalUpdate.status>=200&&goalUpdate.status<300&&providerUpdate.status>=200&&providerUpdate.status<300&&effectiveProvider===provider&&promptSend.status===202&&promptProvider===provider,provider,session_markers:sessionMarkers,child_markers:childMarkers,created_session_id:sessionId,goal_update_status:goalUpdate.status,provider_update_status:providerUpdate.status,effective_provider:effectiveProvider,prompt_send_status:promptSend.status,prompt_provider:promptProvider});"
+                "result.textContent=JSON.stringify({ok:sessionMarkers.session_map&&sessionMarkers.workspace_history&&childMarkers.session_map&&childMarkers.workspace_history&&goalUpdate.status>=200&&goalUpdate.status<300&&providerUpdate.status>=200&&providerUpdate.status<300&&effectiveProvider===provider&&promptSend.status===202&&promptProvider===provider,provider,session_markers:sessionMarkers,child_markers:childMarkers,created_session_id:sessionId,goal_update_status:goalUpdate.status,provider_update_status:providerUpdate.status,effective_provider:effectiveProvider,prompt_send_status:promptSend.status,prompt_provider:promptProvider});"
                 "})().catch((error)=>{result.textContent=JSON.stringify({ok:false,error:String(error&&error.message?error.message:error)});});"
                 "</script></body></html>"
             )
@@ -1684,6 +1684,8 @@ def make_handler(
                 return self._do_WS_upgrade()
             if path == "/":
                 return self._do_GET_root(path, query)
+            if path == "/plugins/entrance":
+                return self._do_GET_entrance_plugin(path, query)
             if path == "/events":
                 return self._do_GET_events(path, query)
             if path == "/health":
@@ -1961,6 +1963,21 @@ def make_handler(
                     items=items,
                 )
             )
+
+        def _do_GET_entrance_plugin(self, path: str, query: dict) -> None:
+            from runtime.html_renderer import render_entrance_plugin_page
+            context = current_context(self, query=query)
+            if not context:
+                self._redirect("/")
+                return
+            self._html(
+                200,
+                render_entrance_plugin_page(
+                    display_name=str(self_service["display_name"]),
+                    username=str(context.get("username") or ""),
+                ),
+            )
+            return
 
 
         def _do_GET_events(self, path: str, query: dict) -> None:

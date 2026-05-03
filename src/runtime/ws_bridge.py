@@ -1,4 +1,4 @@
-"""WebSocket RFC 6455 low-level codec for Aize peer connections.
+"""WebSocket RFC 6455 low-level codec for AIze peer connections.
 
 Supports text frames, ping/pong, and close frames.
 Binary frames and fragmentation are accepted but not used by the peer protocol.

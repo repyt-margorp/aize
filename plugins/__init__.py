@@ -1,1 +1,1 @@
-"""Repo-local plugin namespace for Aize extensions."""
+"""Repo-local plugin namespace for AIze extensions."""

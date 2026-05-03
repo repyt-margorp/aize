@@ -1,7 +1,7 @@
 """Outbound WS peer client — persistent AIze-to-AIze agent participation.
 
-This module implements an outbound WebSocket client that connects a local Aize
-instance to a remote Aize session as an external agent.  Multiple client
+This module implements an outbound WebSocket client that connects a local AIze
+instance to a remote AIze session as an external agent.  Multiple client
 configurations can run concurrently, each in its own daemon thread.
 
 Flow per connection
@@ -19,10 +19,10 @@ Config dict keys (from .aize-runtime/ws_peer_clients.json)
 -----------------------------------------------------------------
 enabled            bool   default True
 target_ws_url      str    wss://host:port/path
-auth_username      str    credential for the remote Aize
+auth_username      str    credential for the remote AIze
 auth_password      str
 remote_username    str    owner of the remote session to join
-remote_session_id  str    session_id on the remote Aize
+remote_session_id  str    session_id on the remote AIze
 local_username     str    username for the local proxy session
 local_session_id   str    session_id of the local proxy session (LLM runs here)
 provider           str    "claude" | "codex" | "gemini"  (default "claude")

@@ -2,7 +2,7 @@
 
 ## Summary
 
-AIZE previously persisted state at the session level, but it did not provide a durable filesystem workspace at the app level.
+AIze previously persisted state at the session level, but it did not provide a durable filesystem workspace at the app level.
 That meant a session template could repeatedly create useful sessions while still lacking a stable place to accumulate code,
 scripts, prompts, notes, and artifacts across launches.
 
@@ -27,7 +27,7 @@ Launcher apps may now declare:
 "workspace_scope": "app"
 ```
 
-When enabled, AIZE creates a persistent workspace here:
+When enabled, AIze creates a persistent workspace here:
 
 ```text
 .aize-state/session-templates/<username>/<template_id>/workspace/

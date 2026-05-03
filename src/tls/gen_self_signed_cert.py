@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a self-signed TLS certificate for the AIZE Web UI.
+"""Generate a self-signed TLS certificate for the AIze Web UI.
 
 Usage (standalone):
     python3 -m tls.gen_self_signed_cert [--cert CERT_PATH] [--key KEY_PATH] [--days DAYS] [--hosts HOSTNAME ...]
