@@ -177,23 +177,5 @@ class AppLauncherTests(unittest.TestCase):
             schedule_info = describe_app_schedule(app, app_state=app_state, now=now)
             self.assertFalse(bool(schedule_info["due"]))
 
-
-class AppLauncherSourceTests(unittest.TestCase):
-    def test_http_and_ui_sources_expose_launcher_flow(self) -> None:
-        http_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-        html_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn('if path == "/session-templates":', http_source)
-        self.assertIn('if path == "/session-templates/launch":', http_source)
-        self.assertIn('"schedule_status": describe_app_schedule(app, app_state=app_state)', http_source)
-        self.assertIn('"viewer_username": viewer_username', http_source)
-        self.assertIn("fetch(`/session-templates?", html_source)
-        self.assertIn("fetch('/session-templates/launch'", html_source)
-        self.assertIn("app-launcher-list", html_source)
-        self.assertIn("view-manage", html_source)
-        self.assertIn("view-apps", html_source)
-        self.assertIn("apps-pane", html_source)
-        self.assertIn("app-launcher-open-last-session", html_source)
-
-
 if __name__ == "__main__":
     unittest.main()

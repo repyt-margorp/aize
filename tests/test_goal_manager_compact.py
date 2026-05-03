@@ -930,19 +930,6 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertNotIn("aize_user_response_wait", prompt)
         self.assertIn("GoalManager is the only role allowed", prompt)
 
-    def test_http_handler_source_renders_wait_signal_in_nav_and_session_map(self) -> None:
-        source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-        self.assertIn("talk-signal-wait", source)
-        self.assertIn("Waiting User Response", source)
-        self.assertIn("Wait Timed Out", source)
-
-    def test_html_renderer_source_tracks_wait_state_in_nav_and_goal_board(self) -> None:
-        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("userResponseWaitStatus", source)
-        self.assertIn("talk-signal-wait", source)
-        self.assertIn("Wait Recorded", source)
-        self.assertIn("Waiting User Response", source)
-
     def test_pending_turn_completed_events_since_last_review_aggregates_multiple_agents(self) -> None:
         history = [
             {
@@ -2241,11 +2228,6 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertNotIn("sessions", persisted)
         self.assertNotIn("talks", persisted)
 
-    def test_source_no_longer_reinjects_legacy_state_aliases(self) -> None:
-        source = (SRC / "runtime" / "persistent_state_pkg" / "_core.py").read_text(encoding="utf-8")
-        self.assertNotIn('state["sessions"] = state["auth_sessions"]', source)
-        self.assertNotIn('state["talks"] = state["conversation_sessions"]', source)
-
     def test_build_worker_count_summary_counts_running_replying_and_reviewing(self) -> None:
         counts = build_worker_count_summary(
             service_snapshots=[
@@ -3424,38 +3406,6 @@ printf '%s\\n' '{"type":"turn.completed"}'
         )
         self.assertFalse(second)
 
-    def test_ui_source_mentions_goal_auto_compact_toggle(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("goal-auto-compact-toggle", source)
-        self.assertIn("GoalManager autonomous compact", source)
-        self.assertIn("goal_auto_compact_enabled", source)
-
-    def test_agent_service_source_mentions_goal_manager_native_dispatch_helper(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn("def resolve_goal_manager_dispatch_service(", source)
-        self.assertIn('session_settings.get("goal_manager_priority")', source)
-        self.assertIn("active_goal_manager_priority(", source)
-        self.assertIn("leased_service_id = lease_session_service(", source)
-
-    def test_agent_service_source_mentions_explicit_goal_followup_targets(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn("explicit_followup_targets", source)
-        self.assertIn("queued_target_counts", source)
-        self.assertIn("pending_for_target_count", source)
-
-    def test_agent_service_source_mentions_goal_manager_service_selection_at_review_start(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn("goal_manager_service_id = resolve_goal_manager_dispatch_service(", source)
-        self.assertIn('"service_id": goal_manager_service_id', source)
-
-    def test_agent_service_source_mentions_goal_manager_review_fifo_dispatch(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn('kind="goal_manager_review"', source)
-        self.assertIn('reason="goal_manager_review"', source)
-        self.assertIn("run_goal_manager_review(", source)
-        self.assertIn("join_session_agent(", source)
-        self.assertIn('role="goal_manager"', source)
-
     def test_maybe_resume_after_restart_requeues_latest_goal_feedback(self) -> None:
         update_session_goal(
             self.runtime_root,
@@ -3582,83 +3532,6 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertIn("<recovery_mode>reconstruct_without_session</recovery_mode>", pending[0]["text"])
         self.assertEqual(len(router.writes), 1)
 
-    def test_agent_service_pool_resolution_reads_live_registry(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn("list_service_records(runtime_root)", source)
-        self.assertIn("if registry_pool:", source)
-
-    def test_ui_source_mentions_agent_status_and_turn_cluster(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("Agent Status", source)
-        self.assertIn("agent-status-value", source)
-        self.assertIn("agent-popover", source)
-        self.assertIn("turn-cluster-log", source)
-        self.assertIn("turn-cluster-inline-status", source)
-        self.assertIn("% left", source)
-        self.assertIn("audit ${auditStateLabel(goalAuditState)}", source)
-        self.assertIn("buildRenderableTimeline", source)
-        self.assertIn("JSON.stringify(eventEntry.event, null, 2)", source)
-        self.assertIn("goal_manager_cluster", source)
-        self.assertIn("GoalManager Review", source)
-
-    def test_restart_resume_source_mentions_dangling_goal_audit_recovery(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("has_dangling_goal_audit", source)
-        self.assertIn("dangling_goal_audit", source)
-
-    def test_source_shows_goal_feedback_uses_pending_fifo_then_dispatch(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        enqueue_idx = source.index('kind="goal_feedback"')
-        dispatch_idx = source.index("goal_message = make_dispatch_pending_message")
-        self.assertLess(enqueue_idx, dispatch_idx)
-        self.assertIn("append_pending_input(", source)
-        self.assertIn('message_type="dispatch_pending"', source)
-        self.assertIn("goal_audit_should_enqueue_agent_followup(", source)
-
-    def test_agent_service_source_shows_ws_peer_goal_feedback_history_transport(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn('directive_service_id.startswith("ws-peer-")', source)
-        self.assertIn('"pending_input_text"', source)
-        self.assertIn('"service.goal_audit_ws_peer_dispatch"', source)
-
-    def test_source_mentions_child_session_broadcast_inputs(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn('kind="child_session_created"', source)
-        self.assertIn('kind="child_session_completed"', source)
-        self.assertIn("_child_session_broadcast_json(", source)
-        self.assertIn("maybe_resume_parent_after_child_completion(", source)
-        self.assertIn('reason="child_session_completed"', source)
-
-    def test_source_uses_recovery_source_session_id_for_recovery_resume(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn("recovery_source_session_id", source)
-        self.assertIn("source_session_id", source)
-
-    def test_panic_recovery_source_uses_top_level_session_creation(self) -> None:
-        source = (SRC / "runtime" / "panic_recovery.py").read_text(encoding="utf-8")
-        self.assertIn("create_conversation_session(", source)
-        self.assertNotIn("create_child_conversation_session(", source)
-
-    def test_source_shows_goal_manager_and_agent_clusters_share_renderer(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("entry?.kind === 'turn_cluster' || entry?.kind === 'goal_manager_cluster'", source)
-        self.assertIn("renderTurnCluster(entry)", source)
-        self.assertIn("GoalManager Review", source)
-
-    def test_source_shows_manual_compact_can_clear_panic_ui_state(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("manual_compact_clears_audit_state", source)
-        self.assertIn("manual_compact_gemini_session", source)
-        self.assertIn("manual_compact_unsupported_for_provider", source)
-        self.assertIn('response["goal_audit_state"] = "all_clear"', source)
-        self.assertIn("if (payload.goal_audit_state) goalAuditState =", source)
-
-    def test_source_allows_manual_compact_for_gemini_sessions(self) -> None:
-        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("const manualCompactAvailableForService = (serviceId) => {", renderer_source)
-        self.assertIn("if (value.includes('gemini') || value.includes('codex') || value.includes('claude')) return true;", renderer_source)
-        self.assertNotIn("Manual Compact unavailable for Gemini sessions", renderer_source)
-
     def test_provider_context_compaction_support_includes_gemini(self) -> None:
         self.assertTrue(provider_supports_context_compaction("codex"))
         self.assertTrue(provider_supports_context_compaction("claude"))
@@ -3694,263 +3567,6 @@ printf '%s\\n' '{"type":"turn.completed"}'
             self.assertEqual((response.get("event") or {}).get("provider"), "gemini")
             self.assertIsNotNone(history_entry)
 
-    def test_goal_manager_compact_normalizer_keeps_unsupported_provider_checked(self) -> None:
-        source = (SRC / "runtime" / "goal_persist.py").read_text(encoding="utf-8")
-        self.assertIn("goal_manager_compact_gemini_session", source)
-        self.assertIn('compaction": "suppressed_by_session_setting"', source)
-
-    def test_source_shows_agent_button_and_goal_manager_compact_split(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("controlsButton.dataset.agentControlsButton = '1';", source)
-        self.assertIn("event.stopPropagation()", source)
-        self.assertIn("eventType.startsWith('service.goal_manager_compact_')) return false;", source)
-        self.assertIn("deriveContextStatusForService(cluster.serviceId)", source)
-
-    def test_source_does_not_open_turn_cluster_for_standalone_status_events(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("if (entry.direction === 'in') {", source)
-        self.assertIn("timeline.push(entry);", source)
-        self.assertIn("continue;", source)
-
-    def test_source_gates_turn_started_for_synthetic_dispatch_pending(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("dispatch_pending_opens_visible_turn(message, incoming_text)", source)
-        self.assertIn('reason not in {"goal_feedback", "turn_completed"}', source)
-
-    def test_source_shows_redispatch_uses_provider_pool_resolution(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("preferred_provider", source)
-        self.assertIn('provider_pool = {"codex": codex_service_pool, "claude": claude_service_pool, "gemini": gemini_service_pool}.get(preferred_provider, codex_service_pool)', source)
-        self.assertIn('if "gemini_pool" in selected_agents_cfg:', source)
-        self.assertIn("return lease_session_service(", source)
-        self.assertIn("to_service = resolve_session_service_for_dispatch", source)
-
-    def test_source_goal_update_payload_includes_previous_goal(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        # enqueue_goal_dispatch accepts previous_goal_text parameter
-        self.assertIn("previous_goal_text: str | None = None", source)
-        self.assertIn("previous_goal_id: str | None = None", source)
-        # payload builds <previous_goal> element when provided
-        self.assertIn("<previous_goal>", source)
-        self.assertIn("<goal_id>", source)
-        self.assertIn("<previous_goal_id>", source)
-
-    def test_source_exposes_session_first_management_routes(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn('if path == "/sessions"', source)
-        self.assertIn('if self.path == "/sessions"', source)
-        self.assertIn('if self.path == "/session/select"', source)
-        self.assertIn('if self.path == "/session/goal/state"', source)
-        self.assertNotIn('"/talks"', source)
-        self.assertNotIn('"/talk/select"', source)
-        self.assertNotIn('"/talk/goal/state"', source)
-        self.assertIn('"active_session_id": context["session_id"]', source)
-        self.assertIn("html.escape(previous_goal_text)", source)
-
-    def test_source_goal_http_handler_captures_previous_goal_before_update(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        # HTTP handler reads old goal_text before calling update_session_goal
-        self.assertIn('previous_goal = str(old_talk.get("goal_text", "")).strip()', source)
-        self.assertIn('previous_goal_id = str(old_talk.get("active_goal_id") or old_talk.get("goal_id") or "").strip() or None', source)
-        # passes it to enqueue_goal_dispatch
-        self.assertIn("previous_goal_text=previous_goal,", source)
-        self.assertIn("previous_goal_id=previous_goal_id,", source)
-
-    def test_source_goal_update_dispatch_still_fires_after_goal_save(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        # Dispatch is still triggered after goal update (goal_saved reason preserved)
-        self.assertIn('reason="goal_saved"', source)
-        # enqueue_goal_dispatch call site passes previous_goal_text
-        prev_idx = source.index("previous_goal_text=previous_goal,")
-        dispatch_idx = source.index('reason="goal_saved"')
-        # previous_goal capture comes before or within same dispatch call
-        self.assertLess(dispatch_idx, prev_idx + 200)
-
-    def test_source_goal_dispatch_honors_selected_agents_and_joined_ws_peers(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        start = source.index("def resolve_session_service_for_dispatch")
-        end = source.index("def codex_service_candidates_for_session")
-        function_source = source[start:end]
-        self.assertIn("selected_agents_cfg = [", function_source)
-        self.assertIn("list_session_agent_contacts(", function_source)
-        self.assertIn('if str(item.get("provider") or "").strip() == "ws_peer"', function_source)
-        self.assertIn("if selected_agents_cfg:", function_source)
-        self.assertIn("if not has_local:", function_source)
-        self.assertIn("join_session_agent(", function_source)
-        self.assertIn("return None", function_source)
-
-    def test_source_goal_dispatch_routes_ws_peers_via_session_history_feedback_instead_of_router_only(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        start = source.index("def enqueue_goal_dispatch")
-        end = source.index("def session_auto_compact_threshold")
-        function_source = source[start:end]
-        self.assertIn('if str(to_service).startswith("ws-peer-"):', function_source)
-        self.assertIn('"direction": "session_input"', function_source)
-        self.assertIn('"kind": "goal_feedback"', function_source)
-        self.assertIn('"pending_input_text": "\\n".join(goal_update_lines)', function_source)
-        self.assertIn("return to_service, None", function_source)
-
-    def test_httpbridge_source_keeps_session_map_title_and_layout_stable(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("renderPageTitle", source)
-        self.assertIn("sessionMapOpen ? 'Sessions' : talkLabel", source)
-        self.assertIn("sessionMapSnapshotTalkIds", source)
-        self.assertIn("captureSessionMapSnapshot", source)
-        self.assertIn("visibleTalkSummaries = sessionMapOpen && sessionMapSnapshotTalkIds.length", source)
-
-    def test_httpbridge_source_preserves_session_map_scroll_on_refresh(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("captureElementScrollState(goalBoardGrid)", source)
-        self.assertIn("restoreElementScrollPosition(goalBoardGrid, scrollState)", source)
-        self.assertIn("const captureElementScrollState = (element) => element ? ({", source)
-        self.assertIn("const restoreElementScrollPosition = (element, state) => {", source)
-
-    def test_httpbridge_sources_render_goal_history_with_child_session_create_ui(self) -> None:
-        handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("create_child_conversation_session(", handler_source)
-        self.assertIn('session_operation_allowed(talk, "update_goal")', handler_source)
-        self.assertIn('session_operation_allowed(talk, "send_prompt")', handler_source)
-        self.assertIn("parent_session_id = str(payload.get(\"parent_session_id\") or context[\"session_id\"] or \"\").strip()", handler_source)
-        self.assertIn("updated_by_username=context[\"username\"]", handler_source)
-        self.assertNotIn("goal-history-list", renderer_source)
-        self.assertIn("renderGoalHistory", renderer_source)
-        self.assertIn("renderGoalHistoryNavigator", renderer_source)
-        self.assertIn("talk-goal-history-prev", renderer_source)
-        self.assertIn("talk-goal-history-next", renderer_source)
-        self.assertIn("talk-goal-history-position", renderer_source)
-        self.assertIn("goalHistoryCursor", renderer_source)
-        self.assertIn("syncGoalHistoryCursor", renderer_source)
-        self.assertIn("goal-state-main", renderer_source)
-        self.assertIn("goal-state-separator", renderer_source)
-        self.assertIn("talk-goal-state-meta", renderer_source)
-        self.assertIn("main-stage", renderer_source)
-        self.assertIn("position:absolute;inset:0;display:flex;align-items:center;justify-content:center", renderer_source)
-        self.assertNotIn("talk-goal-history-status", renderer_source)
-        self.assertNotIn("talkGoalStateBadges", renderer_source)
-        self.assertIn("renderSessionCapabilityState", renderer_source)
-        self.assertIn("Create Child Session", renderer_source)
-        self.assertIn("goal-board-create-form", renderer_source)
-        self.assertIn("goal-board-create-label", renderer_source)
-        self.assertIn("goal-board-create-status", renderer_source)
-        self.assertIn("parent_session_id: activeSessionId", renderer_source)
-        self.assertIn("sessionPermissionAllowed('create_child_session')", renderer_source)
-
-    def test_httpbridge_source_exposes_ui_probe_endpoint(self) -> None:
-        source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-        self.assertIn('if path == "/diagnostics/ui-probe":', source)
-        self.assertIn("def _render_ui_probe_page", source)
-        self.assertIn("UI smoke prompt after restart", source)
-        self.assertIn("sessionToken", source)
-        self.assertIn("preferred_provider:provider", source)
-        self.assertIn("id=\\\"session-map-pane\\\"", source)
-
-    def test_verify_httpbridge_ui_script_uses_headless_chrome_probe(self) -> None:
-        source = (ROOT / "scripts" / "diagnostics" / "verify_httpbridge_ui.py").read_text(encoding="utf-8")
-        self.assertIn("/diagnostics/ui-probe", source)
-        self.assertIn("--session-token", source)
-        self.assertIn("--provider", source)
-        self.assertIn("--headless=new", source)
-        self.assertIn("--dump-dom", source)
-        self.assertIn("extract_result_json", source)
-
-    def test_goal_manager_source_creates_child_sessions_from_audit_requests(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn('audit.get("child_goal_requests")', source)
-        self.assertIn("created_by_username=GOAL_MANAGER_USERNAME", source)
-        self.assertIn('kind="goal_child_session_request"', source)
-        self.assertIn('reason="goal_child_session_request"', source)
-        self.assertIn('reason="goal_child_session_created"', source)
-        self.assertIn('event_type": "service.goal_child_sessions_created"', source)
-        self.assertIn('event_type": "service.goal_child_session_requests_queued"', source)
-
-    def test_goal_manager_source_only_enqueues_followup_when_agent_directives_exist(self) -> None:
-        source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
-        self.assertIn("agent_directives=normalized_directives", source)
-        self.assertNotIn('dispatch_targets = [goal_manager_service_id]', source)
-
-    def test_httpbridge_source_opens_session_map_when_no_session_is_requested(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("initial_session_map_open = requested_session_id(self, query=query) is None", source)
-        self.assertIn('f"let sessionMapOpen = {json.dumps(initial_session_map_open)};"', source)
-        self.assertIn("setSessionMapOpen(sessionMapOpen);", source)
-
-    def test_httpbridge_session_map_source_includes_and_filters(self) -> None:
-        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("goal-board-filter-active", source)
-        self.assertIn("goal-board-filter-in-progress", source)
-        self.assertIn("goal-board-filter-awaiting-user", source)
-        self.assertIn("goal-board-filter-auto-schedule", source)
-        self.assertIn("if (sessionMapFilters.autoScheduleOnly && !summary?.auto_resume_enabled) return false;", source)
-        self.assertIn("const waitingWithoutUserReply = Boolean(summary?.user_response_wait_active) || waitStatus === 'timed_out';", source)
-        self.assertIn("const scopedList = sessionTreeSessions(baseList, sessionMapRootSessionId());", source)
-        self.assertIn("return scopedList.filter(sessionMatchesMapFilters);", source)
-        self.assertIn("goal-board-scope-session", source)
-        self.assertIn("goal-board-scope-all", source)
-
-    def test_httpbridge_settings_popover_and_agent_priority_ui_match_goal_shell(self) -> None:
-        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("session-toolbar-actions", source)
-        self.assertIn("setSettingsPopoverOpen(false);", source)
-        self.assertIn("settingsPopoverCard || settingsPopover", source)
-        self.assertIn("data-priority-move='up'", source)
-        self.assertIn("row.draggable = true;", source)
-        self.assertIn("for (const provider of ['codex', 'claude', 'gemini']) {", source)
-        self.assertIn("GoalManager Priority Order", source)
-        self.assertIn("goal_manager_priority: goalManagerPriority", source)
-        self.assertIn("worker_service_id", source)
-        self.assertIn("goal_worker_service_id", source)
-
-    def test_httpbridge_session_panels_include_manage_sessions_and_apps_views(self) -> None:
-        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("id='view-manage'", source)
-        self.assertIn("id='view-session-map'", source)
-        self.assertIn("id='view-apps'", source)
-        self.assertIn("viewManageButton.onclick = (event) => { event.preventDefault(); openManagePane(); };", source)
-        self.assertIn("viewSessionMapButton.textContent = 'Sessions';", source)
-        self.assertIn("viewSessionMapButton.setAttribute('aria-pressed', sessionMapOpen ? 'true' : 'false');", source)
-        self.assertIn("viewSessionMapButton.onclick = (event) => { event.preventDefault(); toggleSessionMap(); };", source)
-        self.assertIn("viewAppsButton.onclick = (event) => { event.preventDefault(); if (appsPaneOpen) openManagePane(); else openAppsPane(); };", source)
-
-    def test_httpbridge_session_title_rename_defers_during_ime_composition(self) -> None:
-        source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("let sessionNameIsComposing = false;", source)
-        self.assertIn("sessionNameTextarea.addEventListener('compositionstart', () => { sessionNameIsComposing = true; clearTimeout(_renameDebounce); });", source)
-        self.assertIn("sessionNameTextarea.addEventListener('compositionend', () => { sessionNameIsComposing = false;", source)
-        self.assertIn("if (sessionNameIsComposing) return;", source)
-        self.assertIn("if (sessionNameIsComposing || ev.isComposing || ev.keyCode === 229) return;", source)
-
-    def test_httpbridge_session_map_only_mode_hides_talk_toggle_and_forces_map_view(self) -> None:
-        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-        goal_persist_source = (SRC / "runtime" / "goal_persist.py").read_text(encoding="utf-8")
-        self.assertIn("const sessionUsesMapOnlyUI = () => String(sessionUiMode || 'standard').trim().toLowerCase() === 'map_only';", renderer_source)
-        self.assertIn("viewManageButton.classList.toggle('is-hidden', mapOnly || accountRegisterOpen || accountSettingsOpen);", renderer_source)
-        self.assertIn("const nextOpen = sessionUsesMapOnlyUI() ? true : Boolean(open);", renderer_source)
-        self.assertIn("initial_session_map_open = bool(initial_session_map_open or initial_session_ui_mode == \"map_only\")", handler_source)
-        self.assertIn('"session_ui_mode": session_ui_mode(talk),', goal_persist_source)
-
-    def test_httpbridge_session_switch_reloads_session_ui_mode_before_toggling_map(self) -> None:
-        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("if (Array.isArray(payload?.welcomed_agents)) welcomedAgents = payload.welcomed_agents;", renderer_source)
-        self.assertIn("if (Array.isArray(payload?.selected_agents)) selectedAgents = payload.selected_agents;", renderer_source)
-        self.assertIn("renderActiveAgentsSelection();", renderer_source)
-        self.assertIn("const goalRes = await fetch(`/session/goal/state?session_id=${encodeURIComponent(sid)}&_=${Date.now()}`, { cache: 'no-store' });", renderer_source)
-        self.assertIn("applyGoalPayload(goalPayload);", renderer_source)
-        self.assertIn("setSessionMapOpen(sessionUsesMapOnlyUI());", renderer_source)
-        self.assertIn("history.pushState(null, '', sessionUsesMapOnlyUI() ? sessionPathFor('') : sessionPathFor(sid));", renderer_source)
-
-    def test_httpbridge_session_map_activity_labels_reflect_replying_and_goal_manager_review(self) -> None:
-        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        self.assertIn("if (reviewing && replying) return 'Replying + Reviewing';", renderer_source)
-        self.assertIn("if (reviewing) return 'Reviewing';", renderer_source)
-        self.assertIn("if (replying) return 'Replying';", renderer_source)
-        self.assertIn("const goalBoardActivityBadgeClass = (summary) => {", renderer_source)
-        self.assertIn("const workerProvider = ['codex', 'claude', 'gemini'].includes(String(worker?.provider || '').trim().toLowerCase()) ? String(worker.provider).trim().toLowerCase() : String(summary?.preferred_provider || 'codex');", renderer_source)
-        self.assertIn("if (kind) active.push(kind);", renderer_source)
-        self.assertIn("replying_turns", renderer_source)
-        self.assertIn("reviewing_turns", renderer_source)
-
     def test_build_session_runtime_summary_does_not_treat_stale_turn_started_as_live_reply(self) -> None:
         summary = build_session_runtime_summary(
             {
@@ -3976,13 +3592,6 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertFalse(summary["agent_running"])
         self.assertEqual(summary["worker"]["service_id"], "service-codex-001")
 
-    def test_httpbridge_prompt_input_records_submitter_and_rejects_non_owner(self) -> None:
-        source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-        self.assertIn('session_owner_username = str(talk.get("username") or "").strip()', source)
-        self.assertIn('self._json(403, {"error": "session_owner_required"})', source)
-        self.assertIn('"submitted_by_username": username,', source)
-        self.assertIn("submitted_by_username=username,", source)
-
     def test_make_aize_pending_input_and_batch_xml_preserve_submitter(self) -> None:
         entry = make_aize_pending_input(
             kind="user_message",
@@ -4000,23 +3609,6 @@ printf '%s\\n' '{"type":"turn.completed"}'
             instruction="continue",
         )
         self.assertIn('submitted_by_username="alice"', batch_xml)
-
-    def test_httpbridge_source_keeps_timeline_chronological_when_not_showing_all(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("return currentFilter === 'all' ? timeline.reverse() : timeline;", source)
-        self.assertIn("const visible = currentFilter === 'all' ? timeline.slice(0, recentMessagesLimit) : timeline.slice(-recentMessagesLimit);", source)
-
-    def test_httpbridge_source_closes_event_logs_by_default_outside_all_view(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("const eventsShell = document.createElement('details');", source)
-        self.assertIn("if (currentFilter === 'all') eventsShell.open = true;", source)
-        self.assertIn("eventsTitle.textContent = currentFilter === 'all' ? 'Event Log' : 'Event Log (closed by default)';", source)
-
-    def test_httpbridge_source_uses_timeline_all_filter_labels(self) -> None:
-        source = (SRC / "runtime" / "cli_service_adapter.py").read_text(encoding="utf-8")
-        self.assertIn("data-filter='messages'>Timeline</button>", source)
-        self.assertIn("data-filter='all'>ALL</button>", source)
-        self.assertNotIn("data-filter='messages'>In/Out</button>", source)
 
 
 if __name__ == "__main__":

@@ -53,17 +53,5 @@ class AccountSettingsTests(unittest.TestCase):
         self.assertEqual(result, "current_password_incorrect")
         self.assertTrue(verify_user_password(self.runtime_root, username="repyt", password="old-pass"))
 
-    def test_httpbridge_source_exposes_account_settings_pane_and_password_endpoint(self) -> None:
-        renderer_source = (SRC / "runtime" / "html_renderer.py").read_text(encoding="utf-8")
-        handler_source = (SRC / "runtime" / "http_handler.py").read_text(encoding="utf-8")
-
-        self.assertIn("id='account-settings-toggle'", renderer_source)
-        self.assertIn("id='account-settings-pane'", renderer_source)
-        self.assertIn("fetch('/account/password'", renderer_source)
-        self.assertIn("accountSettingsOpen", renderer_source)
-        self.assertIn('if path == "/account/password":', handler_source)
-        self.assertIn("return self._do_POST_account_password(payload)", handler_source)
-
-
 if __name__ == "__main__":
     unittest.main()

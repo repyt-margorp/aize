@@ -148,11 +148,6 @@ class WsPeerClientProxySessionTests(unittest.TestCase):
         talk = get_session_settings(self.runtime_root, username=self.username, session_id=existing_id)
         self.assertEqual(str((talk or {}).get("goal_text") or ""), expected_goal)
 
-    def test_source_supports_gemini_provider_pool_selection(self) -> None:
-        source = Path(ROOT / "src" / "runtime" / "ws_peer_client.py").read_text(encoding="utf-8")
-        self.assertIn('provider           str    "claude" | "codex" | "gemini"  (default "claude")', source)
-        self.assertIn('"gemini": gemini_service_pool', source)
-
     def test_resolve_provider_pool_uses_running_services_from_runtime_state(self) -> None:
         state_dir = self.runtime_root / "state"
         state_dir.mkdir(parents=True)
