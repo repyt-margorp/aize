@@ -1451,17 +1451,17 @@ def make_handler(
             parts.append(
                 "".join(
                     [
-                        f"<a class='talk-nav-item{' is-active' if active else ''}' href='/?session_id={html.escape(sid)}{scope_suffix}'>",
-                        "<span class='talk-nav-head'>",
-                        f"<span class='talk-nav-title'>{html.escape(label)}</span>",
-                        "<span class='talk-nav-signals'>",
-                        f"<span class='talk-signal talk-signal-active{' is-on' if goal_active else ''}' title='Goal active state'>●</span>",
-                        f"<span class='talk-signal talk-signal-completed{' is-on' if goal_completed else ''}' title='Goal completed state'>●</span>",
-                        f"<span class='talk-signal talk-signal-wait{' is-on' if wait_status != 'idle' else ''}{' is-waiting' if wait_active else ''}{' is-timeout' if wait_status == 'timed_out' else ''}' title='User response wait state'>●</span>",
+                        f"<a class='workspace-nav-item{' is-active' if active else ''}' href='/?session_id={html.escape(sid)}{scope_suffix}'>",
+                        "<span class='workspace-nav-head'>",
+                        f"<span class='workspace-nav-title'>{html.escape(label)}</span>",
+                        "<span class='workspace-nav-signals'>",
+                        f"<span class='workspace-signal workspace-signal-active{' is-on' if goal_active else ''}' title='Goal active state'>●</span>",
+                        f"<span class='workspace-signal workspace-signal-completed{' is-on' if goal_completed else ''}' title='Goal completed state'>●</span>",
+                        f"<span class='workspace-signal workspace-signal-wait{' is-on' if wait_status != 'idle' else ''}{' is-waiting' if wait_active else ''}{' is-timeout' if wait_status == 'timed_out' else ''}' title='User response wait state'>●</span>",
                         "</span>",
                         "</span>",
-                        f"<span class='talk-nav-meta'>{html.escape(sid)}</span>",
-                        f"<span class='talk-nav-origin'>{html.escape(origin_meta)}</span>",
+                        f"<span class='workspace-nav-meta'>{html.escape(sid)}</span>",
+                        f"<span class='workspace-nav-origin'>{html.escape(origin_meta)}</span>",
                         "</a>",
                     ]
                 )
@@ -1496,7 +1496,7 @@ def make_handler(
             )
             classes = ["goal-session-card"]
             if sid == active_session_id:
-                classes.append("is-active-talk")
+                classes.append("is-active-workspace")
             if goal_manager_state == "running":
                 classes.append("is-goal-running")
             if not goal_active:
@@ -1627,7 +1627,7 @@ def make_handler(
             context = current_context(self, payload=payload, query=query)
             if context:
                 return context
-            self._json(401, {"error": "auth_required_or_invalid_talk"})
+            self._json(401, {"error": "auth_required_or_invalid_session"})
             return None
 
         def _render_ui_probe_page(self, query: dict[str, list[str]]) -> str:
@@ -1651,7 +1651,7 @@ def make_handler(
                 "const parseJson=async (response)=>{const text=await response.text();try{return text?JSON.parse(text):{};}catch(_err){return {raw_text:text};}};"
                 "const postJson=async (path,body)=>{const response=await fetch(path,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:response.status,payload:await parseJson(response)};};"
                 "const getText=async (path)=>{const response=await fetch(path,{credentials:'include'});return {status:response.status,text:await response.text()};};"
-                "const hasUiMarkers=(html)=>({session_map:(html.includes('id=\"session-map-pane\"')||html.includes(\"id='session-map-pane'\")),talk_history:(html.includes('id=\"messages\"')||html.includes(\"id='messages'\"))&&(html.includes('id=\"talk-view\"')||html.includes(\"id='talk-view'\")),goal_editor:(html.includes('id=\"view-goal\"')||html.includes(\"id='view-goal'\"))});"
+                "const hasUiMarkers=(html)=>({session_map:(html.includes('id=\"session-map-pane\"')||html.includes(\"id='session-map-pane'\")),workspace_history:(html.includes('id=\"messages\"')||html.includes(\"id='messages'\"))&&(html.includes('id=\"workspace-view\"')||html.includes(\"id='workspace-view'\")),nodes:(html.includes('id=\"nodes-pane\"')||html.includes(\"id='nodes-pane'\")),requests:(html.includes('id=\"requests-pane\"')||html.includes(\"id='requests-pane'\")),entrance:(html.includes('id=\"entrance-pane\"')||html.includes(\"id='entrance-pane'\")),goal_editor:(html.includes('id=\"view-goal\"')||html.includes(\"id='view-goal'\"))});"
                 "(async()=>{"
                 "if(sessionToken){document.cookie=`bridge_session=${sessionToken}; path=/; SameSite=Lax`;}"
                 "else{"
@@ -1724,7 +1724,7 @@ def make_handler(
             self._trace_auth_request(phase="get_root", path=path, context=context)
             if not context:
                 req_session_id = requested_session_id(self, query=query)
-                login_hidden_talk = (
+                login_hidden_workspace = (
                     f"<input type='hidden' name='session_id' value='{html.escape(req_session_id)}'>"
                     if req_session_id
                     else ""
@@ -1733,7 +1733,7 @@ def make_handler(
                 self._html(200, render_login_page(
                     display_name=str(self_service["display_name"]),
                     bootstrap_needed=bootstrap_needed,
-                    login_hidden_talk=login_hidden_talk,
+                    login_hidden_workspace=login_hidden_workspace,
                 ))
                 return
             username = context["username"]
