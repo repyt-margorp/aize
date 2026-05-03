@@ -1,13 +1,38 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "plugin_session_template_v1.json",
-  "title": "AIze Plugin Session Template",
+  "$id": "unit_file_v1.json",
+  "title": "AIze UnitFile",
   "type": "object",
-  "required": ["template_id", "launcher"],
+  "required": ["launcher"],
   "properties": {
+    "unit_id": {
+      "type": "string",
+      "minLength": 1
+    },
     "template_id": {
       "type": "string",
       "minLength": 1
+    },
+    "unit_kind": {
+      "type": "string"
+    },
+    "unit_class": {
+      "type": "string"
+    },
+    "instance_policy": {
+      "type": "string"
+    },
+    "lifecycle": {
+      "type": "string"
+    },
+    "restart_policy": {
+      "type": "string"
+    },
+    "interfaces": {
+      "type": "object"
+    },
+    "endpoints": {
+      "type": "object"
     },
     "display_name": {
       "type": "string"

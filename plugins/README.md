@@ -1,29 +1,30 @@
-Plugin packages live under `./plugins/`.
+Unit packages live under `./plugins/`.
 
-Use this tree for service-scoped extensions that should not be mixed into the core `src/services/` set.
+Use this tree for MINIX-style userland units that should not be mixed into the core `src/services/` set.
 
 Recommended layout:
 
 ```text
 plugins/
   private/
-    my_plugin/
+    my_unit_package/
       plugin.json
       services/
         secret_worker/
           __init__.py
           service.json
-      apps/
-        launcher/
-          session-template.json
+      units/
+        entrance/
+          unit.json
 ```
 
 Notes:
 
 - Private or non-public work should live under `./plugins/private/`; that subtree is gitignored.
-- Each plugin must include a `plugin.json`.
+- Each unit package must include a `plugin.json`; the filename is retained as the package manifest for compatibility.
 - Service modules are auto-discovered from `./plugins/**/services/*/service.json`.
-- Session Template descriptors are auto-discovered from `./plugins/**/session-templates/*/session-template.json`.
-- Session Template descriptor shape is documented in `./src/runtime/schemas/plugin_session_template_v1.json`.
-- Launcher apps may set `"workspace_scope": "app"` when they need a durable template-level workspace across launches.
+- UnitFiles are auto-discovered from `./plugins/**/units/*/unit.json`.
+- Legacy `session-templates/*/session-template.json` and `apps/*/app.json` descriptors are still accepted as compatibility input.
+- Unit descriptor shape is documented in `./src/runtime/schemas/plugin_session_template_v1.json`.
+- UnitFiles may set `"workspace_scope": "app"` when they need a durable unit-level workspace across launches.
 - If a service directory is importable from the repo root, its Python module path is derived automatically.

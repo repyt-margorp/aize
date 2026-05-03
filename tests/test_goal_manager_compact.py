@@ -827,7 +827,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(result["dispatch_service_id"], "service-codex-001")
         self.assertEqual(len(sent_messages), 1)
         self.assertEqual(sent_messages[0]["to"], "service-codex-001")
-        self.assertEqual(sent_messages[0]["payload"], {"reason": "scheduled_app_launch"})
+        self.assertEqual(sent_messages[0]["payload"], {"reason": "scheduled_unit_launch"})
 
         pending_inputs = load_pending_inputs(
             self.runtime_root,
@@ -835,7 +835,7 @@ class GoalManagerCompactTests(unittest.TestCase):
             session_id=launched_session_id,
         )
         self.assertEqual(pending_inputs[-1]["kind"], "scheduled_launch")
-        self.assertIn("<aize_scheduled_app_launch>", pending_inputs[-1]["text"])
+        self.assertIn("<aize_scheduled_unit_launch>", pending_inputs[-1]["text"])
 
         app_state = get_registered_session_template_state(self.runtime_root, username=TEST_USERNAME, template_id="nightly_launcher")
         assert app_state is not None
@@ -844,7 +844,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(schedule_state["last_launched_session_id"], launched_session_id)
 
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=launched_session_id)
-        self.assertIn("service.app_schedule_triggered", [str(entry.get("event_type") or "") for entry in history])
+        self.assertIn("service.unit_schedule_triggered", [str(entry.get("event_type") or "") for entry in history])
 
     def test_process_due_scheduled_app_launch_defers_until_worker_running(self) -> None:
         app = normalize_session_template_descriptor(

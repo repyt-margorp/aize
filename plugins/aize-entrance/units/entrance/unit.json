@@ -1,0 +1,31 @@
+{
+  "unit_id": "entrance.service",
+  "template_id": "aize-entrance",
+  "unit_kind": "interface",
+  "unit_class": "service",
+  "instance_policy": "singleton",
+  "lifecycle": "on_demand",
+  "restart_policy": "on_failure",
+  "display_name": "Entrance",
+  "description": "An InterfaceUnit whose purpose is to help route user feedback to the appropriate AIze SessionUnit.",
+  "enabled": true,
+  "interfaces": {
+    "web": "/units/entrance"
+  },
+  "endpoints": {
+    "ipc": "unit://entrance.service/inbox"
+  },
+  "launcher": {
+    "create_as_child": true,
+    "default_label": "Entrance",
+    "goal_text": "Accept user feedback, identify the appropriate AIze SessionUnit that should receive it, and route the feedback so the target session can continue smoothly.",
+    "initial_prompt": "You are the Entrance session for this AIze system. Your job is to help route user feedback to the appropriate target session and keep the broader session graph moving.",
+    "preferred_provider": "codex",
+    "selected_agents": [],
+    "session_group": "user",
+    "workspace_scope": "app",
+    "auto_select_session": true,
+    "auto_send_initial_prompt": false,
+    "ui_url": "/units/entrance"
+  }
+}

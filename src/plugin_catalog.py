@@ -26,6 +26,10 @@ def configured_plugin_roots() -> list[Path]:
     return ordered
 
 
+def configured_unit_package_roots() -> list[Path]:
+    return configured_plugin_roots()
+
+
 def _is_hidden(path: Path) -> bool:
     return any(part.startswith(".") for part in path.parts)
 
@@ -42,16 +46,29 @@ def list_plugin_dirs() -> list[Path]:
     return plugin_dirs
 
 
+def list_unit_package_dirs() -> list[Path]:
+    return list_plugin_dirs()
+
+
 def load_plugin_manifest(plugin_dir: Path) -> dict:
     manifest_path = plugin_dir / "plugin.json"
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     data.setdefault("plugin_id", plugin_dir.name)
+    data.setdefault("package_id", data.get("plugin_id") or plugin_dir.name)
     data["_plugin_dir"] = str(plugin_dir)
     return data
 
 
+def load_unit_package_manifest(package_dir: Path) -> dict:
+    return load_plugin_manifest(package_dir)
+
+
 def list_plugin_manifests() -> list[dict]:
     return [load_plugin_manifest(plugin_dir) for plugin_dir in list_plugin_dirs()]
+
+
+def list_unit_package_manifests() -> list[dict]:
+    return list_plugin_manifests()
 
 
 def _module_name_for_path(path: Path) -> str:
@@ -87,18 +104,24 @@ def list_plugin_session_template_descriptors() -> list[dict]:
     for plugin_dir in list_plugin_dirs():
         plugin_manifest = load_plugin_manifest(plugin_dir)
         descriptor_roots = [
+            plugin_dir / "units",
             plugin_dir / "session-templates",
             plugin_dir / "apps",
         ]
         for descriptors_dir in descriptor_roots:
             if not descriptors_dir.exists():
                 continue
-            for pattern in ("*/session-template.json", "*/app.json"):
+            for pattern in ("*/unit.json", "*/session-template.json", "*/app.json"):
                 for descriptor_path in sorted(descriptors_dir.glob(pattern)):
                     descriptor = _descriptor_with_defaults(descriptor_path, descriptor_type="app")
                     descriptor.setdefault("plugin_id", plugin_manifest["plugin_id"])
+                    descriptor.setdefault("package_id", plugin_manifest.get("package_id") or plugin_manifest["plugin_id"])
                     descriptors.append(descriptor)
     return descriptors
+
+
+def list_unit_file_descriptors() -> list[dict]:
+    return list_plugin_session_template_descriptors()
 
 
 def list_plugin_app_descriptors() -> list[dict]:

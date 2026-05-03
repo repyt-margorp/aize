@@ -34,6 +34,16 @@ SCHEDULE_KINDS = {"daily"}
 SCHEDULE_RETRY_AFTER_SECONDS = 60
 
 
+def _read_unit_metadata(runtime_root: Path, *, username: str, template_id: str) -> dict[str, Any] | None:
+    metadata_path = session_template_metadata_path(runtime_root, username=username, template_id=template_id)
+    metadata = read_json_file(metadata_path)
+    if isinstance(metadata, dict):
+        return metadata
+    legacy_path = metadata_path.with_name("app.json")
+    legacy = read_json_file(legacy_path)
+    return legacy if isinstance(legacy, dict) else None
+
+
 def _normalize_provider(value: Any, *, default_provider: str) -> str:
     provider = str(value or "").strip().lower()
     if provider in VALID_PROVIDERS:
@@ -165,12 +175,13 @@ def list_registered_session_template_states(runtime_root: Path) -> list[dict[str
         for user_dir in sorted(path for path in app_root.iterdir() if path.is_dir()):
             username = normalize_username(user_dir.name)
             for session_template_dir_entry in sorted(path for path in user_dir.iterdir() if path.is_dir()):
-                metadata = read_json_file(session_template_metadata_path(runtime_root, username=username, template_id=session_template_dir_entry.name))
+                metadata = _read_unit_metadata(runtime_root, username=username, template_id=session_template_dir_entry.name)
                 if not isinstance(metadata, dict):
                     continue
                 record = dict(metadata)
                 record["username"] = username
-                record["template_id"] = str(record.get("template_id") or session_template_dir_entry.name).strip() or session_template_dir_entry.name
+                record["unit_id"] = str(record.get("unit_id") or record.get("template_id") or session_template_dir_entry.name).strip() or session_template_dir_entry.name
+                record["template_id"] = record["unit_id"]
                 records.append(record)
     return records
 
@@ -179,11 +190,12 @@ def get_registered_session_template_state(runtime_root: Path, *, username: str, 
     normalized_username = normalize_username(username)
     normalized_template_id = str(template_id or "").strip()
     with state_read_lock(runtime_root):
-        metadata = read_json_file(session_template_metadata_path(runtime_root, username=normalized_username, template_id=normalized_template_id))
+        metadata = _read_unit_metadata(runtime_root, username=normalized_username, template_id=normalized_template_id)
     if not isinstance(metadata, dict):
         return None
     record = dict(metadata)
     record["username"] = normalized_username
+    record["unit_id"] = normalized_template_id
     record["template_id"] = normalized_template_id
     return record
 
@@ -203,6 +215,7 @@ def update_registered_session_template_state(
         payload = dict(current)
         payload.update(
             {
+                "unit_id": normalized_template_id,
                 "template_id": normalized_template_id,
                 "username": normalized_username,
             }
@@ -287,7 +300,7 @@ def resolve_app_launch_parent_session_id(
 
 
 def build_scheduled_app_session_label(app: dict[str, Any], schedule_info: dict[str, Any]) -> str:
-    display_name = str(app.get("display_name") or app.get("template_id") or "Session Template").strip() or "Session Template"
+    display_name = str(app.get("display_name") or app.get("unit_id") or app.get("template_id") or "Unit").strip() or "Unit"
     local_when = str(schedule_info.get("scheduled_for_local") or "").strip()
     timezone_name = str(schedule_info.get("timezone") or "UTC").strip() or "UTC"
     if not local_when:
@@ -299,22 +312,22 @@ def build_scheduled_app_initial_prompt(app: dict[str, Any], schedule_info: dict[
     launcher = dict(app.get("launcher") or {})
     base_prompt = str(launcher.get("initial_prompt") or "").strip()
     lines = [
-        "<aize_scheduled_app_launch>",
-        f"  <template_id>{app.get('template_id') or ''}</template_id>",
+        "<aize_scheduled_unit_launch>",
+        f"  <unit_id>{app.get('unit_id') or app.get('template_id') or ''}</unit_id>",
         f"  <scheduled_for_utc>{schedule_info.get('scheduled_for_utc') or ''}</scheduled_for_utc>",
         f"  <scheduled_for_local timezone=\"{schedule_info.get('timezone') or 'UTC'}\">{schedule_info.get('scheduled_for_local') or ''}</scheduled_for_local>",
-        "  <instruction>This session was created automatically from the session template's wall-clock schedule. Treat this as a fresh run, execute the app goal now, and use the template workspace for durable state instead of relying on prior session-local context.</instruction>",
-        "</aize_scheduled_app_launch>",
+        "  <instruction>This session was created automatically from the UnitFile's wall-clock schedule. Treat this as a fresh run, execute the unit goal now, and use the unit workspace for durable state instead of relying on prior session-local context.</instruction>",
+        "</aize_scheduled_unit_launch>",
     ]
     schedule_prompt = "\n".join(lines).strip()
     return f"{schedule_prompt}\n\n{base_prompt}".strip() if base_prompt else schedule_prompt
 
 
 def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default_provider: str) -> dict[str, Any]:
-    template_id = str(descriptor.get("template_id") or "").strip()
+    template_id = str(descriptor.get("unit_id") or descriptor.get("template_id") or "").strip()
     if not template_id:
         source = descriptor.get("_descriptor_path", "<unknown>")
-        raise RuntimeError(f"app descriptor missing template_id: {source}")
+        raise RuntimeError(f"unit descriptor missing unit_id: {source}")
     launcher = dict(descriptor.get("launcher") or {})
     preferred_provider = _normalize_provider(launcher.get("preferred_provider"), default_provider=default_provider)
     selected_agents = _normalize_selected_agents(launcher.get("selected_agents"), preferred_provider=preferred_provider)
@@ -328,9 +341,24 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
     initial_prompt = str(launcher.get("initial_prompt") or "").strip()
     goal_text = str(launcher.get("goal_text") or "").strip()
     default_label = str(launcher.get("default_label") or descriptor.get("display_name") or template_id).strip() or template_id
+    unit_kind = str(descriptor.get("unit_kind") or descriptor.get("kind") or "session").strip().lower() or "session"
+    instance_policy = str(descriptor.get("instance_policy") or launcher.get("instance_policy") or "multi").strip().lower() or "multi"
+    interfaces = dict(descriptor.get("interfaces") or {})
+    if str(launcher.get("ui_url") or "").strip() and "web" not in interfaces:
+        interfaces["web"] = str(launcher.get("ui_url") or "").strip()
     normalized = {
+        "unit_id": template_id,
         "template_id": template_id,
+        "package_id": str(descriptor.get("package_id") or descriptor.get("plugin_id") or "").strip(),
         "plugin_id": str(descriptor.get("plugin_id") or "").strip(),
+        "unit_kind": unit_kind,
+        "kind": unit_kind,
+        "unit_class": str(descriptor.get("unit_class") or descriptor.get("class") or ("service" if instance_policy == "singleton" else "template")).strip().lower(),
+        "instance_policy": instance_policy,
+        "lifecycle": str(descriptor.get("lifecycle") or launcher.get("lifecycle") or "manual").strip().lower() or "manual",
+        "restart_policy": str(descriptor.get("restart_policy") or launcher.get("restart_policy") or "never").strip().lower() or "never",
+        "interfaces": interfaces,
+        "endpoints": dict(descriptor.get("endpoints") or {}),
         "display_name": str(descriptor.get("display_name") or template_id).strip() or template_id,
         "description": str(descriptor.get("description") or "").strip(),
         "enabled": bool(descriptor.get("enabled", True)),
@@ -345,7 +373,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
             "session_group": session_group,
             "session_permissions": session_permissions,
             "workspace_scope": _normalize_workspace_scope(launcher.get("workspace_scope")),
-            "ui_url": str(launcher.get("ui_url") or "").strip(),
+            "ui_url": str(launcher.get("ui_url") or interfaces.get("web") or "").strip(),
             "auto_select_session": bool(launcher.get("auto_select_session", True)),
             "auto_send_initial_prompt": bool(launcher.get("auto_send_initial_prompt", bool(initial_prompt))),
             "schedule": _normalize_schedule(launcher.get("schedule")),
@@ -364,12 +392,20 @@ def list_launchable_session_templates(*, default_provider: str) -> list[dict[str
     return apps
 
 
+def list_launchable_units(*, default_provider: str) -> list[dict[str, Any]]:
+    return list_launchable_session_templates(default_provider=default_provider)
+
+
 def get_launchable_session_template(template_id: str, *, default_provider: str) -> dict[str, Any]:
     normalized_template_id = str(template_id or "").strip()
     for app in list_launchable_session_templates(default_provider=default_provider):
         if app["template_id"] == normalized_template_id:
             return app
     raise KeyError(normalized_template_id)
+
+
+def get_launchable_unit(unit_id: str, *, default_provider: str) -> dict[str, Any]:
+    return get_launchable_session_template(unit_id, default_provider=default_provider)
 
 
 def launch_session_template(
@@ -410,7 +446,7 @@ def launch_session_template(
             session_group=session_group,
             session_permissions=session_permissions,
             created_by_username=normalized_username,
-            created_by_type="app",
+            created_by_type="unit",
             origin_session_id=parent_session_id,
         )
         if effective_goal_text:
@@ -420,7 +456,7 @@ def launch_session_template(
                 session_id=str(session["session_id"]),
                 goal_text=effective_goal_text,
                 updated_by_username=normalized_username,
-                updated_by_type="app",
+                updated_by_type="unit",
                 origin_session_id=parent_session_id,
             ) or session
     else:
@@ -433,7 +469,7 @@ def launch_session_template(
             session_group=session_group,
             session_permissions=session_permissions,
             created_by_username=normalized_username,
-            created_by_type="app",
+            created_by_type="unit",
             origin_session_id=parent_session_id,
         )
         if not session:
@@ -455,9 +491,9 @@ def launch_session_template(
             )
         )
         workspace_note = (
-            "Persistent template workspace directory: "
+            "Persistent unit workspace directory: "
             f"{workspace_path}\n"
-            "Use this directory for durable code, scripts, notes, and stock that should survive across launches of this app."
+            "Use this directory for durable code, scripts, notes, and stock that should survive across launches of this unit."
         )
         effective_initial_prompt = (
             f"{workspace_note}\n\n{effective_initial_prompt}" if effective_initial_prompt else workspace_note
@@ -467,7 +503,9 @@ def launch_session_template(
         username=normalized_username,
         template_id=str(app.get("template_id") or ""),
         updates={
-            "display_name": str(app.get("display_name") or app.get("template_id") or "").strip(),
+            "unit_id": str(app.get("unit_id") or app.get("template_id") or "").strip(),
+            "display_name": str(app.get("display_name") or app.get("unit_id") or app.get("template_id") or "").strip(),
+            "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
             "plugin_id": str(app.get("plugin_id") or "").strip(),
             "workspace_path": workspace_path,
             "last_session_id": session_id,
@@ -501,6 +539,7 @@ def launch_session_template(
     updated_session = get_session_settings(runtime_root, username=normalized_username, session_id=session_id) or session
     return {
         "app": app,
+        "unit": app,
         "session": updated_session,
         "launch_plan": {
             "preferred_provider": effective_provider,
@@ -512,3 +551,7 @@ def launch_session_template(
             "auto_send_initial_prompt": bool(launcher.get("auto_send_initial_prompt", bool(effective_initial_prompt))),
         },
     }
+
+
+def launch_unit(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return launch_session_template(*args, **kwargs)

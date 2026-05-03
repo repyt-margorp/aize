@@ -381,7 +381,7 @@ def _process_due_scheduled_app_launch(
     app: dict[str, Any],
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    template_id = str(app.get("template_id") or "").strip()
+    template_id = str(app.get("unit_id") or app.get("template_id") or "").strip()
     if not template_id:
         return None
     effective_now = (now or datetime.now(UTC)).astimezone(UTC)
@@ -399,6 +399,8 @@ def _process_due_scheduled_app_launch(
             template_id=template_id,
             updates={
                 "display_name": str(app.get("display_name") or template_id).strip() or template_id,
+                "unit_id": template_id,
+                "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
                 "plugin_id": str(app.get("plugin_id") or "").strip(),
                 "schedule_state": {
                     "last_checked_at": utc_ts(),
@@ -417,13 +419,13 @@ def _process_due_scheduled_app_launch(
     if not parent_session_id:
         retry_not_before_at = (effective_now + timedelta(seconds=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         _update_schedule_state(
-            last_error="scheduled app launch could not find a parent session",
+            last_error="scheduled unit launch could not find a parent session",
             retry_not_before_at=retry_not_before_at,
         )
         write_jsonl(
             log_path,
             {
-                "type": "service.app_schedule_launch_failed",
+                "type": "service.unit_schedule_launch_failed",
                 "ts": utc_ts(),
                 "service_id": self_service_id,
                 "process_id": process_id,
@@ -443,13 +445,13 @@ def _process_due_scheduled_app_launch(
     if not running_pool_service_ids:
         retry_not_before_at = (effective_now + timedelta(seconds=15)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         _update_schedule_state(
-            last_error=f"scheduled app launch for provider {preferred_provider} became due before any running worker was ready",
+            last_error=f"scheduled unit launch for provider {preferred_provider} became due before any running worker was ready",
             retry_not_before_at=retry_not_before_at,
         )
         write_jsonl(
             log_path,
             {
-                "type": "service.app_schedule_due_deferred",
+                "type": "service.unit_schedule_due_deferred",
                 "ts": utc_ts(),
                 "service_id": self_service_id,
                 "process_id": process_id,
@@ -482,7 +484,7 @@ def _process_due_scheduled_app_launch(
         write_jsonl(
             log_path,
             {
-                "type": "service.app_schedule_launch_failed",
+                "type": "service.unit_schedule_launch_failed",
                 "ts": utc_ts(),
                 "service_id": self_service_id,
                 "process_id": process_id,
@@ -526,10 +528,11 @@ def _process_due_scheduled_app_launch(
             "direction": "event",
             "ts": utc_ts(),
             "service_id": self_service_id,
-            "event_type": "service.app_schedule_triggered",
-            "text": "Launcher app schedule created a fresh session and queued its scheduled instructions.",
+            "event_type": "service.unit_schedule_triggered",
+            "text": "Unit schedule created a fresh session and queued its scheduled instructions.",
             "event": {
-                "type": "service.app_schedule_triggered",
+                "type": "service.unit_schedule_triggered",
+                "unit_id": template_id,
                 "template_id": template_id,
                 "scheduled_for_utc": str(schedule_info.get("scheduled_for_utc") or ""),
                 "dispatch_service_id": target_service_id or "",
@@ -545,7 +548,7 @@ def _process_due_scheduled_app_launch(
             "ts": utc_ts(),
             "service_id": self_service_id,
             "to": target_service_id or "",
-            "text": f"Launcher app schedule for {template_id} created this session and queued the scheduled instructions automatically.",
+            "text": f"Unit schedule for {template_id} created this session and queued the scheduled instructions automatically.",
         },
     )
 
@@ -564,22 +567,23 @@ def _process_due_scheduled_app_launch(
                 from_service_id=self_service_id,
                 to_service_id=target_service_id,
                 process_id=process_id,
-                run_id=f"app-schedule-{int(time.time())}",
+                run_id=f"unit-schedule-{int(time.time())}",
                 username=username,
                 session_id=session_id,
                 auth_context=None,
-                reason="scheduled_app_launch",
+                reason="scheduled_unit_launch",
             )
         )
         _update_schedule_state(**schedule_state_updates)
         write_jsonl(
             log_path,
             {
-                "type": "service.app_schedule_processed",
+                "type": "service.unit_schedule_processed",
                 "ts": utc_ts(),
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
+                "unit_id": template_id,
                 "template_id": template_id,
                 "session_id": session_id,
                 "dispatch_service_id": target_service_id,
@@ -594,16 +598,17 @@ def _process_due_scheduled_app_launch(
             "schedule": schedule_info,
         }
 
-    schedule_state_updates["last_error"] = "scheduled app session was created but no worker was available"
+    schedule_state_updates["last_error"] = "scheduled unit session was created but no worker was available"
     _update_schedule_state(**schedule_state_updates)
     write_jsonl(
         log_path,
         {
-            "type": "service.app_schedule_created_without_worker",
+            "type": "service.unit_schedule_created_without_worker",
             "ts": utc_ts(),
             "service_id": self_service_id,
             "process_id": process_id,
             "username": username,
+            "unit_id": template_id,
             "template_id": template_id,
             "session_id": session_id,
             "preferred_provider": preferred_provider,
@@ -1283,13 +1288,13 @@ def make_handler(
     def _app_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
         apps = list_launchable_session_templates(default_provider=default_provider)
         registered_states = {
-            str(state.get("template_id") or "").strip(): state
+            str(state.get("unit_id") or state.get("template_id") or "").strip(): state
             for state in list_registered_session_template_states(runtime_root)
             if str(state.get("username") or "").strip() == str(viewer_username or "").strip()
         }
         merged_apps: list[dict[str, Any]] = []
         for app in apps:
-            app_state = registered_states.get(str(app.get("template_id") or "").strip())
+            app_state = registered_states.get(str(app.get("unit_id") or app.get("template_id") or "").strip())
             state_payload = {
                 "registered": bool(app_state),
                 "workspace_path": str((app_state or {}).get("workspace_path") or "").strip(),
@@ -1308,6 +1313,7 @@ def make_handler(
             )
         return {
             "apps": merged_apps,
+            "units": merged_apps,
             "default_provider": default_provider,
             "ts": utc_ts(),
         }
@@ -1684,7 +1690,7 @@ def make_handler(
                 return self._do_WS_upgrade()
             if path == "/":
                 return self._do_GET_root(path, query)
-            if path == "/plugins/entrance":
+            if path in {"/units/entrance", "/plugins/entrance"}:
                 return self._do_GET_entrance_plugin(path, query)
             if path == "/events":
                 return self._do_GET_events(path, query)
@@ -1700,7 +1706,7 @@ def make_handler(
                 return self._do_GET_session_goal_state(path, query)
             if path == "/messages":
                 return self._do_GET_messages(path, query)
-            if path == "/session-templates":
+            if path in {"/units", "/session-templates"}:
                 return self._do_GET_apps(path, query)
             if path == "/sessions":
                 return self._do_GET_sessions(path, query)
@@ -2255,7 +2261,7 @@ def make_handler(
                 return self._do_POST_account_password(payload)
             if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
-            if path == "/session-templates/launch":
+            if path in {"/units/launch", "/session-templates/launch"}:
                 return self._do_POST_apps_launch(payload)
             if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
@@ -2516,9 +2522,9 @@ def make_handler(
             context = self._require_user(payload=payload)
             if not context:
                 return
-            template_id = str(payload.get("template_id") or "").strip()
+            template_id = str(payload.get("unit_id") or payload.get("template_id") or "").strip()
             if not template_id:
-                self._json(400, {"error": "template_id_required"})
+                self._json(400, {"error": "unit_id_required"})
                 return
             parent_session_id = str(payload.get("parent_session_id") or context["session_id"] or "").strip()
             if not parent_session_id:
@@ -2527,7 +2533,7 @@ def make_handler(
             try:
                 app = get_launchable_session_template(template_id, default_provider=default_provider)
             except KeyError:
-                self._json(404, {"error": "app_not_found", "template_id": template_id})
+                self._json(404, {"error": "unit_not_found", "unit_id": template_id, "template_id": template_id})
                 return
             selected_agents = payload.get("selected_agents")
             if selected_agents is not None and not isinstance(selected_agents, list):
@@ -2546,7 +2552,7 @@ def make_handler(
                     selected_agents=selected_agents,
                 )
             except RuntimeError as exc:
-                self._json(400, {"error": str(exc), "template_id": template_id})
+                self._json(400, {"error": str(exc), "unit_id": template_id, "template_id": template_id})
                 return
             session = launched.get("session") if isinstance(launched, dict) else {}
             session_id = str((session or {}).get("session_id") or "").strip()
@@ -2557,6 +2563,7 @@ def make_handler(
                 {
                     "ok": True,
                     "app": launched.get("app"),
+                    "unit": launched.get("unit") or launched.get("app"),
                     "session": session,
                     "session_id": session_id,
                     "active_session_id": session_id,
@@ -3932,7 +3939,7 @@ def make_handler(
         while not stopped.wait(timeout=3.5):
             try:
                 apps = {
-                    str(app.get("template_id") or "").strip(): app
+                    str(app.get("unit_id") or app.get("template_id") or "").strip(): app
                     for app in list_launchable_session_templates(default_provider=default_provider)
                 }
                 registered_apps = list_registered_session_template_states(runtime_root)
@@ -3942,7 +3949,7 @@ def make_handler(
                 if not isinstance(app_state, dict):
                     continue
                 username = str(app_state.get("username") or "").strip()
-                template_id = str(app_state.get("template_id") or "").strip()
+                template_id = str(app_state.get("unit_id") or app_state.get("template_id") or "").strip()
                 if not username or not template_id:
                     continue
                 app = apps.get(template_id)
@@ -3966,11 +3973,12 @@ def make_handler(
                     write_jsonl(
                         log_path,
                         {
-                            "type": "service.app_schedule_watcher_failed",
+                            "type": "service.unit_schedule_watcher_failed",
                             "ts": utc_ts(),
                             "service_id": self_service["service_id"],
                             "process_id": process_id,
                             "username": username,
+                            "unit_id": template_id,
                             "template_id": template_id,
                             "error": repr(exc),
                         },

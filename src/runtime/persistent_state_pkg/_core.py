@@ -316,7 +316,7 @@ def session_template_workspace_dir(runtime_root: Path, *, username: str, templat
 
 
 def session_template_metadata_path(runtime_root: Path, *, username: str, template_id: str) -> Path:
-    return session_template_dir(runtime_root, username=username, template_id=template_id) / "app.json"
+    return session_template_dir(runtime_root, username=username, template_id=template_id) / "unit.json"
 
 
 def session_agent_entry_files_dir(
@@ -464,6 +464,7 @@ def ensure_session_template_workspace(
     payload = dict(current)
     payload.update(
         {
+            "unit_id": normalized_template_id,
             "template_id": normalized_template_id,
             "username": normalized_username,
             "display_name": str(display_name or normalized_template_id).strip(),
