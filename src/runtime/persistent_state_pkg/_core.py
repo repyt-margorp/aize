@@ -24,6 +24,7 @@ DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS = 5 * 60
 AGENT_PRIORITY_BORDER = "border"
 NATIVE_PROVIDER_KINDS = ("codex", "claude", "gemini")
 DEFAULT_AGENT_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
+DEFAULT_GOAL_MANAGER_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
 GOAL_MANAGER_USERNAME = "goalmanager"
 DEFAULT_SESSION_UI_MODE = "standard"
 SESSION_UI_MODES = {"standard", "map_only"}
@@ -103,6 +104,24 @@ def active_agent_priority(value: Any, *, available_kinds: set[str] | None = None
         if item in available and item not in active:
             active.append(item)
     fallback = [kind for kind in DEFAULT_AGENT_PRIORITY if kind in available]
+    return active or fallback
+
+
+def normalize_goal_manager_priority(value: Any) -> list[str]:
+    if value is None:
+        return list(DEFAULT_GOAL_MANAGER_PRIORITY)
+    return normalize_agent_priority(value)
+
+
+def active_goal_manager_priority(value: Any, *, available_kinds: set[str] | None = None) -> list[str]:
+    available = available_kinds or set(NATIVE_PROVIDER_KINDS)
+    active: list[str] = []
+    for item in normalize_goal_manager_priority(value):
+        if item == AGENT_PRIORITY_BORDER:
+            break
+        if item in available and item not in active:
+            active.append(item)
+    fallback = [kind for kind in DEFAULT_GOAL_MANAGER_PRIORITY if kind in available]
     return active or fallback
 
 
@@ -749,6 +768,9 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session["goal_context_recent_limit"] = max(1, int(session.get("goal_context_recent_limit", 2) or 2))
     # agent_priority: ordered list with an optional border marker that disables entries below it
     session["agent_priority"] = normalize_agent_priority(session.get("agent_priority"))
+    # goal_manager_priority is role-scoped. External providers are supported when
+    # explicitly placed above the divider, but the default runnable set is native only.
+    session["goal_manager_priority"] = normalize_goal_manager_priority(session.get("goal_manager_priority"))
     # session_priority: 0–100, higher means more important (default 50)
     try:
         session["session_priority"] = max(0, min(100, int(session.get("session_priority", 50))))

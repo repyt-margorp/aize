@@ -29,6 +29,7 @@ from ._core import (
     write_state,
     digest_token,
     normalize_agent_priority,
+    normalize_goal_manager_priority,
     ensure_session_storage_unlocked,
     normalize_auto_compact_threshold_left_percent,
     normalize_username,
@@ -774,6 +775,7 @@ def update_session_goal_flags(
     auto_resume_enabled: Any | None = None,
     auto_resume_interval_seconds: Any | None = None,
     agent_priority: Any | None = None,
+    goal_manager_priority: Any | None = None,
     session_priority: Any | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
@@ -866,6 +868,8 @@ def update_session_goal_flags(
                     talk["preferred_provider"] = provider if provider in set(NATIVE_PROVIDER_KINDS) else "codex"
                 if agent_priority is not None:
                     talk["agent_priority"] = normalize_agent_priority(agent_priority)
+                if goal_manager_priority is not None:
+                    talk["goal_manager_priority"] = normalize_goal_manager_priority(goal_manager_priority)
                 if session_priority is not None:
                     try:
                         talk["session_priority"] = max(0, min(100, int(session_priority)))

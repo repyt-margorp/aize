@@ -63,6 +63,7 @@ from runtime.persistent_state import (
     get_history as get_user_history,
     get_session_settings,
     active_agent_priority,
+    active_goal_manager_priority,
     lease_session_service,
     load_agent_audit_state,
     load_codex_session,
@@ -118,6 +119,22 @@ def _provider_from_service_id(service_id: str, *, default: str = "codex") -> str
         if provider in normalized:
             return provider
     return default
+
+
+def _resolve_audit_state_after_goal_manager_compact(
+    audit_state: str | None,
+    compact_event: dict[str, Any] | None,
+) -> str:
+    normalized_audit_state = str(audit_state or "").strip().lower() or "all_clear"
+    if normalized_audit_state not in {"needs_compact", "panic"}:
+        return normalized_audit_state
+    if compact_event is None:
+        return "panic" if normalized_audit_state == "needs_compact" else normalized_audit_state
+    if str(compact_event.get("type") or "").strip() == "service.goal_manager_compact_failed":
+        return "panic"
+    if str(compact_event.get("compaction") or "").strip() == "suppressed_by_session_setting":
+        return "needs_compact" if normalized_audit_state == "needs_compact" else normalized_audit_state
+    return "all_clear"
 
 
 def _materialize_goal_child_sessions(
@@ -703,6 +720,40 @@ def run_agent_service(
             if isinstance(s.get("service_id"), str) and s.get("kind") == kind
         ]
 
+    def _available_dispatch_kinds(*, include_external: bool) -> set[str]:
+        native_kinds = {"codex", "claude", "gemini"}
+        kinds: set[str] = set(native_kinds)
+        if not include_external:
+            return kinds
+        for service in list_service_records(runtime_root):
+            if not isinstance(service, dict):
+                continue
+            kind = str(service.get("kind") or "").strip().lower()
+            service_id_value = str(service.get("service_id") or "").strip()
+            status = str(service.get("status") or "").strip().lower()
+            if kind and service_id_value and status == "running":
+                kinds.add(kind)
+        for service in manifest.get("services", []):
+            if not isinstance(service, dict):
+                continue
+            kind = str(service.get("kind") or "").strip().lower()
+            if kind and isinstance(service.get("service_id"), str):
+                kinds.add(kind)
+        return kinds
+
+    def _priority_allows_external(value: Any) -> bool:
+        if not isinstance(value, list):
+            return False
+        for raw_item in value:
+            item = str(raw_item or "").strip().lower()
+            if item == "boarder":
+                item = "border"
+            if item == "border":
+                return False
+            if item and item not in {"codex", "claude", "gemini"}:
+                return True
+        return False
+
     def resolve_session_dispatch_service(
         *,
         username: str,
@@ -710,7 +761,10 @@ def run_agent_service(
         default_service_id: str | None = None,
     ) -> str | None:
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
-        agent_priority = active_agent_priority(session_settings.get("agent_priority"))
+        agent_priority = active_agent_priority(
+            session_settings.get("agent_priority"),
+            available_kinds=_available_dispatch_kinds(include_external=True),
+        )
         if not agent_priority:
             preferred_provider = (
                 str(session_settings.get("preferred_provider") or self_service.get("kind") or "").strip().lower()
@@ -740,19 +794,32 @@ def run_agent_service(
         session_id: str,
     ) -> str | None:
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
-        preferred_provider = (
-            str(session_settings.get("preferred_provider") or self_service.get("kind") or "").strip().lower()
-            or str(self_service.get("kind") or "codex")
+        goal_manager_priority = active_goal_manager_priority(
+            session_settings.get("goal_manager_priority"),
+            available_kinds=_available_dispatch_kinds(
+                include_external=_priority_allows_external(session_settings.get("goal_manager_priority"))
+            ),
         )
-        pool = _pool_for_kind_from_manifest(preferred_provider)
-        if not pool:
-            return None
-        return lease_session_service(
-            runtime_root,
-            username=username,
-            session_id=session_id,
-            pool_service_ids=pool,
-        )
+        if not goal_manager_priority:
+            preferred_provider = (
+                str(session_settings.get("preferred_provider") or self_service.get("kind") or "").strip().lower()
+                or str(self_service.get("kind") or "codex")
+            )
+            goal_manager_priority = [preferred_provider]
+        current_service_id = str(session_settings.get("service_id") or "").strip()
+        for provider in goal_manager_priority:
+            pool = _pool_for_kind_from_manifest(provider)
+            if current_service_id and current_service_id in pool:
+                return current_service_id
+            leased_service_id = lease_session_service(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                pool_service_ids=pool,
+            )
+            if leased_service_id:
+                return leased_service_id
+        return None
 
     def kickoff_goal_child_session_for_dispatch(
         *,
@@ -856,7 +923,10 @@ def run_agent_service(
 
         # Determine provider kind of the failed service
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
-        agent_priority = active_agent_priority(session_settings.get("agent_priority"))
+        agent_priority = active_agent_priority(
+            session_settings.get("agent_priority"),
+            available_kinds=_available_dispatch_kinds(include_external=True),
+        )
 
         # Determine which kind the failed service is
         failed_kind = str(
@@ -1356,15 +1426,10 @@ def run_agent_service(
                     },
                     history_sink=goal_history_sink,
                 )
-            if resolved_audit_state == "needs_compact":
-                if compact_event is None:
-                    resolved_audit_state = "panic"
-                elif str(compact_event.get("type")) == "service.goal_manager_compact_failed":
-                    resolved_audit_state = "panic"
-                elif str(compact_event.get("compaction")) == "suppressed_by_session_setting":
-                    resolved_audit_state = "needs_compact"
-                else:
-                    resolved_audit_state = "all_clear"
+            resolved_audit_state = _resolve_audit_state_after_goal_manager_compact(
+                resolved_audit_state,
+                compact_event,
+            )
             audit_progress_state = (
                 str(audit["progress_state"]).strip().lower()
                 if audit is not None

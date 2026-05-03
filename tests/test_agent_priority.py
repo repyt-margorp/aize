@@ -9,7 +9,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from runtime.persistent_state_pkg._core import normalize_agent_priority
+from runtime.persistent_state_pkg._core import (
+    active_agent_priority,
+    active_goal_manager_priority,
+    normalize_agent_priority,
+    normalize_goal_manager_priority,
+)
 
 
 class AgentPriorityNormalizationTests(unittest.TestCase):
@@ -23,6 +28,19 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
         self.assertEqual(
             normalize_agent_priority(["claude", "boarder"]),
             ["claude", "border", "codex", "gemini"],
+        )
+
+    def test_agent_priority_can_activate_external_provider_when_available(self) -> None:
+        self.assertEqual(
+            active_agent_priority(["ws-peer", "codex", "border"], available_kinds={"codex", "ws-peer"}),
+            ["ws-peer", "codex"],
+        )
+
+    def test_goal_manager_priority_defaults_to_native_provider_set(self) -> None:
+        self.assertEqual(normalize_goal_manager_priority(None), ["codex", "claude", "gemini", "border"])
+        self.assertEqual(
+            active_goal_manager_priority(["ws-peer", "codex", "border"], available_kinds={"codex", "ws-peer"}),
+            ["ws-peer", "codex"],
         )
 
 

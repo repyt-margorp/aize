@@ -52,6 +52,7 @@ from runtime.providers import provider_supports_context_compaction  # noqa: E402
 from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
 from runtime.compaction import maybe_resume_after_restart  # noqa: E402
 from runtime.agent_service import (  # noqa: E402
+    _resolve_audit_state_after_goal_manager_compact,
     _materialize_goal_child_sessions,
     _extract_user_response_wait_control,
     _should_defer_dispatch_for_completed_goal,
@@ -465,6 +466,19 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert talk is not None
         payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
         self.assertTrue(payload["agent_welcome_enabled"])
+
+    def test_goal_state_response_payload_includes_goal_manager_priority(self) -> None:
+        talk = update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_manager_priority=["ws-peer", "codex", "border"],
+        )
+        assert talk is not None
+
+        payload = goal_state_response_payload(talk, session_id=self.session_id, default_provider="codex")
+
+        self.assertEqual(payload["goal_manager_priority"], ["ws-peer", "codex", "border", "claude", "gemini"])
 
     def test_goal_state_response_payload_includes_session_permissions(self) -> None:
         talk = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
@@ -2396,6 +2410,39 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(audit["request_compact"])
         self.assertEqual(audit["continue_xml"], "")
 
+    def test_successful_goal_manager_compact_clears_panic_audit_state(self) -> None:
+        self.assertEqual(
+            _resolve_audit_state_after_goal_manager_compact(
+                "panic",
+                {
+                    "type": "service.goal_manager_compact_checked",
+                    "compaction": "triggered",
+                    "wait_status": "turn_completed",
+                },
+            ),
+            "all_clear",
+        )
+        self.assertEqual(
+            _resolve_audit_state_after_goal_manager_compact(
+                "needs_compact",
+                {
+                    "type": "service.goal_manager_compact_checked",
+                    "compaction": "suppressed_by_session_setting",
+                },
+            ),
+            "needs_compact",
+        )
+        self.assertEqual(
+            _resolve_audit_state_after_goal_manager_compact(
+                "needs_compact",
+                {
+                    "type": "service.goal_manager_compact_failed",
+                    "compaction": "failed",
+                },
+            ),
+            "panic",
+        )
+
     def test_run_goal_audit_parses_agent_directives(self) -> None:
         record_session_agent_contact(
             self.runtime_root,
@@ -3200,6 +3247,45 @@ exit 1
         self.assertIn("left_percent: 100", proc.stdout)
         self.assertIn("used_percent: 0", proc.stdout)
 
+    def test_compact_codex_session_uses_noninteractive_resume(self) -> None:
+        bin_dir = Path(self.tempdir.name) / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        codex_path = bin_dir / "codex"
+        codex_path.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" > "$CODEX_ARGS_FILE"
+printf '%s\\n' '{"type":"thread.started","thread_id":"session-1"}'
+printf '%s\\n' '{"type":"turn.started"}'
+printf '%s\\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Current state after compaction"}}'
+printf '%s\\n' '{"type":"turn.completed"}'
+""",
+            encoding="utf-8",
+        )
+        codex_path.chmod(0o755)
+        script_path = ROOT / "scripts" / "compact_codex_session.sh"
+        args_file = Path(self.tempdir.name) / "codex-args.txt"
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["CODEX_ARGS_FILE"] = str(args_file)
+        proc = subprocess.run(
+            [str(script_path), "session-1", str(ROOT), "101"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("command_status: accepted", proc.stdout)
+        self.assertIn("compaction: triggered", proc.stdout)
+        self.assertIn("wait_status: turn_completed", proc.stdout)
+        self.assertEqual(
+            args_file.read_text(encoding="utf-8").strip(),
+            "exec resume --dangerously-bypass-approvals-and-sandbox --json session-1 /compact",
+        )
+
     def test_goal_audit_history_text_labels_provider_session_explicitly(self) -> None:
         text = goal_audit_history_text(
             {
@@ -3396,8 +3482,9 @@ exit 1
     def test_agent_service_source_mentions_goal_manager_native_dispatch_helper(self) -> None:
         source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
         self.assertIn("def resolve_goal_manager_dispatch_service(", source)
-        self.assertIn('session_settings.get("preferred_provider")', source)
-        self.assertIn("return lease_session_service(", source)
+        self.assertIn('session_settings.get("goal_manager_priority")', source)
+        self.assertIn("active_goal_manager_priority(", source)
+        self.assertIn("leased_service_id = lease_session_service(", source)
 
     def test_agent_service_source_mentions_explicit_goal_followup_targets(self) -> None:
         source = (SRC / "runtime" / "agent_service.py").read_text(encoding="utf-8")
@@ -3856,6 +3943,8 @@ exit 1
         self.assertIn("data-priority-move='up'", source)
         self.assertIn("row.draggable = true;", source)
         self.assertIn("for (const provider of ['codex', 'claude', 'gemini']) {", source)
+        self.assertIn("GoalManager Priority Order", source)
+        self.assertIn("goal_manager_priority: goalManagerPriority", source)
         self.assertIn("worker_service_id", source)
         self.assertIn("goal_worker_service_id", source)
 
@@ -3905,7 +3994,7 @@ exit 1
         self.assertIn("if (replying) return 'Replying';", renderer_source)
         self.assertIn("const goalBoardActivityBadgeClass = (summary) => {", renderer_source)
         self.assertIn("const workerProvider = ['codex', 'claude', 'gemini'].includes(String(worker?.provider || '').trim().toLowerCase()) ? String(worker.provider).trim().toLowerCase() : String(summary?.preferred_provider || 'codex');", renderer_source)
-        self.assertIn("if (kind === 'codex' || kind === 'claude' || kind === 'gemini') active.push(kind);", renderer_source)
+        self.assertIn("if (kind) active.push(kind);", renderer_source)
         self.assertIn("replying_turns", renderer_source)
         self.assertIn("reviewing_turns", renderer_source)
 

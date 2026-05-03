@@ -64,6 +64,7 @@ from runtime.persistent_state import (
     load_agent_audit_state,
     normalize_auto_compact_threshold_left_percent,
     normalize_agent_priority,
+    normalize_goal_manager_priority,
     register_history_subscriber,
     record_session_agent_contact,
     rename_session,
@@ -1826,6 +1827,7 @@ def make_handler(
             ).replace("</", "<\\/")
             initial_preferred_provider = str(session_settings.get("preferred_provider", default_provider))
             initial_agent_priority = normalize_agent_priority(session_settings.get("agent_priority"))
+            initial_goal_manager_priority = normalize_goal_manager_priority(session_settings.get("goal_manager_priority"))
             try:
                 initial_session_priority: int = max(0, min(100, int(session_settings.get("session_priority", 50))))
             except (TypeError, ValueError):
@@ -1930,6 +1932,7 @@ def make_handler(
                     initial_session_permissions_json=initial_session_permissions_json,
                     initial_preferred_provider=initial_preferred_provider,
                     initial_agent_priority=initial_agent_priority,
+                    initial_goal_manager_priority=initial_goal_manager_priority,
                     initial_session_priority=initial_session_priority,
                     initial_goal_manager_state=str(initial_goal_manager_state),
                     initial_agent_welcome_enabled=initial_agent_welcome_enabled,
@@ -2794,6 +2797,7 @@ def make_handler(
                     else None
                 ),
                 agent_priority=payload.get("agent_priority") if "agent_priority" in payload else None,
+                goal_manager_priority=payload.get("goal_manager_priority") if "goal_manager_priority" in payload else None,
                 session_priority=payload.get("session_priority") if "session_priority" in payload else None,
             )
             if not talk:
