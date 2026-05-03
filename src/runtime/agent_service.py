@@ -111,6 +111,32 @@ _USER_RESPONSE_WAIT_RE = re.compile(
     r"<aize_user_response_wait>(?P<body>[\s\S]*?)</aize_user_response_wait>",
     re.IGNORECASE,
 )
+DEFAULT_PROVIDER_SESSION_SLOT = "worker_agent"
+
+
+def _normalize_provider_session_slot(value: Any) -> str:
+    normalized = "".join(
+        ch if ch.isalnum() or ch in {"_", "-", "."} else "_"
+        for ch in str(value or "").strip().lower()
+    ).strip("._-")
+    return normalized or DEFAULT_PROVIDER_SESSION_SLOT
+
+
+def _dispatch_provider_session_slot(message: dict[str, Any], agent_profile: dict[str, Any] | None = None) -> str:
+    if isinstance(agent_profile, dict):
+        for key in ("session_slot", "lot", "role"):
+            raw_value = agent_profile.get(key)
+            if isinstance(raw_value, str) and raw_value.strip():
+                return _normalize_provider_session_slot(raw_value)
+    payload = message.get("payload")
+    reason = ""
+    if isinstance(payload, dict):
+        reason = str(payload.get("reason") or "").strip().lower()
+    if reason == "http_user_dialogue" or message_meta_get(message, "interactive_agent"):
+        return "interactive_agent"
+    if reason == "goal_manager_review":
+        return "goal_manager"
+    return DEFAULT_PROVIDER_SESSION_SLOT
 
 
 def _provider_from_service_id(service_id: str, *, default: str = "codex") -> str:
@@ -2150,6 +2176,8 @@ def run_agent_service(
                         transport="local_dispatch",
                     )
 
+                profile_ephemeral = False
+
                 def emit_provider_event(event: dict[str, Any]) -> None:
                     write_jsonl(
                         log_path,
@@ -2162,7 +2190,11 @@ def run_agent_service(
                             "event": event,
                         },
                     )
-                    if self_service["kind"] == "codex" and event.get("type") == "thread.started":
+                    if (
+                        self_service["kind"] == "codex"
+                        and event.get("type") == "thread.started"
+                        and not profile_ephemeral
+                    ):
                         started_session_id = event.get("thread_id")
                         if isinstance(started_session_id, str) and started_session_id.strip():
                             update_process_fields(
@@ -2209,8 +2241,15 @@ def run_agent_service(
                     agent_profile = message_meta_get(message, "agent_profile")
                     profile_model = ""
                     profile_config: dict[str, Any] = {}
+                    provider_session_slot = _dispatch_provider_session_slot(
+                        message,
+                        agent_profile if isinstance(agent_profile, dict) else None,
+                    )
                     if isinstance(agent_profile, dict):
                         profile_model = str(agent_profile.get("model") or "").strip()
+                        profile_ephemeral = bool(agent_profile.get("ephemeral")) or (
+                            str(agent_profile.get("session_mode") or "").strip().lower() == "ephemeral"
+                        )
                         raw_profile_config = agent_profile.get("config") or agent_profile.get("config_overrides")
                         if isinstance(raw_profile_config, dict):
                             profile_config = {
@@ -2227,11 +2266,14 @@ def run_agent_service(
                         service_id=service_id,
                         username=scope_username,
                         session_id=scope_session_id,
+                        slot=provider_session_slot,
                     )
                     if scope_username and scope_session_id:
                         session_id = scoped_session_id
                     else:
                         session_id = scoped_session_id or process_record.get("codex_session_id")
+                    if profile_ephemeral:
+                        session_id = None
 
                     final_text, provider_events, next_session_id = run_codex(
                         prompt,
@@ -2241,24 +2283,28 @@ def run_agent_service(
                         config_overrides=profile_config,
                         on_event=emit_provider_event,
                     )
-                    update_process_fields(
-                        runtime_root,
-                        process_id=process_id,
-                        fields={"codex_session_id": next_session_id},
-                    )
-                    save_codex_session(
-                        runtime_root,
-                        service_id=service_id,
-                        provider_session_id=next_session_id,
-                        username=scope_username,
-                        session_id=scope_session_id,
-                    )
+                    if not profile_ephemeral:
+                        update_process_fields(
+                            runtime_root,
+                            process_id=process_id,
+                            fields={"codex_session_id": next_session_id},
+                        )
+                        save_codex_session(
+                            runtime_root,
+                            service_id=service_id,
+                            provider_session_id=next_session_id,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            slot=provider_session_slot,
+                        )
                 elif self_service["kind"] == "claude":
+                    provider_session_slot = _dispatch_provider_session_slot(message)
                     scoped_claude_session_id = load_claude_session(
                         runtime_root,
                         service_id=service_id,
                         username=scope_username,
                         session_id=scope_session_id,
+                        slot=provider_session_slot,
                     )
                     final_text, provider_events, next_session_id = run_claude(
                         prompt,
@@ -2272,13 +2318,16 @@ def run_agent_service(
                         provider_session_id=next_session_id,
                         username=scope_username,
                         session_id=scope_session_id,
+                        slot=provider_session_slot,
                     )
                 elif self_service["kind"] == "gemini":
+                    provider_session_slot = _dispatch_provider_session_slot(message)
                     scoped_gemini_session_id = load_gemini_session(
                         runtime_root,
                         service_id=service_id,
                         username=scope_username,
                         session_id=scope_session_id,
+                        slot=provider_session_slot,
                     )
                     final_text, provider_events, next_session_id = run_gemini(
                         prompt,
@@ -2293,6 +2342,7 @@ def run_agent_service(
                         provider_session_id=next_session_id,
                         username=scope_username,
                         session_id=scope_session_id,
+                        slot=provider_session_slot,
                     )
                 else:
                     raise RuntimeError(f"unsupported kind: {self_service['kind']}")

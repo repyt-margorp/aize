@@ -208,6 +208,7 @@ class AppLauncherTests(unittest.TestCase):
             self.assertTrue(app["launcher"]["communication_agent_enabled"])
             self.assertEqual(app["launcher"]["communication_agent_priority"][0]["provider"], "codex")
             self.assertEqual(app["launcher"]["communication_agent_priority"][0]["profile"], "interactive-fast")
+            self.assertEqual(app["launcher"]["communication_agent_priority"][0]["session_slot"], "interactive_agent")
             session = launched["session"]
             stored = get_session_settings(runtime_root, username="repyt", session_id=str(session["session_id"]))
             self.assertIsNotNone(stored)
@@ -215,6 +216,7 @@ class AppLauncherTests(unittest.TestCase):
             self.assertTrue(stored["session_interactive"])
             self.assertTrue(stored["communication_agent_enabled"])
             self.assertEqual(stored["communication_agent_priority"][0]["provider"], "codex")
+            self.assertEqual(stored["communication_agent_priority"][0]["session_slot"], "interactive_agent")
             self.assertEqual(stored["communication_agent_priority"][0]["config"]["model_reasoning_effort"], "low")
 
     def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:

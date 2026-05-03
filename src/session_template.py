@@ -171,6 +171,11 @@ def _normalize_provider_profile_priority(value: Any) -> list[Any]:
                 continue
             entry = dict(item)
             entry["provider"] = provider
+            for slot_key in ("session_slot", "lot"):
+                slot_text = str(item.get(slot_key) or "").strip().lower()
+                if slot_text:
+                    entry["session_slot"] = slot_text
+                    break
         else:
             provider = str(item or "").strip().lower()
             if provider not in VALID_PROVIDERS:
@@ -391,6 +396,10 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
     communication_agent_priority = _normalize_provider_profile_priority(
         launcher.get("communication_agent_priority") or communication.get("agent_priority")
     )
+    if communication_agent_enabled:
+        for priority_item in communication_agent_priority:
+            if isinstance(priority_item, dict) and not str(priority_item.get("session_slot") or "").strip():
+                priority_item["session_slot"] = "interactive_agent"
     default_label = str(launcher.get("default_label") or descriptor.get("display_name") or template_id).strip() or template_id
     unit_kind = str(descriptor.get("unit_kind") or descriptor.get("kind") or "session").strip().lower() or "session"
     instance_policy = str(descriptor.get("instance_policy") or launcher.get("instance_policy") or "multi").strip().lower() or "multi"

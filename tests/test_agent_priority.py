@@ -50,11 +50,12 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
         priority = normalize_agent_profile_priority(
             [
                 {
-                    "provider": "codex",
-                    "profile": "interactive-fast",
-                    "model": "gpt-5.5",
-                    "reasoning_effort": "low",
-                    "verbosity": "low",
+                "provider": "codex",
+                "profile": "interactive-fast",
+                "model": "gpt-5.5",
+                "session_slot": "interactive_agent",
+                "reasoning_effort": "low",
+                "verbosity": "low",
                 },
                 "border",
                 "claude",
@@ -66,6 +67,7 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
                 "provider": "codex",
                 "profile": "interactive-fast",
                 "model": "gpt-5.5",
+                "session_slot": "interactive_agent",
                 "config": {
                     "model_reasoning_effort": "low",
                     "model_verbosity": "low",
@@ -78,6 +80,7 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
         priority = normalize_agent_profile_priority(DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY)
         self.assertEqual(priority[0]["provider"], "codex")
         self.assertEqual(priority[0]["model"], "gpt-5.5")
+        self.assertEqual(priority[0]["session_slot"], "interactive_agent")
         self.assertEqual(priority[0]["config"]["model_reasoning_effort"], "low")
 
 

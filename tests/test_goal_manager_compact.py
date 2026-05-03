@@ -47,6 +47,7 @@ from kernel.lifecycle import init_lifecycle_state, register_process  # noqa: E40
 from kernel.auth import bootstrap_root_user, has_users as auth_has_users, resolve_user_record, verify_user_password  # noqa: E402
 from kernel.registry import init_registry, update_service_process  # noqa: E402
 from runtime.providers.claude import normalize_claude_stream_event, run_claude  # noqa: E402
+from runtime.providers.codex import run_codex  # noqa: E402
 from runtime.providers.gemini import run_gemini  # noqa: E402
 from runtime.providers import provider_supports_context_compaction  # noqa: E402
 from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
@@ -56,6 +57,7 @@ from runtime.agent_service import (  # noqa: E402
     _materialize_goal_child_sessions,
     _extract_user_response_wait_control,
     _should_defer_dispatch_for_completed_goal,
+    _dispatch_provider_session_slot,
 )
 from runtime.http_handler import _process_due_auto_resume_session, _process_due_scheduled_app_launch  # noqa: E402
 from runtime.ui_history import build_session_ui_history  # noqa: E402
@@ -81,6 +83,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     load_goal_manager_pending_inputs,
     lease_session_service,
     load_service_pending_inputs,
+    load_codex_session,
     list_codex_sessions,
     load_pending_inputs,
     join_session_agent,
@@ -475,7 +478,11 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         self.assertTrue(service_state_path.exists())
         payload = json.loads(service_state_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["codex_session_id"], "thread-123")
+        self.assertNotIn("codex_session_id", payload)
+        self.assertEqual(
+            payload["provider_sessions"]["worker_agent"]["codex_session_id"],
+            "thread-123",
+        )
 
     def test_goal_state_response_payload_includes_agent_welcome_toggle(self) -> None:
         talk = update_session_goal_flags(
@@ -1376,6 +1383,119 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(any(entry.get("event_type") == "service.goal_audit_started" for entry in history))
         self.assertTrue(any(entry.get("event_type") == "service.goal_audit_completed" for entry in history))
         self.assertFalse(any(entry.get("text") == "old aggregate only" for entry in history))
+
+    def test_build_session_ui_history_includes_provider_agent_message_delta(self) -> None:
+        service_id = "service-codex-001"
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=service_id,
+            provider="codex",
+            role="interactive_agent",
+            transport="http_user_dialogue",
+        )
+        (self.runtime_root / "logs" / f"{service_id}.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "service.event",
+                            "ts": "2026-04-06T10:00:01Z",
+                            "service_id": service_id,
+                            "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
+                            "event": {"type": "agent_message.delta", "delta": "hel"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "service.event",
+                            "ts": "2026-04-06T10:00:02Z",
+                            "service_id": service_id,
+                            "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
+                            "event": {
+                                "type": "item.completed",
+                                "item": {"type": "agent_message", "text": "hello"},
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        history = build_session_ui_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            limit=20,
+        )
+
+        self.assertTrue(any(entry.get("event_type") == "agent_message.delta" and entry.get("text") == "hel" for entry in history))
+        self.assertTrue(any(entry.get("event_type") == "item.completed" and entry.get("text") == "hello" for entry in history))
+
+    def test_provider_sessions_are_scoped_by_agent_lot(self) -> None:
+        service_id = "service-codex-001"
+        save_codex_session(
+            self.runtime_root,
+            service_id=service_id,
+            provider_session_id="goal-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        save_codex_session(
+            self.runtime_root,
+            service_id=service_id,
+            provider_session_id="interactive-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="interactive_agent",
+        )
+
+        self.assertEqual(
+            load_codex_session(
+                self.runtime_root,
+                service_id=service_id,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                slot="worker_agent",
+            ),
+            "goal-thread",
+        )
+        self.assertEqual(
+            load_codex_session(
+                self.runtime_root,
+                service_id=service_id,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                slot="interactive_agent",
+            ),
+            "interactive-thread",
+        )
+        self.assertEqual(
+            load_codex_session(
+                self.runtime_root,
+                service_id=service_id,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            "goal-thread",
+        )
+
+    def test_dispatch_provider_session_slot_uses_system_roles(self) -> None:
+        self.assertEqual(
+            _dispatch_provider_session_slot({"payload": {"reason": "http_user_dialogue"}}),
+            "interactive_agent",
+        )
+        self.assertEqual(
+            _dispatch_provider_session_slot({"payload": {"reason": "goal_manager_review"}}),
+            "goal_manager",
+        )
+        self.assertEqual(_dispatch_provider_session_slot({"payload": {"reason": "http_prompt"}}), "worker_agent")
 
     def test_persisted_goal_manager_runtime_state_reads_state_file(self) -> None:
         state_path = session_goal_manager_state_path(
@@ -2976,6 +3096,110 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual([event["provider"] for event in seen], ["claude", "claude"])
         self.assertEqual(events[0]["type"], "claude.assistant.tool_use")
         self.assertEqual(events[0]["tool_name"], "StructuredOutput")
+
+    def test_run_codex_coerces_minimal_reasoning_effort_when_tools_are_available(self) -> None:
+        seen_cmds: list[list[str]] = []
+
+        class FakeProc:
+            def __init__(self, cmd: list[str]) -> None:
+                seen_cmds.append(list(cmd))
+                self.stdout = StringIO(
+                    "\n".join(
+                        [
+                            json.dumps({"type": "thread.started", "thread_id": "codex-session-2"}),
+                            json.dumps(
+                                {
+                                    "type": "item.completed",
+                                    "item": {
+                                        "type": "agent_message",
+                                        "text": '{"assistant_text":"ok","spawn_requests":[]}',
+                                    },
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n"
+                )
+                self.stderr = StringIO("")
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(cmd: list[str], **_: Any) -> FakeProc:
+            return FakeProc(cmd)
+
+        with patch("runtime.providers.codex.subprocess.Popen", side_effect=fake_popen):
+            final_text, events, next_session_id = run_codex(
+                "prompt",
+                session_id="codex-session-1",
+                response_schema_id="service_control_v1",
+                config_overrides={"model_reasoning_effort": "minimal", "model_verbosity": "low"},
+            )
+
+        self.assertEqual(final_text, '{"assistant_text":"ok","spawn_requests":[]}')
+        self.assertEqual(next_session_id, "codex-session-2")
+        self.assertEqual(events[0]["type"], "thread.started")
+        self.assertTrue(seen_cmds)
+        self.assertIn('model_reasoning_effort="low"', seen_cmds[0])
+        self.assertNotIn('model_reasoning_effort="minimal"', seen_cmds[0])
+
+    def test_run_codex_retries_without_session_when_resumed_thread_is_missing(self) -> None:
+        seen_cmds: list[list[str]] = []
+
+        class FakeProc:
+            def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
+                seen_cmds.append(list(cmd))
+                self.stdout = StringIO(stdout_text)
+                self.stderr = StringIO(stderr_text)
+                self._returncode = returncode
+
+            def wait(self) -> int:
+                return self._returncode
+
+        attempts = [
+            {
+                "stdout_text": "",
+                "stderr_text": "ERROR codex_core::session: failed to record rollout items: thread stale-session not found",
+                "returncode": 1,
+            },
+            {
+                "stdout_text": "\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "fresh-session"}),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": '{"assistant_text":"recovered","spawn_requests":[]}',
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                "stderr_text": "",
+                "returncode": 0,
+            },
+        ]
+
+        def fake_popen(cmd: list[str], **_: Any) -> FakeProc:
+            attempt = attempts.pop(0)
+            return FakeProc(cmd, **attempt)
+
+        with patch("runtime.providers.codex.subprocess.Popen", side_effect=fake_popen):
+            final_text, _events, next_session_id = run_codex(
+                "prompt",
+                session_id="stale-session",
+                response_schema_id="service_control_v1",
+            )
+
+        self.assertEqual(final_text, '{"assistant_text":"recovered","spawn_requests":[]}')
+        self.assertEqual(next_session_id, "fresh-session")
+        self.assertEqual(len(seen_cmds), 2)
+        self.assertIn("resume", seen_cmds[0])
+        self.assertNotIn("resume", seen_cmds[1])
+        self.assertNotIn("stale-session", seen_cmds[1])
 
     def test_run_gemini_aggregates_streamed_assistant_message_content(self) -> None:
         class FakeProc:

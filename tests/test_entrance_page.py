@@ -19,7 +19,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("Entrance Chat", page)
         self.assertIn("id='chat-log'", page)
         self.assertIn("/messages?session_id=", page)
-        self.assertIn("Entrance Agent", page)
+        self.assertIn("InteractiveAgent", page)
         self.assertIn("agent_message.delta", page)
         self.assertIn("user", page)
 

@@ -30,6 +30,7 @@ DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
         "provider": "codex",
         "profile": "interactive-fast",
         "model": "gpt-5.5",
+        "session_slot": "interactive_agent",
         "config": {
             "model_reasoning_effort": "low",
             "model_verbosity": "low",
@@ -134,6 +135,16 @@ def normalize_agent_profile_priority(value: Any, *, default_priority: list[Any] 
                 text = str(raw_item.get(key) or "").strip()
                 if text:
                     item[key] = text
+            for slot_key in ("session_slot", "lot"):
+                slot_text = str(raw_item.get(slot_key) or "").strip().lower()
+                if slot_text:
+                    item["session_slot"] = slot_text
+                    break
+            session_mode = str(raw_item.get("session_mode") or "").strip().lower()
+            if session_mode:
+                item["session_mode"] = session_mode
+            if "ephemeral" in raw_item:
+                item["ephemeral"] = bool(raw_item.get("ephemeral"))
             config: dict[str, str] = {}
             for config_key in (
                 "model_reasoning_effort",
@@ -944,6 +955,10 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     for item in session["communication_agent_priority"]:
         if not isinstance(item, dict):
             continue
+        if str(item.get("provider") or "").strip().lower() != AGENT_PRIORITY_BORDER and not str(
+            item.get("session_slot") or ""
+        ).strip():
+            item["session_slot"] = "interactive_agent"
         config = item.get("config")
         if isinstance(config, dict) and config.get("model_reasoning_effort") == "minimal":
             config["model_reasoning_effort"] = "low"

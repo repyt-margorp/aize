@@ -179,6 +179,60 @@ def _make_goal_audit_provider_entry(record: dict[str, Any], *, service_id: str) 
     return None
 
 
+def _make_provider_event_entry(record: dict[str, Any], *, service_id: str) -> dict[str, Any] | None:
+    provider_event = record.get("event")
+    if not isinstance(provider_event, dict):
+        return None
+    provider_type = str(provider_event.get("type") or "").strip()
+    item = provider_event.get("item") if isinstance(provider_event.get("item"), dict) else {}
+    if provider_type == "item.completed" and str(item.get("type") or "") == "agent_message":
+        text = summarize_provider_event(provider_event)
+        if not text:
+            return None
+        return {
+            "direction": "agent",
+            "ts": str(record.get("ts") or ""),
+            "service_id": service_id,
+            "from": service_id,
+            "event_type": "item.completed",
+            "text": text,
+            "event": {
+                "type": "item.completed",
+                "provider_event": provider_event,
+            },
+        }
+    if provider_type == "agent_message.delta":
+        delta = str(provider_event.get("delta") or "").strip()
+        if not delta:
+            return None
+        return {
+            "direction": "event",
+            "ts": str(record.get("ts") or ""),
+            "service_id": service_id,
+            "from": service_id,
+            "event_type": "agent_message.delta",
+            "text": delta,
+            "event": {
+                "type": "agent_message.delta",
+                "delta": delta,
+                "provider_event": provider_event,
+            },
+        }
+    if provider_type in {"thread.started", "turn.started", "turn.completed"}:
+        return {
+            "direction": "event",
+            "ts": str(record.get("ts") or ""),
+            "service_id": service_id,
+            "event_type": provider_type,
+            "text": summarize_provider_event(provider_event),
+            "event": {
+                "type": provider_type,
+                "provider_event": provider_event,
+            },
+        }
+    return None
+
+
 def _make_goal_review_entry(review: dict[str, Any]) -> dict[str, Any]:
     event = dict(review)
     event["type"] = "service.goal_audit_completed"
@@ -268,6 +322,9 @@ def build_session_ui_history(
             record_type = str(record.get("type") or "").strip()
             if record_type == "agent.turn_started":
                 add(_make_turn_started_entry(record, service_id=service_id))
+                continue
+            if record_type == "service.event":
+                add(_make_provider_event_entry(record, service_id=service_id))
                 continue
             if record_type == "service.goal_audit_provider_event":
                 add(_make_goal_audit_provider_entry(record, service_id=service_id))

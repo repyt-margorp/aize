@@ -38,6 +38,7 @@
         "provider": "codex",
         "profile": "interactive-fast",
         "model": "gpt-5.5",
+        "session_slot": "interactive_agent",
         "config": {
           "model_reasoning_effort": "low",
           "model_verbosity": "low"

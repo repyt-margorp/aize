@@ -3586,7 +3586,7 @@ def make_handler(
                     )
                     prompt_kind = "user_dialogue" if communication_agent_enabled else "user_message"
                     dispatch_reason = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
-                    agent_role = "communication_agent" if communication_agent_enabled else "agent"
+                    agent_role = "interactive_agent" if communication_agent_enabled else "agent"
                     agent_transport = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
                     selected_agent_profile: dict[str, Any] | None = None
                     if communication_agent_enabled:
