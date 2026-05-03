@@ -92,6 +92,7 @@ from runtime.persistent_state_pkg import (
 )
 from runtime.providers import run_claude, run_codex, run_gemini
 from runtime.service_control import (
+    build_interactive_prompt,
     build_prompt,
     parse_service_response_with_fallback,
 )
@@ -2041,20 +2042,32 @@ def run_agent_service(
                             },
                         )
                         return
-                    batch_instruction = (
-                        "Respond to the queued talk inputs in order, prioritizing the latest user-visible requirement while preserving relevant pending system context."
-                    )
-                    if batch_has_input_kind(pending_inputs, "restart_resume") or batch_has_input_kind(pending_inputs, "scheduled_resume"):
-                        batch_instruction += (
-                            " If a restart-resume input is present, treat it as an execution-resume directive: continue the interrupted work immediately and do not consume the turn with a status-only acknowledgment."
+                    if provider_session_slot == "interactive_agent":
+                        latest_user_dialogue = next(
+                            (
+                                item
+                                for item in reversed(pending_inputs)
+                                if str(item.get("kind") or "").strip().lower()
+                                in {"user_dialogue", "user_message"}
+                            ),
+                            pending_inputs[-1],
                         )
-                    incoming_text = build_aize_input_batch_xml(
-                        sender_display_name=str(peer_service["display_name"]),
-                        username=scope_username,
-                        session_id=scope_session_id,
-                        inputs=pending_inputs,
-                        instruction=batch_instruction,
-                    )
+                        incoming_text = str(latest_user_dialogue.get("text") or "").strip()
+                    else:
+                        batch_instruction = (
+                            "Respond to the queued talk inputs in order, prioritizing the latest user-visible requirement while preserving relevant pending system context."
+                        )
+                        if batch_has_input_kind(pending_inputs, "restart_resume") or batch_has_input_kind(pending_inputs, "scheduled_resume"):
+                            batch_instruction += (
+                                " If a restart-resume input is present, treat it as an execution-resume directive: continue the interrupted work immediately and do not consume the turn with a status-only acknowledgment."
+                            )
+                        incoming_text = build_aize_input_batch_xml(
+                            sender_display_name=str(peer_service["display_name"]),
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            inputs=pending_inputs,
+                            instruction=batch_instruction,
+                        )
                 else:
                     incoming_text = resolve_payload_text(runtime_root, message)
                 is_user_turn = batch_has_input_kind(incoming_text, "user_message")
@@ -2130,7 +2143,14 @@ def run_agent_service(
                         )
                     return
 
-                prompt = build_prompt(self_service, peer_service, incoming_text, reply_index)
+                if provider_session_slot == "interactive_agent":
+                    prompt = build_interactive_prompt(
+                        text=incoming_text,
+                        username=scope_username or "",
+                        session_id=scope_session_id or "",
+                    )
+                else:
+                    prompt = build_prompt(self_service, peer_service, incoming_text, reply_index)
                 next_session_id: str | None = None
                 provider_events: list[dict[str, Any]] = []
 
@@ -2274,6 +2294,16 @@ def run_agent_service(
                         session_id = scoped_session_id
                     else:
                         session_id = scoped_session_id or process_record.get("codex_session_id")
+                    if provider_session_slot == "interactive_agent" and scope_username and scope_session_id:
+                        worker_session_id = load_codex_session(
+                            runtime_root,
+                            service_id=service_id,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            slot="worker_agent",
+                        )
+                        if worker_session_id and worker_session_id == session_id:
+                            session_id = None
                     if profile_ephemeral:
                         session_id = None
 

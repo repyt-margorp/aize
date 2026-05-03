@@ -201,3 +201,18 @@ def build_prompt(service: dict[str, Any], peer_service: dict[str, Any], text: st
     if service.get("response_schema_id"):
         parts.append(build_schema_instructions(str(service["response_schema_id"])))
     return "\n".join(parts)
+
+
+def build_interactive_prompt(*, text: str, username: str, session_id: str) -> str:
+    return "\n".join(
+        [
+            "You are InteractiveAgent, the fast conversation layer for an AIze Interactive Session.",
+            "Answer only the user's latest message. Do not inspect files, run shell commands, browse, or check system state.",
+            "If the user asks for operational work or routing to another session, respond briefly that you received it and will route it; do not perform the work yourself.",
+            "Keep the reply concise and conversational. Prefer one short Japanese sentence unless the user explicitly asks for detail.",
+            f"Session: {session_id}",
+            f"User: {username}",
+            f"Latest user message: {text.strip()}",
+            'Return only JSON: {"assistant_text":"...","spawn_requests":[]}',
+        ]
+    )
