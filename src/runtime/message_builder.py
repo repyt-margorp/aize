@@ -266,6 +266,7 @@ def make_dispatch_pending_message(
     reason: str,
     reply_to_service_id: str = "service-http-001",
     session_agent_id: str | None = None,
+    agent_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     message = make_message(
         from_node_id=manifest["node_id"],
@@ -281,6 +282,8 @@ def make_dispatch_pending_message(
     message_set_meta(message, "reply_to_service_id", reply_to_service_id)
     if isinstance(session_agent_id, str) and session_agent_id.strip():
         message_set_meta(message, "session_agent_id", session_agent_id.strip())
+    if isinstance(agent_profile, dict):
+        message_set_meta(message, "agent_profile", dict(agent_profile))
     if isinstance(auth_context, dict):
         message_set_meta(message, "auth", dict(auth_context))
     return message

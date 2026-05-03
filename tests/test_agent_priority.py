@@ -10,9 +10,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from runtime.persistent_state_pkg._core import (
+    DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY,
     active_agent_priority,
     active_goal_manager_priority,
+    active_agent_profile_priority,
     normalize_agent_priority,
+    normalize_agent_profile_priority,
     normalize_goal_manager_priority,
 )
 
@@ -42,6 +45,40 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
             active_goal_manager_priority(["ws-peer", "codex", "border"], available_kinds={"codex", "ws-peer"}),
             ["ws-peer", "codex"],
         )
+
+    def test_agent_profile_priority_preserves_provider_settings(self) -> None:
+        priority = normalize_agent_profile_priority(
+            [
+                {
+                    "provider": "codex",
+                    "profile": "interactive-fast",
+                    "model": "gpt-5.5",
+                    "reasoning_effort": "minimal",
+                    "verbosity": "low",
+                },
+                "border",
+                "claude",
+            ]
+        )
+        self.assertEqual(
+            priority[0],
+            {
+                "provider": "codex",
+                "profile": "interactive-fast",
+                "model": "gpt-5.5",
+                "config": {
+                    "model_reasoning_effort": "minimal",
+                    "model_verbosity": "low",
+                },
+            },
+        )
+        self.assertEqual(active_agent_profile_priority(priority)[0]["provider"], "codex")
+
+    def test_interactive_profile_default_uses_minimal_codex_reasoning(self) -> None:
+        priority = normalize_agent_profile_priority(DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY)
+        self.assertEqual(priority[0]["provider"], "codex")
+        self.assertEqual(priority[0]["model"], "gpt-5.5")
+        self.assertEqual(priority[0]["config"]["model_reasoning_effort"], "minimal")
 
 
 if __name__ == "__main__":

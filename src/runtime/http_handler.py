@@ -63,6 +63,7 @@ from runtime.persistent_state_pkg import (
     list_sessions,
     load_agent_audit_state,
     normalize_auto_compact_threshold_left_percent,
+    active_agent_profile_priority,
     normalize_agent_priority,
     normalize_goal_manager_priority,
     register_history_subscriber,
@@ -3587,14 +3588,26 @@ def make_handler(
                     dispatch_reason = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
                     agent_role = "communication_agent" if communication_agent_enabled else "agent"
                     agent_transport = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
+                    selected_agent_profile: dict[str, Any] | None = None
                     if communication_agent_enabled:
-                        communication_agent_priority = session_settings.get("communication_agent_priority")
-                        if isinstance(communication_agent_priority, list):
-                            for provider_candidate in communication_agent_priority:
-                                normalized_provider = str(provider_candidate or "").strip().lower()
-                                if normalized_provider in {"codex", "claude", "gemini"}:
-                                    preferred_provider = normalized_provider
-                                    break
+                        communication_agent_priority = active_agent_profile_priority(
+                            session_settings.get("communication_agent_priority")
+                        )
+                        if communication_agent_priority:
+                            selected_agent_profile = dict(communication_agent_priority[0])
+                            normalized_provider = str(selected_agent_profile.get("provider") or "").strip().lower()
+                            if normalized_provider in {"codex", "claude", "gemini"}:
+                                preferred_provider = normalized_provider
+                    else:
+                        agent_profile_priority = active_agent_profile_priority(
+                            session_settings.get("agent_profile_priority")
+                            or session_settings.get("agent_priority")
+                        )
+                        if agent_profile_priority:
+                            selected_agent_profile = dict(agent_profile_priority[0])
+                            normalized_provider = str(selected_agent_profile.get("provider") or "").strip().lower()
+                            if normalized_provider in {"codex", "claude", "gemini"}:
+                                preferred_provider = normalized_provider
                     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
@@ -3762,6 +3775,7 @@ def make_handler(
                                 session_id=session_id,
                                 auth_context=auth_context,
                                 reason=dispatch_reason,
+                                agent_profile=selected_agent_profile,
                             )
                         ):
                             dispatch_error = dispatch_error or "router_control_injection_failed"

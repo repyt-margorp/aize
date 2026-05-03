@@ -146,6 +146,23 @@ def _make_goal_audit_provider_entry(record: dict[str, Any], *, service_id: str) 
                 "goal_audit_job_id": record.get("goal_audit_job_id"),
             },
         }
+    if provider_type == "agent_message.delta":
+        delta = str(provider_event.get("delta") or "").strip()
+        if not delta:
+            return None
+        return {
+            "direction": "event",
+            "ts": str(record.get("ts") or ""),
+            "service_id": service_id,
+            "from": service_id,
+            "event_type": "agent_message.delta",
+            "text": delta,
+            "event": {
+                "type": "agent_message.delta",
+                "delta": delta,
+                "provider_event": provider_event,
+            },
+        }
     if provider_type in {"thread.started", "turn.started", "turn.completed"}:
         return {
             "direction": "event",

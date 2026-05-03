@@ -33,7 +33,17 @@
     "session_ui_mode": "communication",
     "session_interactive": true,
     "communication_agent_enabled": true,
-    "communication_agent_priority": ["codex"],
+    "communication_agent_priority": [
+      {
+        "provider": "codex",
+        "profile": "interactive-fast",
+        "model": "gpt-5.5",
+        "config": {
+          "model_reasoning_effort": "minimal",
+          "model_verbosity": "low"
+        }
+      }
+    ],
     "workspace_scope": "app",
     "auto_select_session": true,
     "auto_send_initial_prompt": false,

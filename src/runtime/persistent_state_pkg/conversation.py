@@ -470,9 +470,9 @@ def create_conversation_session(
             "session_interactive": bool(session_interactive),
             "communication_agent_enabled": bool(communication_agent_enabled),
             "communication_agent_priority": [
-                str(item).strip()
+                dict(item) if isinstance(item, dict) else str(item).strip()
                 for item in (communication_agent_priority or [])
-                if str(item).strip()
+                if isinstance(item, dict) or str(item).strip()
             ],
             "session_permissions": normalized_permissions,
             "auto_resume_enabled": False,

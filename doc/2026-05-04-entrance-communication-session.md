@@ -23,7 +23,21 @@ The `communication` session UI mode marks this intent while remaining compatible
 - `communication_agent_enabled`: turns the quick-response communication agent route on or off.
 - `communication_agent_priority`
 
-When `communication_agent_enabled` is true, normal user prompts are queued as `user_dialogue` and dispatched to the existing AgentService pool with the session role `communication_agent`. This does not introduce a separate process type; Codex, Claude Code, and Gemini workers can all serve as communication agents according to provider priority and normal session agent selection.
+When `communication_agent_enabled` is true, normal user prompts are queued as `user_dialogue` and dispatched to the existing AgentService pool with the session role `communication_agent`. This does not introduce a separate process type; Codex, Claude Code, and Gemini workers can all serve as communication agents according to provider priority and normal session agent selection. Priority entries can be provider strings or provider profile objects, so an interactive session can select `codex` with a specific model and config overrides while leaving unspecified parameters at provider defaults.
+
+Entrance defaults to the `interactive-fast` Codex profile:
+
+```json
+{
+  "provider": "codex",
+  "profile": "interactive-fast",
+  "model": "gpt-5.5",
+  "config": {
+    "model_reasoning_effort": "minimal",
+    "model_verbosity": "low"
+  }
+}
+```
 
 Future work should split the remaining runtime dispatch roles more explicitly:
 

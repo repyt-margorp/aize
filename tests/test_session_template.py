@@ -69,7 +69,17 @@ class AppLauncherTests(unittest.TestCase):
                     "description": "Spawn an interactive communication session",
                     "communication": {
                         "enabled": True,
-                        "agent_priority": ["gemini", "codex"],
+                        "agent_priority": [
+                            {
+                                "provider": "codex",
+                                "profile": "interactive-fast",
+                                "model": "gpt-5.5",
+                                "config": {
+                                    "model_reasoning_effort": "minimal",
+                                },
+                            },
+                            "gemini",
+                        ],
                     },
                     "launcher": {
                         "default_label": "Communication",
@@ -196,14 +206,16 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(app["launcher"]["session_ui_mode"], "communication")
             self.assertTrue(app["launcher"]["session_interactive"])
             self.assertTrue(app["launcher"]["communication_agent_enabled"])
-            self.assertEqual(app["launcher"]["communication_agent_priority"], ["gemini", "codex"])
+            self.assertEqual(app["launcher"]["communication_agent_priority"][0]["provider"], "codex")
+            self.assertEqual(app["launcher"]["communication_agent_priority"][0]["profile"], "interactive-fast")
             session = launched["session"]
             stored = get_session_settings(runtime_root, username="repyt", session_id=str(session["session_id"]))
             self.assertIsNotNone(stored)
             self.assertEqual(stored["session_ui_mode"], "communication")
             self.assertTrue(stored["session_interactive"])
             self.assertTrue(stored["communication_agent_enabled"])
-            self.assertEqual(stored["communication_agent_priority"], ["gemini", "codex"])
+            self.assertEqual(stored["communication_agent_priority"][0]["provider"], "codex")
+            self.assertEqual(stored["communication_agent_priority"][0]["config"]["model_reasoning_effort"], "minimal")
 
     def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:

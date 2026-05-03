@@ -25,6 +25,20 @@ AGENT_PRIORITY_BORDER = "border"
 NATIVE_PROVIDER_KINDS = ("codex", "claude", "gemini")
 DEFAULT_AGENT_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
 DEFAULT_GOAL_MANAGER_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
+DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
+    {
+        "provider": "codex",
+        "profile": "interactive-fast",
+        "model": "gpt-5.5",
+        "config": {
+            "model_reasoning_effort": "minimal",
+            "model_verbosity": "low",
+        },
+    },
+    AGENT_PRIORITY_BORDER,
+    "claude",
+    "gemini",
+]
 GOAL_MANAGER_USERNAME = "goalmanager"
 DEFAULT_SESSION_UI_MODE = "standard"
 SESSION_UI_MODES = {"standard", "map_only", "communication"}
@@ -103,6 +117,79 @@ def active_agent_priority(value: Any, *, available_kinds: set[str] | None = None
             active.append(item)
     fallback = [kind for kind in DEFAULT_AGENT_PRIORITY if kind in available]
     return active or fallback
+
+
+def normalize_agent_profile_priority(value: Any, *, default_priority: list[Any] | None = None) -> list[dict[str, Any]]:
+    source = value if isinstance(value, list) else (default_priority or DEFAULT_AGENT_PRIORITY)
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    border_seen = False
+    for raw_item in source:
+        if isinstance(raw_item, dict):
+            provider = str(raw_item.get("provider") or raw_item.get("kind") or "").strip().lower()
+            if not provider:
+                continue
+            item: dict[str, Any] = {"provider": provider}
+            for key in ("profile", "model"):
+                text = str(raw_item.get(key) or "").strip()
+                if text:
+                    item[key] = text
+            config: dict[str, str] = {}
+            for config_key in (
+                "model_reasoning_effort",
+                "model_reasoning_summary",
+                "model_verbosity",
+                "reasoning_effort",
+                "verbosity",
+            ):
+                config_value = raw_item.get(config_key)
+                if isinstance(config_value, (str, int, float, bool)) and str(config_value).strip():
+                    normalized_key = {
+                        "reasoning_effort": "model_reasoning_effort",
+                        "verbosity": "model_verbosity",
+                    }.get(config_key, config_key)
+                    config[normalized_key] = str(config_value).strip()
+            raw_config = raw_item.get("config") or raw_item.get("config_overrides")
+            if isinstance(raw_config, dict):
+                for config_key, config_value in raw_config.items():
+                    if isinstance(config_value, (str, int, float, bool)) and str(config_value).strip():
+                        config[str(config_key).strip()] = str(config_value).strip()
+            if config:
+                item["config"] = config
+        else:
+            provider = str(raw_item or "").strip().lower()
+            if not provider:
+                continue
+            item = {"provider": provider}
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider == AGENT_PRIORITY_BORDER:
+            if not border_seen:
+                normalized.append({"provider": AGENT_PRIORITY_BORDER})
+                border_seen = True
+            continue
+        identity = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(item)
+    return normalized or normalize_agent_profile_priority(DEFAULT_AGENT_PRIORITY)
+
+
+def active_agent_profile_priority(
+    value: Any,
+    *,
+    available_kinds: set[str] | None = None,
+    default_priority: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    available = available_kinds or set(NATIVE_PROVIDER_KINDS)
+    active: list[dict[str, Any]] = []
+    for item in normalize_agent_profile_priority(value, default_priority=default_priority):
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider == AGENT_PRIORITY_BORDER:
+            break
+        if provider in available:
+            active.append(dict(item))
+    return active
 
 
 def normalize_goal_manager_priority(value: Any) -> list[str]:
@@ -741,9 +828,16 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session["goal_context_recent_limit"] = max(1, int(session.get("goal_context_recent_limit", 2) or 2))
     # agent_priority: ordered list with an optional border marker that disables entries below it
     session["agent_priority"] = normalize_agent_priority(session.get("agent_priority"))
+    session["agent_profile_priority"] = normalize_agent_profile_priority(
+        session.get("agent_profile_priority") or session.get("agent_priority")
+    )
     # goal_manager_priority is role-scoped. External providers are supported when
     # explicitly placed above the divider, but the default runnable set is native only.
     session["goal_manager_priority"] = normalize_goal_manager_priority(session.get("goal_manager_priority"))
+    session["goal_manager_profile_priority"] = normalize_agent_profile_priority(
+        session.get("goal_manager_profile_priority") or session.get("goal_manager_priority"),
+        default_priority=DEFAULT_GOAL_MANAGER_PRIORITY,
+    )
     # session_priority: 0–100, higher means more important (default 50)
     try:
         session["session_priority"] = max(0, min(100, int(session.get("session_priority", 50))))
@@ -841,13 +935,12 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     else:
         session["communication_agent_enabled"] = bool(session.get("session_interactive", False))
     communication_agent_priority = session.get("communication_agent_priority")
-    if not isinstance(communication_agent_priority, list):
-        communication_agent_priority = []
-    session["communication_agent_priority"] = [
-        str(item).strip()
-        for item in communication_agent_priority
-        if str(item).strip()
-    ]
+    if communication_agent_priority == ["codex"]:
+        communication_agent_priority = DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY
+    session["communication_agent_priority"] = normalize_agent_profile_priority(
+        communication_agent_priority,
+        default_priority=DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY,
+    )
     welcomed_agents = session.get("welcomed_agents")
     if not isinstance(welcomed_agents, list):
         welcomed_agents = []

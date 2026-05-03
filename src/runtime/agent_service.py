@@ -2206,6 +2206,18 @@ def run_agent_service(
                         send_tx(event_message)
 
                 if self_service["kind"] == "codex":
+                    agent_profile = message_meta_get(message, "agent_profile")
+                    profile_model = ""
+                    profile_config: dict[str, Any] = {}
+                    if isinstance(agent_profile, dict):
+                        profile_model = str(agent_profile.get("model") or "").strip()
+                        raw_profile_config = agent_profile.get("config") or agent_profile.get("config_overrides")
+                        if isinstance(raw_profile_config, dict):
+                            profile_config = {
+                                str(key).strip(): value
+                                for key, value in raw_profile_config.items()
+                                if str(key).strip()
+                            }
                     try:
                         process_record = get_process_record(runtime_root, process_id)
                     except KeyError:
@@ -2225,7 +2237,8 @@ def run_agent_service(
                         prompt,
                         session_id=session_id,
                         response_schema_id=self_service.get("response_schema_id"),
-                        model=str((self_service.get("config") or {}).get("model") or "").strip() or None,
+                        model=profile_model or str((self_service.get("config") or {}).get("model") or "").strip() or None,
+                        config_overrides=profile_config,
                         on_event=emit_provider_event,
                     )
                     update_process_fields(

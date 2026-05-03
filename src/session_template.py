@@ -159,6 +159,31 @@ def _normalize_provider_priority(value: Any) -> list[str]:
     return normalized
 
 
+def _normalize_provider_profile_priority(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[Any] = []
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, dict):
+            provider = str(item.get("provider") or item.get("kind") or "").strip().lower()
+            if provider not in VALID_PROVIDERS:
+                continue
+            entry = dict(item)
+            entry["provider"] = provider
+        else:
+            provider = str(item or "").strip().lower()
+            if provider not in VALID_PROVIDERS:
+                continue
+            entry = provider
+        identity = str(entry)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(entry)
+    return normalized
+
+
 def _schedule_occurrence_windows(schedule: dict[str, Any], *, now: datetime) -> dict[str, Any]:
     timezone_name = str(schedule.get("timezone") or "UTC").strip() or "UTC"
     local_zone = ZoneInfo(timezone_name)
@@ -363,7 +388,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
             communication.get("enabled", session_interactive),
         )
     )
-    communication_agent_priority = _normalize_provider_priority(
+    communication_agent_priority = _normalize_provider_profile_priority(
         launcher.get("communication_agent_priority") or communication.get("agent_priority")
     )
     default_label = str(launcher.get("default_label") or descriptor.get("display_name") or template_id).strip() or template_id
@@ -469,7 +494,7 @@ def launch_session_template(
     session_ui_mode = str(launcher.get("session_ui_mode") or "standard").strip().lower() or "standard"
     session_interactive = bool(launcher.get("session_interactive", session_ui_mode == "communication"))
     communication_agent_enabled = bool(launcher.get("communication_agent_enabled", session_interactive))
-    communication_agent_priority = _normalize_provider_priority(launcher.get("communication_agent_priority"))
+    communication_agent_priority = _normalize_provider_profile_priority(launcher.get("communication_agent_priority"))
     session_permissions = dict(launcher.get("session_permissions") or {})
     workspace_scope = _normalize_workspace_scope(launcher.get("workspace_scope"))
 

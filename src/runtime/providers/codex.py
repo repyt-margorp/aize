@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ def run_codex(
     session_id: str | None,
     response_schema_id: str | None,
     model: str | None = None,
+    config_overrides: dict[str, Any] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, list[dict[str, Any]], str | None]:
     def build_cmd(attempt_model: str | None) -> list[str]:
@@ -31,6 +33,8 @@ def run_codex(
             ]
             if attempt_model:
                 cmd.extend(["--model", str(attempt_model)])
+            for key, value in (config_overrides or {}).items():
+                cmd.extend(["-c", f"{key}={json.dumps(str(value))}"])
             cmd.extend([session_id, prompt])
         else:
             cmd = [
@@ -41,6 +45,8 @@ def run_codex(
             ]
             if attempt_model:
                 cmd.extend(["--model", str(attempt_model)])
+            for key, value in (config_overrides or {}).items():
+                cmd.extend(["-c", f"{key}={json.dumps(str(value))}"])
             if response_schema_id:
                 cmd.extend(["--output-schema", str(schema_path(response_schema_id))])
             cmd.append(prompt)
