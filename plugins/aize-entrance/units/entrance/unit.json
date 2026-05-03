@@ -7,7 +7,7 @@
   "lifecycle": "on_demand",
   "restart_policy": "on_failure",
   "display_name": "Entrance",
-  "description": "An InterfaceUnit whose purpose is to help route user feedback to the appropriate AIze SessionUnit.",
+  "description": "An InterfaceUnit and SessionUnit pair that receives user feedback first and has its agent forward it to the appropriate AIze SessionUnit as a UserPrompt.",
   "enabled": true,
   "interfaces": {
     "web": "/units/entrance"
@@ -18,8 +18,8 @@
   "launcher": {
     "create_as_child": true,
     "default_label": "Entrance",
-    "goal_text": "Accept user feedback, identify the appropriate AIze SessionUnit that should receive it, and route the feedback so the target session can continue smoothly.",
-    "initial_prompt": "You are the Entrance session for this AIze system. Your job is to help route user feedback to the appropriate target session and keep the broader session graph moving.",
+    "goal_text": "Receive UserPrompt input addressed to Entrance, identify the appropriate AIze SessionUnit, and submit the user's feedback to that target SessionUnit as a UserPrompt on the user's behalf.",
+    "initial_prompt": "You are the Entrance session for this AIze system. User feedback arrives here first as UserPrompt input. Infer which AIze SessionUnit should receive each input, then forward the user's feedback to that target SessionUnit as a UserPrompt on the user's behalf. Do not ask the user to choose a target unless the destination cannot be inferred from the available session context.",
     "preferred_provider": "codex",
     "selected_agents": [],
     "session_group": "user",
