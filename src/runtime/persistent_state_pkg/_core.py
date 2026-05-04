@@ -1000,10 +1000,33 @@ def _ensure_default_session_unlocked(state: dict[str, Any], username: str) -> st
     normalized = normalize_username(username)
     sessions = _ensure_user_sessions_cache_unlocked(state["_runtime_root"], state, normalized) if "_runtime_root" in state else _conversation_sessions(state).setdefault(normalized, [])
     if sessions:
+        preferred_index: int | None = None
+        fallback_session_id = ""
+        root_group_index: int | None = None
         for session in sessions:
             if isinstance(session, dict):
                 _ensure_session_defaults_unlocked(session)
-        return str(sessions[0]["session_id"])
+        for index, session in enumerate(sessions):
+            if not isinstance(session, dict):
+                continue
+            session_id = str(session.get("session_id") or "").strip()
+            if session_id and not fallback_session_id:
+                fallback_session_id = session_id
+            if session_id == "default":
+                preferred_index = index
+                break
+            if normalized == "root" and root_group_index is None and str(session.get("session_group") or "").strip() == "root":
+                root_group_index = index
+        if preferred_index is None:
+            preferred_index = root_group_index
+        if preferred_index not in (None, 0):
+            sessions.insert(0, sessions.pop(preferred_index))
+        if preferred_index is not None and isinstance(sessions[0], dict):
+            session_id = str(sessions[0].get("session_id") or "").strip()
+            if session_id:
+                return session_id
+        if fallback_session_id:
+            return fallback_session_id
     runtime_root = state["_runtime_root"]
     if not isinstance(runtime_root, Path):
         return "default"

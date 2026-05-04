@@ -89,6 +89,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     join_session_agent,
     record_session_agent_contact,
     release_nonrunnable_session_services,
+    resolve_session_context,
     save_codex_session,
     save_gemini_session,
     session_ui_mode,
@@ -1927,6 +1928,34 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(session_operation_allowed(session, "create_child_session"))
         self.assertFalse(session_operation_allowed(session, "update_goal"))
         self.assertFalse(session_operation_allowed(session, "send_prompt"))
+
+    def test_create_session_keeps_root_auth_bound_to_default_session_when_cache_order_is_drifted(self) -> None:
+        ok, _username = bootstrap_root_user(self.runtime_root, password="root-pass")
+        self.assertTrue(ok)
+        create_session(self.runtime_root, username="root")
+        create_child_conversation_session(
+            self.runtime_root,
+            username="root",
+            parent_session_id="default",
+            label="UI Verify Child",
+            created_by_username="root",
+            created_by_type="user",
+        )
+        default_session = get_session_settings(self.runtime_root, username="root", session_id="default")
+        child_sessions = list_session_children(self.runtime_root, username="root", session_id="default")
+        self.assertEqual(len(child_sessions), 1)
+        child_session = get_session_settings(self.runtime_root, username="root", session_id=child_sessions[0])
+        assert default_session is not None
+        assert child_session is not None
+        state = json.loads(state_path(self.runtime_root).read_text(encoding="utf-8"))
+        state.setdefault("conversation_sessions", {})
+        state["conversation_sessions"]["root"] = [child_session, default_session]
+        state_path(self.runtime_root).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        token = create_session(self.runtime_root, username="root")
+        context = resolve_session_context(self.runtime_root, token)
+        assert context is not None
+        self.assertEqual(context.get("session_id"), "default")
 
     def test_materialize_goal_child_sessions_creates_children_with_goalmanager_provenance(self) -> None:
         dispatched_child_sessions: list[str] = []

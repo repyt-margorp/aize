@@ -1659,6 +1659,17 @@ def make_handler(
             self.end_headers()
             self.wfile.write(data)
 
+        def _html_with_cookie(self, status: int, body: str, token: str | None) -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self._set_session_cookie(token)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def _json(self, status: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -1790,7 +1801,11 @@ def make_handler(
             if path == "/health":
                 return self._do_GET_health(path, query)
             if path == "/diagnostics/ui-probe":
-                return self._html(200, self._render_ui_probe_page(query))
+                requested_session_token = str((query.get("session_token") or [""])[0] or "").strip()
+                body = self._render_ui_probe_page(query)
+                if requested_session_token:
+                    return self._html_with_cookie(200, body, requested_session_token)
+                return self._html(200, body)
             if path == "/peer/ping":
                 return self._do_GET_peer_ping(path, query)
             if path == "/federation/peers":
