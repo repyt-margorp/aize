@@ -2535,9 +2535,14 @@ def run_agent_service(
                     "scope": {"username": scope_username, "session_id": scope_session_id},
                 },
             )
+            response_schema_id = (
+                "service_control_v1"
+                if provider_session_slot == "interactive_agent"
+                else self_service.get("response_schema_id")
+            )
             visible_text, spawn_requests, schema_error = parse_service_response_with_fallback(
                 final_text,
-                self_service.get("response_schema_id"),
+                response_schema_id,
             )
             visible_text, user_response_wait = _extract_user_response_wait_control(visible_text)
             if scope_username and scope_session_id:

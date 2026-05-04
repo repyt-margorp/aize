@@ -27,6 +27,7 @@ from runtime.persistent_state_pkg import (
 from runtime.service_control import (
     build_interactive_prompt,
     build_prompt,
+    extract_agent_message_visible_text,
     parse_service_response,
     parse_service_response_with_fallback,
 )
@@ -109,6 +110,25 @@ class ServiceControlParserTests(unittest.TestCase):
         self.assertEqual(text, "plain text progress update")
         self.assertEqual(spawn_requests, [])
         self.assertIn("invalid JSON output for service_control_v1", str(error))
+
+    def test_parse_service_response_with_fallback_extracts_assistant_text_shape(self) -> None:
+        text, spawn_requests, error = parse_service_response_with_fallback(
+            '{"AssistantText":"本文だけ表示する","spawn_requests":[]}',
+            "service_control_v1",
+        )
+        self.assertEqual(text, "本文だけ表示する")
+        self.assertEqual(spawn_requests, [])
+        self.assertIsNotNone(error)
+
+    def test_extract_agent_message_visible_text_strips_control_json(self) -> None:
+        self.assertEqual(
+            extract_agent_message_visible_text('{"assistant_text":"本文","spawn_requests":[]}'),
+            "本文",
+        )
+        self.assertEqual(
+            extract_agent_message_visible_text('{"AssistantText":"本文","spawn_requests":[]}'),
+            "本文",
+        )
 
     def test_build_prompt_spells_out_spawn_request_shape(self) -> None:
         prompt = build_prompt(

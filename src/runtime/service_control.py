@@ -148,6 +148,37 @@ def parse_service_response(text: str, schema_id: str | None) -> tuple[str, list[
     raise RuntimeError(f"invalid JSON output for {schema_id}: no valid JSON object found")
 
 
+def extract_assistant_text_lenient(text: str) -> str:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return ""
+    candidates: list[Any] = []
+    try:
+        candidates.append(json.loads(stripped))
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(stripped):
+        if char not in "{[":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(stripped, idx)
+        except json.JSONDecodeError:
+            continue
+        candidates.append(parsed)
+    for parsed in candidates:
+        if not isinstance(parsed, dict):
+            continue
+        normalized = {
+            str(key).strip().lower().replace("_", ""): value
+            for key, value in parsed.items()
+        }
+        for key in ("assistanttext", "assistant"):
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
 
 def parse_service_response_with_fallback(
     text: str,
@@ -159,6 +190,9 @@ def parse_service_response_with_fallback(
     except RuntimeError as exc:
         if schema_id is None:
             raise
+        lenient_text = extract_assistant_text_lenient(text)
+        if lenient_text:
+            return lenient_text, [], str(exc)
         return text.strip(), [], str(exc)
 
 
@@ -170,7 +204,7 @@ def extract_agent_message_visible_text(text: str) -> str:
         stripped,
         "service_control_v1",
     )
-    if error is None and visible_text:
+    if visible_text:
         return visible_text
     return stripped
 
