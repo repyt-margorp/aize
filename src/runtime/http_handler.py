@@ -47,6 +47,7 @@ from runtime.message_builder import (
 )
 from runtime.persistent_state_pkg import (
     append_pending_input,
+    append_service_pending_input,
     clear_session_service_runtime,
     create_child_conversation_session,
     create_session,
@@ -111,6 +112,38 @@ DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 HTTP_EVENT_TEXT_LIMIT = 4000
 INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT = 40
+
+
+def _interactive_prompt_needs_worker(text: str) -> bool:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+        return False
+    keywords = (
+        "調べ",
+        "確認",
+        "教えて",
+        "見て",
+        "原因",
+        "状況",
+        "状態",
+        "動いて",
+        "動作",
+        "システム",
+        "サービス",
+        "プロセス",
+        "ログ",
+        "health",
+        "port",
+        "ポート",
+        "running",
+        "status",
+        "what is running",
+    )
+    return any(keyword in normalized for keyword in keywords)
+
+
+def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
+    return f"{service_id}@@{session_id}@@{slot}"
 
 
 def _normalize_session_preferred_provider(
@@ -3763,6 +3796,93 @@ def make_handler(
                         source_text=prompt_text,
                         provider=str(target_kind or preferred_provider),
                     )
+                    worker_dispatch_queued = False
+                    if (
+                        communication_agent_enabled
+                        and isinstance(to_service, str)
+                        and to_service
+                        and _interactive_prompt_needs_worker(prompt_text)
+                    ):
+                        worker_agent_id = _slot_agent_id(to_service, session_id, "worker_agent")
+                        worker_request_id = f"interactive-worker-{int(time.time() * 1000)}"
+                        worker_profile: dict[str, Any] | None = None
+                        worker_priority = active_agent_profile_priority(
+                            session_settings.get("agent_profile_priority")
+                            or session_settings.get("agent_priority")
+                        )
+                        if worker_priority:
+                            worker_profile = dict(worker_priority[0])
+                        else:
+                            worker_profile = {
+                                "provider": str(target_kind or preferred_provider),
+                                "session_slot": "worker_agent",
+                            }
+                        worker_profile["session_slot"] = "worker_agent"
+                        worker_profile.setdefault("model", "gpt-5.4-mini")
+                        worker_profile["session_mode"] = "ephemeral"
+                        worker_profile["ephemeral"] = True
+                        worker_profile.setdefault(
+                            "config",
+                            {"model_reasoning_effort": "low", "model_verbosity": "low"},
+                        )
+                        worker_request_xml = (
+                            f'<aize_worker_request id="{html.escape(worker_request_id, quote=True)}" '
+                            'source_role="interactive_agent" target_role="worker_agent">\n'
+                            f"<user_message>{html.escape(prompt_text)}</user_message>\n"
+                            "<instruction>Investigate the user request using the available system context and tools. "
+                            "Return concise findings for InteractiveAgent to present to the user. "
+                            "Do not ask the user directly.</instruction>\n"
+                            '<resume target_role="interactive_agent" reason="worker_completed" />\n'
+                            "</aize_worker_request>"
+                        )
+                        worker_pending = make_aize_pending_input(
+                            kind="interactive_worker_request",
+                            role="system",
+                            text=worker_request_xml,
+                            submitted_by_username=username,
+                        )
+                        worker_pending["request_id"] = worker_request_id
+                        worker_pending["source_user_text"] = prompt_text
+                        append_service_pending_input(
+                            runtime_root,
+                            service_id=to_service,
+                            agent_id=worker_agent_id,
+                            username=username,
+                            session_id=session_id,
+                            entry=worker_pending,
+                        )
+                        worker_dispatch_queued = send_router_control(
+                            make_dispatch_pending_message(
+                                manifest=manifest,
+                                from_service_id=self_service["service_id"],
+                                to_service_id=to_service,
+                                process_id=process_id,
+                                run_id=manifest["run_id"],
+                                username=username,
+                                session_id=session_id,
+                                auth_context=auth_context,
+                                reason="interactive_worker_request",
+                                session_agent_id=worker_agent_id,
+                                agent_profile=worker_profile,
+                            )
+                        )
+                        append_history(
+                            username,
+                            session_id,
+                            {
+                                "direction": "event",
+                                "ts": utc_ts(),
+                                "session_id": session_id,
+                                "event_type": "interactive.worker_dispatched",
+                                "text": "WorkerAgent started background investigation for InteractiveAgent.",
+                                "event": {
+                                    "type": "interactive.worker_dispatched",
+                                    "request_id": worker_request_id,
+                                    "worker_agent_id": worker_agent_id,
+                                    "queued": worker_dispatch_queued,
+                                },
+                            },
+                        )
                     if isinstance(to_service, str) and to_service:
                         if not send_router_control(
                             make_dispatch_pending_message(
@@ -3793,6 +3913,7 @@ def make_handler(
                             "dispatch_error": dispatch_error,
                             "prompt_kind": prompt_kind,
                             "communication_agent": communication_agent_enabled,
+                            "interactive_worker_dispatched": worker_dispatch_queued,
                             "user_response_request_ids": response_request_ids,
                         },
                     )

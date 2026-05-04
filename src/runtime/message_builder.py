@@ -333,6 +333,7 @@ def dispatch_pending_opens_visible_turn(message: dict[str, Any], incoming_text: 
     return reason not in {
         "goal_feedback",
         "goal_manager_review",
+        "interactive_worker_request",
         "turn_completed",
         "child_session_created",
         "child_session_completed",

@@ -63,6 +63,7 @@ from runtime.persistent_state_pkg import (
     get_history as get_user_history,
     get_session_settings,
     active_agent_priority,
+    active_agent_profile_priority,
     active_goal_manager_priority,
     join_session_agent,
     lease_session_service,
@@ -135,9 +136,34 @@ def _dispatch_provider_session_slot(message: dict[str, Any], agent_profile: dict
         reason = str(payload.get("reason") or "").strip().lower()
     if reason == "http_user_dialogue" or message_meta_get(message, "interactive_agent"):
         return "interactive_agent"
+    if reason == "interactive_worker_result":
+        return "interactive_agent"
     if reason == "goal_manager_review":
         return "goal_manager"
     return DEFAULT_PROVIDER_SESSION_SLOT
+
+
+def _dispatch_reason(message: dict[str, Any]) -> str:
+    payload = message.get("payload")
+    if isinstance(payload, dict):
+        return str(payload.get("reason") or "").strip().lower()
+    return ""
+
+
+def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
+    return f"{service_id}@@{session_id}@@{slot}"
+
+
+def _interactive_resume_xml(*, request_id: str, worker_text: str, source_user_text: str) -> str:
+    return (
+        f'<aize_resume target_role="interactive_agent" source_role="worker_agent" '
+        f'reason="worker_completed" request_id="{html.escape(request_id, quote=True)}">\n'
+        f"<original_user_message>{html.escape(source_user_text)}</original_user_message>\n"
+        f"<worker_result>{html.escape(worker_text)}</worker_result>\n"
+        "<instruction>Summarize the worker result for the user in concise Japanese. "
+        "Do not mention raw XML.</instruction>\n"
+        "</aize_resume>"
+    )
 
 
 def _provider_from_service_id(service_id: str, *, default: str = "codex") -> str:
@@ -1886,6 +1912,11 @@ def run_agent_service(
             }
         scope_username, scope_session_id = resolve_conversation_scope(message)
         provider_session_slot = _dispatch_provider_session_slot(message)
+        dispatch_reason = _dispatch_reason(message)
+        service_pending_only = dispatch_reason in {
+            "interactive_worker_request",
+            "interactive_worker_result",
+        }
 
         def append_scoped_history(entry: dict[str, Any], *, limit: int) -> None:
             if not (scope_username and scope_session_id):
@@ -1924,7 +1955,7 @@ def run_agent_service(
                 )
             ).strip()
             # Quick pre-check (peek, not drain) to skip lock contention for obvious noops
-            session_pending_inputs = load_pending_inputs(
+            session_pending_inputs = [] if service_pending_only else load_pending_inputs(
                 runtime_root,
                 username=scope_username,
                 session_id=scope_session_id,
@@ -1973,7 +2004,10 @@ def run_agent_service(
                 )
                 return
         try:
-            with scope_lock_for(scope_username, scope_session_id):
+            lock_session_id = scope_session_id
+            if provider_session_slot in {"interactive_agent", "worker_agent"}:
+                lock_session_id = f"{scope_session_id}::{provider_session_slot}"
+            with scope_lock_for(scope_username, lock_session_id):
                 goal_manager_review_items: list[dict[str, Any]] = []
                 goal_child_session_request_items: list[dict[str, Any]] = []
                 # Drain pending inputs inside the scope lock to prevent a race where two
@@ -1984,7 +2018,7 @@ def run_agent_service(
                         username=scope_username,
                         session_id=scope_session_id,
                     ) or {}
-                    session_pending_inputs = load_pending_inputs(
+                    session_pending_inputs = [] if service_pending_only else load_pending_inputs(
                         runtime_root,
                         username=scope_username,
                         session_id=scope_session_id,
@@ -2014,7 +2048,7 @@ def run_agent_service(
                             },
                         )
                         return
-                    pending_inputs = drain_pending_inputs(
+                    pending_inputs = [] if service_pending_only else drain_pending_inputs(
                         runtime_root,
                         username=scope_username,
                         session_id=scope_session_id,
@@ -2048,7 +2082,7 @@ def run_agent_service(
                                 item
                                 for item in reversed(pending_inputs)
                                 if str(item.get("kind") or "").strip().lower()
-                                in {"user_dialogue", "user_message"}
+                                in {"user_dialogue", "user_message", "interactive_worker_result"}
                             ),
                             pending_inputs[-1],
                         )
@@ -2241,6 +2275,8 @@ def run_agent_service(
                         self_service["kind"] == "claude"
                         and event.get("type") in _claude_internal_event_types
                     ):
+                        return
+                    if dispatch_reason == "interactive_worker_request" and provider_session_slot == "worker_agent":
                         return
                     if scope_username and scope_session_id:
                         event_entry = make_history_event_entry(event, service_id=service_id)
@@ -2501,6 +2537,95 @@ def run_agent_service(
                     },
                     limit=GOAL_AUDIT_HISTORY_LIMIT,
                 )
+            if (
+                dispatch_reason == "interactive_worker_request"
+                and provider_session_slot == "worker_agent"
+                and scope_username
+                and scope_session_id
+            ):
+                request_item = next(
+                    (
+                        item
+                        for item in pending_inputs
+                        if str(item.get("kind") or "").strip().lower() == "interactive_worker_request"
+                    ),
+                    {},
+                )
+                request_id = str(request_item.get("request_id") or uuid.uuid4().hex[:12])
+                source_user_text = str(request_item.get("source_user_text") or "").strip()
+                resume_text = _interactive_resume_xml(
+                    request_id=request_id,
+                    worker_text=visible_text or final_text,
+                    source_user_text=source_user_text,
+                )
+                interactive_agent_id = _slot_agent_id(service_id, scope_session_id, "interactive_agent")
+                resume_entry = make_aize_pending_input(
+                    kind="interactive_worker_result",
+                    role="system",
+                    text=resume_text,
+                )
+                resume_entry["request_id"] = request_id
+                append_service_pending_input(
+                    runtime_root,
+                    service_id=service_id,
+                    agent_id=interactive_agent_id,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                    entry=resume_entry,
+                )
+                session_settings = get_session_settings(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                ) or {}
+                interactive_priority = active_agent_profile_priority(
+                    session_settings.get("communication_agent_priority")
+                )
+                interactive_profile = dict(interactive_priority[0]) if interactive_priority else {
+                    "provider": str(self_service.get("kind") or "codex"),
+                    "session_slot": "interactive_agent",
+                    "session_mode": "ephemeral",
+                    "ephemeral": True,
+                    "config": {"model_reasoning_effort": "none", "model_verbosity": "low"},
+                }
+                interactive_profile["session_slot"] = "interactive_agent"
+                send_tx(
+                    make_dispatch_pending_message(
+                        manifest=manifest,
+                        from_service_id=service_id,
+                        to_service_id=service_id,
+                        process_id=process_id,
+                        run_id=message_meta_get(message, "run_id"),
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        auth_context=message_meta_get(message, "auth")
+                        if isinstance(message_meta_get(message, "auth"), dict)
+                        else None,
+                        reason="interactive_worker_result",
+                        reply_to_service_id=sender_service_id,
+                        session_agent_id=interactive_agent_id,
+                        agent_profile=interactive_profile,
+                    )
+                )
+                append_user_history(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                    entry={
+                        "direction": "event",
+                        "ts": utc_ts(),
+                        "service_id": service_id,
+                        "event_type": "interactive.worker_completed",
+                        "text": "WorkerAgent completed background investigation and resumed InteractiveAgent.",
+                        "event": {
+                            "type": "interactive.worker_completed",
+                            "request_id": request_id,
+                            "interactive_agent_id": interactive_agent_id,
+                        },
+                    },
+                    limit=GOAL_AUDIT_HISTORY_LIMIT,
+                )
+                visible_text = ""
             for control in spawn_requests:
                 spawn_message = make_message(
                     from_node_id=manifest["node_id"],
