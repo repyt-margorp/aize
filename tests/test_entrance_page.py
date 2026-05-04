@@ -32,6 +32,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("/overview?scope=all", page)
         self.assertIn("visibleAssistantText", page)
         self.assertIn("assistanttext", page)
+        self.assertIn("mergeMessages", page)
+        self.assertIn("renderChat([entry])", page)
         self.assertIn("/messages?session_id=", page)
         self.assertIn("InteractiveAgent", page)
         self.assertIn("agent_message.delta", page)
