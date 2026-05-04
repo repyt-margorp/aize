@@ -61,6 +61,8 @@ class ServiceControlParserTests(unittest.TestCase):
         self.assertIn("Worker found the latest diff", prompt)
         self.assertIn("Think normally before answering", prompt)
         self.assertIn("do not inspect files, run shell commands, browse, or use tools", prompt)
+        self.assertIn("WorkerAgent is already running in parallel", prompt)
+        self.assertIn("Do not frame your reply as a future proposal", prompt)
 
     def test_interactive_recent_context_keeps_worker_and_goal_manager_results(self) -> None:
         context = _interactive_recent_context(

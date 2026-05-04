@@ -15,7 +15,44 @@ from pathlib import Path
 ROOT = Path(os.environ.get("AIZE_ROOT", Path(__file__).resolve().parents[2]))
 RUNTIME_ROOT = Path(os.environ.get("AIZE_RUNTIME_ROOT", str(ROOT / ".aize-runtime")))
 HTTP_HOST = os.environ.get("AIZE_HTTP_HOST", "0.0.0.0")
-HTTP_PORT = os.environ.get("AIZE_HTTP_PORT", "4123")
+
+
+def resolve_http_port() -> str:
+    configured = str(os.environ.get("AIZE_HTTP_PORT") or "").strip()
+    if configured:
+        return configured
+    for path in (
+        RUNTIME_ROOT / "state" / "services.json",
+        RUNTIME_ROOT / "manifest.json",
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        services = data.get("services", {})
+        if isinstance(services, dict):
+            service = services.get("service-http-001")
+        elif isinstance(services, list):
+            service = next(
+                (
+                    item
+                    for item in services
+                    if isinstance(item, dict)
+                    and str(item.get("service_id") or item.get("id") or "").strip() == "service-http-001"
+                ),
+                None,
+            )
+        else:
+            service = None
+        port = ((service or {}).get("config") or {}).get("port") if isinstance(service, dict) else None
+        if isinstance(port, int):
+            return str(port)
+        if isinstance(port, str) and port.strip():
+            return port.strip()
+    return "4123"
+
+
+HTTP_PORT = resolve_http_port()
 
 
 def resolve_node_id() -> str:
@@ -111,6 +148,7 @@ def main() -> int:
     before = {name: pgrep(pattern) for name, pattern in PROCESS_PATTERNS.items()}
     report: dict[str, object] = {
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "health_url": HEALTH_URL,
         "before": before,
         "health_before": curl_health()[1],
     }

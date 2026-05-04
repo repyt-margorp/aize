@@ -15,7 +15,7 @@ Entrance adds a communication layer:
 - `EntranceAgent -> target SessionUnit`: inferred forwarding of user feedback as UserPrompt input.
 - `Goal / GoalManager / GoalCompleterAgent`: the longer-running work loop inside the target sessions.
 
-This keeps the user-facing entrypoint responsive. Entrance should acknowledge, answer simple operational questions, or ask a short clarifying question without forcing every user input through the slower goal-completion loop. When the input is intended to advance work elsewhere in AIze, Entrance infers the target SessionUnit and submits the feedback there on the user's behalf.
+This keeps the user-facing entrypoint responsive. Entrance should acknowledge, answer simple operational questions, or ask a short clarifying question without forcing every user input through the slower goal-completion loop. It must not start doing implementation, debugging, or other worker-style task execution itself. When the input is intended to advance work elsewhere in AIze, Entrance infers the target SessionUnit and submits the feedback there on the user's behalf.
 
 The `communication` session UI mode marks this intent while remaining compatible with the existing standard session renderer. Runtime behavior is controlled by:
 

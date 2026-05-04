@@ -9,7 +9,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from runtime.html_renderer import render_entrance_plugin_page
+from runtime.html_renderer import render_entrance_plugin_page, render_main_page
 from runtime.http_handler import (
     _communication_forward_hints,
     _infer_communication_forward_target_session_id,
@@ -26,8 +26,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("id='chat-log'", page)
         self.assertIn("entrance-status-badges", page)
         self.assertIn("renderEntranceState", page)
-        self.assertIn("double-enter-send", page)
-        self.assertIn("Send with double Enter", page)
+        self.assertIn("enter-send", page)
+        self.assertIn("Enter sends message", page)
         self.assertIn("submitEntrancePrompt", page)
         self.assertIn("/overview?scope=all", page)
         self.assertIn("visibleAssistantText", page)
@@ -40,6 +40,81 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("user", page)
         self.assertIn("normalizedText==='response started'", page)
         self.assertIn("eventType==='agent.turn_started'", page)
+
+    def test_main_page_renders_latest_first_workspace_header_and_fixed_composer(self) -> None:
+        page = render_main_page(
+            username="repyt",
+            session_id="session-123",
+            role_name="superuser",
+            is_superuser=True,
+            initial_session_scope="owned",
+            display_name="AIze",
+            default_target="service-codex-001",
+            default_provider="codex",
+            initial_session_map_open=False,
+            entries_json="[]",
+            context_status_json="{}",
+            initial_auto_compact_threshold=20,
+            initial_session_label="WorkspaceView",
+            initial_goal_text="Ship the WorkspaceView refresh",
+            initial_active_goal_id="goal-1",
+            initial_goal_history_json="[]",
+            initial_goal_active=True,
+            initial_goal_completed=False,
+            initial_goal_progress_state="in_progress",
+            initial_goal_audit_state="all_clear",
+            initial_bound_service_id="service-codex-001",
+            default_httpbridge_recent_messages_limit=40,
+            initial_goal_reset_completed_on_prompt=True,
+            initial_goal_auto_compact_enabled=True,
+            initial_auto_resume_enabled=False,
+            initial_auto_resume_interval_seconds=0,
+            initial_auto_resume_next_at="",
+            initial_auto_resume_reason="",
+            initial_user_response_wait_status="idle",
+            initial_user_response_wait_active=False,
+            initial_user_response_wait_timeout_seconds=0,
+            initial_user_response_wait_effective_timeout_seconds=0,
+            initial_user_response_wait_started_at="",
+            initial_user_response_wait_until_at="",
+            initial_user_response_wait_request_id="",
+            initial_user_response_wait_prompt_text="",
+            initial_user_response_wait_reason="",
+            initial_user_response_wait_last_cleared_at="",
+            initial_user_response_wait_last_timeout_at="",
+            initial_session_group="",
+            initial_session_ui_mode="standard",
+            initial_session_permissions_json='{"send_prompt": true}',
+            initial_preferred_provider="codex",
+            initial_agent_priority=[],
+            initial_goal_manager_priority=[],
+            initial_session_priority=0,
+            initial_goal_manager_state="running",
+            initial_agent_welcome_enabled=False,
+            initial_welcomed_agents=[],
+            initial_selected_agents=[],
+            recent_messages_limit_max=200,
+            initial_session_summaries_json="[]",
+            initial_worker_counts_json="{}",
+            initial_latest_user_prompt="",
+            initial_latest_agent_reply="",
+            session_nav_items="",
+            goal_board_items="",
+            sidebar_system_html="",
+            codex_service_pool=["service-codex-001"],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+            items="",
+        )
+
+        self.assertIn("renderSessionStatusStrip", page)
+        self.assertIn("composer-dock", page)
+        self.assertIn("composer-dock-form", page)
+        self.assertIn("list.replaceChildren(...timeline.map", page)
+        self.assertIn("Send to the active ${providerLabel()} service", page)
+        self.assertNotIn("id='session-status-strip'", page)
+        self.assertNotIn("id='composer-dock-meta'", page)
+        self.assertNotIn("Workspace Header", page)
 
     def test_communication_session_settings_detect_interactive_sessions(self) -> None:
         self.assertTrue(_is_communication_session_settings({"session_interactive": True}))
