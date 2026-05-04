@@ -80,14 +80,14 @@ class AgentPriorityNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(active_agent_profile_priority(priority)[0]["provider"], "codex")
 
-    def test_interactive_profile_default_uses_instant_codex_reasoning(self) -> None:
+    def test_interactive_profile_default_uses_codex_default_reasoning(self) -> None:
         priority = normalize_agent_profile_priority(DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY)
         self.assertEqual(priority[0]["provider"], "codex")
         self.assertEqual(priority[0]["model"], "gpt-5.4-mini")
         self.assertEqual(priority[0]["session_slot"], "interactive_agent")
         self.assertEqual(priority[0]["session_mode"], "ephemeral")
         self.assertTrue(priority[0]["ephemeral"])
-        self.assertEqual(priority[0]["config"]["model_reasoning_effort"], "none")
+        self.assertNotIn("config", priority[0])
 
 
 if __name__ == "__main__":

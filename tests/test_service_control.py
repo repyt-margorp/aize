@@ -11,6 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from runtime.agent_service import (
+    _interactive_recent_context,
     maybe_dispatch_panic_recovery_parent_resume,
 )
 from runtime.panic_recovery import ensure_panic_recovery_session
@@ -24,6 +25,7 @@ from runtime.persistent_state_pkg import (
     read_jsonl,
 )
 from runtime.service_control import (
+    build_interactive_prompt,
     build_prompt,
     parse_service_response,
     parse_service_response_with_fallback,
@@ -34,6 +36,56 @@ TEST_USERNAME = "test-user"
 
 
 class ServiceControlParserTests(unittest.TestCase):
+    def test_build_interactive_prompt_includes_recent_session_context(self) -> None:
+        prompt = build_interactive_prompt(
+            text="状況を教えて",
+            username=TEST_USERNAME,
+            session_id="session-1",
+            recent_context=[
+                {
+                    "role": "GoalManager(service-codex-001)",
+                    "ts": "2026-05-04T01:00:00Z",
+                    "text": "GoalManager marked routing incomplete.",
+                },
+                {
+                    "role": "Agent(service-codex-002)",
+                    "ts": "2026-05-04T01:01:00Z",
+                    "text": "Worker found the latest diff in http_handler.py.",
+                },
+            ],
+        )
+
+        self.assertIn("<aize_recent_session_context>", prompt)
+        self.assertIn("GoalManager(service-codex-001)", prompt)
+        self.assertIn("Worker found the latest diff", prompt)
+        self.assertIn("Think normally before answering", prompt)
+        self.assertIn("do not inspect files, run shell commands, browse, or use tools", prompt)
+
+    def test_interactive_recent_context_keeps_worker_and_goal_manager_results(self) -> None:
+        context = _interactive_recent_context(
+            [
+                {"direction": "event", "event_type": "agent.turn_started", "text": "Agent started"},
+                {
+                    "direction": "agent",
+                    "event_type": "service.goal_audit_completed",
+                    "service_id": "service-codex-001",
+                    "text": "Goal still needs routing verification.",
+                    "ts": "2026-05-04T01:00:00Z",
+                },
+                {
+                    "direction": "in",
+                    "service_id": "service-codex-002",
+                    "text": "Worker verified that the target session was not updated.",
+                    "ts": "2026-05-04T01:01:00Z",
+                },
+            ]
+        )
+
+        self.assertEqual(len(context), 2)
+        self.assertEqual(context[0]["role"], "GoalManager(service-codex-001)")
+        self.assertEqual(context[1]["role"], "Agent(service-codex-002)")
+        self.assertIn("target session", context[1]["text"])
+
     def test_parse_service_response_rejects_missing_comma_with_json_decode_shape(self) -> None:
         malformed = '{"assistant_text":"ok" "spawn_requests":[]}'
         with self.assertRaisesRegex(

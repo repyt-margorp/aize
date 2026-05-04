@@ -119,6 +119,72 @@ def _interactive_prompt_needs_worker(text: str) -> bool:
     return bool(normalized)
 
 
+def _communication_forward_hints(text: str) -> set[str]:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+        return set()
+    hints: set[str] = set()
+    if "開発セッション" in text or "開発 session" in normalized or "development session" in normalized:
+        hints.update({"開発", "development", "dev"})
+    if "aize development" in normalized or "aiize development" in normalized:
+        hints.update({"aize", "development"})
+    return hints
+
+
+def _infer_communication_forward_target_session_id(
+    sessions: list[dict[str, Any]],
+    *,
+    current_session_id: str,
+    prompt_text: str,
+) -> str | None:
+    hints = _communication_forward_hints(prompt_text)
+    if not hints:
+        return None
+    scored: list[tuple[int, str]] = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        candidate_session_id = str(session.get("session_id") or "").strip()
+        if not candidate_session_id or candidate_session_id == current_session_id:
+            continue
+        fields = [
+            str(session.get("label") or ""),
+            str(session.get("launcher_display_name") or ""),
+            str(session.get("launcher_template_id") or ""),
+            str(session.get("goal_text") or ""),
+            str(session.get("origin_goal_text") or ""),
+        ]
+        haystack = " ".join(fields).lower()
+        if not haystack:
+            continue
+        score = sum(4 for hint in hints if hint and hint.lower() in haystack)
+        if score <= 0:
+            continue
+        if str(session.get("session_ui_mode") or "").strip().lower() != "communication":
+            score += 2
+        if not bool(session.get("communication_agent_enabled", False)):
+            score += 1
+        scored.append((score, candidate_session_id))
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+
+def _session_record_by_id(sessions: list[dict[str, Any]], session_id: str) -> dict[str, Any] | None:
+    target_session_id = str(session_id or "").strip()
+    if not target_session_id:
+        return None
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        if str(session.get("session_id") or "").strip() == target_session_id:
+            return session
+    return None
+
+
 def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
     return f"{service_id}@@{session_id}@@{slot}"
 
@@ -3564,6 +3630,7 @@ def make_handler(
             def process_prompt_submission() -> None:
                 dispatch_error: str | None = None
                 to_service: str | None = None
+                forwarded_session_id: str | None = None
                 try:
                     previous_session_settings = get_session_settings(
                         runtime_root,
@@ -3643,6 +3710,13 @@ def make_handler(
                             normalized_provider = str(selected_agent_profile.get("provider") or "").strip().lower()
                             if normalized_provider in {"codex", "claude", "gemini"}:
                                 preferred_provider = normalized_provider
+                    visible_sessions = list_sessions(runtime_root, username=username)
+                    if communication_agent_enabled:
+                        forwarded_session_id = _infer_communication_forward_target_session_id(
+                            visible_sessions,
+                            current_session_id=session_id,
+                            prompt_text=prompt_text,
+                        )
                     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
@@ -3683,7 +3757,45 @@ def make_handler(
                         username=username,
                         session_id=session_id,
                     )
-                    if ws_only_mode:
+                    if forwarded_session_id:
+                        target_session = _session_record_by_id(visible_sessions, forwarded_session_id) or {}
+                        target_preferred_provider = _normalize_session_preferred_provider(
+                            target_session,
+                            default_provider=preferred_provider,
+                        )
+                        append_pending_input(
+                            runtime_root,
+                            username=username,
+                            session_id=forwarded_session_id,
+                            entry=make_aize_pending_input(
+                                kind="user_message",
+                                role="user",
+                                text=prompt_text,
+                                submitted_by_username=username,
+                                user_response_request_ids=response_request_ids,
+                            ),
+                        )
+                        to_service = _resolve_dispatch_service_for_session(
+                            runtime_root=runtime_root,
+                            username=username,
+                            session_id=forwarded_session_id,
+                            preferred_provider=target_preferred_provider,
+                            default_provider=default_provider,
+                            current_llm_service_topology=current_llm_service_topology,
+                        )
+                        if to_service:
+                            join_session_agent(
+                                runtime_root,
+                                username=username,
+                                session_id=forwarded_session_id,
+                                service_id=to_service,
+                                provider=str(llm_service_kinds.get(to_service) or target_preferred_provider),
+                                role="agent",
+                                transport="http_prompt",
+                            )
+                        else:
+                            dispatch_error = "forward_target_no_available_provider_worker"
+                    elif ws_only_mode:
                         # No local LLM worker — WS peer handles this session
                         to_service = None
                     elif requested_to_service == default_target and (current_codex_service_pool or current_claude_service_pool or current_gemini_service_pool):
@@ -3733,6 +3845,8 @@ def make_handler(
                     # Determine display target for history entry
                     if ws_only_mode:
                         display_to = "pending:ws_peer"
+                    elif forwarded_session_id:
+                        display_to = f"forward:{forwarded_session_id}"
                     elif to_service:
                         display_to = to_service
                     else:
@@ -3888,6 +4002,8 @@ def make_handler(
                                 },
                             },
                         )
+                    dispatch_session_id = forwarded_session_id or session_id
+                    dispatch_agent_profile = None if forwarded_session_id else selected_agent_profile
                     if isinstance(to_service, str) and to_service:
                         if not send_router_control(
                             make_dispatch_pending_message(
@@ -3897,10 +4013,10 @@ def make_handler(
                                 process_id=process_id,
                                 run_id=manifest["run_id"],
                                 username=username,
-                                session_id=session_id,
+                                session_id=dispatch_session_id,
                                 auth_context=auth_context,
-                                reason=dispatch_reason,
-                                agent_profile=selected_agent_profile,
+                                reason="http_prompt" if forwarded_session_id else dispatch_reason,
+                                agent_profile=dispatch_agent_profile,
                             )
                         ):
                             dispatch_error = dispatch_error or "router_control_injection_failed"

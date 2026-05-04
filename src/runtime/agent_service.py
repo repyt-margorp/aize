@@ -154,6 +154,51 @@ def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
     return f"{service_id}@@{session_id}@@{slot}"
 
 
+def _interactive_recent_context(history: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, str]]:
+    context: list[dict[str, str]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            continue
+        event_type = str(entry.get("event_type") or "").strip()
+        direction = str(entry.get("direction") or "").strip()
+        service_id = str(entry.get("service_id") or entry.get("from") or "").strip()
+        lower_text = text.lower()
+        if event_type in {"agent.turn_started", "item.started", "thread.started", "turn.started"}:
+            continue
+        if lower_text in {"response started", "item.started"} or lower_text.startswith("item.completed: command_execution"):
+            continue
+        role = ""
+        if event_type in {
+            "service.goal_audit_completed",
+            "service.goal_audit_failed",
+            "service.goal_manager_compact_failed",
+            "service.goal_child_session_requests_queued",
+            "service.goal_child_sessions_created",
+        }:
+            role = "GoalManager"
+        elif event_type == "interactive.worker_completed":
+            role = "WorkerAgent"
+        elif direction == "in":
+            role = "Agent"
+        elif direction == "agent" and event_type.startswith("service.goal_"):
+            role = "GoalManager"
+        if not role:
+            continue
+        if service_id:
+            role = f"{role}({service_id})"
+        context.append(
+            {
+                "role": role,
+                "ts": str(entry.get("ts") or ""),
+                "text": text[:1200],
+            }
+        )
+    return context[-max(1, limit):]
+
+
 def _interactive_resume_xml(*, request_id: str, worker_text: str, source_user_text: str) -> str:
     return (
         f'<aize_resume target_role="interactive_agent" source_role="worker_agent" '
@@ -2178,10 +2223,22 @@ def run_agent_service(
                     return
 
                 if provider_session_slot == "interactive_agent":
+                    recent_context = (
+                        _interactive_recent_context(
+                            get_user_history(
+                                runtime_root,
+                                username=scope_username,
+                                session_id=scope_session_id,
+                            )
+                        )
+                        if scope_username and scope_session_id
+                        else []
+                    )
                     prompt = build_interactive_prompt(
                         text=incoming_text,
                         username=scope_username or "",
                         session_id=scope_session_id or "",
+                        recent_context=recent_context,
                     )
                 else:
                     prompt = build_prompt(self_service, peer_service, incoming_text, reply_index)
@@ -2586,7 +2643,6 @@ def run_agent_service(
                     "session_slot": "interactive_agent",
                     "session_mode": "ephemeral",
                     "ephemeral": True,
-                    "config": {"model_reasoning_effort": "none", "model_verbosity": "low"},
                 }
                 interactive_profile["session_slot"] = "interactive_agent"
                 send_tx(

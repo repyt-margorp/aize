@@ -10,7 +10,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from runtime.html_renderer import render_entrance_plugin_page
-from runtime.http_handler import _is_communication_chat_noise, _is_communication_session_settings
+from runtime.http_handler import (
+    _communication_forward_hints,
+    _infer_communication_forward_target_session_id,
+    _is_communication_chat_noise,
+    _is_communication_session_settings,
+)
 
 
 class EntrancePageTests(unittest.TestCase):
@@ -43,6 +48,55 @@ class EntrancePageTests(unittest.TestCase):
         self.assertTrue(_is_communication_chat_noise({"text": " Response Started "}))
         self.assertFalse(_is_communication_chat_noise({"direction": "in", "text": "actual reply"}))
         self.assertFalse(_is_communication_chat_noise({"direction": "out", "text": "user prompt"}))
+
+    def test_communication_forward_hints_detect_development_session_request(self) -> None:
+        self.assertEqual(
+            _communication_forward_hints("この修正を行いたくて、AIze開発セッションの下で開発してください"),
+            {"開発", "development", "dev"},
+        )
+        self.assertEqual(
+            _communication_forward_hints("Please send this to the AIze Development session."),
+            {"aize", "development", "dev", "開発"},
+        )
+        self.assertEqual(_communication_forward_hints("こんにちは"), set())
+
+    def test_infer_communication_forward_target_session_id_prefers_development_session(self) -> None:
+        sessions = [
+            {
+                "session_id": "entrance",
+                "label": "Entrance Verify Clean",
+                "session_ui_mode": "communication",
+                "communication_agent_enabled": True,
+            },
+            {
+                "session_id": "dev",
+                "label": "AIze Development",
+                "session_ui_mode": "standard",
+                "communication_agent_enabled": False,
+            },
+        ]
+        self.assertEqual(
+            _infer_communication_forward_target_session_id(
+                sessions,
+                current_session_id="entrance",
+                prompt_text="この修正を行いたくて、AIze開発セッションの下で開発してください",
+            ),
+            "dev",
+        )
+
+    def test_infer_communication_forward_target_session_id_returns_none_on_tie(self) -> None:
+        sessions = [
+            {"session_id": "entrance", "label": "Entrance", "session_ui_mode": "communication"},
+            {"session_id": "dev-a", "label": "Development A"},
+            {"session_id": "dev-b", "label": "Development B"},
+        ]
+        self.assertIsNone(
+            _infer_communication_forward_target_session_id(
+                sessions,
+                current_session_id="entrance",
+                prompt_text="development session に送ってください",
+            )
+        )
 
 
 if __name__ == "__main__":

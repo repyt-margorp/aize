@@ -33,10 +33,6 @@ DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
         "session_slot": "interactive_agent",
         "session_mode": "ephemeral",
         "ephemeral": True,
-        "config": {
-            "model_reasoning_effort": "none",
-            "model_verbosity": "low",
-        },
     },
     AGENT_PRIORITY_BORDER,
     "claude",

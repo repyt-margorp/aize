@@ -41,11 +41,7 @@
         "model": "gpt-5.4-mini",
         "session_slot": "interactive_agent",
         "session_mode": "ephemeral",
-        "ephemeral": true,
-        "config": {
-          "model_reasoning_effort": "none",
-          "model_verbosity": "low"
-        }
+        "ephemeral": true
       }
     ],
     "workspace_scope": "app",

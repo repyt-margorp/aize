@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import html
 from typing import Any
 
 
@@ -203,19 +204,49 @@ def build_prompt(service: dict[str, Any], peer_service: dict[str, Any], text: st
     return "\n".join(parts)
 
 
-def build_interactive_prompt(*, text: str, username: str, session_id: str) -> str:
+def build_interactive_prompt(
+    *,
+    text: str,
+    username: str,
+    session_id: str,
+    recent_context: list[dict[str, str]] | None = None,
+) -> str:
+    context_lines: list[str] = []
+    for index, item in enumerate(recent_context or [], start=1):
+        role = str(item.get("role") or "Session").strip() or "Session"
+        ts = str(item.get("ts") or "").strip()
+        item_text = str(item.get("text") or "").strip()
+        if not item_text:
+            continue
+        ts_attr = f' ts="{html.escape(ts, quote=True)}"' if ts else ""
+        context_lines.extend(
+            [
+                f'  <entry index="{index}" role="{html.escape(role, quote=True)}"{ts_attr}>',
+                f"    <text>{html.escape(item_text)}</text>",
+                "  </entry>",
+            ]
+        )
+    context_block = "\n".join(
+        [
+            "<aize_recent_session_context>",
+            *(context_lines or ["  <entry role=\"system\"><text>No prior WorkerAgent or GoalManager result is available.</text></entry>"]),
+            "</aize_recent_session_context>",
+        ]
+    )
     return "\n".join(
         [
-            "You are InteractiveAgent, the fast conversation layer for an AIze Interactive Session.",
-            "Answer only the user's latest message. Do not inspect files, run shell commands, browse, or check system state yourself.",
-            "WorkerAgent is started automatically in parallel for user inputs. If you do not know the answer immediately, do not refuse and do not say you cannot answer; say briefly that you will check and share the result when it is ready.",
-            "If the latest message is an <aize_resume> from WorkerAgent, present the worker_result to the user as the follow-up answer. In that case, prioritize the worker_result details over brevity and do not replace concrete findings with a status-only acknowledgement.",
+            "You are InteractiveAgent, the conversation layer for an AIze Interactive Session.",
+            "Think normally before answering, but do not inspect files, run shell commands, browse, or use tools yourself.",
+            "You share the session goal with WorkerAgent and GoalManager. Use the recent session context below before replying, especially WorkerAgent results and GoalManager completion/failure summaries.",
+            "WorkerAgent is started automatically in parallel for user inputs. If the context does not yet contain the needed result, do not refuse and do not guess; say briefly that you will check and share the result when it is ready.",
+            "If the latest message is an <aize_resume> from WorkerAgent, present the worker_result to the user as the follow-up answer. In that case, prioritize the worker_result details and do not replace concrete findings with a status-only acknowledgement.",
             "If the user asks about live system state that needs investigation, say briefly that you will check it and share the result when ready.",
             "For ordinary chat or test messages, answer directly without saying you will route it.",
             "Only mention routing when the user explicitly asks to send work or feedback to another session; do not perform that work yourself.",
-            "Keep the reply concise and conversational. Prefer one short Japanese sentence unless the user explicitly asks for detail.",
+            "Keep the reply concise, but include enough concrete context that the user can tell you understood the session state.",
             f"Session: {session_id}",
             f"User: {username}",
+            context_block,
             f"Latest user message: {text.strip()}",
             'Return only JSON: {"assistant_text":"...","spawn_requests":[]}',
         ]
