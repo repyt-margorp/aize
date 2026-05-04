@@ -1497,6 +1497,60 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         self.assertEqual(_dispatch_provider_session_slot({"payload": {"reason": "http_prompt"}}), "worker_agent")
 
+    def test_goal_manager_compact_falls_back_to_any_saved_codex_session_for_conversation(self) -> None:
+        from runtime.compaction import goal_manager_compact_codex_session
+
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-002",
+            provider_session_id="interactive-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="interactive_agent",
+        )
+
+        with patch("runtime.compaction.run_codex_compaction", return_value=({"type": "service.goal_manager_compact_checked"}, 0)) as compact_mock:
+            event, returncode = goal_manager_compact_codex_session(
+                repo_root=ROOT,
+                runtime_root=self.runtime_root,
+                service_id="service-codex-001",
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(event["type"], "service.goal_manager_compact_checked")
+        compact_mock.assert_called_once()
+        self.assertEqual(compact_mock.call_args.kwargs["session_id"], "interactive-thread")
+
+    def test_manual_compact_falls_back_to_any_saved_codex_session_for_conversation(self) -> None:
+        from runtime.compaction import manual_compact_codex_session
+
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-004",
+            provider_session_id="worker-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+
+        with patch("runtime.compaction.run_codex_compaction", return_value=({"type": "service.manual_compact_checked"}, 0)) as compact_mock:
+            status, payload, history_entry = manual_compact_codex_session(
+                repo_root=ROOT,
+                runtime_root=self.runtime_root,
+                service_id="service-codex-001",
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["session_id"], "worker-thread")
+        self.assertEqual(history_entry["event"]["type"], "service.manual_compact_checked")
+        compact_mock.assert_called_once()
+        self.assertEqual(compact_mock.call_args.kwargs["session_id"], "worker-thread")
+
     def test_persisted_goal_manager_runtime_state_reads_state_file(self) -> None:
         state_path = session_goal_manager_state_path(
             self.runtime_root,
@@ -2321,8 +2375,24 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         assert stored_recovery is not None
         self.assertEqual(stored_recovery.get("session_group"), "error")
+        self.assertEqual(session_ui_mode(stored_recovery), "standard")
         self.assertEqual(stored_recovery.get("recovery_source_session_id"), self.session_id)
         self.assertEqual(stored_recovery.get("parent_session_id"), self.session_id)
+
+    def test_legacy_recovery_session_is_not_map_only(self) -> None:
+        recovery = create_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            label="Recovery: Legacy",
+            session_group="error",
+        )
+        stored = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=str(recovery["session_id"]),
+        )
+        assert stored is not None
+        self.assertEqual(session_ui_mode(stored), "standard")
 
     def test_ensure_state_ignores_legacy_talk_and_auth_session_keys(self) -> None:
         legacy_state_path = state_path(self.runtime_root)

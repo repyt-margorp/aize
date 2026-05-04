@@ -386,6 +386,9 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
     goal_text = str(launcher.get("goal_text") or "").strip()
     session_ui_mode = str(launcher.get("session_ui_mode") or descriptor.get("session_ui_mode") or "standard").strip().lower() or "standard"
     session_interactive = bool(launcher.get("session_interactive", descriptor.get("session_interactive", session_ui_mode == "communication")))
+    goal_completion_policy = str(launcher.get("goal_completion_policy") or descriptor.get("goal_completion_policy") or "standard").strip().lower()
+    if goal_completion_policy not in {"standard", "continuous"}:
+        goal_completion_policy = "standard"
     communication = dict(descriptor.get("communication") or {})
     communication_agent_enabled = bool(
         launcher.get(
@@ -436,6 +439,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
             "session_interactive": session_interactive,
             "communication_agent_enabled": communication_agent_enabled,
             "communication_agent_priority": communication_agent_priority,
+            "goal_completion_policy": goal_completion_policy,
             "session_permissions": session_permissions,
             "workspace_scope": _normalize_workspace_scope(launcher.get("workspace_scope")),
             "ui_url": str(launcher.get("ui_url") or interfaces.get("web") or "").strip(),
@@ -506,6 +510,9 @@ def launch_session_template(
     communication_agent_priority = _normalize_provider_profile_priority(launcher.get("communication_agent_priority"))
     session_permissions = dict(launcher.get("session_permissions") or {})
     workspace_scope = _normalize_workspace_scope(launcher.get("workspace_scope"))
+    goal_completion_policy = str(launcher.get("goal_completion_policy") or "standard").strip().lower()
+    if goal_completion_policy not in {"standard", "continuous"}:
+        goal_completion_policy = "standard"
 
     if mode == "create_session":
         session = create_conversation_session(
@@ -612,6 +619,7 @@ def launch_session_template(
         service_targets=_service_targets(effective_agents, preferred_provider=effective_provider),
         workspace_scope=workspace_scope,
         workspace_path=workspace_path,
+        goal_completion_policy=goal_completion_policy,
     )
     updated_session = get_session_settings(runtime_root, username=normalized_username, session_id=session_id) or session
     return {

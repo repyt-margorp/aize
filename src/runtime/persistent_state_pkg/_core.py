@@ -45,6 +45,8 @@ DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
 GOAL_MANAGER_USERNAME = "goalmanager"
 DEFAULT_SESSION_UI_MODE = "standard"
 SESSION_UI_MODES = {"standard", "map_only", "communication"}
+GOAL_COMPLETION_POLICIES = {"standard", "continuous"}
+CONTINUOUS_GOAL_TEMPLATE_IDS = {"entrance.service", "aize-entrance"}
 SESSION_GROUP_DEFAULT_PERMISSIONS = {
     "root": {
         "create_child_session": True,
@@ -884,11 +886,16 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
             normalized_permissions[operation_name] = bool(default_value)
     session["session_permissions"] = normalized_permissions
     requested_ui_mode = str(session.get("session_ui_mode") or "").strip().lower()
+    is_recovery_session = bool(str(session.get("recovery_source_session_id") or "").strip()) or (
+        group == "error"
+        and str(session.get("label") or "").strip().lower().startswith("recovery:")
+    )
     if requested_ui_mode in SESSION_UI_MODES:
-        session["session_ui_mode"] = requested_ui_mode
+        session["session_ui_mode"] = DEFAULT_SESSION_UI_MODE if is_recovery_session and requested_ui_mode == "map_only" else requested_ui_mode
     elif group == "root" or (
         not bool(normalized_permissions.get("update_goal", True))
         and not bool(normalized_permissions.get("send_prompt", True))
+        and not is_recovery_session
     ):
         session["session_ui_mode"] = "map_only"
     else:
@@ -939,6 +946,14 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("launcher_preferred_provider", "")
     session.setdefault("launcher_workspace_scope", "none")
     session.setdefault("launcher_workspace_path", "")
+    requested_completion_policy = str(session.get("goal_completion_policy") or "").strip().lower()
+    launcher_template_id = str(session.get("launcher_template_id") or "").strip()
+    if requested_completion_policy in GOAL_COMPLETION_POLICIES:
+        session["goal_completion_policy"] = requested_completion_policy
+    elif launcher_template_id in CONTINUOUS_GOAL_TEMPLATE_IDS:
+        session["goal_completion_policy"] = "continuous"
+    else:
+        session["goal_completion_policy"] = "standard"
     if "session_interactive" in session:
         session["session_interactive"] = bool(session.get("session_interactive", False))
     else:
@@ -970,6 +985,19 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session["welcomed_agents"] = [dict(item) for item in welcomed_agents if isinstance(item, dict)]
     session.setdefault("goal_manager_last_reviewed_turn_completed_at", "")
     _ensure_goal_history_unlocked(session)
+    if session["goal_completion_policy"] == "continuous" and str(session.get("goal_text") or "").strip():
+        active_revision = _active_goal_revision_unlocked(session)
+        if active_revision is not None:
+            if (
+                not bool(active_revision.get("goal_active", False))
+                or bool(active_revision.get("goal_completed", False))
+                or str(active_revision.get("goal_progress_state") or "").strip().lower() != "in_progress"
+            ):
+                active_revision["goal_active"] = True
+                active_revision["goal_completed"] = False
+                active_revision["goal_progress_state"] = "in_progress"
+                active_revision["updated_at"] = utc_ts()
+                _apply_active_goal_snapshot_unlocked(session)
 
 
 def _ensure_default_session_unlocked(state: dict[str, Any], username: str) -> str:

@@ -159,6 +159,7 @@ def ensure_panic_recovery_session(
         username=username,
         label=f"Recovery: {source_label or source_session_id}",
         session_group="error",
+        session_ui_mode="standard",
         session_permissions={
             "create_child_session": False,
             "auto_spawn_recovery": False,

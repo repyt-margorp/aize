@@ -865,6 +865,13 @@ def update_session_goal_flags(
                         target_revision["goal_completed"] = (
                             target_revision["goal_progress_state"] == "complete"
                         )
+                    if (
+                        str(talk.get("goal_completion_policy") or "").strip().lower() == "continuous"
+                        and str(target_revision.get("goal_text") or "").strip()
+                    ):
+                        target_revision["goal_active"] = True
+                        target_revision["goal_completed"] = False
+                        target_revision["goal_progress_state"] = "in_progress"
                     target_revision["updated_at"] = utc_ts()
                 if goal_reset_completed_on_prompt is not None:
                     talk["goal_reset_completed_on_prompt"] = bool(goal_reset_completed_on_prompt)
@@ -1841,6 +1848,7 @@ def update_session_launcher_profile(
     service_targets: list[dict[str, str]],
     workspace_scope: str = "none",
     workspace_path: str = "",
+    goal_completion_policy: str = "standard",
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
@@ -1856,6 +1864,10 @@ def update_session_launcher_profile(
                 talk["launcher_selected_agents"] = [str(agent) for agent in selected_agents if str(agent).strip()]
                 talk["launcher_workspace_scope"] = str(workspace_scope or "none").strip().lower() or "none"
                 talk["launcher_workspace_path"] = str(workspace_path or "").strip()
+                completion_policy = str(goal_completion_policy or "standard").strip().lower()
+                talk["goal_completion_policy"] = (
+                    completion_policy if completion_policy in {"standard", "continuous"} else "standard"
+                )
                 talk["launcher_service_targets"] = [
                     {
                         "mode": str(target.get("mode") or "").strip(),
@@ -1866,6 +1878,7 @@ def update_session_launcher_profile(
                     if isinstance(target, dict) and str(target.get("target") or "").strip()
                 ]
                 talk["updated_at"] = utc_ts()
+                _ensure_session_defaults_unlocked(talk)
                 ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
                 return dict(talk)
     return None

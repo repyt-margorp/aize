@@ -41,7 +41,9 @@ from runtime.persistent_state_pkg import (
     resolve_session_agent_id,
     session_goal_manager_reviews_path,
     session_goal_manager_state_path,
+    session_service_state_path,
     session_dir,
+    session_services_dir,
     session_timeline_path,
     update_session_context_status,
     write_json_file,
@@ -57,6 +59,67 @@ from runtime.providers import (
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
+
+
+def _fallback_codex_session_id_for_conversation(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    preferred_service_id: str,
+) -> str | None:
+    service_dir = session_services_dir(runtime_root, username=username, session_id=session_id)
+    if not service_dir.exists():
+        return None
+
+    service_ids: list[str] = []
+    if preferred_service_id:
+        service_ids.append(preferred_service_id)
+    session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+    for candidate in (
+        str(session_settings.get("service_id") or "").strip(),
+        str(session_settings.get("restart_resume_claim_service_id") or "").strip(),
+    ):
+        if candidate and candidate not in service_ids:
+            service_ids.append(candidate)
+    for path in sorted(service_dir.glob("service-*.json")):
+        candidate = path.stem
+        if candidate not in service_ids:
+            service_ids.append(candidate)
+
+    slot_priority = ("interactive_agent", "worker_agent")
+    for candidate_service_id in service_ids:
+        service_state = read_json_file(
+            session_service_state_path(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=candidate_service_id,
+            )
+        )
+        if not isinstance(service_state, dict):
+            continue
+        provider_sessions = service_state.get("provider_sessions")
+        if not isinstance(provider_sessions, dict):
+            continue
+        for slot in slot_priority:
+            slot_state = provider_sessions.get(slot)
+            provider_session_id = (
+                slot_state.get("codex_session_id")
+                if isinstance(slot_state, dict)
+                else None
+            )
+            if isinstance(provider_session_id, str) and provider_session_id.strip():
+                return provider_session_id.strip()
+        for slot_state in provider_sessions.values():
+            provider_session_id = (
+                slot_state.get("codex_session_id")
+                if isinstance(slot_state, dict)
+                else None
+            )
+            if isinstance(provider_session_id, str) and provider_session_id.strip():
+                return provider_session_id.strip()
+    return None
 
 
 def _latest_goal_manager_review(runtime_root: Path, *, username: str, session_id: str) -> dict[str, Any] | None:
@@ -906,12 +969,20 @@ def manual_compact_codex_session(
     username: str,
     session_id: str,
 ) -> tuple[int, dict[str, Any], dict[str, Any] | None]:
+    conversation_session_id = session_id
     session_id = load_codex_session(
         runtime_root,
         service_id=service_id,
         username=username,
-        session_id=session_id,
+        session_id=conversation_session_id,
     )
+    if not session_id:
+        session_id = _fallback_codex_session_id_for_conversation(
+            runtime_root,
+            username=username,
+            session_id=conversation_session_id,
+            preferred_service_id=service_id,
+        )
     if not session_id:
         return (
             409,
@@ -939,12 +1010,20 @@ def goal_manager_compact_codex_session(
     username: str,
     session_id: str,
 ) -> tuple[dict[str, Any], int]:
+    conversation_session_id = session_id
     session_id = load_codex_session(
         runtime_root,
         service_id=service_id,
         username=username,
-        session_id=session_id,
+        session_id=conversation_session_id,
     )
+    if not session_id:
+        session_id = _fallback_codex_session_id_for_conversation(
+            runtime_root,
+            username=username,
+            session_id=conversation_session_id,
+            preferred_service_id=service_id,
+        )
     if not session_id:
         return (
             {

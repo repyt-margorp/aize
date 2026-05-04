@@ -21,7 +21,12 @@ from session_template import (
     list_launchable_session_templates,
     list_registered_session_template_states,
 )
-from runtime.persistent_state_pkg import create_conversation_session, ensure_state, get_session_settings
+from runtime.persistent_state_pkg import (
+    create_conversation_session,
+    ensure_state,
+    get_session_settings,
+    update_session_goal_flags,
+)
 
 
 class AppLauncherTests(unittest.TestCase):
@@ -93,6 +98,7 @@ class AppLauncherTests(unittest.TestCase):
                         "session_ui_mode": "communication",
                         "session_interactive": True,
                         "communication_agent_enabled": True,
+                        "goal_completion_policy": "continuous",
                     },
                 }
             )
@@ -224,6 +230,21 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(stored["communication_agent_priority"][0]["session_mode"], "ephemeral")
             self.assertTrue(stored["communication_agent_priority"][0]["ephemeral"])
             self.assertEqual(stored["communication_agent_priority"][0]["config"]["model_reasoning_effort"], "low")
+            self.assertEqual(stored["goal_completion_policy"], "continuous")
+            self.assertFalse(stored["goal_completed"])
+            update_session_goal_flags(
+                runtime_root,
+                username="repyt",
+                session_id=str(session["session_id"]),
+                goal_completed=True,
+                goal_progress_state="complete",
+            )
+            refreshed = get_session_settings(runtime_root, username="repyt", session_id=str(session["session_id"]))
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertTrue(refreshed["goal_active"])
+            self.assertFalse(refreshed["goal_completed"])
+            self.assertEqual(refreshed["goal_progress_state"], "in_progress")
 
     def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
