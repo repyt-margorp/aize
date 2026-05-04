@@ -1744,10 +1744,12 @@ def make_handler(
             requested_password = ""
             requested_session_token = ""
             requested_provider = ""
+            requested_parent_session_id = ""
             if isinstance(query, dict):
                 requested_password = str((query.get("password") or [""])[0] or "").strip()
                 requested_session_token = str((query.get("session_token") or [""])[0] or "").strip()
                 requested_provider = str((query.get("provider") or [""])[0] or "").strip().lower()
+                requested_parent_session_id = str((query.get("parent_session_id") or [""])[0] or "").strip()
             password = requested_password or "ui-verify-pass"
             provider = requested_provider if requested_provider in {"codex", "claude", "gemini"} else "codex"
             return (
@@ -1757,6 +1759,7 @@ def make_handler(
                 f"const password={json.dumps(password, ensure_ascii=False)};"
                 f"const sessionToken={json.dumps(requested_session_token, ensure_ascii=False)};"
                 f"const provider={json.dumps(provider, ensure_ascii=False)};"
+                f"const parentSessionId={json.dumps(requested_parent_session_id, ensure_ascii=False)};"
                 "const result=document.getElementById('result');"
                 "const parseJson=async (response)=>{const text=await response.text();try{return text?JSON.parse(text):{};}catch(_err){return {raw_text:text};}};"
                 "const postJson=async (path,body)=>{const response=await fetch(path,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:response.status,payload:await parseJson(response)};};"
@@ -1771,12 +1774,15 @@ def make_handler(
                 "if(!(login.status>=200&&login.status<300)) throw new Error('login_failed:'+JSON.stringify(login));"
                 "}else if(!(bootstrap.status>=200&&bootstrap.status<300)) throw new Error('bootstrap_failed:'+JSON.stringify(bootstrap));"
                 "}"
+                "const targetGoalText='Verify HTTPBridge goal save flow updated';"
                 "const rootPage=await getText('/');"
                 "const sessionMarkers=hasUiMarkers(rootPage.text);"
-                "const childSession=await postJson('/sessions',{label:'UI Verify Child'});"
+                "const childSessionPayload={label:'UI Verify Child'};"
+                "if(parentSessionId) childSessionPayload.parent_session_id=parentSessionId;"
+                "const childSession=await postJson('/sessions',childSessionPayload);"
                 "const sessionId=String(childSession.payload?.active_session_id||childSession.payload?.session?.session_id||'').trim();"
                 "if(!sessionId) throw new Error('session_create_failed:'+JSON.stringify(childSession));"
-                "const goalUpdate=await postJson('/session/goal',{session_id:sessionId,goal_text:'Verify HTTPBridge goal save flow'});"
+                "const goalUpdate=await postJson('/session/goal',{session_id:sessionId,goal_text:targetGoalText});"
                 "const providerUpdate=await postJson('/session/goal/state',{session_id:sessionId,preferred_provider:provider});"
                 "const promptSend=await postJson('/message',{session_id:sessionId,text:`UI smoke prompt after restart via ${provider}`,provider});"
                 "const childPage=await getText('/?session_id='+encodeURIComponent(sessionId));"

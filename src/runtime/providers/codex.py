@@ -22,7 +22,9 @@ def _is_thread_not_found_error(text: str, *, session_id: str | None) -> bool:
     if not session_id:
         return False
     lowered = text.lower()
-    return "thread" in lowered and "not found" in lowered
+    return ("thread" in lowered and "not found" in lowered) or (
+        "thread/resume" in lowered and "no rollout found for thread id" in lowered
+    )
 
 
 def _sanitize_config_overrides(config_overrides: dict[str, Any] | None) -> dict[str, Any]:

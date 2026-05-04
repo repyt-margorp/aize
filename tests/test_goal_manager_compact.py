@@ -2999,6 +2999,41 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(audit["goal_audit_session_id"], "claude-audit-session")
         self.assertEqual(audit["goal_audit_provider_session_id"], "claude-audit-session")
 
+    def test_run_goal_audit_falls_back_when_requested_provider_binary_is_missing(self) -> None:
+        seen: list[dict[str, Any]] = []
+        with patch(
+            "runtime.cli_service_adapter.run_gemini",
+            side_effect=FileNotFoundError(2, "No such file or directory", "gemini"),
+        ) as gemini_mock, patch(
+            "runtime.cli_service_adapter.run_codex",
+            return_value=(
+                goal_audit_jsonl({"kind": "goal_state", "progress_state": "complete", "goal_satisfied": True, "summary": "done"}),
+                [],
+                "codex-audit-session",
+            ),
+        ) as codex_mock:
+            audit = run_goal_audit(
+                runtime_root=self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                goal_text="Ship it",
+                history_entries=[],
+                provider_kind="gemini",
+                on_event=seen.append,
+            )
+
+        gemini_mock.assert_called_once()
+        codex_mock.assert_called_once()
+        self.assertEqual(audit["goal_audit_session_id"], "codex-audit-session")
+        self.assertEqual(audit["goal_audit_provider_session_id"], "codex-audit-session")
+        self.assertTrue(
+            any(
+                event.get("type") == "service.goal_audit_provider_unavailable"
+                and event.get("provider") == "gemini"
+                for event in seen
+            )
+        )
+
     def test_manual_compact_clears_audit_state_only_on_successful_checked_event(self) -> None:
         self.assertTrue(
             manual_compact_clears_audit_state(
@@ -3292,6 +3327,64 @@ class GoalManagerCompactTests(unittest.TestCase):
             {
                 "stdout_text": "",
                 "stderr_text": "ERROR codex_core::session: failed to record rollout items: thread stale-session not found",
+                "returncode": 1,
+            },
+            {
+                "stdout_text": "\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "fresh-session"}),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": '{"assistant_text":"recovered","spawn_requests":[]}',
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                "stderr_text": "",
+                "returncode": 0,
+            },
+        ]
+
+        def fake_popen(cmd: list[str], **_: Any) -> FakeProc:
+            attempt = attempts.pop(0)
+            return FakeProc(cmd, **attempt)
+
+        with patch("runtime.providers.codex.subprocess.Popen", side_effect=fake_popen):
+            final_text, _events, next_session_id = run_codex(
+                "prompt",
+                session_id="stale-session",
+                response_schema_id="service_control_v1",
+            )
+
+        self.assertEqual(final_text, '{"assistant_text":"recovered","spawn_requests":[]}')
+        self.assertEqual(next_session_id, "fresh-session")
+        self.assertEqual(len(seen_cmds), 2)
+        self.assertIn("resume", seen_cmds[0])
+        self.assertNotIn("resume", seen_cmds[1])
+        self.assertNotIn("stale-session", seen_cmds[1])
+
+    def test_run_codex_retries_without_session_when_resume_has_no_rollout(self) -> None:
+        seen_cmds: list[list[str]] = []
+
+        class FakeProc:
+            def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
+                seen_cmds.append(list(cmd))
+                self.stdout = StringIO(stdout_text)
+                self.stderr = StringIO(stderr_text)
+                self._returncode = returncode
+
+            def wait(self) -> int:
+                return self._returncode
+
+        attempts = [
+            {
+                "stdout_text": "",
+                "stderr_text": "Error: thread/resume: thread/resume failed: no rollout found for thread id stale-session",
                 "returncode": 1,
             },
             {
