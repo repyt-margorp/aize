@@ -732,6 +732,22 @@ def _history_entry_for_http(entry: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _is_communication_session_settings(settings: dict[str, Any] | None) -> bool:
+    if not isinstance(settings, dict):
+        return False
+    return bool(
+        settings.get("session_interactive")
+        or settings.get("communication_agent_enabled")
+        or str(settings.get("session_ui_mode") or "").strip().lower() == "communication"
+    )
+
+
+def _is_communication_chat_noise(entry: dict[str, Any]) -> bool:
+    event_type = str(entry.get("event_type") or "")
+    text = str(entry.get("text") or "").strip().lower()
+    return event_type in {"agent.turn_started", "thread.started", "turn.started"} or text == "response started"
+
+
 def _entry_service_id(entry: dict[str, Any]) -> str:
     return str(entry.get("service_id") or entry.get("from") or "").strip()
 
@@ -2111,6 +2127,15 @@ def make_handler(
                 limit=limit,
             )
             visible_history = _history_tail_with_latest_goal_cluster(history, limit=limit)
+            session_settings = get_session_settings(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+            ) or {}
+            if _is_communication_session_settings(session_settings):
+                visible_history = [
+                    entry for entry in visible_history if not _is_communication_chat_noise(entry)
+                ]
             self._json(
                 200,
                 {
