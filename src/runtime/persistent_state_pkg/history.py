@@ -96,6 +96,10 @@ def append_history(
     with state_lock(runtime_root):
         timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
         history = [sanitize_history_entry(item) for item in read_jsonl(timeline_path)]
+        # Skip exact replay of the most recent entry. This avoids local append +
+        # HttpBridge event echo writing the same timeline record twice.
+        if history and history[-1] == sanitized_entry:
+            return history
         history.append(sanitized_entry)
         if len(history) > limit:
             # Protect user-visible reply/message entries from being evicted by event flooding.

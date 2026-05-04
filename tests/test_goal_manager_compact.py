@@ -1274,6 +1274,39 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("[truncated", history[0]["text"])
         self.assertIn("[truncated", history[0]["event"]["provider_event"]["item"]["aggregated_output"])
 
+    def test_append_history_skips_exact_duplicate_replay(self) -> None:
+        entry = {
+            "direction": "event",
+            "ts": "2026-03-19T09:00:00Z",
+            "service_id": "service-codex-001",
+            "event_type": "agent.turn_started",
+            "text": "Agent service-codex-001 started responding",
+            "event": {
+                "type": "agent.turn_started",
+                "process_id": "proc-service-codex-001-aaaa1111",
+                "run_id": "system-restart-123",
+                "reply_index": 2,
+            },
+        }
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=entry,
+            limit=500,
+        )
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=dict(entry),
+            limit=500,
+        )
+
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["event"]["run_id"], "system-restart-123")
+
     def test_build_session_ui_history_prefers_runtime_logs_and_goal_reviews(self) -> None:
         append_history(
             self.runtime_root,
