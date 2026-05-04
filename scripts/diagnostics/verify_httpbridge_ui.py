@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlencode
 
+from runtime.persistent_state_pkg.auth import create_session
+
 
 def resolve_base_url(runtime_root: Path) -> str:
     configured = str(os.environ.get("AIZE_HTTP_BASE_URL") or "").strip()
@@ -106,12 +108,29 @@ def run_probe(
     return result
 
 
+def maybe_mint_local_session_token(runtime_root: Path, *, username: str) -> str:
+    persistent_path = runtime_root.parent / ".aize-state" / "persistent.json"
+    if not persistent_path.exists():
+        raise RuntimeError("local_persistent_state_missing")
+    return create_session(runtime_root, username=username)
+
+
+def needs_local_session_fallback(result: dict, *, session_token: str) -> bool:
+    if session_token:
+        return False
+    if bool(result.get("ok")):
+        return False
+    error = str(result.get("error") or "")
+    return "login_failed:" in error or "bootstrap_failed:" in error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify HTTPBridge UI markers and basic post-restart actions via headless Chrome.")
     parser.add_argument("--base-url", default="", help="HTTPBridge base URL; when omitted, resolve from runtime state")
     parser.add_argument("--runtime-root", default=str(Path(os.environ.get("AIZE_RUNTIME_ROOT", Path(__file__).resolve().parents[2] / ".aize-runtime"))), help="Runtime root used when resolving the default base URL")
     parser.add_argument("--password", default="ui-verify-pass", help="Bootstrap password for the temporary verification user")
     parser.add_argument("--session-token", default="", help="Existing bridge_session token to reuse instead of bootstrap/login")
+    parser.add_argument("--username", default="root", help="Local username to mint a fallback bridge_session token for when password bootstrap/login is not reusable")
     parser.add_argument("--provider", default="codex", choices=["codex", "claude", "gemini"], help="Preferred provider to verify through the UI probe")
     parser.add_argument("--chrome-bin", default="/usr/bin/google-chrome", help="Chrome/Chromium binary path")
     parser.add_argument("--timeout-ms", type=int, default=8000, help="Virtual time budget for headless Chrome")
@@ -119,14 +138,31 @@ def main() -> int:
     runtime_root = Path(args.runtime_root).expanduser().resolve()
     base_url = args.base_url.rstrip("/") if args.base_url else resolve_base_url(runtime_root)
 
+    session_token = args.session_token.strip()
+    timeout_ms = max(1000, int(args.timeout_ms))
     result = run_probe(
         chrome_bin=args.chrome_bin,
         base_url=base_url,
         password=args.password,
-        session_token=args.session_token.strip(),
+        session_token=session_token,
         provider=args.provider,
-        timeout_ms=max(1000, int(args.timeout_ms)),
+        timeout_ms=timeout_ms,
     )
+    if needs_local_session_fallback(result, session_token=session_token):
+        session_token = maybe_mint_local_session_token(
+            runtime_root,
+            username=str(args.username or "").strip() or "root",
+        )
+        result = run_probe(
+            chrome_bin=args.chrome_bin,
+            base_url=base_url,
+            password=args.password,
+            session_token=session_token,
+            provider=args.provider,
+            timeout_ms=timeout_ms,
+        )
+        result["auth_fallback"] = "local_session_token"
+        result["auth_username"] = str(args.username or "").strip() or "root"
     result["base_url"] = base_url
     print(json.dumps(result, ensure_ascii=False))
     return 0 if bool(result.get("ok")) else 1
