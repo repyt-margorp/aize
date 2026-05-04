@@ -78,6 +78,10 @@ def run_codex(
                 cmd.extend(["-c", f"{key}={json.dumps(str(value))}"])
             if ephemeral:
                 cmd.append("--ephemeral")
+                cmd.append("--ignore-rules")
+                cmd.append("--ignore-user-config")
+                cmd.extend(["--disable", "image_generation"])
+                cmd.extend(["-c", 'web_search="disabled"'])
             if response_schema_id:
                 cmd.extend(["--output-schema", str(schema_path(response_schema_id))])
             cmd.append(prompt)

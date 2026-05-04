@@ -42,7 +42,7 @@
         "session_mode": "ephemeral",
         "ephemeral": true,
         "config": {
-          "model_reasoning_effort": "low",
+          "model_reasoning_effort": "none",
           "model_verbosity": "low"
         }
       }
