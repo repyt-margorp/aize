@@ -116,30 +116,7 @@ INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT = 40
 
 def _interactive_prompt_needs_worker(text: str) -> bool:
     normalized = " ".join(str(text or "").strip().lower().split())
-    if not normalized:
-        return False
-    keywords = (
-        "調べ",
-        "確認",
-        "教えて",
-        "見て",
-        "原因",
-        "状況",
-        "状態",
-        "動いて",
-        "動作",
-        "システム",
-        "サービス",
-        "プロセス",
-        "ログ",
-        "health",
-        "port",
-        "ポート",
-        "running",
-        "status",
-        "what is running",
-    )
-    return any(keyword in normalized for keyword in keywords)
+    return bool(normalized)
 
 
 def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
@@ -3829,8 +3806,11 @@ def make_handler(
                             f'<aize_worker_request id="{html.escape(worker_request_id, quote=True)}" '
                             'source_role="interactive_agent" target_role="worker_agent">\n'
                             f"<user_message>{html.escape(prompt_text)}</user_message>\n"
-                            "<instruction>Investigate the user request using the available system context and tools. "
-                            "Return concise findings for InteractiveAgent to present to the user. "
+                            "<instruction>Treat this as the main WorkerAgent turn for the interactive session. "
+                            "Advance the session goal or investigate the user request using the available context and tools. "
+                            "Return the concrete answer, findings, or progress for InteractiveAgent to present to the user. "
+                            "Do not return only a status acknowledgement such as checked, confirmed, or completed. "
+                            "If the user asks for a list, include the list. "
                             "Do not ask the user directly.</instruction>\n"
                             '<resume target_role="interactive_agent" reason="worker_completed" />\n'
                             "</aize_worker_request>"
