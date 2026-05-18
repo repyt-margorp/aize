@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "unit_file_v1.json",
-  "title": "AIze UnitFile",
+  "title": "AIze Unit Descriptor",
   "type": "object",
   "required": ["launcher"],
   "properties": {

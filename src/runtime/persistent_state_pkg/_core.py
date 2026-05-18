@@ -618,7 +618,7 @@ def unit_metadata_path(runtime_root: Path, *, username: str, unit_id: str) -> Pa
 
 
 def session_templates_dir(runtime_root: Path) -> Path:
-    # Legacy state root for UnitFile-launched workspaces.
+    # Legacy state root for unit-launched workspaces.
     return state_dir(runtime_root) / "apps"
 
 

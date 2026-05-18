@@ -549,7 +549,7 @@ def build_scheduled_session_template_initial_prompt(session_template: dict[str, 
         f"  <unit_id>{session_template.get('unit_id') or session_template.get('template_id') or ''}</unit_id>",
         f"  <scheduled_for_utc>{schedule_info.get('scheduled_for_utc') or ''}</scheduled_for_utc>",
         f"  <scheduled_for_local timezone=\"{schedule_info.get('timezone') or 'UTC'}\">{schedule_info.get('scheduled_for_local') or ''}</scheduled_for_local>",
-        "  <instruction>This session was created automatically from the UnitFile's wall-clock schedule. Treat this as a fresh run, execute the unit goal now, and use the unit workspace for durable state instead of relying on prior session-local context.</instruction>",
+        "  <instruction>This session was created automatically from the unit's wall-clock schedule. Treat this as a fresh run, execute the unit goal now, and use the unit workspace for durable state instead of relying on prior session-local context.</instruction>",
         "</aize_scheduled_unit_launch>",
     ]
     schedule_prompt = "\n".join(lines).strip()

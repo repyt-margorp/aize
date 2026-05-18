@@ -2614,7 +2614,7 @@ def make_handler(
                         f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Active' if goal_active else 'Inactive'}</span>",
                         f"<span class='goal-session-badge{' is-done' if goal_completed else ''}'>{'Completed' if goal_completed else 'In Progress'}</span>",
                         "<span class='goal-session-badge' title='Resident Unit-backed session'>Resident Unit</span>" if resident_unit else "",
-                        f"<span class='goal-session-badge' title='Associated UnitFile: {html.escape(unit_id or unit_display)}'>UnitFile{' · ' + html.escape(unit_display) if unit_display else ''}</span>" if has_unit_file else "",
+                        f"<span class='goal-session-badge' title='Associated unit: {html.escape(unit_id or unit_display)}'>Unit{' · ' + html.escape(unit_display) if unit_display else ''}</span>" if has_unit_file else "",
                         (
                             f"<span class='goal-session-badge{' is-warn' if wait_active else ''}'>"
                             f"{'Waiting User Response' if wait_active else ('Wait Timed Out' if wait_status == 'timed_out' else 'Wait Recorded')}"
