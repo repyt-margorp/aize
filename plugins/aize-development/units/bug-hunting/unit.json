@@ -6,7 +6,7 @@
   "lifecycle": "manual",
   "restart_policy": "never",
   "display_name": "AIze Bug Hunting",
-  "description": "The canonical non-UI AIzeDevelopment UnitFile that coordinates delegated implementation work, verification, and careful runtime cutover in the shared AIze codebase.",
+  "description": "The canonical non-UI AIzeDevelopment unit that coordinates delegated implementation work, verification, and careful runtime cutover in the shared AIze codebase.",
   "enabled": true,
   "launcher": {
     "create_as_child": true,
@@ -48,7 +48,7 @@
           {
             "path": "README.md",
             "description": "High-level operating contract for the bug-hunting session.",
-            "content": "# AIze Development Unit\n\nThis UnitFile is the canonical non-UI AIzeDevelopment parent workflow for routed implementation work.\n\nGuidelines:\n- Keep the parent session focused on coordination, audit trail, and workflow discipline.\n- Run concrete code changes in delegated child task sessions.\n- Prefer focused fixes over broad rewrites.\n- Keep service boundaries explicit and observable.\n- Verify on a separate port or isolated runtime before claiming completion.\n- Only cut over after the currently running AIze runtime can be stopped and the verified runtime can be migrated carefully.\n- Treat Entrance as IO/management only; implementation routed from Entrance belongs in delegated child sessions under this parent.\n"
+            "content": "# AIze Development Unit\n\nThis unit is the canonical non-UI AIzeDevelopment parent workflow for routed implementation work.\n\nGuidelines:\n- Keep the parent session focused on coordination, audit trail, and workflow discipline.\n- Run concrete code changes in delegated child task sessions.\n- Prefer focused fixes over broad rewrites.\n- Keep service boundaries explicit and observable.\n- Verify on a separate port or isolated runtime before claiming completion.\n- Only cut over after the currently running AIze runtime can be stopped and the verified runtime can be migrated carefully.\n- Treat Entrance as IO/management only; implementation routed from Entrance belongs in delegated child sessions under this parent.\n"
           },
           {
             "path": "message-system-checklist.md",
@@ -65,14 +65,14 @@
       {
         "skill_id": "unit-file-migration-audit",
         "kind": "audit",
-        "title": "UnitFile Migration Audit",
+        "title": "Unit Migration Audit",
         "description": "Audit and finish public-facing App and SessionTemplate migration while preserving compatibility shims where required.",
-        "prompt": "Treat legacy App and SessionTemplate names as compatibility aliases only. New user-facing descriptors, tests, docs, and UI language should prefer Unit or UnitFile terminology.",
+        "prompt": "Treat legacy App and SessionTemplate names as compatibility aliases only. New user-facing descriptors, tests, docs, and UI language should prefer Unit terminology.",
         "files": [
           {
             "path": "migration-audit.md",
             "description": "Checklist for legacy App terminology.",
-            "content": "# UnitFile Migration Audit\n\nAudit scope:\n- Public UI strings should say UnitFile or Unit.\n- New descriptors should use `unit.json` first.\n- Legacy `session-templates/*/session-template.json`, `apps/*/app.json`, and `plugin_app_v1.json` are compatibility inputs only.\n- Compatibility behavior must stay tested while primary flows stop depending on old names.\n"
+            "content": "# Unit Migration Audit\n\nAudit scope:\n- Public UI strings should say Unit.\n- New descriptors should use `unit.json` first.\n- Legacy `session-templates/*/session-template.json`, `apps/*/app.json`, and `plugin_app_v1.json` are compatibility inputs only.\n- Compatibility behavior must stay tested while primary flows stop depending on old names.\n"
           }
         ]
       }

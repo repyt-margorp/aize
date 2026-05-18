@@ -6,7 +6,7 @@
   "lifecycle": "scheduled",
   "restart_policy": "schedule",
   "display_name": "AIze MINIX Refactor",
-  "description": "Autonomous AIze Development child UnitFile for periodic issue discovery, codebase crawling, incremental task routing into child sessions, and MINIX-style verification/reporting passes.",
+  "description": "Autonomous AIze Development child unit for periodic issue discovery, codebase crawling, incremental task routing into child sessions, and MINIX-style verification/reporting passes.",
   "enabled": true,
   "launcher": {
     "create_as_child": true,
@@ -45,7 +45,7 @@
           {
             "path": "README.md",
             "description": "Operating contract for the autonomous MINIX refactor Unit.",
-            "content": "# AIze MINIX Refactor Unit\n\nThis UnitFile runs as a scheduled child of the canonical AIze Development Unit.\n\nCadence:\n- Run every 4 hours through the UnitFile schedule.\n- Start each pass by reading the records in this workspace.\n- Crawl a small, previously under-inspected area of the codebase.\n- Record inspected paths, findings, delegated tasks, verification, and blockers.\n- Prefer one small verified fix per run.\n\nExecution model:\n- This scheduled session is the coordinator and audit trail.\n- When a concrete fix is warranted, spawn one narrow child session for implementation.\n- Require the child session to run targeted verification and report completion back here.\n- Update the durable records after the child reports or a blocker is confirmed.\n\nBoundaries:\n- Do not work inside Entrance; Entrance is IO/management only.\n- Keep runtime behavior driven by explicit settings or persisted state.\n- Avoid text heuristics for core dispatch and service behavior.\n"
+            "content": "# AIze MINIX Refactor Unit\n\nThis unit runs as a scheduled child of the canonical AIze Development Unit.\n\nCadence:\n- Run every 4 hours through the unit schedule.\n- Start each pass by reading the records in this workspace.\n- Crawl a small, previously under-inspected area of the codebase.\n- Record inspected paths, findings, delegated tasks, verification, and blockers.\n- Prefer one small verified fix per run.\n\nExecution model:\n- This scheduled session is the coordinator and audit trail.\n- When a concrete fix is warranted, spawn one narrow child session for implementation.\n- Require the child session to run targeted verification and report completion back here.\n- Update the durable records after the child reports or a blocker is confirmed.\n\nBoundaries:\n- Do not work inside Entrance; Entrance is IO/management only.\n- Keep runtime behavior driven by explicit settings or persisted state.\n- Avoid text heuristics for core dispatch and service behavior.\n"
           },
           {
             "path": "crawl-record.md",

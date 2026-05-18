@@ -5,7 +5,7 @@ AIze names runtime-managed components with OS-style terms. The system follows a 
 ## Vocabulary
 
 - `Unit`: any AIze kernel-managed execution target.
-- `UnitFile`: a declarative unit definition discovered from a unit package.
+- `unit.json`: a declarative unit definition discovered from a unit package.
 - `Server`: a long-lived userland unit that owns a responsibility and receives messages.
 - `Process`: a running instance of a unit.
 - `Endpoint`: a message-addressable port exposed by a unit.
@@ -22,10 +22,10 @@ AIze names runtime-managed components with OS-style terms. The system follows a 
 The old terms remain as compatibility inputs only:
 
 - `plugin` means a unit package directory under `./plugins/`.
-- `session template` means a legacy UnitFile descriptor.
-- `app` means an older launcher record for a UnitFile.
+- `session template` means a legacy unit descriptor.
+- `app` means an older launcher record for a unit.
 
-New UI and API surfaces should prefer `Unit`, `UnitFile`, and `Interface`.
+New UI and API surfaces should prefer `Unit` and `Interface`.
 
 ## Descriptor Direction
 

@@ -6,7 +6,7 @@
   "lifecycle": "auto",
   "restart_policy": "schedule",
   "display_name": "AIze System Monitor",
-  "description": "Root-lineage monitoring UnitFile that scans AIze sessions for unresolved user input, unfinished goals, stalled work, and runtime problems.",
+  "description": "Root-lineage monitoring unit that scans AIze sessions for unresolved user input, unfinished goals, stalled work, and runtime problems.",
   "enabled": true,
   "launcher": {
     "create_as_child": true,
