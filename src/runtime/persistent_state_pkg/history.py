@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -11,8 +12,11 @@ from ._core import (
     normalize_username,
     read_jsonl,
     remove_file_if_exists,
+    append_jsonl,
     session_goal_manager_pending_path,
     session_pending_path,
+    session_runtime_journal_path,
+    session_dir,
     session_service_pending_path,
     session_timeline_path,
     state_lock,
@@ -22,6 +26,7 @@ from ._core import (
 _history_subscribers: dict[str, set[queue.Queue[dict[str, Any]]]] = defaultdict(set)
 _history_subscribers_lock = threading.Lock()
 MAX_HISTORY_STRING_LENGTH = 4000
+EXTERNALIZED_TEXT_THRESHOLD_BYTES = 4096
 
 
 def _sanitize_history_value(value: Any) -> Any:
@@ -39,6 +44,76 @@ def _sanitize_history_value(value: Any) -> Any:
 
 def sanitize_history_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return _sanitize_history_value(dict(entry))
+
+
+def runtime_journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    sanitized = sanitize_history_entry(entry)
+    event = sanitized.get("event")
+    event_payload = event if isinstance(event, dict) else {}
+    event_type = str(sanitized.get("event_type") or event_payload.get("type") or "").strip()
+    return {
+        "journal_type": "runtime.event",
+        "ts": str(sanitized.get("ts") or event_payload.get("ts") or ""),
+        "event_type": event_type,
+        "entry": sanitized,
+    }
+
+
+def _externalized_text_preview(text: str) -> str:
+    if len(text) <= MAX_HISTORY_STRING_LENGTH:
+        return text
+    omitted = len(text) - MAX_HISTORY_STRING_LENGTH
+    return f"{text[:MAX_HISTORY_STRING_LENGTH]}...[externalized {omitted} chars]"
+
+
+def _externalize_entry_text(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    text = entry.get("text")
+    if not isinstance(text, str):
+        return dict(entry)
+    text_bytes = text.encode("utf-8")
+    if len(text_bytes) <= EXTERNALIZED_TEXT_THRESHOLD_BYTES:
+        return dict(entry)
+    message_id = str(entry.get("message_id") or f"msg-{uuid.uuid4().hex}").strip()
+    relative_path = Path("messages") / message_id / "body.txt"
+    body_path = session_dir(runtime_root, username=username, session_id=session_id) / relative_path
+    body_path.parent.mkdir(parents=True, exist_ok=True)
+    body_path.write_text(text, encoding="utf-8")
+    stored = dict(entry)
+    preview = _externalized_text_preview(text)
+    stored["text"] = preview
+    stored["text_preview"] = preview
+    stored["text_inline"] = False
+    stored["text_path"] = str(relative_path)
+    stored["size_bytes"] = len(text_bytes)
+    stored["message_id"] = message_id
+    return stored
+
+
+def _hydrate_entry_text(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    hydrated = dict(entry)
+    if bool(hydrated.get("text_inline", True)):
+        return hydrated
+    relative_path = str(hydrated.get("text_path") or "").strip()
+    if not relative_path:
+        return hydrated
+    body_path = session_dir(runtime_root, username=username, session_id=session_id) / relative_path
+    try:
+        hydrated["text"] = body_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return hydrated
+    return hydrated
 
 
 def history_subscriber_key(username: str, session_id: str) -> str:
@@ -92,9 +167,19 @@ def append_history(
     limit: int,
 ) -> list[dict[str, Any]]:
     normalized = normalize_username(username)
-    sanitized_entry = sanitize_history_entry(entry)
+    stored_entry = _externalize_entry_text(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        entry=entry,
+    )
+    sanitized_entry = sanitize_history_entry(stored_entry)
     with state_lock(runtime_root):
         timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
+        append_jsonl(
+            session_runtime_journal_path(runtime_root, username=normalized, session_id=session_id),
+            runtime_journal_entry(entry),
+        )
         history = [sanitize_history_entry(item) for item in read_jsonl(timeline_path)]
         # Skip exact replay of the most recent entry. This avoids local append +
         # HttpBridge event echo writing the same timeline record twice.
@@ -120,7 +205,15 @@ def get_history(runtime_root: Path, *, username: str, session_id: str) -> list[d
     normalized = normalize_username(username)
     with state_lock(runtime_root):
         timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
-        return read_jsonl(timeline_path)
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in read_jsonl(timeline_path)
+        ]
 
 
 def service_pending_state_key(service_id: str, username: str, session_id: str) -> str:
@@ -143,11 +236,26 @@ def append_pending_input(
     with state_lock(runtime_root):
         pending_path = session_pending_path(runtime_root, username=normalized, session_id=session_id)
         pending = read_jsonl(pending_path)
-        pending.append(dict(entry))
+        pending.append(
+            _externalize_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=entry,
+            )
+        )
         if len(pending) > limit:
             pending = pending[-limit:]
         write_jsonl(pending_path, pending)
-        return pending
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in pending
+        ]
 
 
 def append_service_pending_input(
@@ -170,18 +278,70 @@ def append_service_pending_input(
             service_id=queue_agent_id,
         )
         pending = read_jsonl(pending_path)
-        pending.append(dict(entry))
+        pending.append(
+            _externalize_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=entry,
+            )
+        )
         if len(pending) > limit:
             pending = pending[-limit:]
         write_jsonl(pending_path, pending)
-        return pending
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in pending
+        ]
+
+
+def _service_pending_paths(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+    agent_id: str | None = None,
+) -> list[Path]:
+    queue_agent_id = str(agent_id or service_id).strip() or str(service_id).strip()
+    primary_path = session_service_pending_path(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=queue_agent_id,
+    )
+    paths = [primary_path]
+    legacy_service_id = str(service_id).strip()
+    if legacy_service_id and queue_agent_id != legacy_service_id:
+        paths.append(
+            session_service_pending_path(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=legacy_service_id,
+            )
+        )
+    return paths
 
 
 def load_pending_inputs(runtime_root: Path, *, username: str, session_id: str) -> list[dict[str, Any]]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
         pending_path = session_pending_path(runtime_root, username=normalized, session_id=session_id)
-        return read_jsonl(pending_path)
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in read_jsonl(pending_path)
+        ]
 
 
 def load_service_pending_inputs(
@@ -194,14 +354,24 @@ def load_service_pending_inputs(
 ) -> list[dict[str, Any]]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
-        queue_agent_id = str(agent_id or service_id).strip() or str(service_id).strip()
-        pending_path = session_service_pending_path(
+        merged: list[dict[str, Any]] = []
+        for pending_path in _service_pending_paths(
             runtime_root,
             username=normalized,
             session_id=session_id,
-            service_id=queue_agent_id,
-        )
-        return read_jsonl(pending_path)
+            service_id=service_id,
+            agent_id=agent_id,
+        ):
+            merged.extend(read_jsonl(pending_path))
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in merged
+        ]
 
 
 def clear_pending_inputs(runtime_root: Path, *, username: str, session_id: str) -> None:
@@ -217,7 +387,15 @@ def drain_pending_inputs(runtime_root: Path, *, username: str, session_id: str) 
         drained = read_jsonl(pending_path)
         if drained:
             remove_file_if_exists(pending_path)
-            return drained
+            return [
+                _hydrate_entry_text(
+                    runtime_root,
+                    username=normalized,
+                    session_id=session_id,
+                    entry=item,
+                )
+                for item in drained
+            ]
         return []
 
 
@@ -231,16 +409,28 @@ def drain_service_pending_inputs(
 ) -> list[dict[str, Any]]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
-        queue_agent_id = str(agent_id or service_id).strip() or str(service_id).strip()
-        pending_path = session_service_pending_path(
+        drained: list[dict[str, Any]] = []
+        for pending_path in _service_pending_paths(
             runtime_root,
             username=normalized,
             session_id=session_id,
-            service_id=queue_agent_id,
-        )
-        drained = read_jsonl(pending_path)
+            service_id=service_id,
+            agent_id=agent_id,
+        ):
+            entries = read_jsonl(pending_path)
+            if entries:
+                drained.extend(entries)
+                remove_file_if_exists(pending_path)
         if drained:
-            remove_file_if_exists(pending_path)
+            return [
+                _hydrate_entry_text(
+                    runtime_root,
+                    username=normalized,
+                    session_id=session_id,
+                    entry=item,
+                )
+                for item in drained
+            ]
         return drained
 
 
@@ -256,11 +446,26 @@ def append_goal_manager_pending_input(
     with state_lock(runtime_root):
         pending_path = session_goal_manager_pending_path(runtime_root, username=normalized, session_id=session_id)
         pending = read_jsonl(pending_path)
-        pending.append(dict(entry))
+        pending.append(
+            _externalize_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=entry,
+            )
+        )
         if len(pending) > limit:
             pending = pending[-limit:]
         write_jsonl(pending_path, pending)
-        return pending
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in pending
+        ]
 
 
 def load_goal_manager_pending_inputs(
@@ -271,7 +476,17 @@ def load_goal_manager_pending_inputs(
 ) -> list[dict[str, Any]]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
-        return read_jsonl(session_goal_manager_pending_path(runtime_root, username=normalized, session_id=session_id))
+        return [
+            _hydrate_entry_text(
+                runtime_root,
+                username=normalized,
+                session_id=session_id,
+                entry=item,
+            )
+            for item in read_jsonl(
+                session_goal_manager_pending_path(runtime_root, username=normalized, session_id=session_id)
+            )
+        ]
 
 
 def drain_goal_manager_pending_inputs(
@@ -286,4 +501,13 @@ def drain_goal_manager_pending_inputs(
         drained = read_jsonl(pending_path)
         if drained:
             remove_file_if_exists(pending_path)
+            return [
+                _hydrate_entry_text(
+                    runtime_root,
+                    username=normalized,
+                    session_id=session_id,
+                    entry=item,
+                )
+                for item in drained
+            ]
         return drained

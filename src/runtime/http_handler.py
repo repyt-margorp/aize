@@ -15,17 +15,18 @@ from urllib.parse import parse_qs, urlencode
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable
 
-from session_template import (
-    build_scheduled_app_initial_prompt,
-    build_scheduled_app_session_label,
-    describe_app_schedule,
-    get_launchable_session_template,
-    get_registered_session_template_state,
-    launch_session_template,
-    list_launchable_session_templates,
-    list_registered_session_template_states,
-    resolve_app_launch_parent_session_id,
-    update_registered_session_template_state,
+from unit_file import (
+    build_scheduled_unit_initial_prompt,
+    build_scheduled_unit_session_label,
+    describe_unit_schedule,
+    ensure_auto_scheduled_root_unit_states,
+    get_launchable_unit,
+    get_registered_unit_state,
+    launch_unit,
+    list_launchable_units,
+    list_registered_unit_states,
+    resolve_unit_launch_parent_session_id,
+    update_registered_unit_state,
 )
 from kernel.auth import (
     bootstrap_root_user,
@@ -39,6 +40,7 @@ from kernel.auth import auth_context_allows
 from kernel.lifecycle import load_lifecycle_state
 from kernel.peers import list_peers, register_peer
 from kernel.registry import get_service_record
+from runtime.goal_audit import default_goal_continue_xml
 from runtime.goal_persist import goal_state_response_payload, persist_goal_manager_runtime_reset
 from runtime.message_builder import (
     maybe_release_session_provider,
@@ -47,9 +49,11 @@ from runtime.message_builder import (
 )
 from runtime.persistent_state_pkg import (
     append_pending_input,
+    append_goal_manager_pending_input,
     append_service_pending_input,
     clear_session_service_runtime,
     create_child_conversation_session,
+    create_conversation_session,
     create_session,
     consume_session_due_auto_resume,
     consume_session_due_user_response_wait,
@@ -64,7 +68,9 @@ from runtime.persistent_state_pkg import (
     list_sessions,
     load_agent_audit_state,
     normalize_auto_compact_threshold_left_percent,
+    normalize_child_session_sharing_policy,
     active_agent_profile_priority,
+    active_goal_manager_priority,
     normalize_agent_priority,
     normalize_goal_manager_priority,
     register_history_subscriber,
@@ -77,6 +83,7 @@ from runtime.persistent_state_pkg import (
     session_operation_allowed,
     unregister_history_subscriber,
     update_session_auto_compact_threshold,
+    update_session_child_sharing,
     update_session_goal,
     update_session_goal_flags,
     update_session_user_response_wait,
@@ -85,6 +92,7 @@ from runtime.persistent_state_pkg import (
     write_agent_file,
     read_agent_file,
     release_session_service,
+    resolve_session_agent_id,
     list_agent_files,
     delete_agent_file,
     get_agent_file_dir_acl,
@@ -92,14 +100,25 @@ from runtime.persistent_state_pkg import (
     check_agent_file_acl,
     list_goal_attachments,
     save_goal_attachment,
+    save_session_message_artifacts,
     schedule_session_auto_resume,
+    sync_communication_goal_progress,
 )
 from runtime.session_view import (
     build_worker_count_summary,
     latest_goal_manager_runtime_state,
     persisted_goal_manager_runtime_state,
     maybe_enqueue_mid_turn_progress_inquiry,
+    session_registration_metadata,
     worker_slot_badge,
+)
+from runtime.status_events import append_goal_status_changed
+from runtime.status_gateway import merge_runtime_status
+from runtime.service_control import extract_assistant_text_lenient
+from runtime.session_skills import (
+    append_session_skill_agent_turn,
+    matching_interactive_session_skills,
+    run_interactive_session_skill,
 )
 from runtime.ui_history import build_session_ui_history
 from wire.protocol import (
@@ -114,21 +133,144 @@ HTTP_EVENT_TEXT_LIMIT = 4000
 INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT = 40
 
 
-def _interactive_prompt_needs_worker(text: str) -> bool:
-    normalized = " ".join(str(text or "").strip().lower().split())
-    return bool(normalized)
+def _matching_communication_skill_routes(
+    current_session: dict[str, Any] | None,
+    *,
+    prompt_text: str,
+) -> list[dict[str, Any]]:
+    session = current_session if isinstance(current_session, dict) else {}
+    prompt = str(prompt_text or "")
+    normalized_prompt = " ".join(prompt.strip().lower().split())
+    if not normalized_prompt:
+        return []
+    matches: list[dict[str, Any]] = []
+    session_skills = session.get("session_skills", []) if isinstance(session.get("session_skills"), list) else []
+    if not session_skills:
+        launcher_unit_id = str(session.get("launcher_unit_id") or session.get("launcher_template_id") or "").strip()
+        if launcher_unit_id:
+            try:
+                template = get_launchable_unit(launcher_unit_id, default_provider="codex")
+            except KeyError:
+                template = None
+            launcher = template.get("launcher") if isinstance(template, dict) else None
+            template_skills = launcher.get("skills") if isinstance(launcher, dict) else None
+            if isinstance(template_skills, list):
+                session_skills = template_skills
+    for skill in session_skills:
+        if not isinstance(skill, dict):
+            continue
+        routing_mode = str(skill.get("routing_mode") or "").strip().lower()
+        if routing_mode not in {
+            "forward_to_canonical_session",
+            "direct_unit",
+            "launch_unit",
+            "direct_session_template",
+            "launch_session_template",
+            "create_child_session",
+        }:
+            continue
+        tags = [
+            str(tag).strip()
+            for tag in skill.get("routing_tags", [])
+            if str(tag).strip()
+        ]
+        if not tags:
+            continue
+        if any(tag.lower() in normalized_prompt for tag in tags):
+            matches.append(skill)
+    return matches
 
 
-def _communication_forward_hints(text: str) -> set[str]:
-    normalized = " ".join(str(text or "").strip().lower().split())
-    if not normalized:
-        return set()
-    hints: set[str] = set()
-    if "開発セッション" in text or "開発 session" in normalized or "development session" in normalized:
-        hints.update({"開発", "development", "dev"})
-    if "aize development" in normalized or "aiize development" in normalized:
-        hints.update({"aize", "development"})
-    return hints
+def _score_communication_route_parent_candidate(
+    session: dict[str, Any] | None,
+    *,
+    canonical_session_key: str,
+    target_label: str,
+    target_template_id: str = "",
+) -> tuple[int, str, str]:
+    candidate = session if isinstance(session, dict) else {}
+    label = str(candidate.get("label") or "").strip().lower()
+    target_label_text = str(target_label or "").strip().lower()
+    parent_session_id = str(candidate.get("parent_session_id") or "").strip()
+    launcher_template_id = str(
+        candidate.get("launcher_template_id") or candidate.get("launcher_unit_id") or ""
+    ).strip()
+    session_group = str(candidate.get("session_group") or "").strip().lower()
+    progress_state = str(
+        candidate.get("goal_progress_state")
+        or ("complete" if bool(candidate.get("goal_completed", False)) else "in_progress")
+    ).strip().lower()
+    score = 0
+    if not parent_session_id:
+        score += 20
+    if parent_session_id == "default":
+        score += 14
+    if session_group in {"root", "unit", "resident", "system"}:
+        score += 12
+    if target_template_id and launcher_template_id == target_template_id:
+        score += 30
+    if bool(candidate.get("goal_active", False)):
+        score += 10
+    if progress_state == "in_progress":
+        score += 8
+    if target_label_text and label == target_label_text:
+        score += 6
+    if str(candidate.get("created_by_type") or "").strip().lower() == "user":
+        score += 4
+    if canonical_session_key and any(
+        isinstance(skill, dict)
+        and str(skill.get("canonical_session_key") or "").strip() == canonical_session_key
+        for skill in candidate.get("session_skills", [])
+        if isinstance(candidate.get("session_skills"), list)
+    ):
+        score += 2
+    updated_at = str(candidate.get("updated_at") or candidate.get("created_at") or "").strip()
+    session_id = str(candidate.get("session_id") or "").strip()
+    return score, updated_at, session_id
+
+
+def _resolve_communication_route_parent_session_id(
+    sessions: list[dict[str, Any]],
+    *,
+    current_session_id: str,
+    canonical_session_key: str,
+    target_label: str = "",
+    target_template_id: str = "",
+) -> str | None:
+    normalized_key = str(canonical_session_key or "").strip()
+    if not normalized_key:
+        return None
+    candidates = [
+        session
+        for session in sessions
+        if isinstance(session, dict)
+        and str(session.get("session_id") or "").strip()
+        and str(session.get("session_id") or "").strip() != current_session_id
+        and any(
+            isinstance(skill, dict)
+            and str(skill.get("canonical_session_key") or "").strip() == normalized_key
+            for skill in session.get("session_skills", [])
+            if isinstance(session.get("session_skills"), list)
+        )
+    ]
+    if not candidates:
+        return None
+    scored = [
+        (
+            _score_communication_route_parent_candidate(
+                session,
+                canonical_session_key=normalized_key,
+                target_label=target_label,
+                target_template_id=target_template_id,
+            ),
+            session,
+        )
+        for session in candidates
+    ]
+    ranked = sorted(scored, key=lambda item: item[0], reverse=True)
+    if len(ranked) > 1 and ranked[0][0][:2] == ranked[1][0][:2]:
+        return None
+    return str(ranked[0][1].get("session_id") or "").strip() or None
 
 
 def _infer_communication_forward_target_session_id(
@@ -136,41 +278,266 @@ def _infer_communication_forward_target_session_id(
     *,
     current_session_id: str,
     prompt_text: str,
+    current_session: dict[str, Any] | None = None,
 ) -> str | None:
-    hints = _communication_forward_hints(prompt_text)
-    if not hints:
+    matched_routes = _matching_communication_skill_routes(
+        current_session,
+        prompt_text=prompt_text,
+    )
+    if not matched_routes:
         return None
-    scored: list[tuple[int, str]] = []
-    for session in sessions:
-        if not isinstance(session, dict):
+    for route in matched_routes:
+        if str(route.get("routing_mode") or "").strip().lower() in {
+            "create_child_session",
+            "direct_unit",
+            "launch_unit",
+            "direct_session_template",
+            "launch_session_template",
+        }:
             continue
-        candidate_session_id = str(session.get("session_id") or "").strip()
-        if not candidate_session_id or candidate_session_id == current_session_id:
+        target_session_id = str(route.get("target_session_id") or "").strip()
+        if target_session_id and target_session_id != current_session_id:
+            return target_session_id
+        canonical_session_key = str(route.get("canonical_session_key") or "").strip()
+        if not canonical_session_key:
             continue
-        fields = [
-            str(session.get("label") or ""),
-            str(session.get("launcher_display_name") or ""),
-            str(session.get("launcher_template_id") or ""),
-            str(session.get("goal_text") or ""),
-            str(session.get("origin_goal_text") or ""),
-        ]
-        haystack = " ".join(fields).lower()
-        if not haystack:
-            continue
-        score = sum(4 for hint in hints if hint and hint.lower() in haystack)
-        if score <= 0:
-            continue
-        if str(session.get("session_ui_mode") or "").strip().lower() != "communication":
-            score += 2
-        if not bool(session.get("communication_agent_enabled", False)):
-            score += 1
-        scored.append((score, candidate_session_id))
-    if not scored:
+        resolved_parent_session_id = _resolve_communication_route_parent_session_id(
+            sessions,
+            current_session_id=current_session_id,
+            canonical_session_key=canonical_session_key,
+            target_label=str(route.get("target_label") or "").strip(),
+            target_template_id=str(
+                route.get("target_unit_id") or route.get("target_template_id") or ""
+            ).strip(),
+        )
+        if resolved_parent_session_id:
+            return resolved_parent_session_id
+    return None
+
+
+def _materialize_communication_routed_child_session(
+    runtime_root: Path,
+    *,
+    username: str,
+    current_session: dict[str, Any],
+    prompt_text: str,
+    sessions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    matched_routes = _matching_communication_skill_routes(
+        current_session,
+        prompt_text=prompt_text,
+    )
+    if not matched_routes:
         return None
-    scored.sort(reverse=True)
-    if len(scored) > 1 and scored[0][0] == scored[1][0]:
-        return None
-    return scored[0][1]
+    current_session_id = str(current_session.get("session_id") or "").strip()
+    for route in matched_routes:
+        routing_mode = str(route.get("routing_mode") or "").strip().lower()
+        target_label = str(route.get("target_label") or "").strip()
+        target_goal_text = str(route.get("target_goal_text") or "").strip()
+        target_child_label = str(route.get("target_child_label") or "").strip()
+        direct_route = routing_mode in {"direct_unit", "launch_unit", "direct_session_template", "launch_session_template"}
+        should_create = routing_mode == "create_child_session"
+        should_create = should_create or bool(target_label) or bool(target_goal_text)
+        if not should_create and not direct_route:
+            continue
+        canonical_session_key = str(route.get("canonical_session_key") or "").strip()
+        parent_session_id = current_session_id
+        if canonical_session_key and isinstance(sessions, list):
+            resolved_parent_session_id = _resolve_communication_route_parent_session_id(
+                sessions,
+                current_session_id=current_session_id,
+                canonical_session_key=canonical_session_key,
+                target_label=target_label,
+                target_template_id=str(
+                    route.get("target_unit_id") or route.get("target_template_id") or ""
+                ).strip(),
+            )
+            if resolved_parent_session_id:
+                if direct_route:
+                    resolved_session = _session_record_by_id(sessions, resolved_parent_session_id)
+                    if isinstance(resolved_session, dict):
+                        return resolved_session
+                    stored = get_session_settings(runtime_root, username=username, session_id=resolved_parent_session_id)
+                    if isinstance(stored, dict):
+                        return stored
+                parent_session_id = resolved_parent_session_id
+        target_template_id = (
+            str(route.get("target_unit_id") or route.get("target_template_id") or "").strip()
+            if direct_route or parent_session_id == current_session_id
+            else ""
+        )
+        if target_template_id:
+            preferred_provider = str(route.get("preferred_provider") or "").strip().lower() or "codex"
+            selected_agents = [
+                str(item).strip()
+                for item in route.get("selected_agents", [])
+                if str(item).strip()
+            ] if isinstance(route.get("selected_agents"), list) else None
+            try:
+                template = get_launchable_unit(
+                    target_template_id,
+                    default_provider=preferred_provider,
+                )
+            except KeyError:
+                template = None
+            if isinstance(template, dict):
+                template_for_launch = dict(template)
+                launcher = dict(template_for_launch.get("launcher") or {})
+                if direct_route and not (
+                    str(launcher.get("resident_parent_session_id") or "").strip()
+                    or str(launcher.get("parent_unit_id") or "").strip()
+                ):
+                    launcher["mode"] = "create_session"
+                template_for_launch["launcher"] = launcher
+                launched = launch_unit(
+                    runtime_root,
+                    username=username,
+                    parent_session_id=parent_session_id,
+                    app=template_for_launch,
+                    label=target_label or None,
+                    goal_text=(prompt_text if direct_route else target_goal_text) or None,
+                    preferred_provider=preferred_provider,
+                    selected_agents=selected_agents,
+                    origin_session_id=current_session_id,
+                )
+                session = launched.get("session") if isinstance(launched, dict) else None
+                if isinstance(session, dict):
+                    if direct_route:
+                        return session
+                    parent_session_id = str(session.get("session_id") or "").strip() or parent_session_id
+        if direct_route:
+            child_skills = route.get("spawn_session_skills")
+            if not isinstance(child_skills, list) and canonical_session_key:
+                child_skills = [
+                    {
+                        "skill_id": f"{canonical_session_key}.session",
+                        "kind": "routing",
+                        "skill_scope": "unit",
+                        "title": target_label or canonical_session_key,
+                        "canonical_session_key": canonical_session_key,
+                    }
+                ]
+            session = create_conversation_session(
+                runtime_root,
+                username=username,
+                label=target_label or "Delegated Session",
+                created_by_username=username,
+                created_by_type="unit",
+                origin_session_id=current_session_id,
+                origin_goal_id=str(
+                    current_session.get("active_goal_id")
+                    or current_session.get("goal_id")
+                    or ""
+                ).strip(),
+                origin_goal_text=str(current_session.get("goal_text") or ""),
+                session_ui_mode=str(route.get("session_ui_mode") or "standard").strip().lower() or "standard",
+                communication_agent_enabled=bool(route.get("communication_agent_enabled", False)),
+                session_skills=child_skills if isinstance(child_skills, list) else None,
+            )
+            session_id = str(session.get("session_id") or "").strip()
+            if prompt_text or target_goal_text:
+                session = update_session_goal(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_text=prompt_text or target_goal_text,
+                    updated_by_username=username,
+                    updated_by_type="unit",
+                    origin_session_id=current_session_id,
+                ) or session
+            preferred_provider = str(route.get("preferred_provider") or "").strip().lower()
+            if preferred_provider:
+                update_session_goal_flags(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    preferred_provider=preferred_provider,
+                )
+            selected_agents = route.get("selected_agents")
+            if isinstance(selected_agents, list):
+                update_session_selected_agents(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    selected_agents=[str(item) for item in selected_agents if str(item).strip()],
+                )
+            return get_session_settings(runtime_root, username=username, session_id=session_id) or session
+        canonical_session_key = str(route.get("canonical_session_key") or "").strip()
+        child_skills = route.get("spawn_session_skills")
+        if not isinstance(child_skills, list) and canonical_session_key:
+            child_skills = [
+                {
+                    "skill_id": f"{canonical_session_key}.session",
+                    "kind": "routing",
+                    "skill_scope": "unit",
+                    "title": target_label or canonical_session_key,
+                    "canonical_session_key": canonical_session_key,
+                }
+            ]
+        if parent_session_id == current_session_id and canonical_session_key:
+            parent = create_child_conversation_session(
+                runtime_root,
+                username=username,
+                parent_session_id=current_session_id,
+                label=target_label or canonical_session_key,
+                goal_text=target_goal_text,
+                created_by_username=username,
+                created_by_type="user",
+                origin_session_id=current_session_id,
+                origin_goal_id=str(
+                    current_session.get("active_goal_id")
+                    or current_session.get("goal_id")
+                    or ""
+                ).strip(),
+                origin_goal_text=str(current_session.get("goal_text") or ""),
+                session_ui_mode="standard",
+                communication_agent_enabled=False,
+                session_skills=child_skills if isinstance(child_skills, list) else None,
+                requester_session_id=current_session_id,
+            )
+            if not parent:
+                continue
+            parent_session_id = str(parent.get("session_id") or "").strip() or current_session_id
+        child = create_child_conversation_session(
+            runtime_root,
+            username=username,
+            parent_session_id=parent_session_id,
+            label=target_child_label or ("Development Task" if parent_session_id != current_session_id else target_label) or "Delegated Session",
+            goal_text=prompt_text if parent_session_id != current_session_id else target_goal_text,
+            created_by_username=username,
+            created_by_type="user",
+            origin_session_id=current_session_id,
+            origin_goal_id=str(
+                current_session.get("active_goal_id")
+                or current_session.get("goal_id")
+                or ""
+            ).strip(),
+            origin_goal_text=str(current_session.get("goal_text") or ""),
+            session_ui_mode=str(route.get("session_ui_mode") or "standard").strip().lower() or "standard",
+            communication_agent_enabled=bool(route.get("communication_agent_enabled", False)),
+            session_skills=child_skills if isinstance(child_skills, list) else None,
+            requester_session_id=parent_session_id,
+        )
+        if child:
+            child_session_id = str(child.get("session_id") or "").strip()
+            preferred_provider = str(route.get("preferred_provider") or "").strip().lower()
+            if preferred_provider:
+                update_session_goal_flags(
+                    runtime_root,
+                    username=username,
+                    session_id=child_session_id,
+                    preferred_provider=preferred_provider,
+                )
+            selected_agents = route.get("selected_agents")
+            if isinstance(selected_agents, list):
+                update_session_selected_agents(
+                    runtime_root,
+                    username=username,
+                    session_id=child_session_id,
+                    selected_agents=[str(item) for item in selected_agents if str(item).strip()],
+                )
+            return child
+    return None
 
 
 def _session_record_by_id(sessions: list[dict[str, Any]], session_id: str) -> dict[str, Any] | None:
@@ -183,6 +550,255 @@ def _session_record_by_id(sessions: list[dict[str, Any]], session_id: str) -> di
         if str(session.get("session_id") or "").strip() == target_session_id:
             return session
     return None
+
+
+def _forwarded_session_pending_input(
+    target_session: dict[str, Any] | None,
+    *,
+    prompt_text: str,
+    submitted_by_username: str,
+    user_response_request_ids: list[str] | None = None,
+    message_meta: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    target = target_session or {}
+    resolved_message_meta = message_meta if isinstance(message_meta, dict) else {}
+    target_goal_text = str(target.get("goal_text") or "").strip()
+    target_goal_active = bool(target.get("goal_active", False))
+    if target_goal_text and target_goal_active:
+        return (
+            make_aize_pending_input(
+                kind="goal_feedback",
+                role="system",
+                text=default_goal_continue_xml(summary=prompt_text),
+                submitted_by_username=submitted_by_username,
+                message_id=str(resolved_message_meta.get("message_id") or ""),
+                message_text_relpath=str(resolved_message_meta.get("text_relpath") or ""),
+                message_text_size=resolved_message_meta.get("text_size"),
+                attachments=list(resolved_message_meta.get("attachments") or []),
+            ),
+            "goal_feedback",
+        )
+    return (
+        make_aize_pending_input(
+            kind="user_message",
+            role="user",
+            text=prompt_text,
+            submitted_by_username=submitted_by_username,
+            user_response_request_ids=user_response_request_ids,
+            message_id=str(resolved_message_meta.get("message_id") or ""),
+            message_text_relpath=str(resolved_message_meta.get("text_relpath") or ""),
+            message_text_size=resolved_message_meta.get("text_size"),
+            attachments=list(resolved_message_meta.get("attachments") or []),
+        ),
+        "http_prompt",
+    )
+
+
+def _select_communication_worker_service_id(
+    interactive_service_id: str | None,
+    provider_pool: list[str],
+) -> str | None:
+    current_service_id = str(interactive_service_id or "").strip()
+    if not current_service_id:
+        return ""
+    for service_id in provider_pool:
+        normalized_service_id = str(service_id or "").strip()
+        if normalized_service_id and normalized_service_id != current_service_id:
+            return normalized_service_id
+    return current_service_id
+
+
+def _communication_worker_request_xml(
+    *,
+    request_id: str,
+    transport_text: str,
+    session_settings: dict[str, Any] | None,
+    forwarded_session: dict[str, Any] | None = None,
+) -> str:
+    settings = session_settings or {}
+    worker_goal_text = str(settings.get("goal_text") or "").strip()
+    worker_goal_state = str(
+        settings.get(
+            "goal_progress_state",
+            "complete" if bool(settings.get("goal_completed", False)) else "in_progress",
+        )
+    ).strip()
+    delegated_session = forwarded_session or {}
+    delegated_session_id = str(delegated_session.get("session_id") or "").strip()
+    delegated_goal_text = str(delegated_session.get("goal_text") or "").strip()
+    delegated_label = str(delegated_session.get("label") or "").strip()
+    instruction = (
+        "Treat this as the main WorkerAgent turn for the interactive session. "
+        "Use both the user_message and session_goal. Advance the session goal or investigate the user request using the available context and tools. "
+        "Return the concrete answer, findings, or progress for InteractiveAgent to present to the user. "
+        "Do not return only a status acknowledgement such as checked, confirmed, or completed. "
+        "If the user asks for a list, include the list. "
+        "Do not ask the user directly."
+    )
+    delegated_xml = ""
+    if delegated_session_id:
+        instruction = (
+            "Entrance already delegated the implementation work to the child SessionUnit below. "
+            "Do not perform the implementation inside Entrance. "
+            "Inspect the delegated child when needed and return a concise routing or progress update for InteractiveAgent to present to the user."
+        )
+        delegated_xml = (
+            "<delegated_session>\n"
+            f"  <session_id>{html.escape(delegated_session_id)}</session_id>\n"
+            f"  <label>{html.escape(delegated_label)}</label>\n"
+            f"  <goal_text>{html.escape(delegated_goal_text)}</goal_text>\n"
+            "</delegated_session>\n"
+        )
+    return (
+        f'<aize_worker_request id="{html.escape(request_id, quote=True)}" '
+        'source_role="interactive_agent" target_role="worker_agent">\n'
+        f"<user_message>{html.escape(transport_text)}</user_message>\n"
+        "<session_goal>\n"
+        f"  <active>{'true' if bool(settings.get('goal_active', False)) else 'false'}</active>\n"
+        f"  <progress_state>{html.escape(worker_goal_state)}</progress_state>\n"
+        f"  <text>{html.escape(worker_goal_text)}</text>\n"
+        "</session_goal>\n"
+        f"{delegated_xml}"
+        f"<instruction>{html.escape(instruction)}</instruction>\n"
+        '<resume target_role="interactive_agent" reason="worker_completed" />\n'
+        "</aize_worker_request>"
+    )
+
+
+def _communication_immediate_ack_text(
+    *,
+    forwarded_session: dict[str, Any] | None = None,
+    forwarded_label: str = "",
+) -> str:
+    delegated_session = forwarded_session or {}
+    delegated_session_id = str(delegated_session.get("session_id") or "").strip()
+    delegated_label = str(forwarded_label or delegated_session.get("label") or "").strip()
+    if delegated_session_id:
+        target_label = delegated_label or "the delegated session"
+        return (
+            f"Routed to {target_label}. Entrance will keep this session updated while that work runs."
+        )
+    return (
+        "Entrance received your request. InteractiveAgent is responding and WorkerAgent is checking in parallel."
+    )
+
+
+def _append_communication_immediate_ack(
+    append_history: Callable[[str, str, dict[str, Any]], None],
+    *,
+    username: str,
+    session_id: str,
+    text: str,
+) -> None:
+    visible_text = str(text or "").strip()
+    if not visible_text:
+        return
+    service_id = "service-entrance-router"
+    now = utc_ts()
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "event",
+            "ts": now,
+            "service_id": service_id,
+            "session_id": session_id,
+            "event_type": "agent.turn_started",
+            "text": "Entrance acknowledged the prompt and started routing.",
+            "event": {
+                "type": "agent.turn_started",
+                "service_id": service_id,
+                "provider": "communication_router",
+            },
+        },
+    )
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "in",
+            "ts": now,
+            "from": "Entrance",
+            "service_id": service_id,
+            "session_id": session_id,
+            "text": visible_text,
+            "provider": "communication_router",
+        },
+    )
+    append_history(
+        username,
+        session_id,
+        {
+            "direction": "event",
+            "ts": now,
+            "service_id": service_id,
+            "session_id": session_id,
+            "event_type": "turn.completed",
+            "text": "Turn completed",
+            "event": {
+                "type": "turn.completed",
+                "status": "success",
+                "provider": "communication_router",
+            },
+        },
+    )
+
+
+def _communication_dispatch_plan(
+    *,
+    session_id: str,
+    interactive_service_id: str | None,
+    worker_service_id: str | None,
+    goal_manager_service_id: str | None,
+    forwarded_session_id: str | None,
+    forwarded_service_id: str | None,
+    forwarded_dispatch_reason: str | None,
+) -> list[dict[str, str]]:
+    plan: list[dict[str, str]] = []
+    normalized_session_id = str(session_id or "").strip()
+    normalized_interactive_service_id = str(interactive_service_id or "").strip()
+    normalized_worker_service_id = str(worker_service_id or "").strip()
+    normalized_goal_manager_service_id = str(goal_manager_service_id or "").strip()
+    normalized_forwarded_session_id = str(forwarded_session_id or "").strip()
+    normalized_forwarded_service_id = str(forwarded_service_id or "").strip()
+    normalized_forwarded_reason = str(forwarded_dispatch_reason or "http_prompt").strip() or "http_prompt"
+    if normalized_interactive_service_id and normalized_session_id:
+        plan.append(
+            {
+                "channel": "interactive",
+                "service_id": normalized_interactive_service_id,
+                "session_id": normalized_session_id,
+                "reason": "http_user_dialogue",
+            }
+        )
+    if normalized_worker_service_id and normalized_session_id:
+        plan.append(
+            {
+                "channel": "worker",
+                "service_id": normalized_worker_service_id,
+                "session_id": normalized_session_id,
+                "reason": "interactive_worker_request",
+            }
+        )
+    if normalized_goal_manager_service_id and normalized_session_id:
+        plan.append(
+            {
+                "channel": "goal_manager",
+                "service_id": normalized_goal_manager_service_id,
+                "session_id": normalized_session_id,
+                "reason": "goal_manager_review",
+            }
+        )
+    if normalized_forwarded_session_id and normalized_forwarded_service_id:
+        plan.append(
+            {
+                "channel": "forwarded",
+                "service_id": normalized_forwarded_service_id,
+                "session_id": normalized_forwarded_session_id,
+                "reason": normalized_forwarded_reason,
+            }
+        )
+    return plan
 
 
 def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
@@ -291,6 +907,52 @@ def _resolve_dispatch_service_for_session(
             pool_service_ids=pool_service_ids,
         )
     return str(target_service_id or "").strip()
+
+
+def _resolve_goal_manager_dispatch_service_for_session(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    preferred_provider: str,
+    default_provider: str,
+    current_llm_service_topology: Callable[[], tuple[list[str], list[str], list[str], Any]],
+) -> str:
+    session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+    goal_manager_priority = active_goal_manager_priority(
+        session_settings.get("goal_manager_priority"),
+        available_kinds=None,
+    )
+    if not goal_manager_priority:
+        goal_manager_priority = [preferred_provider or default_provider]
+    current_service_id = str(session_settings.get("service_id") or "").strip()
+    current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _ = current_llm_service_topology()
+    for provider in goal_manager_priority:
+        pool_service_ids = (
+            current_claude_service_pool
+            if provider == "claude"
+            else (current_gemini_service_pool if provider == "gemini" else current_codex_service_pool)
+        )
+        if current_service_id and current_service_id in pool_service_ids:
+            return current_service_id
+        leased_service_id = lease_session_service(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            pool_service_ids=pool_service_ids,
+        )
+        if leased_service_id:
+            join_session_agent(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=leased_service_id,
+                provider=provider,
+                role="goal_manager",
+                transport="local_dispatch",
+            )
+            return leased_service_id
+    return ""
 
 
 def _build_scheduled_auto_resume_xml(
@@ -443,7 +1105,7 @@ def _process_due_auto_resume_session(
     }
 
 
-def _process_due_scheduled_app_launch(
+def _process_due_scheduled_unit_launch(
     *,
     runtime_root: Path,
     manifest: dict[str, Any],
@@ -455,30 +1117,30 @@ def _process_due_scheduled_app_launch(
     append_history: Callable[[str, str, dict[str, Any]], None],
     send_router_control: Callable[[dict[str, Any]], None],
     username: str,
-    app: dict[str, Any],
+    unit: dict[str, Any],
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    template_id = str(app.get("unit_id") or app.get("template_id") or "").strip()
+    template_id = str(unit.get("unit_id") or unit.get("template_id") or "").strip()
     if not template_id:
         return None
     effective_now = (now or datetime.now(UTC)).astimezone(UTC)
-    app_state = get_registered_session_template_state(runtime_root, username=username, template_id=template_id)
+    app_state = get_registered_unit_state(runtime_root, username=username, unit_id=template_id)
     if not isinstance(app_state, dict):
         return None
-    schedule_info = describe_app_schedule(app, app_state=app_state, now=effective_now)
+    schedule_info = describe_unit_schedule(unit, unit_state=app_state, now=effective_now)
     if not bool(schedule_info.get("due")):
         return None
 
     def _update_schedule_state(**updates: Any) -> dict[str, Any]:
-        return update_registered_session_template_state(
+        return update_registered_unit_state(
             runtime_root,
             username=username,
-            template_id=template_id,
+            unit_id=template_id,
             updates={
-                "display_name": str(app.get("display_name") or template_id).strip() or template_id,
+                "display_name": str(unit.get("display_name") or template_id).strip() or template_id,
                 "unit_id": template_id,
-                "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
-                "plugin_id": str(app.get("plugin_id") or "").strip(),
+                "package_id": str(unit.get("package_id") or unit.get("plugin_id") or "").strip(),
+                "plugin_id": str(unit.get("plugin_id") or "").strip(),
                 "schedule_state": {
                     "last_checked_at": utc_ts(),
                     "last_due_at": str(schedule_info.get("scheduled_for_utc") or "").strip(),
@@ -488,10 +1150,11 @@ def _process_due_scheduled_app_launch(
             },
         )
 
-    parent_session_id = resolve_app_launch_parent_session_id(
+    parent_session_id = resolve_unit_launch_parent_session_id(
         runtime_root,
         username=username,
-        app_state=app_state,
+        unit_state=app_state,
+        unit=unit,
     )
     if not parent_session_id:
         retry_not_before_at = (effective_now + timedelta(seconds=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -513,7 +1176,7 @@ def _process_due_scheduled_app_launch(
         )
         return None
 
-    preferred_provider = str(((app.get("launcher") or {}).get("preferred_provider") or default_provider)).strip().lower() or default_provider
+    preferred_provider = str(((unit.get("launcher") or {}).get("preferred_provider") or default_provider)).strip().lower() or default_provider
     running_pool_service_ids = _running_provider_service_pool(
         runtime_root,
         preferred_provider=preferred_provider,
@@ -541,14 +1204,14 @@ def _process_due_scheduled_app_launch(
         )
         return None
 
-    launch_label = build_scheduled_app_session_label(app, schedule_info)
-    scheduled_prompt = build_scheduled_app_initial_prompt(app, schedule_info)
+    launch_label = build_scheduled_unit_session_label(unit, schedule_info)
+    scheduled_prompt = build_scheduled_unit_initial_prompt(unit, schedule_info)
     try:
-        launched = launch_session_template(
+        launched = launch_unit(
             runtime_root,
             username=username,
             parent_session_id=parent_session_id,
-            app=app,
+            app=unit,
             label=launch_label,
             initial_prompt=scheduled_prompt,
         )
@@ -668,7 +1331,8 @@ def _process_due_scheduled_app_launch(
             },
         )
         return {
-            "app": app,
+            "unit": unit,
+            "app": unit,
             "session": session,
             "dispatch_service_id": target_service_id,
             "preferred_provider": preferred_provider,
@@ -692,12 +1356,17 @@ def _process_due_scheduled_app_launch(
         },
     )
     return {
-        "app": app,
+        "unit": unit,
+        "app": unit,
         "session": session,
         "dispatch_service_id": "",
         "preferred_provider": preferred_provider,
         "schedule": schedule_info,
     }
+
+
+def _process_due_scheduled_app_launch(*, app: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any] | None:
+    return _process_due_scheduled_unit_launch(unit=app or {}, **kwargs)
 
 
 def _parse_multipart_bytes(raw: bytes, boundary: str) -> list[dict]:
@@ -732,7 +1401,14 @@ def _parse_multipart_bytes(raw: bytes, boundary: str) -> list[dict]:
                 name = token[5:].strip().strip('"')
             elif token.startswith("filename="):
                 filename = token[9:].strip().strip('"')
-        parts.append({"name": name, "filename": filename, "data": body})
+        parts.append(
+            {
+                "name": name,
+                "filename": filename,
+                "data": body,
+                "content_type": headers.get("content-type", ""),
+            }
+        )
     return parts
 
 
@@ -741,6 +1417,69 @@ def _truncate_http_text(value: Any, *, limit: int = HTTP_EVENT_TEXT_LIMIT) -> st
     if len(text) <= limit:
         return text
     return f"{text[:limit]}..."
+
+
+def _stringify_form_value(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _coerce_multipart_payload(parts: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    payload: dict[str, Any] = {}
+    attachments: list[dict[str, Any]] = []
+    request_ids: list[str] = []
+    for part in parts:
+        name = str(part.get("name") or "").strip()
+        if not name:
+            continue
+        filename = str(part.get("filename") or "").strip()
+        if filename:
+            if name in {"file", "files", "attachment", "attachments"}:
+                attachments.append(
+                    {
+                        "filename": filename,
+                        "content_type": str(part.get("content_type") or "").strip(),
+                        "data": part.get("data") or b"",
+                    }
+                )
+            continue
+        raw_text = _stringify_form_value(part.get("data") or b"")
+        if name == "user_response_request_ids":
+            request_ids.extend([item.strip() for item in raw_text.replace("\n", ",").split(",") if item.strip()])
+        else:
+            payload[name] = raw_text
+    if request_ids:
+        payload["user_response_request_ids"] = request_ids
+    return payload, attachments
+
+
+def _message_attachment_summary_lines(message_meta: dict[str, Any]) -> list[str]:
+    attachments = message_meta.get("attachments") if isinstance(message_meta, dict) else None
+    if not isinstance(attachments, list) or not attachments:
+        return []
+    lines = ["", "[Attached files]"]
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("original_filename") or item.get("filename") or "attachment").strip() or "attachment"
+        content_type = str(item.get("content_type") or "application/octet-stream").strip() or "application/octet-stream"
+        relpath = str(item.get("relpath") or "").strip()
+        size = item.get("size")
+        size_label = f"{size} bytes" if isinstance(size, int) and size >= 0 else "size unknown"
+        location = f" stored at {relpath}" if relpath else ""
+        lines.append(f"- {filename} ({content_type}, {size_label}){location}")
+    return lines
+
+
+def _message_transport_text(base_text: str, message_meta: dict[str, Any]) -> str:
+    text = str(base_text or "").strip()
+    attachment_lines = _message_attachment_summary_lines(message_meta)
+    if attachment_lines:
+        if text:
+            return "\n".join([text, *attachment_lines])
+        return "\n".join(["(No inline text body)", *attachment_lines])
+    return text
 
 
 def _http_event_summary(event_type: str, event: Any) -> dict[str, Any] | None:
@@ -759,7 +1498,7 @@ def _http_event_summary(event_type: str, event: Any) -> dict[str, Any] | None:
                         "text": _truncate_http_text(item.get("text")),
                     },
                 }
-    if normalized_type == "service.goal_audit_completed":
+    if normalized_type == "service.goal_manager_compact_completed":
         payload: dict[str, Any] = {"type": normalized_type}
         if "goal_satisfied" in event:
             payload["goal_satisfied"] = bool(event.get("goal_satisfied"))
@@ -812,6 +1551,87 @@ def _is_communication_chat_noise(entry: dict[str, Any]) -> bool:
     event_type = str(entry.get("event_type") or "")
     text = str(entry.get("text") or "").strip().lower()
     return event_type in {"agent.turn_started", "thread.started", "turn.started"} or text == "response started"
+
+
+def _communication_entry_visible_text(entry: dict[str, Any]) -> str:
+    raw_text = str(entry.get("text") or "").strip()
+    visible_text = extract_assistant_text_lenient(raw_text)
+    if visible_text:
+        return visible_text
+    event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    provider_event = event.get("provider_event") if isinstance(event.get("provider_event"), dict) else {}
+    provider_item = provider_event.get("item") if isinstance(provider_event.get("item"), dict) else {}
+    for value in (
+        item.get("text"),
+        provider_item.get("text"),
+        event.get("delta"),
+        provider_event.get("delta"),
+        raw_text,
+    ):
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _is_communication_final_agent_output(entry: dict[str, Any]) -> bool:
+    direction = str(entry.get("direction") or "").strip()
+    event_type = str(entry.get("event_type") or "").strip()
+    event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    provider_event = event.get("provider_event") if isinstance(event.get("provider_event"), dict) else {}
+    provider_item = provider_event.get("item") if isinstance(provider_event.get("item"), dict) else {}
+    if direction == "in":
+        return bool(_entry_service_id(entry) and _communication_entry_visible_text(entry))
+    if event_type not in {"item.completed", "service.goal_manager_compact_provider_event.item.completed"}:
+        return False
+    item_type = str(item.get("type") or provider_item.get("type") or "").strip()
+    return item_type == "agent_message" and bool(_entry_service_id(entry) and _communication_entry_visible_text(entry))
+
+
+def _communication_reply_ts(entry: dict[str, Any]) -> datetime | None:
+    raw_ts = str(entry.get("ts") or "").strip()
+    if not raw_ts:
+        return None
+    try:
+        return datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _collapse_communication_duplicate_outputs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    incoming_replies: list[tuple[str, str, datetime | None]] = []
+    for entry in history:
+        if str(entry.get("direction") or "").strip() != "in":
+            continue
+        service_id = _entry_service_id(entry)
+        visible_text = _communication_entry_visible_text(entry)
+        if not service_id or not visible_text:
+            continue
+        incoming_replies.append((service_id, visible_text, _communication_reply_ts(entry)))
+
+    if not incoming_replies:
+        return history
+
+    collapsed: list[dict[str, Any]] = []
+    for entry in history:
+        if not _is_communication_final_agent_output(entry) or str(entry.get("direction") or "").strip() == "in":
+            collapsed.append(entry)
+            continue
+        service_id = _entry_service_id(entry)
+        visible_text = _communication_entry_visible_text(entry)
+        entry_ts = _communication_reply_ts(entry)
+        is_duplicate = False
+        for reply_service_id, reply_text, reply_ts in incoming_replies:
+            if reply_service_id != service_id or reply_text != visible_text:
+                continue
+            if entry_ts is None or reply_ts is None or abs((entry_ts - reply_ts).total_seconds()) <= 5:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            collapsed.append(entry)
+    return collapsed
 
 
 def _entry_service_id(entry: dict[str, Any]) -> str:
@@ -1059,15 +1879,23 @@ def _render_cluster_html(item: dict[str, Any]) -> str:
         )
     is_goal_cluster = kind == "goal_manager_cluster"
     service_id = str(item.get("service_id") or "")
-    title = "GoalManager Review" if is_goal_cluster else ("Claude Code" if "claude" in service_id else ("Gemini" if "gemini" in service_id else "Codex"))
+    title = (
+        "GoalManager Review"
+        if is_goal_cluster
+        else (
+            "Session Skill"
+            if service_id.startswith("session-skill-")
+            else ("Claude Code" if "claude" in service_id else ("Gemini" if "gemini" in service_id else "Codex"))
+        )
+    )
     if is_goal_cluster:
         last = entries[-1]
         last_type = str(last.get("event_type") or "")
-        if last_type in {"service.goal_audit_failed", "service.post_turn_followup_failed", "service.goal_manager_compact_failed"}:
+        if last_type in {"service.goal_manager_compact_failed", "service.post_turn_followup_failed"}:
             progress_text = "Failed"
             progress_class = " is-signal-red"
             meta_text = "GoalManager review hit an error"
-        elif last_type == "service.goal_audit_completed":
+        elif last_type == "service.goal_manager_compact_completed":
             progress_text = "Completed"
             progress_class = " is-complete"
             meta_text = "GoalManager finished this review cycle"
@@ -1234,6 +2062,109 @@ def _raise_unless_client_disconnect(error: BaseException) -> None:
         raise error
 
 
+def _query_requests_live_overview(query: dict[str, list[str]] | None) -> bool:
+    if not isinstance(query, dict):
+        return False
+    return "_" in query
+
+
+DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS = 7 * 24 * 60 * 60
+
+
+def _parse_recent_window_seconds(query: dict[str, list[str]] | None) -> int:
+    if not isinstance(query, dict):
+        return DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS
+    raw_values = query.get("session_window_seconds") or query.get("session_window") or []
+    raw_value = raw_values[0] if raw_values else None
+    try:
+        parsed = int(str(raw_value).strip()) if raw_value is not None else DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS
+    return max(0, parsed)
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(text).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _session_updated_at_for_sort_key(session: dict[str, Any] | None) -> datetime:
+    record = session if isinstance(session, dict) else {}
+    return (
+        _parse_utc_datetime(record.get("updated_at"))
+        or _parse_utc_datetime(record.get("created_at"))
+        or datetime.fromtimestamp(0, tz=UTC)
+    )
+
+
+def _resident_session_ids_for_view(
+    *,
+    runtime_root: Path,
+    viewer_username: str,
+    include_all: bool,
+) -> set[str]:
+    resident_ids: set[str] = set()
+    for state in list_registered_unit_states(runtime_root):
+        if not isinstance(state, dict):
+            continue
+        state_username = str(state.get("username") or "").strip()
+        if not include_all and state_username != str(viewer_username or "").strip():
+            continue
+        session_id = str(state.get("last_session_id") or "").strip()
+        if session_id:
+            resident_ids.add(session_id)
+    return resident_ids
+
+
+def _filter_display_sessions(
+    sessions: list[dict[str, Any]],
+    *,
+    runtime_root: Path,
+    viewer_username: str,
+    include_all: bool,
+    active_session_id: str = "",
+    recent_window_seconds: int = DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS,
+) -> list[dict[str, Any]]:
+    resident_ids = _resident_session_ids_for_view(
+        runtime_root=runtime_root,
+        viewer_username=viewer_username,
+        include_all=include_all,
+    )
+    current_session_id = str(active_session_id or "").strip()
+    cutoff = (
+        datetime.now(UTC) - timedelta(seconds=recent_window_seconds)
+        if recent_window_seconds > 0
+        else None
+    )
+    filtered: list[dict[str, Any]] = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id:
+            continue
+        updated_at = _session_updated_at_for_sort_key(session)
+        include_recent = cutoff is None or updated_at >= cutoff
+        if session_id == current_session_id or session_id in resident_ids or include_recent:
+            filtered.append(session)
+    filtered.sort(
+        key=lambda session: (
+            0 if str(session.get("session_id") or "").strip() == current_session_id else 1,
+            0 if str(session.get("session_id") or "").strip() in resident_ids else 1,
+            -_session_updated_at_for_sort_key(session).timestamp(),
+            str(session.get("label") or session.get("session_id") or "").lower(),
+        )
+    )
+    return filtered
+
+
 def make_handler(
     *,
     # State variables
@@ -1282,14 +2213,30 @@ def make_handler(
             records.append(entry)
         return records
 
-    def _compute_overview_payload(*, viewer_username: str, include_all: bool) -> dict:  # type: ignore[misc]
+    def _compute_overview_payload(
+        *,
+        viewer_username: str,
+        include_all: bool,
+        active_session_id: str = "",
+        recent_window_seconds: int = DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS,
+    ) -> dict:  # type: ignore[misc]
         release_stale_session_bindings()
-        all_sessions = _visible_session_records(viewer_username=viewer_username, include_all=include_all)
+        all_sessions = _filter_display_sessions(
+            _visible_session_records(viewer_username=viewer_username, include_all=include_all),
+            runtime_root=runtime_root,
+            viewer_username=viewer_username,
+            include_all=include_all,
+            active_session_id=active_session_id,
+            recent_window_seconds=recent_window_seconds,
+        )
         with _active_agent_turns_lock:
             _active_turns_snap = dict(_active_agent_turns)
         with _active_goal_audits_lock:
             _active_audits_snap = dict(_active_goal_audits)
         _snaps = service_snapshots()
+        current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
+            current_llm_service_topology()
+        )
         _summaries: list[dict[str, Any]] = []
         for _talk in all_sessions:
             _t_user = str(_talk.get("username", ""))
@@ -1302,15 +2249,15 @@ def make_handler(
             _gm_svc = str((_goal_audit or {}).get("service_id") or _bound_svc).strip()
             _worker = worker_slot_badge(
                 _active_svc or _bound_svc,
-                codex_service_pool=codex_service_pool,
-                claude_service_pool=claude_service_pool,
-                gemini_service_pool=gemini_service_pool,
+                codex_service_pool=current_codex_service_pool,
+                claude_service_pool=current_claude_service_pool,
+                gemini_service_pool=current_gemini_service_pool,
             )
             _gm_worker = worker_slot_badge(
                 _gm_svc,
-                codex_service_pool=codex_service_pool,
-                claude_service_pool=claude_service_pool,
-                gemini_service_pool=gemini_service_pool,
+                codex_service_pool=current_codex_service_pool,
+                claude_service_pool=current_claude_service_pool,
+                gemini_service_pool=current_gemini_service_pool,
             ) if _goal_audit else None
             _preferred_provider = str(_talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
             _goal_completed = bool(_talk.get("goal_completed", False))
@@ -1326,7 +2273,7 @@ def make_handler(
                     else ("recorded" if _wait_started_at else "idle")
                 )
             )
-            _summaries.append({
+            _summaries.append(merge_runtime_status({
                 "username": _t_user,
                 "session_id": _t_id,
                 "label": str(_talk.get("label", _t_id)),
@@ -1352,64 +2299,80 @@ def make_handler(
                 "created_by_type": str(_talk.get("created_by_type") or "").strip(),
                 "origin_session_id": str(_talk.get("origin_session_id") or "").strip(),
                 "origin_goal_id": str(_talk.get("origin_goal_id") or "").strip(),
+                **session_registration_metadata(_talk),
                 "session_ui_mode": session_ui_mode(_talk),
-            })
+            }))
         _wc = build_worker_count_summary(service_snapshots=_snaps, session_summaries=_summaries)
         return {
             "session_summaries": _summaries,
             "worker_counts": _wc,
-            "codex_pool": codex_service_pool,
-            "claude_pool": claude_service_pool,
-            "gemini_pool": gemini_service_pool,
+            "codex_pool": current_codex_service_pool,
+            "claude_pool": current_claude_service_pool,
+            "gemini_pool": current_gemini_service_pool,
+            "session_window_seconds": recent_window_seconds,
             "ts": utc_ts(),
         }
 
-    def _get_overview_cached(*, viewer_username: str, include_all: bool) -> dict:  # type: ignore[misc]
+    def _get_overview_cached(
+        *,
+        viewer_username: str,
+        include_all: bool,
+        active_session_id: str = "",
+        recent_window_seconds: int = DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS,
+    ) -> dict:  # type: ignore[misc]
         _now = time.monotonic()
-        _cache_key = f"{viewer_username}::{'all' if include_all else 'owned'}"
+        _cache_key = f"{viewer_username}::{'all' if include_all else 'owned'}::{active_session_id}::{recent_window_seconds}"
         with _ov_cache_lock:
             _cached, _ts, _stored_key = _ov_cache_state
             if _cached is not None and _stored_key == _cache_key and (_now - _ts) < _OV_CACHE_TTL:
                 return _cached
-        _result = _compute_overview_payload(viewer_username=viewer_username, include_all=include_all)
+        _result = _compute_overview_payload(
+            viewer_username=viewer_username,
+            include_all=include_all,
+            active_session_id=active_session_id,
+            recent_window_seconds=recent_window_seconds,
+        )
         with _ov_cache_lock:
             _ov_cache_state[0] = _result
             _ov_cache_state[1] = time.monotonic()
             _ov_cache_state[2] = _cache_key
         return _result
 
-    def _app_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
-        apps = list_launchable_session_templates(default_provider=default_provider)
+    def _unit_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
+        units = list_launchable_units(default_provider=default_provider)
         registered_states = {
             str(state.get("unit_id") or state.get("template_id") or "").strip(): state
-            for state in list_registered_session_template_states(runtime_root)
+            for state in list_registered_unit_states(runtime_root)
             if str(state.get("username") or "").strip() == str(viewer_username or "").strip()
         }
-        merged_apps: list[dict[str, Any]] = []
-        for app in apps:
-            app_state = registered_states.get(str(app.get("unit_id") or app.get("template_id") or "").strip())
+        merged_units: list[dict[str, Any]] = []
+        for unit in units:
+            unit_state = registered_states.get(str(unit.get("unit_id") or unit.get("template_id") or "").strip())
             state_payload = {
-                "registered": bool(app_state),
-                "workspace_path": str((app_state or {}).get("workspace_path") or "").strip(),
-                "last_session_id": str((app_state or {}).get("last_session_id") or "").strip(),
-                "last_parent_session_id": str((app_state or {}).get("last_parent_session_id") or "").strip(),
-                "created_at": str((app_state or {}).get("created_at") or "").strip(),
-                "updated_at": str((app_state or {}).get("updated_at") or "").strip(),
-                "schedule_state": dict((app_state or {}).get("schedule_state") or {}),
+                "registered": bool(unit_state),
+                "workspace_path": str((unit_state or {}).get("workspace_path") or "").strip(),
+                "last_session_id": str((unit_state or {}).get("last_session_id") or "").strip(),
+                "last_parent_session_id": str((unit_state or {}).get("last_parent_session_id") or "").strip(),
+                "created_at": str((unit_state or {}).get("created_at") or "").strip(),
+                "updated_at": str((unit_state or {}).get("updated_at") or "").strip(),
+                "schedule_state": dict((unit_state or {}).get("schedule_state") or {}),
             }
-            merged_apps.append(
+            merged_units.append(
                 {
-                    **app,
+                    **unit,
                     "state": state_payload,
-                    "schedule_status": describe_app_schedule(app, app_state=app_state),
+                    "schedule_status": describe_unit_schedule(unit, unit_state=unit_state),
                 }
             )
         return {
-            "apps": merged_apps,
-            "units": merged_apps,
+            "units": merged_units,
+            "apps": merged_units,
             "default_provider": default_provider,
             "ts": utc_ts(),
         }
+
+    def _app_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
+        return _unit_catalog_payload(viewer_username=viewer_username)
 
     def _goal_manager_runtime_payload(
         *,
@@ -1454,12 +2417,25 @@ def make_handler(
                 ) if service_id else None,
         }
 
-    def _initial_session_summaries_for_view(*, viewer_username: str, include_all: bool) -> list[dict[str, Any]]:
+    def _initial_session_summaries_for_view(
+        *,
+        viewer_username: str,
+        include_all: bool,
+        active_session_id: str = "",
+        recent_window_seconds: int = DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS,
+    ) -> list[dict[str, Any]]:
         current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
             current_llm_service_topology()
         )
         summaries: list[dict[str, Any]] = []
-        for talk in _visible_session_records(viewer_username=viewer_username, include_all=include_all):
+        for talk in _filter_display_sessions(
+            _visible_session_records(viewer_username=viewer_username, include_all=include_all),
+            runtime_root=runtime_root,
+            viewer_username=viewer_username,
+            include_all=include_all,
+            active_session_id=active_session_id,
+            recent_window_seconds=recent_window_seconds,
+        ):
             username = str(talk.get("username") or viewer_username).strip() or viewer_username
             session_id = str(talk.get("session_id") or "").strip()
             if not session_id:
@@ -1517,6 +2493,7 @@ def make_handler(
                     "created_by_type": str(talk.get("created_by_type") or "").strip(),
                     "origin_session_id": str(talk.get("origin_session_id") or "").strip(),
                     "origin_goal_id": str(talk.get("origin_goal_id") or "").strip(),
+                    **session_registration_metadata(talk),
                     "session_ui_mode": session_ui_mode(talk),
                 }
             )
@@ -1540,6 +2517,12 @@ def make_handler(
             goal_completed = bool(summary.get("goal_completed"))
             wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
             wait_active = bool(summary.get("user_response_wait_active", False))
+            registered_at = str(summary.get("registered_at") or summary.get("created_at") or "").strip()
+            goal_updated_at = str(summary.get("goal_updated_at") or summary.get("updated_at") or "").strip()
+            unit_id = str(summary.get("associated_unit_id") or summary.get("associated_template_id") or "").strip()
+            unit_display = str(summary.get("associated_unit_display_name") or unit_id).strip()
+            resident_unit = bool(summary.get("resident_unit_session", False))
+            has_unit_file = bool(summary.get("has_associated_unit_file", False) or unit_id)
             created_by_username = str(summary.get("created_by_username") or "").strip() or "unknown"
             origin_session_id = str(summary.get("origin_session_id") or "").strip()
             origin_meta = (
@@ -1586,6 +2569,12 @@ def make_handler(
             goal_manager_state = str(summary.get("goal_manager_state") or "idle")
             wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
             wait_active = bool(summary.get("user_response_wait_active", False))
+            registered_at = str(summary.get("registered_at") or summary.get("created_at") or "").strip()
+            goal_updated_at = str(summary.get("goal_updated_at") or summary.get("updated_at") or "").strip()
+            unit_id = str(summary.get("associated_unit_id") or summary.get("associated_template_id") or "").strip()
+            unit_display = str(summary.get("associated_unit_display_name") or unit_id).strip()
+            resident_unit = bool(summary.get("resident_unit_session", False))
+            has_unit_file = bool(summary.get("has_associated_unit_file", False) or unit_id)
             created_by_username = str(summary.get("created_by_username") or "").strip() or "unknown"
             origin_session_id = str(summary.get("origin_session_id") or "").strip()
             origin_meta = (
@@ -1609,17 +2598,23 @@ def make_handler(
             parts.append(
                 "".join(
                     [
-                        f"<a class='{' '.join(classes)}' href='/?session_id={html.escape(sid)}{scope_suffix}' title='Open this session'>",
+                        f"<a class='{' '.join(classes)}' href='/?session_id={html.escape(sid)}{scope_suffix}' title='Open this session"
+                        f"{' | registered ' + html.escape(registered_at) if registered_at else ''}"
+                        f"{' | goal updated ' + html.escape(goal_updated_at) if goal_updated_at else ''}"
+                        f"{' | unit ' + html.escape(unit_id) if unit_id else ''}'>",
                         f"<span class='goal-marker goal-marker-left{' is-claude' if worker_provider == 'claude' else ''}{'' if worker else ' is-idle'}' title='Bound/selected worker'>{html.escape(worker_slot)}</span>",
                         f"<span class='goal-marker goal-marker-right{'' if goal_manager_state == 'running' else ' is-hidden'}' title='GoalManager running'>{html.escape(gm_slot)}</span>",
                         "<div class='goal-session-card-head'>",
                         f"<div class='goal-session-title'>{html.escape(label)}</div>",
                         "</div>",
                         f"<div class='goal-session-meta'>{html.escape(summary.get('username', ''))}{' · ' if summary.get('username') else ''}{html.escape(sid)}{html.escape(origin_meta)}</div>",
+                        f"<div class='goal-session-timing'><span class='goal-session-elapsed' title='Registered at {html.escape(registered_at or 'unknown')}'>Elapsed pending</span><span class='goal-session-updated' title='Goal last updated at {html.escape(goal_updated_at or 'unknown')}'>Goal updated {html.escape(goal_updated_at or 'unknown')}</span></div>",
                         f"<div class='goal-session-goal'>{goal_html}</div>",
                         "<div class='goal-session-state'>",
                         f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Active' if goal_active else 'Inactive'}</span>",
                         f"<span class='goal-session-badge{' is-done' if goal_completed else ''}'>{'Completed' if goal_completed else 'In Progress'}</span>",
+                        "<span class='goal-session-badge' title='Resident Unit-backed session'>Resident Unit</span>" if resident_unit else "",
+                        f"<span class='goal-session-badge' title='Associated UnitFile: {html.escape(unit_id or unit_display)}'>UnitFile{' · ' + html.escape(unit_display) if unit_display else ''}</span>" if has_unit_file else "",
                         (
                             f"<span class='goal-session-badge{' is-warn' if wait_active else ''}'>"
                             f"{'Waiting User Response' if wait_active else ('Wait Timed Out' if wait_status == 'timed_out' else 'Wait Recorded')}"
@@ -1800,8 +2795,8 @@ def make_handler(
                 return self._do_WS_upgrade()
             if path == "/":
                 return self._do_GET_root(path, query)
-            if path in {"/units/entrance", "/plugins/entrance"}:
-                return self._do_GET_entrance_plugin(path, query)
+            if path in {"/unit/entrance", "/units/entrance", "/plugins/entrance"}:
+                return self._do_GET_entrance_unit(path, query)
             if path == "/events":
                 return self._do_GET_events(path, query)
             if path == "/health":
@@ -1821,7 +2816,7 @@ def make_handler(
             if path == "/messages":
                 return self._do_GET_messages(path, query)
             if path in {"/units", "/session-templates"}:
-                return self._do_GET_apps(path, query)
+                return self._do_GET_units(path, query)
             if path == "/sessions":
                 return self._do_GET_sessions(path, query)
             if path == "/services":
@@ -1864,8 +2859,10 @@ def make_handler(
             role_name = context.get("role", "user")
             is_superuser = bool(context.get("is_superuser"))
             initial_session_scope = "all" if _scope_include_all(context=context, query=query) else "owned"
+            initial_session_window_seconds = _parse_recent_window_seconds(query)
             initial_session_map_open = requested_session_id(self, query=query) is None
             initial_context_status = stored_context_status(username, session_id)
+            session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
             initial_history = build_session_ui_history(
                 runtime_root,
                 username=username,
@@ -1876,11 +2873,12 @@ def make_handler(
                 initial_history,
                 limit=INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT,
             )
+            if _is_communication_session_settings(session_settings):
+                initial_history = _collapse_communication_duplicate_outputs(initial_history)
             initial_history_for_http = [_history_entry_for_http(entry) for entry in initial_history]
             entries_json = json.dumps(initial_history_for_http, ensure_ascii=False).replace("</", "<\\/")
             context_status_json = json.dumps(initial_context_status, ensure_ascii=False).replace("</", "<\\/")
             initial_auto_compact_threshold = session_auto_compact_threshold(username, session_id)
-            session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
             initial_session_label = str(session_settings.get("label", session_id))
             initial_goal_text = str(session_settings.get("goal_text", ""))
             initial_active_goal_id = str(session_settings.get("active_goal_id", "") or "")
@@ -1954,6 +2952,10 @@ def make_handler(
                 else {},
                 ensure_ascii=False,
             ).replace("</", "<\\/")
+            initial_child_session_sharing_json = json.dumps(
+                normalize_child_session_sharing_policy(session_settings.get("child_session_sharing")),
+                ensure_ascii=False,
+            ).replace("</", "<\\/")
             initial_preferred_provider = str(session_settings.get("preferred_provider", default_provider))
             initial_agent_priority = normalize_agent_priority(session_settings.get("agent_priority"))
             initial_goal_manager_priority = normalize_goal_manager_priority(session_settings.get("goal_manager_priority"))
@@ -1976,12 +2978,16 @@ def make_handler(
             initial_session_summaries = _initial_session_summaries_for_view(
                 viewer_username=viewer_username,
                 include_all=(initial_session_scope == "all"),
+                active_session_id=session_id,
+                recent_window_seconds=initial_session_window_seconds,
             )
             if initial_session_map_open:
                 try:
                     _paged_ov = _get_overview_cached(
                         viewer_username=viewer_username,
                         include_all=(initial_session_scope == "all"),
+                        active_session_id=session_id,
+                        recent_window_seconds=initial_session_window_seconds,
                     )
                     initial_session_summaries_json = json.dumps(_paged_ov["session_summaries"], ensure_ascii=False).replace("</", "<\\/")
                     initial_worker_counts_json = json.dumps(_paged_ov["worker_counts"], ensure_ascii=False).replace("</", "<\\/")
@@ -2061,6 +3067,7 @@ def make_handler(
                     initial_session_group=initial_session_group,
                     initial_session_ui_mode=initial_session_ui_mode,
                     initial_session_permissions_json=initial_session_permissions_json,
+                    initial_child_session_sharing_json=initial_child_session_sharing_json,
                     initial_preferred_provider=initial_preferred_provider,
                     initial_agent_priority=initial_agent_priority,
                     initial_goal_manager_priority=initial_goal_manager_priority,
@@ -2070,6 +3077,7 @@ def make_handler(
                     initial_welcomed_agents=initial_welcomed_agents,
                     initial_selected_agents=initial_selected_agents,
                     recent_messages_limit_max=MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT,
+                    initial_session_window_seconds=initial_session_window_seconds,
                     initial_session_summaries_json=initial_session_summaries_json,
                     initial_worker_counts_json=initial_worker_counts_json,
                     initial_latest_user_prompt=initial_latest_user_prompt,
@@ -2084,20 +3092,23 @@ def make_handler(
                 )
             )
 
-        def _do_GET_entrance_plugin(self, path: str, query: dict) -> None:
-            from runtime.html_renderer import render_entrance_plugin_page
+        def _do_GET_entrance_unit(self, path: str, query: dict) -> None:
+            from runtime.html_renderer import render_entrance_unit_page
             context = current_context(self, query=query)
             if not context:
                 self._redirect("/")
                 return
             self._html(
                 200,
-                render_entrance_plugin_page(
+                render_entrance_unit_page(
                     display_name=str(self_service["display_name"]),
                     username=str(context.get("username") or ""),
                 ),
             )
             return
+
+        def _do_GET_entrance_plugin(self, path: str, query: dict) -> None:
+            return self._do_GET_entrance_unit(path, query)
 
 
         def _do_GET_events(self, path: str, query: dict) -> None:
@@ -2220,6 +3231,7 @@ def make_handler(
                 session_id=context["session_id"],
             ) or {}
             if _is_communication_session_settings(session_settings):
+                visible_history = _collapse_communication_duplicate_outputs(visible_history)
                 visible_history = [
                     entry for entry in visible_history if not _is_communication_chat_noise(entry)
                 ]
@@ -2239,9 +3251,12 @@ def make_handler(
             if not context:
                 return
             include_all = _scope_include_all(context=context, query=query)
+            recent_window_seconds = _parse_recent_window_seconds(query)
             talks_payload = _compute_overview_payload(
                 viewer_username=str(context.get("viewer_username") or context["username"]),
                 include_all=include_all,
+                active_session_id=str(context.get("session_id") or ""),
+                recent_window_seconds=recent_window_seconds,
             )
             self._json(
                 200,
@@ -2250,6 +3265,7 @@ def make_handler(
                     "viewer_username": str(context.get("viewer_username") or context["username"]),
                     "active_session_id": context["session_id"],
                     "scope": "all" if include_all else "owned",
+                    "session_window_seconds": recent_window_seconds,
                     "sessions": talks_payload["session_summaries"],
                     "session_summaries": talks_payload["session_summaries"],
                     "worker_counts": talks_payload["worker_counts"],
@@ -2257,7 +3273,7 @@ def make_handler(
             )
             return
 
-        def _do_GET_apps(self, path: str, query: dict) -> None:
+        def _do_GET_units(self, path: str, query: dict) -> None:
             context = self._require_user(query=query)
             if not context:
                 return
@@ -2265,13 +3281,16 @@ def make_handler(
             self._json(
                 200,
                 {
-                    **_app_catalog_payload(viewer_username=viewer_username),
+                    **_unit_catalog_payload(viewer_username=viewer_username),
                     "username": context["username"],
                     "viewer_username": viewer_username,
                     "active_session_id": context["session_id"],
                 },
             )
             return
+
+        def _do_GET_apps(self, path: str, query: dict) -> None:
+            return self._do_GET_units(path, query)
 
         def _do_GET_services(self, path: str, query: dict) -> None:
             context = self._require_user(query=query)
@@ -2293,13 +3312,26 @@ def make_handler(
             if not context:
                 return
             include_all = _scope_include_all(context=context, query=query)
+            recent_window_seconds = _parse_recent_window_seconds(query)
+            payload = (
+                _compute_overview_payload(
+                    viewer_username=str(context.get("viewer_username") or context["username"]),
+                    include_all=include_all,
+                    active_session_id=str(context.get("session_id") or ""),
+                    recent_window_seconds=recent_window_seconds,
+                )
+                if _query_requests_live_overview(query)
+                else _get_overview_cached(
+                    viewer_username=str(context.get("viewer_username") or context["username"]),
+                    include_all=include_all,
+                    active_session_id=str(context.get("session_id") or ""),
+                    recent_window_seconds=recent_window_seconds,
+                )
+            )
             self._json(
                 200,
                 {
-                    **_get_overview_cached(
-                        viewer_username=str(context.get("viewer_username") or context["username"]),
-                        include_all=include_all,
-                    ),
+                    **payload,
                     "scope": "all" if include_all else "owned",
                 },
             )
@@ -2353,6 +3385,9 @@ def make_handler(
             if "multipart/form-data" in content_type and path == "/session/goal/attach":
                 raw_bytes = self.rfile.read(length) if length else b""
                 return self._do_POST_goal_attach_multipart(raw_bytes, content_type)
+            if "multipart/form-data" in content_type and path == "/message":
+                raw_bytes = self.rfile.read(length) if length else b""
+                return self._do_POST_message_multipart(raw_bytes, content_type)
             raw = self.rfile.read(length).decode("utf-8") if length else ""
             payload: dict[str, Any]
             if "application/json" in content_type:
@@ -2385,7 +3420,7 @@ def make_handler(
             if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
             if path in {"/units/launch", "/session-templates/launch"}:
-                return self._do_POST_apps_launch(payload)
+                return self._do_POST_units_launch(payload)
             if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
             if path == "/session/rename":
@@ -2396,6 +3431,8 @@ def make_handler(
                 return self._do_POST_usage(payload)
             if path == "/session/auto-compact-threshold":
                 return self._do_POST_session_auto_compact_threshold(payload)
+            if path == "/session/child-sharing":
+                return self._do_POST_session_child_sharing(payload)
             if path == "/session/goal":
                 return self._do_POST_session_goal(payload)
             if path == "/session/goal/state":
@@ -2612,6 +3649,14 @@ def make_handler(
                 username=context["username"],
                 session_id=parent_session_id,
             ) or {}
+            if not parent_talk:
+                self._json(404, {"error": "parent_session_not_found"})
+                return
+            requester_talk = get_session_settings(
+                runtime_root,
+                username=context["username"],
+                session_id=context["session_id"],
+            ) or {}
             talk = create_child_conversation_session(
                 runtime_root,
                 username=context["username"],
@@ -2622,9 +3667,12 @@ def make_handler(
                 origin_session_id=parent_session_id,
                 origin_goal_id=str(parent_talk.get("active_goal_id") or parent_talk.get("goal_id") or "").strip(),
                 origin_goal_text=str(parent_talk.get("goal_text") or ""),
+                requester_session_id=context["session_id"],
+                requester_unit_id=str(requester_talk.get("launcher_unit_id") or requester_talk.get("launcher_template_id") or "").strip(),
+                requester_template_id=str(requester_talk.get("launcher_template_id") or requester_talk.get("launcher_unit_id") or "").strip(),
             )
             if not talk:
-                self._json(404, {"error": "parent_session_not_found"})
+                self._json(403, {"error": "child_session_creation_not_allowed"})
                 return
             with _ov_cache_lock:
                 _ov_cache_state[0] = None  # invalidate so next /overview reflects the new session
@@ -2641,7 +3689,7 @@ def make_handler(
             self._redirect(f"/?{urlencode({'session_id': str(talk['session_id'])})}")
             return
 
-        def _do_POST_apps_launch(self, payload: dict) -> None:
+        def _do_POST_units_launch(self, payload: dict) -> None:
             context = self._require_user(payload=payload)
             if not context:
                 return
@@ -2654,7 +3702,7 @@ def make_handler(
                 self._json(400, {"error": "parent_session_id_required"})
                 return
             try:
-                app = get_launchable_session_template(template_id, default_provider=default_provider)
+                app = get_launchable_unit(template_id, default_provider=default_provider)
             except KeyError:
                 self._json(404, {"error": "unit_not_found", "unit_id": template_id, "template_id": template_id})
                 return
@@ -2663,7 +3711,7 @@ def make_handler(
                 self._json(400, {"error": "selected_agents_list_required"})
                 return
             try:
-                launched = launch_session_template(
+                launched = launch_unit(
                     runtime_root,
                     username=context["username"],
                     parent_session_id=parent_session_id,
@@ -2691,6 +3739,44 @@ def make_handler(
                     "session_id": session_id,
                     "active_session_id": session_id,
                     "launch_plan": launched.get("launch_plan"),
+                },
+            )
+            return
+
+        def _do_POST_session_child_sharing(self, payload: dict) -> None:
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            session_id = str(payload.get("session_id") or context["session_id"] or "").strip()
+            if not session_id:
+                self._json(400, {"error": "session_id_required"})
+                return
+            sharing_payload = payload.get("child_session_sharing")
+            if not isinstance(sharing_payload, dict):
+                sharing_payload = {
+                    "mode": payload.get("mode"),
+                    "allowed_source_session_ids": payload.get("allowed_source_session_ids"),
+                    "allowed_source_unit_ids": payload.get("allowed_source_unit_ids") or payload.get("allowed_source_template_ids"),
+                    "allowed_source_template_ids": payload.get("allowed_source_template_ids") or payload.get("allowed_source_unit_ids"),
+                }
+            updated = update_session_child_sharing(
+                runtime_root,
+                username=context["username"],
+                session_id=session_id,
+                child_session_sharing=sharing_payload,
+            )
+            if not updated:
+                self._json(404, {"error": "session_not_found"})
+                return
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "session_id": session_id,
+                    "child_session_sharing": normalize_child_session_sharing_policy(
+                        updated.get("child_session_sharing")
+                    ),
+                    "session": updated,
                 },
             )
             return
@@ -2959,6 +4045,14 @@ def make_handler(
             if not talk:
                 self._json(404, {"error": "session_not_found"})
                 return
+            append_goal_status_changed(
+                append_history,
+                service_id=self_service["service_id"],
+                username=context["username"],
+                session_id=context["session_id"],
+                session=talk,
+                previous_session=current_talk,
+            )
             requested_provider = (
                 str(payload.get("preferred_provider")).strip().lower()
                 if "preferred_provider" in payload
@@ -3482,7 +4576,27 @@ def make_handler(
             )
             self._json(200, {"ok": True, "agent_id": agent_id, "acl": acl})
 
-        def _do_POST_message(self, payload: dict, content_type: str) -> None:
+        def _do_POST_message_multipart(self, raw_bytes: bytes, content_type: str) -> None:
+            boundary = ""
+            for part in content_type.split(";"):
+                part = part.strip()
+                if part.startswith("boundary="):
+                    boundary = part[len("boundary="):].strip().strip('"')
+                    break
+            if not boundary:
+                self._json(400, {"error": "missing_multipart_boundary"})
+                return
+            parts = _parse_multipart_bytes(raw_bytes, boundary)
+            payload, attachments = _coerce_multipart_payload(parts)
+            self._do_POST_message(payload, content_type, uploaded_attachments=attachments)
+
+        def _do_POST_message(
+            self,
+            payload: dict,
+            content_type: str,
+            *,
+            uploaded_attachments: list[dict[str, Any]] | None = None,
+        ) -> None:
             context = self._require_user(payload=payload)
             if not context:
                 return
@@ -3504,8 +4618,11 @@ def make_handler(
                 )
             payload.setdefault("to", default_target)
             text = payload.get("text")
-            if not isinstance(text, str) or not text.strip():
-                self._json(400, {"error": "text_required"})
+            has_uploads = bool(uploaded_attachments)
+            if not isinstance(text, str):
+                text = ""
+            if not text.strip() and not has_uploads:
+                self._json(400, {"error": "text_or_file_required"})
                 return
             raw_response_request_ids = payload.get("user_response_request_ids")
             response_request_ids: list[str] = []
@@ -3575,6 +4692,13 @@ def make_handler(
                             runtime_root,
                             username=username,
                             session_id=session_id,
+                        )
+                        persist_goal_manager_runtime_reset(
+                            runtime_root=runtime_root,
+                            service_id=self_service["service_id"],
+                            username=username,
+                            session_id=session_id,
+                            reason="goal_updated",
                         )
                         dispatched_to, dispatch_error = enqueue_goal_dispatch(
                             username=username,
@@ -3647,11 +4771,19 @@ def make_handler(
                 self._json(400, {"error": "to_required"})
                 return
             prompt_text = text.strip()
+            uploaded_files = [dict(item) for item in uploaded_attachments or [] if isinstance(item, dict)]
 
             def process_prompt_submission() -> None:
                 dispatch_error: str | None = None
-                to_service: str | None = None
+                goal_manager_dispatch_error: str | None = None
+                interactive_service_id: str | None = None
+                worker_service_id: str | None = None
+                forwarded_service_id: str | None = None
+                goal_manager_service_id: str | None = None
                 forwarded_session_id: str | None = None
+                forwarded_dispatch_reason: str | None = None
+                message_meta: dict[str, Any] = {}
+                transport_text = prompt_text
                 try:
                     previous_session_settings = get_session_settings(
                         runtime_root,
@@ -3695,6 +4827,14 @@ def make_handler(
                         username=username,
                         session_id=session_id,
                     ) or {}
+                    message_meta = save_session_message_artifacts(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                        text=prompt_text,
+                        attachments=uploaded_files,
+                    )
+                    transport_text = _message_transport_text(prompt_text, message_meta)
                     preferred_provider = (
                         str(session_settings.get("preferred_provider", default_provider)).strip().lower()
                         or default_provider
@@ -3707,6 +4847,14 @@ def make_handler(
                     communication_agent_enabled = bool(
                         session_settings.get("communication_agent_enabled", is_interactive_session)
                     )
+                    if communication_agent_enabled:
+                        sync_communication_goal_progress(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            completed=False,
+                            session=session_settings,
+                        )
                     prompt_kind = "user_dialogue" if communication_agent_enabled else "user_message"
                     dispatch_reason = "http_user_dialogue" if communication_agent_enabled else "http_prompt"
                     agent_role = "interactive_agent" if communication_agent_enabled else "agent"
@@ -3737,7 +4885,21 @@ def make_handler(
                             visible_sessions,
                             current_session_id=session_id,
                             prompt_text=prompt_text,
+                            current_session=session_settings,
                         )
+                        if not forwarded_session_id:
+                            routed_child_session = _materialize_communication_routed_child_session(
+                                runtime_root,
+                                username=username,
+                                current_session=session_settings,
+                                prompt_text=prompt_text,
+                                sessions=visible_sessions,
+                            )
+                            if isinstance(routed_child_session, dict):
+                                visible_sessions = list_sessions(runtime_root, username=username)
+                                forwarded_session_id = str(
+                                    routed_child_session.get("session_id") or ""
+                                ).strip() or None
                     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
@@ -3778,48 +4940,12 @@ def make_handler(
                         username=username,
                         session_id=session_id,
                     )
-                    if forwarded_session_id:
-                        target_session = _session_record_by_id(visible_sessions, forwarded_session_id) or {}
-                        target_preferred_provider = _normalize_session_preferred_provider(
-                            target_session,
-                            default_provider=preferred_provider,
-                        )
-                        append_pending_input(
-                            runtime_root,
-                            username=username,
-                            session_id=forwarded_session_id,
-                            entry=make_aize_pending_input(
-                                kind="user_message",
-                                role="user",
-                                text=prompt_text,
-                                submitted_by_username=username,
-                                user_response_request_ids=response_request_ids,
-                            ),
-                        )
-                        to_service = _resolve_dispatch_service_for_session(
-                            runtime_root=runtime_root,
-                            username=username,
-                            session_id=forwarded_session_id,
-                            preferred_provider=target_preferred_provider,
-                            default_provider=default_provider,
-                            current_llm_service_topology=current_llm_service_topology,
-                        )
-                        if to_service:
-                            join_session_agent(
-                                runtime_root,
-                                username=username,
-                                session_id=forwarded_session_id,
-                                service_id=to_service,
-                                provider=str(llm_service_kinds.get(to_service) or target_preferred_provider),
-                                role="agent",
-                                transport="http_prompt",
-                            )
-                        else:
-                            dispatch_error = "forward_target_no_available_provider_worker"
-                    elif ws_only_mode:
+                    if ws_only_mode:
                         # No local LLM worker — WS peer handles this session
-                        to_service = None
-                    elif requested_to_service == default_target and (current_codex_service_pool or current_claude_service_pool or current_gemini_service_pool):
+                        interactive_service_id = None
+                    elif requested_to_service == default_target and (
+                        current_codex_service_pool or current_claude_service_pool or current_gemini_service_pool
+                    ):
                         if leased_service_id and provider_pool and leased_service_id not in provider_pool:
                             leased_service_id = None
                         if not leased_service_id:
@@ -3830,7 +4956,7 @@ def make_handler(
                                 pool_service_ids=provider_pool,
                             )
                         if leased_service_id:
-                            to_service = leased_service_id
+                            interactive_service_id = leased_service_id
                             join_session_agent(
                                 runtime_root,
                                 username=username,
@@ -3843,21 +4969,112 @@ def make_handler(
                         else:
                             dispatch_error = "no_available_provider_worker"
                     else:
-                        to_service = requested_to_service
-                    target_kind = llm_service_kinds.get(to_service) if isinstance(to_service, str) and to_service else None
+                        interactive_service_id = requested_to_service
+                    if communication_agent_enabled:
+                        worker_service_id = _select_communication_worker_service_id(
+                            interactive_service_id,
+                            provider_pool,
+                        )
+                    target_session: dict[str, Any] = {}
+                    if forwarded_session_id:
+                        target_session = _session_record_by_id(visible_sessions, forwarded_session_id) or {}
+                        target_preferred_provider = _normalize_session_preferred_provider(
+                            target_session,
+                            default_provider=preferred_provider,
+                        )
+                        forwarded_pending_input, forwarded_dispatch_reason = _forwarded_session_pending_input(
+                            target_session,
+                            prompt_text=transport_text,
+                            submitted_by_username=username,
+                            user_response_request_ids=response_request_ids,
+                            message_meta=message_meta,
+                        )
+                        append_pending_input(
+                            runtime_root,
+                            username=username,
+                            session_id=forwarded_session_id,
+                            entry=forwarded_pending_input,
+                        )
+                        forwarded_service_id = _resolve_dispatch_service_for_session(
+                            runtime_root=runtime_root,
+                            username=username,
+                            session_id=forwarded_session_id,
+                            preferred_provider=target_preferred_provider,
+                            default_provider=default_provider,
+                            current_llm_service_topology=current_llm_service_topology,
+                        )
+                        if forwarded_service_id:
+                            join_session_agent(
+                                runtime_root,
+                                username=username,
+                                session_id=forwarded_session_id,
+                                service_id=forwarded_service_id,
+                                provider=str(llm_service_kinds.get(forwarded_service_id) or target_preferred_provider),
+                                role="agent",
+                                transport="http_prompt",
+                            )
+                        else:
+                            dispatch_error = "forward_target_no_available_provider_worker"
+                    if communication_agent_enabled:
+                        goal_manager_service_id = _resolve_goal_manager_dispatch_service_for_session(
+                            runtime_root=runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            preferred_provider=preferred_provider,
+                            default_provider=default_provider,
+                            current_llm_service_topology=current_llm_service_topology,
+                        )
+                        if goal_manager_service_id:
+                            append_goal_manager_pending_input(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                entry=make_aize_pending_input(
+                                    kind="goal_manager_review",
+                                    role="system",
+                                    text=json.dumps(
+                                        {
+                                            "kind": "user_prompt",
+                                            "prompt_text": transport_text,
+                                            "session_id": session_id,
+                                            "submitted_by_username": username,
+                                            "communication_agent": True,
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                ),
+                            )
+                        else:
+                            goal_manager_dispatch_error = "no_available_goal_manager_worker"
+                    target_kind = (
+                        llm_service_kinds.get(interactive_service_id)
+                        if isinstance(interactive_service_id, str) and interactive_service_id
+                        else None
+                    )
                     if str(session_settings.get("goal_text", "")).strip() and bool(
                         session_settings.get("goal_active", False)
                     ):
-                        reset_completed = bool(session_settings.get("goal_completed", False)) and bool(
-                            session_settings.get("goal_reset_completed_on_prompt", True)
+                        should_reopen_goal = communication_agent_enabled or (
+                            bool(session_settings.get("goal_completed", False))
+                            and bool(session_settings.get("goal_reset_completed_on_prompt", True))
                         )
-                        if reset_completed:
-                            update_session_goal_flags(
+                        if should_reopen_goal:
+                            reopened_talk = update_session_goal_flags(
                                 runtime_root,
                                 username=username,
                                 session_id=session_id,
                                 goal_completed=False,
+                                goal_progress_state="in_progress",
                             )
+                            if reopened_talk:
+                                append_goal_status_changed(
+                                    append_history,
+                                    service_id=self_service["service_id"],
+                                    username=username,
+                                    session_id=session_id,
+                                    session=reopened_talk,
+                                    previous_session=session_settings,
+                                )
                         reset_agent_audit_states_for_session(
                             runtime_root,
                             username=username,
@@ -3868,8 +5085,8 @@ def make_handler(
                         display_to = "pending:ws_peer"
                     elif forwarded_session_id:
                         display_to = f"forward:{forwarded_session_id}"
-                    elif to_service:
-                        display_to = to_service
+                    elif interactive_service_id:
+                        display_to = interactive_service_id
                     else:
                         display_to = f"pending:{preferred_provider}"
                     append_history(
@@ -3880,13 +5097,121 @@ def make_handler(
                             "ts": utc_ts(),
                             "to": display_to,
                             "session_id": session_id,
-                            "text": prompt_text,
+                            "text": transport_text,
                             "submitted_by_username": username,
                             "message_kind": prompt_kind,
                             "communication_agent": communication_agent_enabled,
+                            "goal_manager_dispatch_error": goal_manager_dispatch_error,
                             "user_response_request_ids": response_request_ids,
+                            "message_id": str(message_meta.get("message_id") or ""),
+                            "message_text_relpath": str(message_meta.get("text_relpath") or ""),
+                            "message_text_size": message_meta.get("text_size"),
+                            "attachments": list(message_meta.get("attachments") or []),
                         },
                     )
+                    if communication_agent_enabled:
+                        immediate_ack_label = ""
+                        if forwarded_session_id:
+                            parent_session_id = str(target_session.get("parent_session_id") or "").strip()
+                            if parent_session_id and parent_session_id != session_id:
+                                parent_session = _session_record_by_id(visible_sessions, parent_session_id) or {}
+                                immediate_ack_label = str(parent_session.get("label") or "").strip()
+                        _append_communication_immediate_ack(
+                            append_history,
+                            username=username,
+                            session_id=session_id,
+                            text=_communication_immediate_ack_text(
+                                forwarded_session=target_session if forwarded_session_id else None,
+                                forwarded_label=immediate_ack_label,
+                            ),
+                        )
+                    for session_skill in matching_interactive_session_skills(
+                        session_settings,
+                        prompt_text=transport_text,
+                    ):
+                        skill_error = ""
+                        skill_visible_text = ""
+                        skill_handled = True
+                        try:
+                            skill_result = run_interactive_session_skill(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                skill=session_skill,
+                                prompt_text=transport_text,
+                                session=session_settings,
+                            )
+                            skill_handled = bool(skill_result.get("handled", True))
+                            if not skill_handled:
+                                write_jsonl(
+                                    log_path,
+                                    {
+                                        "type": "http.session_skill_declined_prompt",
+                                        "ts": utc_ts(),
+                                        "service_id": self_service["service_id"],
+                                        "process_id": process_id,
+                                        "username": username,
+                                        "session_id": session_id,
+                                        "skill_id": str(session_skill.get("skill_id") or ""),
+                                    },
+                                )
+                                continue
+                            skill_visible_text = str(skill_result.get("assistant_text") or "").strip()
+                            append_session_skill_agent_turn(
+                                append_history,
+                                username=username,
+                                session_id=session_id,
+                                skill=session_skill,
+                                text=skill_visible_text,
+                            )
+                        except Exception as skill_exc:
+                            skill_error = repr(skill_exc)
+                            append_session_skill_agent_turn(
+                                append_history,
+                                username=username,
+                                session_id=session_id,
+                                skill=session_skill,
+                                text=f"Session Skill failed: {skill_error}",
+                                status="failed",
+                                error=skill_error,
+                            )
+                            dispatch_error = f"session_skill_failed:{skill_error}"
+                        if goal_manager_service_id:
+                            send_router_control(
+                                make_dispatch_pending_message(
+                                    manifest=manifest,
+                                    from_service_id=self_service["service_id"],
+                                    to_service_id=goal_manager_service_id,
+                                    process_id=process_id,
+                                    run_id=manifest["run_id"],
+                                    username=username,
+                                    session_id=session_id,
+                                    auth_context=auth_context,
+                                    reason="session_skill_result",
+                                    session_agent_id=resolve_session_agent_id(
+                                        runtime_root,
+                                        username=username,
+                                        session_id=session_id,
+                                        service_id=goal_manager_service_id,
+                                    ),
+                                )
+                            )
+                        write_jsonl(
+                            log_path,
+                            {
+                                "type": "http.session_skill_handled_prompt",
+                                "ts": utc_ts(),
+                                "service_id": self_service["service_id"],
+                                "process_id": process_id,
+                                "username": username,
+                                "session_id": session_id,
+                                "skill_id": str(session_skill.get("skill_id") or ""),
+                                "has_visible_text": bool(skill_visible_text),
+                                "dispatch_error": dispatch_error,
+                                "error": skill_error,
+                            },
+                        )
+                        return
                     # When WS-only, write a degraded-state event if no WS peer is
                     # actively subscribed (no live connection joined the session).
                     if ws_only_mode:
@@ -3910,18 +5235,33 @@ def make_handler(
                                     "event": {"type": "ws_peer.no_agent"},
                                 },
                             )
-                    append_pending_input(
-                        runtime_root,
-                        username=username,
-                        session_id=session_id,
-                        entry=make_aize_pending_input(
-                            kind=prompt_kind,
-                            role="user",
-                            text=prompt_text,
-                            submitted_by_username=username,
-                            user_response_request_ids=response_request_ids,
-                        ),
+                    prompt_pending_input = make_aize_pending_input(
+                        kind=prompt_kind,
+                        role="user",
+                        text=transport_text,
+                        submitted_by_username=username,
+                        user_response_request_ids=response_request_ids,
+                        message_id=str(message_meta.get("message_id") or ""),
+                        message_text_relpath=str(message_meta.get("text_relpath") or ""),
+                        message_text_size=message_meta.get("text_size"),
+                        attachments=list(message_meta.get("attachments") or []),
                     )
+                    if communication_agent_enabled and isinstance(interactive_service_id, str) and interactive_service_id:
+                        append_service_pending_input(
+                            runtime_root,
+                            service_id=interactive_service_id,
+                            agent_id=_slot_agent_id(interactive_service_id, session_id, "interactive_agent"),
+                            username=username,
+                            session_id=session_id,
+                            entry=prompt_pending_input,
+                        )
+                    else:
+                        append_pending_input(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                            entry=prompt_pending_input,
+                        )
                     maybe_enqueue_mid_turn_progress_inquiry(
                         runtime_root=runtime_root,
                         log_path=log_path,
@@ -3934,13 +5274,13 @@ def make_handler(
                         provider=str(target_kind or preferred_provider),
                     )
                     worker_dispatch_queued = False
+                    worker_request_id = ""
                     if (
                         communication_agent_enabled
-                        and isinstance(to_service, str)
-                        and to_service
-                        and _interactive_prompt_needs_worker(prompt_text)
+                        and isinstance(worker_service_id, str)
+                        and worker_service_id
+                        and not forwarded_session_id
                     ):
-                        worker_agent_id = _slot_agent_id(to_service, session_id, "worker_agent")
                         worker_request_id = f"interactive-worker-{int(time.time() * 1000)}"
                         worker_profile: dict[str, Any] | None = None
                         worker_priority = active_agent_profile_priority(
@@ -3951,7 +5291,7 @@ def make_handler(
                             worker_profile = dict(worker_priority[0])
                         else:
                             worker_profile = {
-                                "provider": str(target_kind or preferred_provider),
+                                "provider": str(preferred_provider),
                                 "session_slot": "worker_agent",
                             }
                         worker_profile["session_slot"] = "worker_agent"
@@ -3962,85 +5302,95 @@ def make_handler(
                             "config",
                             {"model_reasoning_effort": "low", "model_verbosity": "low"},
                         )
-                        worker_request_xml = (
-                            f'<aize_worker_request id="{html.escape(worker_request_id, quote=True)}" '
-                            'source_role="interactive_agent" target_role="worker_agent">\n'
-                            f"<user_message>{html.escape(prompt_text)}</user_message>\n"
-                            "<instruction>Treat this as the main WorkerAgent turn for the interactive session. "
-                            "Advance the session goal or investigate the user request using the available context and tools. "
-                            "Return the concrete answer, findings, or progress for InteractiveAgent to present to the user. "
-                            "Do not return only a status acknowledgement such as checked, confirmed, or completed. "
-                            "If the user asks for a list, include the list. "
-                            "Do not ask the user directly.</instruction>\n"
-                            '<resume target_role="interactive_agent" reason="worker_completed" />\n'
-                            "</aize_worker_request>"
+                        worker_request_xml = _communication_worker_request_xml(
+                            request_id=worker_request_id,
+                            transport_text=transport_text,
+                            session_settings=session_settings,
+                            forwarded_session=target_session if forwarded_session_id else None,
                         )
                         worker_pending = make_aize_pending_input(
                             kind="interactive_worker_request",
                             role="system",
                             text=worker_request_xml,
                             submitted_by_username=username,
+                            message_id=str(message_meta.get("message_id") or ""),
+                            message_text_relpath=str(message_meta.get("text_relpath") or ""),
+                            message_text_size=message_meta.get("text_size"),
+                            attachments=list(message_meta.get("attachments") or []),
                         )
                         worker_pending["request_id"] = worker_request_id
-                        worker_pending["source_user_text"] = prompt_text
+                        worker_pending["source_user_text"] = transport_text
+                        if forwarded_session_id:
+                            worker_pending["delegated_session_id"] = forwarded_session_id
+                            worker_pending["delegated_goal_text"] = str(target_session.get("goal_text") or "")
+                        if isinstance(interactive_service_id, str) and interactive_service_id:
+                            worker_pending["interactive_service_id"] = interactive_service_id
+                            worker_pending["interactive_agent_id"] = _slot_agent_id(
+                                interactive_service_id,
+                                session_id,
+                                "interactive_agent",
+                            )
                         append_service_pending_input(
                             runtime_root,
-                            service_id=to_service,
-                            agent_id=worker_agent_id,
+                            service_id=worker_service_id,
+                            agent_id=_slot_agent_id(worker_service_id, session_id, "worker_agent"),
                             username=username,
                             session_id=session_id,
                             entry=worker_pending,
                         )
-                        worker_dispatch_queued = send_router_control(
-                            make_dispatch_pending_message(
-                                manifest=manifest,
-                                from_service_id=self_service["service_id"],
-                                to_service_id=to_service,
-                                process_id=process_id,
-                                run_id=manifest["run_id"],
-                                username=username,
-                                session_id=session_id,
-                                auth_context=auth_context,
-                                reason="interactive_worker_request",
-                                session_agent_id=worker_agent_id,
-                                agent_profile=worker_profile,
-                            )
-                        )
-                        append_history(
-                            username,
-                            session_id,
+                    dispatch_plan = _communication_dispatch_plan(
+                        session_id=session_id,
+                        interactive_service_id=interactive_service_id if communication_agent_enabled else None,
+                        worker_service_id=worker_service_id if communication_agent_enabled else None,
+                        goal_manager_service_id=goal_manager_service_id if communication_agent_enabled else None,
+                        forwarded_session_id=forwarded_session_id,
+                        forwarded_service_id=forwarded_service_id,
+                        forwarded_dispatch_reason=forwarded_dispatch_reason,
+                    )
+                    if not communication_agent_enabled and isinstance(interactive_service_id, str) and interactive_service_id:
+                        dispatch_plan.append(
                             {
-                                "direction": "event",
-                                "ts": utc_ts(),
+                                "channel": "agent",
+                                "service_id": interactive_service_id,
                                 "session_id": session_id,
-                                "event_type": "interactive.worker_dispatched",
-                                "text": "WorkerAgent started background investigation for InteractiveAgent.",
-                                "event": {
-                                    "type": "interactive.worker_dispatched",
-                                    "request_id": worker_request_id,
-                                    "worker_agent_id": worker_agent_id,
-                                    "queued": worker_dispatch_queued,
-                                },
-                            },
+                                "reason": dispatch_reason,
+                            }
                         )
-                    dispatch_session_id = forwarded_session_id or session_id
-                    dispatch_agent_profile = None if forwarded_session_id else selected_agent_profile
-                    if isinstance(to_service, str) and to_service:
+                    for dispatch_step in dispatch_plan:
+                        channel = str(dispatch_step.get("channel") or "")
+                        target_service_id = str(dispatch_step.get("service_id") or "")
+                        target_session_id = str(dispatch_step.get("session_id") or "")
+                        reason = str(dispatch_step.get("reason") or "")
+                        session_agent_id = None
+                        agent_profile = None
+                        if channel in {"interactive", "agent"}:
+                            agent_profile = selected_agent_profile
+                        elif channel == "worker":
+                            session_agent_id = _slot_agent_id(target_service_id, target_session_id, "worker_agent")
+                            worker_dispatch_queued = True
+                        elif channel == "goal_manager":
+                            session_agent_id = resolve_session_agent_id(
+                                runtime_root,
+                                username=username,
+                                session_id=target_session_id,
+                                service_id=target_service_id,
+                            )
                         if not send_router_control(
                             make_dispatch_pending_message(
                                 manifest=manifest,
                                 from_service_id=self_service["service_id"],
-                                to_service_id=to_service,
+                                to_service_id=target_service_id,
                                 process_id=process_id,
-                                run_id=manifest["run_id"],
+                                run_id=(worker_request_id or manifest["run_id"]) if channel == "worker" else manifest["run_id"],
                                 username=username,
-                                session_id=dispatch_session_id,
+                                session_id=target_session_id,
                                 auth_context=auth_context,
-                                reason="http_prompt" if forwarded_session_id else dispatch_reason,
-                                agent_profile=dispatch_agent_profile,
+                                reason=reason,
+                                session_agent_id=session_agent_id,
+                                agent_profile=agent_profile,
                             )
                         ):
-                            dispatch_error = dispatch_error or "router_control_injection_failed"
+                            dispatch_error = dispatch_error or f"router_control_injection_failed:{channel}"
                     write_jsonl(
                         log_path,
                         {
@@ -4051,7 +5401,7 @@ def make_handler(
                             "username": username,
                             "submitted_by_username": username,
                             "session_id": session_id,
-                            "to": to_service,
+                            "to": interactive_service_id,
                             "dispatch_error": dispatch_error,
                             "prompt_kind": prompt_kind,
                             "communication_agent": communication_agent_enabled,
@@ -4070,7 +5420,7 @@ def make_handler(
                             "username": username,
                             "submitted_by_username": username,
                             "session_id": session_id,
-                            "to": to_service,
+                            "to": interactive_service_id or forwarded_service_id,
                             "error": repr(exc),
                         },
                     )
@@ -4239,25 +5589,29 @@ def make_handler(
     def _app_schedule_watcher() -> None:
         while not stopped.wait(timeout=3.5):
             try:
-                apps = {
-                    str(app.get("unit_id") or app.get("template_id") or "").strip(): app
-                    for app in list_launchable_session_templates(default_provider=default_provider)
+                ensure_auto_scheduled_root_unit_states(
+                    runtime_root,
+                    default_provider=default_provider,
+                )
+                units = {
+                    str(unit.get("unit_id") or unit.get("template_id") or "").strip(): unit
+                    for unit in list_launchable_units(default_provider=default_provider)
                 }
-                registered_apps = list_registered_session_template_states(runtime_root)
+                registered_units = list_registered_unit_states(runtime_root)
             except Exception:
                 continue
-            for app_state in registered_apps:
-                if not isinstance(app_state, dict):
+            for unit_state in registered_units:
+                if not isinstance(unit_state, dict):
                     continue
-                username = str(app_state.get("username") or "").strip()
-                template_id = str(app_state.get("unit_id") or app_state.get("template_id") or "").strip()
+                username = str(unit_state.get("username") or "").strip()
+                template_id = str(unit_state.get("unit_id") or unit_state.get("template_id") or "").strip()
                 if not username or not template_id:
                     continue
-                app = apps.get(template_id)
-                if not isinstance(app, dict) or not bool(app.get("enabled", True)):
+                unit = units.get(template_id)
+                if not isinstance(unit, dict) or not bool(unit.get("enabled", True)):
                     continue
                 try:
-                    _process_due_scheduled_app_launch(
+                    _process_due_scheduled_unit_launch(
                         runtime_root=runtime_root,
                         manifest=manifest,
                         self_service_id=self_service["service_id"],
@@ -4268,7 +5622,7 @@ def make_handler(
                         append_history=append_history,
                         send_router_control=send_router_control,
                         username=username,
-                        app=app,
+                        unit=unit,
                     )
                 except Exception as exc:
                     write_jsonl(

@@ -23,7 +23,7 @@ Every future pass for this goal should review these files:
 - `src/kernel/registry.py`
 - `src/kernel/router.py`
 - `src/kernel/spawn.py`
-- `src/cli/run_codex_http_mesh.py`
+- `src/cli/run_aize_unit.py`
 - `src/runtime/cli_service_adapter.py`
 
 The checks for each pass are:
@@ -57,7 +57,7 @@ Files reviewed in this pass:
 - `src/kernel/registry.py`
 - `src/kernel/router.py`
 - `src/kernel/spawn.py`
-- `src/cli/run_codex_http_mesh.py`
+- `src/cli/run_aize_unit.py`
 - `src/runtime/cli_service_adapter.py`
 
 ## Findings By Module
@@ -153,7 +153,7 @@ Reason:
   inside `SpawnManager` versus being split into additional kernel submodules.
 - That is architecture work, not a low-risk cleanup.
 
-### `src/cli/run_codex_http_mesh.py`
+### `src/cli/run_aize_unit.py`
 
 Status:
 
@@ -204,7 +204,7 @@ Reason:
 - Rejected externally injected `service.done`.
 - Removed explicit `MINIX` / `minix` philosophy drift from the codebase and
   current design notes.
-- Removed the duplicate `host` key in `src/cli/run_codex_http_mesh.py`.
+- Removed the duplicate `host` key in `src/cli/run_aize_unit.py`.
 - Removed the pseudo-service GoalManager sender special case from the
   kernel/runtime boundary and UI detection path.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import select
@@ -39,10 +40,24 @@ def is_local_message(manifest: dict, message: dict) -> bool:
 CONTROL_MESSAGE_TYPES = {"service.start", "service.stop", "service.restart", "service.reload", "service.status"}
 KERNEL_SPAWN_RECIPIENT = "kernel.spawn"
 KERNEL_CONTROL_RECIPIENT = "kernel.control"
+HTTP_BRIDGE_SERVICE_ID = "service-http-001"
 
 
 def has_core_message_fields(message: dict) -> bool:
     return all(key in message for key in ("from", "to", "type"))
+
+
+def _is_scoped_http_event(message: dict) -> bool:
+    if str(message.get("type") or "").strip() != "event":
+        return False
+    if str(message.get("to") or "").strip() != HTTP_BRIDGE_SERVICE_ID:
+        return False
+    conversation = message_meta_get(message, "conversation")
+    if not isinstance(conversation, dict):
+        return False
+    username = str(conversation.get("username") or "").strip()
+    session_id = str(conversation.get("session_id") or "").strip()
+    return bool(username and session_id)
 
 
 def parse_service_done(message: dict) -> tuple[str | None, str | None]:
@@ -158,6 +173,9 @@ def authorize_control_injection(
     if recipient_id in {KERNEL_SPAWN_RECIPIENT, KERNEL_CONTROL_RECIPIENT}:
         return True, "known_service_to_kernel"
 
+    if _is_scoped_http_event(message):
+        return True, "scoped_http_event"
+
     allowed_peers = set(sender_record.get("allowed_peers", []))
     if recipient_id not in allowed_peers:
         return False, "recipient_not_allowed_for_sender"
@@ -264,6 +282,9 @@ class _Conn:
     sock: socket.socket
     sender_id: str | None = None  # None until handshake
     buf: str = ""
+    decoder: codecs.IncrementalDecoder = field(
+        default_factory=lambda: codecs.getincrementaldecoder("utf-8")()
+    )
 
     @property
     def is_system(self) -> bool:
@@ -336,7 +357,7 @@ def main() -> int:
                 continue
 
             try:
-                chunk = conn.sock.recv(65536).decode("utf-8")
+                chunk = conn.decoder.decode(conn.sock.recv(65536))
             except OSError:
                 chunk = ""
 

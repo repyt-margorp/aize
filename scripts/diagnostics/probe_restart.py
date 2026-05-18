@@ -66,7 +66,7 @@ def resolve_node_id() -> str:
 
 
 NODE_ID = resolve_node_id()
-RESTART_SCRIPT = ROOT / "restart_codex_http_mesh.sh"
+RESTART_SCRIPT = ROOT / "restart_aize_unit.sh"
 LOG_DIR = ROOT / ".temp" / "restart-debug" / "logs"
 HEALTH_HOST = "127.0.0.1" if HTTP_HOST in {"0.0.0.0", "::"} else HTTP_HOST
 HEALTH_URL = f"https://{HEALTH_HOST}:{HTTP_PORT}/health"
@@ -74,7 +74,7 @@ _TLS_CTX = ssl.create_default_context()
 _TLS_CTX.check_hostname = False
 _TLS_CTX.verify_mode = ssl.CERT_NONE
 PROCESS_PATTERNS = {
-    "parent": f"cli.run_codex_http_mesh --runtime-root {RUNTIME_ROOT}",
+    "parent": f"cli.run_aize_unit --runtime-root {RUNTIME_ROOT}",
     "router": f"python3 -m kernel.router --manifest {RUNTIME_ROOT / 'manifest.json'}",
     "adapter": f"python3 -m runtime.cli_service_adapter --manifest {RUNTIME_ROOT / 'manifest.json'}",
 }

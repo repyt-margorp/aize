@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 import uuid
+import hashlib
+import fcntl
 from pathlib import Path
 from collections import defaultdict
 
@@ -36,6 +38,7 @@ LOGS = RUNTIME_ROOT / "logs"
 OBJECTS = RUNTIME_ROOT / "objects"
 STATE = RUNTIME_ROOT / "state"
 MANIFEST = RUNTIME_ROOT / "manifest.json"
+_RUNTIME_LOCK_HANDLE = None
 
 
 def resolve_node_id() -> str:
@@ -60,6 +63,42 @@ DESCRIPTOR_MANAGED_SERVICE_IDS = {
     str(service["service_id"])
     for service in build_service_plan_for_kinds(exclude_kinds={"svcmgr"})
 }
+
+
+def acquire_runtime_singleton_lock() -> bool:
+    global _RUNTIME_LOCK_HANDLE
+    lock_root = ROOT / ".temp" / "runtime-locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    runtime_key = hashlib.sha256(str(RUNTIME_ROOT.resolve()).encode("utf-8")).hexdigest()[:24]
+    lock_path = lock_root / f"{runtime_key}.lock"
+    lock_handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_handle.close()
+        print(
+            json.dumps(
+                {
+                    "error": "runtime_already_running",
+                    "runtime_root": str(RUNTIME_ROOT),
+                    "lock_path": str(lock_path.relative_to(ROOT)),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    lock_handle.write(str(os.getpid()) + "\n")
+    lock_handle.flush()
+    _RUNTIME_LOCK_HANDLE = lock_handle
+    return True
+
+
+def runtime_http_scheme() -> str:
+    return "https" if HTTP_TLS else "http"
 
 
 def build_core_manifest(
@@ -348,6 +387,8 @@ def spawn_service_process(service_id: str) -> subprocess.Popen:
 
 
 def main() -> int:
+    if not acquire_runtime_singleton_lock():
+        return 2
     manifest = bootstrap_runtime()
     procs: dict[str, subprocess.Popen] = {"kernel.router": spawn_router_process()}
     for service in manifest.get("services", []):
@@ -373,9 +414,9 @@ def main() -> int:
                 "run_id": manifest["run_id"],
                 "runtime_root": str(RUNTIME_ROOT),
                 "http": {
-                    "health": f"http://{HTTP_HOST}:{HTTP_PORT}/health",
-                    "messages": f"http://{HTTP_HOST}:{HTTP_PORT}/messages",
-                    "post_message": f"curl -s -X POST http://{HTTP_HOST}:{HTTP_PORT}/message -H 'Content-Type: application/json' -d '{{\"text\":\"Hello CodexFox\"}}'",
+                    "health": f"{runtime_http_scheme()}://{HTTP_HOST}:{HTTP_PORT}/health",
+                    "messages": f"{runtime_http_scheme()}://{HTTP_HOST}:{HTTP_PORT}/messages",
+                    "post_message": f"curl -s -X POST {runtime_http_scheme()}://{HTTP_HOST}:{HTTP_PORT}/message -H 'Content-Type: application/json' -d '{{\"text\":\"Hello CodexFox\"}}'",
                 },
             },
             ensure_ascii=False,

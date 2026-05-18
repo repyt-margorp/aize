@@ -52,27 +52,27 @@ def summarize_provider_event(event: dict[str, Any]) -> str:
         reason = str(event.get("reason", "")).strip()
         suffix = f" | reason {reason}" if reason else ""
         return f"GoalManager compact failed | last left {left_percent}%{suffix}"
-    if event_type == "service.goal_audit_started":
-        return "GoalManager running"
-    if event_type == "service.goal_audit_completed":
+    if event_type == "service.goal_manager_compact_started":
+        return "Manager running"
+    if event_type == "service.goal_manager_compact_completed":
         progress_state = str(event.get("progress_state", "complete" if bool(event.get("goal_satisfied")) else "in_progress"))
         audit_state = str(event.get("audit_state", "all_clear"))
         if progress_state == "complete":
-            return f"GoalManager completed the goal | audit {audit_state}"
+            return f"Manager completed the goal | review {audit_state}"
         request_compact = bool(event.get("request_compact"))
         reason = str(event.get("request_compact_reason", "")).strip()
         if request_compact and reason:
-            return f"GoalManager requested more work | audit {audit_state} | compact requested: {reason}"
+            return f"Manager requested more work | review {audit_state} | compact requested: {reason}"
         if request_compact:
-            return f"GoalManager requested more work | audit {audit_state} | compact requested"
-        return f"GoalManager requested more work | audit {audit_state}"
-    if event_type == "service.goal_audit_failed":
-        return "GoalManager failed"
-    if event_type == "service.goal_audit_parse_retry":
+            return f"Manager requested more work | review {audit_state} | compact requested"
+        return f"Manager requested more work | review {audit_state}"
+    if event_type == "service.goal_manager_compact_failed":
+        return "Manager failed"
+    if event_type == "service.goal_manager_compact_parse_retry":
         attempt = int(event.get("attempt", 1))
         error = str(event.get("error", "")).strip()
         short_error = error[:120] if error else "unknown parse error"
-        return f"GoalManager parse error (attempt {attempt}) — retrying | {short_error}"
+        return f"Manager parse error (attempt {attempt}) — retrying | {short_error}"
     if event_type == "service.restart_resume_enqueued":
         previous_process_id = str(event.get("previous_process_id", "?"))
         process_id = str(event.get("process_id", "?"))

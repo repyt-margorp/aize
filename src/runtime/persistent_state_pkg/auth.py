@@ -141,6 +141,7 @@ def resolve_session_context(runtime_root: Path, token: str | None) -> dict[str, 
     if not token:
         return None
     token_hash = digest_token(token)
+    normalized_roles: list[str] = ["user"]
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         session = _auth_sessions(state).get(token_hash)
@@ -161,14 +162,15 @@ def resolve_session_context(runtime_root: Path, token: str | None) -> dict[str, 
             cached = _load_session_record_by_id(runtime_root, username=username, session_id=session_id)
         if isinstance(cached, dict):
             ensure_session_storage_unlocked(runtime_root, username=username, session=cached)
+        record = state["users"].get(username)
+        if not isinstance(record, dict):
+            return None
+        roles = record.get("roles")
+        if isinstance(roles, list) and roles and all(isinstance(role, str) for role in roles):
+            normalized_roles = [str(role) for role in roles]
         session["active_session_id"] = session_id
         if session.get("active_session_id") != original_active_session_id:
             write_state(runtime_root, state)
-    from kernel.auth import resolve_user_record
-
-    user = resolve_user_record(runtime_root, username=username) or {}
-    roles = user.get("roles")
-    normalized_roles = [str(role) for role in roles] if isinstance(roles, list) and roles else ["user"]
     return {"username": username, "session_id": session_id, "roles": normalized_roles, "role": normalized_roles[0]}
 
 

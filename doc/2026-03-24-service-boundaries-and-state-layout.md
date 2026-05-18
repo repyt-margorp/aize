@@ -5,7 +5,7 @@
 This refactor keeps the MINIX-style boot model introduced on 2026-03-23 and tightens one remaining boundary around persistent state placement.
 
 - Boot now remains explicitly two-stage:
-  - `src/cli/run_codex_http_mesh.py` starts only the router plus `service-svcmgr-001`
+  - `src/cli/run_aize_unit.py` starts only the router plus `service-svcmgr-001`
   - `service-svcmgr-001` expands service descriptors and spawns `HttpBridge`, Codex, Claude, and any restored dynamic services
 - Runtime service definitions continue to live under `src/services/`
 - Persistent session/auth state stays outside the disposable runtime root for the canonical repo runtime, but ephemeral runtimes now isolate their own state trees

@@ -116,15 +116,20 @@ def _run_claude_helper(
     threshold_left_percent: int,
     extra_args: list[str] | None = None,
 ) -> tuple[dict[str, Any], int]:
-    helper = repo_root / ".temp" / helper_name
-    if not helper.exists():
+    helper_candidates = [
+        repo_root / ".temp" / helper_name,
+        repo_root / "scripts" / helper_name,
+    ]
+    helper = next((candidate for candidate in helper_candidates if candidate.exists()), None)
+    if helper is None:
         return (
             {
                 "type": failed_type,
                 "threshold_left_percent": threshold_left_percent,
                 "session_id": session_id,
                 "error": "helper_missing",
-                "helper_path": str(helper),
+                "helper_path": str(helper_candidates[0]),
+                "helper_candidates": [str(path) for path in helper_candidates],
             },
             1,
         )
@@ -212,6 +217,7 @@ def run_claude_compaction(
         **({"returncode": event["returncode"]} if "returncode" in event else {}),
         **({"error": event["error"]} if "error" in event else {}),
         **({"helper_path": event["helper_path"]} if "helper_path" in event else {}),
+        **({"helper_candidates": event["helper_candidates"]} if "helper_candidates" in event else {}),
     }
     return event, rc
 
@@ -256,4 +262,6 @@ def run_claude_context_check(
         normalized_event["error"] = event["error"]
     if "helper_path" in event:
         normalized_event["helper_path"] = event["helper_path"]
+    if "helper_candidates" in event:
+        normalized_event["helper_candidates"] = event["helper_candidates"]
     return normalized_event, rc

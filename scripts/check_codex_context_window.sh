@@ -10,6 +10,13 @@ SESSION_ID="$1"
 WORKDIR="${2:-$(pwd)}"
 TMUX_SESSION="codex_ctx_check_$$"
 
+if ! command -v tmux >/dev/null 2>&1; then
+  printf 'status_line: tmux unavailable\n'
+  printf 'left_percent: ?\n'
+  printf 'used_percent: ?\n'
+  exit 0
+fi
+
 cleanup() {
   tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
 }

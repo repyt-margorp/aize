@@ -51,15 +51,20 @@ from runtime.providers.codex import run_codex  # noqa: E402
 from runtime.providers.gemini import run_gemini  # noqa: E402
 from runtime.providers import provider_supports_context_compaction  # noqa: E402
 from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
-from runtime.compaction import maybe_resume_after_restart  # noqa: E402
+from runtime.compaction import build_restart_resume_claim_run_id, maybe_resume_after_restart  # noqa: E402
 from runtime.agent_service import (  # noqa: E402
+    _dispatch_spawn_initial_prompt,
     _resolve_audit_state_after_goal_manager_compact,
     _materialize_goal_child_sessions,
     _extract_user_response_wait_control,
+    _dispatch_reason_uses_service_pending_only,
+    _post_turn_followup_pending_state,
     _should_defer_dispatch_for_completed_goal,
     _dispatch_provider_session_slot,
 )
 from runtime.http_handler import _process_due_auto_resume_session, _process_due_scheduled_app_launch  # noqa: E402
+from runtime.status_gateway import goal_status_changed_event, runtime_status_changed_event  # noqa: E402
+from runtime.status_events import append_goal_status_changed  # noqa: E402
 from runtime.ui_history import build_session_ui_history  # noqa: E402
 from runtime.ws_peer_client import _remote_session_entry_to_dispatch  # noqa: E402
 from session_template import get_registered_session_template_state, launch_session_template, normalize_session_template_descriptor  # noqa: E402
@@ -67,21 +72,26 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     add_session_child,
     append_history,
     append_goal_manager_pending_input,
+    append_service_pending_input,
     claim_session_restart_resume,
     consume_session_due_user_response_wait,
     complete_session_child,
     create_conversation_session,
     create_session,
     create_child_conversation_session,
+    update_session_child_sharing,
     ensure_state,
     get_history,
     list_session_agent_contacts,
+    load_session_audit_summary,
     list_active_in_progress_child_sessions,
     list_session_children,
     list_session_parents,
+    supersede_recovery_child_sessions,
     get_session_settings,
     load_goal_manager_pending_inputs,
     lease_session_service,
+    drain_service_pending_inputs,
     load_service_pending_inputs,
     load_codex_session,
     list_codex_sessions,
@@ -89,6 +99,8 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     join_session_agent,
     record_session_agent_contact,
     release_nonrunnable_session_services,
+    reconcile_session_waiting_on_children,
+    resolve_session_agent_id,
     resolve_session_context,
     save_codex_session,
     save_gemini_session,
@@ -103,9 +115,12 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     session_metadata_path,
     session_service_state_path,
     session_timeline_path,
+    save_agent_audit_state,
+    sync_communication_goal_progress,
     state_path,
     update_session_goal,
     update_session_goal_flags,
+    update_session_launcher_profile,
     update_session_user_response_wait,
     write_json_file,
 )
@@ -133,6 +148,48 @@ class GoalManagerCompactTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_load_session_audit_summary_uses_strongest_agent_state(self) -> None:
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-claude-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="needs_compact",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-gemini-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(summary["audit_state"], "panic")
+        self.assertEqual(
+            {
+                str(service["service_id"]): str(service["audit_state"])
+                for service in summary["services"]
+            },
+            {
+                "service-codex-001": "all_clear",
+                "service-claude-001": "needs_compact",
+                "service-gemini-001": "panic",
+            },
+        )
 
     def _register_running_service(self, service_id: str, *, kind: str = "codex") -> None:
         init_registry(
@@ -282,6 +339,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("including a single child goal", prompt)
         self.assertIn("inherits parent-goal lineage/context", prompt)
         self.assertIn("Session files:", prompt)
+        self.assertIn("Do NOT load the entire JSONL bundle in one read call", prompt)
+        self.assertIn("Use targeted inspection first", prompt)
+        self.assertIn("switch to targeted searches and partial reads", prompt)
         self.assertIn("/tmp/session/timeline.jsonl", prompt)
         self.assertIn('"goal_id": "goal-1"', prompt)
         self.assertNotIn("recent history", prompt)
@@ -362,6 +422,46 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual([item["service_id"] for item in contacts], ["service-codex-001"])
         self.assertEqual(contacts[0]["last_turn_completed_at"], "2026-03-20T12:10:00Z")
 
+    def test_record_session_agent_contact_keeps_native_goal_manager_alongside_native_agent(self) -> None:
+        record_session_agent_contact(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            provider="codex",
+            join_role="agent",
+        )
+        record_session_agent_contact(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-claude-001",
+            provider="claude",
+            join_role="goal_manager",
+        )
+        record_session_agent_contact(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-002",
+            provider="codex",
+            join_role="agent",
+        )
+
+        contacts = list_session_agent_contacts(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(
+            [(item["service_id"], item.get("join_role")) for item in contacts],
+            [
+                ("service-claude-001", "goal_manager"),
+                ("service-codex-002", "agent"),
+            ],
+        )
+
     def test_join_session_agent_records_common_join_metadata(self) -> None:
         result = join_session_agent(
             self.runtime_root,
@@ -384,6 +484,60 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(contacts[0]["join_role"], "goal_manager")
         self.assertEqual(contacts[0]["join_transport"], "local_dispatch")
         self.assertTrue(contacts[0]["joined_at"])
+
+    def test_join_session_agent_keeps_provider_slots_separate(self) -> None:
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            provider="codex",
+            role="interactive_agent",
+            transport="http_user_dialogue",
+        )
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            provider="codex",
+            role="worker_agent",
+            transport="interactive_worker_request",
+        )
+
+        contacts = list_session_agent_contacts(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(
+            [(item["agent_id"], item.get("join_role")) for item in contacts],
+            [
+                (f"service-codex-001@@{self.session_id}@@interactive_agent", "interactive_agent"),
+                (f"service-codex-001@@{self.session_id}@@worker_agent", "worker_agent"),
+            ],
+        )
+        self.assertEqual(
+            resolve_session_agent_id(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+                role="interactive_agent",
+            ),
+            f"service-codex-001@@{self.session_id}@@interactive_agent",
+        )
+        self.assertEqual(
+            resolve_session_agent_id(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+                role="worker_agent",
+            ),
+            f"service-codex-001@@{self.session_id}@@worker_agent",
+        )
 
     def test_session_history_is_written_to_timeline_jsonl(self) -> None:
         append_history(
@@ -518,8 +672,11 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(
             payload["session_permissions"],
             {
+                "create_session": True,
                 "create_child_session": True,
+                "update_session_goal": True,
                 "update_goal": True,
+                "send_user_prompt": True,
                 "send_prompt": True,
                 "auto_spawn_recovery": True,
                 "auto_resume": True,
@@ -1017,6 +1174,35 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(verified[0]["validation"], "json_valid")
         self.assertTrue(Path(verified[0]["local_path"]).exists())
 
+    def test_collect_and_verify_turn_completed_artifacts_reads_goal_manager_pending_inputs(self) -> None:
+        artifact_source = self.runtime_root / "sample-goal-manager.json"
+        artifact_source.write_text(json.dumps({"ok": True, "source": "goal_manager"}), encoding="utf-8")
+        artifact_url = artifact_source.resolve().as_uri()
+
+        append_goal_manager_pending_input(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "kind": "turn_completed",
+                "ts": "2026-03-20T12:31:00Z",
+                "service_id": "service-codex-001",
+                "latest_reply": f"Download {artifact_url}",
+            },
+        )
+
+        verified = collect_and_verify_turn_completed_artifacts(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            last_reviewed_turn_completed_at="",
+        )
+
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(verified[0]["validation"], "json_valid")
+        self.assertEqual(verified[0]["completed_at"], "2026-03-20T12:31:00Z")
+        self.assertTrue(Path(verified[0]["local_path"]).exists())
+
     def test_goal_audit_followup_only_enqueues_for_in_progress_all_clear(self) -> None:
         self.assertTrue(
             goal_audit_should_enqueue_agent_followup(
@@ -1126,6 +1312,104 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(state["state"], "idle")
         self.assertEqual(state["pending_work_items"], [])
 
+    def test_persist_goal_audit_completion_mirrors_terminal_status_into_service_state(self) -> None:
+        log_path = self.runtime_root / "logs" / "goal-manager.jsonl"
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="worker-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+
+        persist_goal_audit_completion(
+            runtime_root=self.runtime_root,
+            log_path=log_path,
+            service_id="service-codex-001",
+            process_id="proc-1",
+            goal_audit_job_id="job-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit={
+                "goal_audit_session_id": "session-1",
+                "progress_state": "complete",
+                "audit_state": "all_clear",
+                "goal_satisfied": True,
+                "summary": "Completed successfully.",
+                "continue_xml": "",
+                "request_compact": False,
+                "request_compact_reason": "",
+            },
+        )
+
+        service_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(service_state["status"], "complete")
+        self.assertTrue(service_state["updated_at"])
+        self.assertEqual(service_state["goal_manager"]["state"], "idle")
+        self.assertEqual(service_state["goal_manager"]["progress_state"], "complete")
+        self.assertTrue(service_state["goal_manager"]["goal_satisfied"])
+        self.assertEqual(service_state["provider_sessions"]["worker_agent"]["codex_session_id"], "worker-thread")
+
+    def test_persist_goal_audit_completion_keeps_continuous_goal_in_progress(self) -> None:
+        log_path = self.runtime_root / "logs" / "goal-manager.jsonl"
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep Entrance available.",
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["goal_completion_policy"] = "continuous"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+
+        persist_goal_audit_completion(
+            runtime_root=self.runtime_root,
+            log_path=log_path,
+            service_id="service-codex-001",
+            process_id="proc-1",
+            goal_audit_job_id="job-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit={
+                "goal_audit_session_id": "session-1",
+                "progress_state": "complete",
+                "audit_state": "all_clear",
+                "goal_satisfied": True,
+                "summary": "The standing service is healthy.",
+                "continue_xml": "",
+                "request_compact": False,
+                "request_compact_reason": "",
+            },
+        )
+
+        written = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(written[0]["progress_state"], "in_progress")
+        self.assertFalse(written[0]["goal_satisfied"])
+        state = json.loads(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["progress_state"], "in_progress")
+        self.assertFalse(state["goal_satisfied"])
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual(history[0]["event"]["progress_state"], "in_progress")
+        self.assertFalse(history[0]["event"]["goal_satisfied"])
+
     def test_persist_goal_audit_failure_clears_stale_goal_manager_pending_work(self) -> None:
         log_path = self.runtime_root / "logs" / "goal-manager.jsonl"
         state_path = session_goal_manager_state_path(
@@ -1195,6 +1479,36 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(history[-1]["event_type"], "service.goal_manager_reset")
         self.assertEqual(history[-1]["event"]["reason"], "goal_updated")
 
+    def test_persist_goal_manager_runtime_reset_mirrors_idle_status_into_service_state(self) -> None:
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="worker-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        persist_goal_manager_runtime_reset(
+            runtime_root=self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            reason="goal_updated",
+        )
+
+        service_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(service_state["status"], "idle")
+        self.assertTrue(service_state["updated_at"])
+        self.assertEqual(service_state["goal_manager"]["state"], "idle")
+        self.assertEqual(service_state["provider_sessions"]["worker_agent"]["codex_session_id"], "worker-thread")
+
     def test_goal_auto_compact_state_round_trip_payload(self) -> None:
         from runtime.persistent_state_pkg import update_session_goal
 
@@ -1218,6 +1532,150 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(payload["goal_progress_state"], "in_progress")
         self.assertEqual(payload["goal_audit_state"], "all_clear")
         self.assertEqual(payload["session_id"], self.session_id)
+
+    def test_sync_communication_goal_progress_toggles_active_communication_goal(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Handle Entrance work",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+        talk = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert talk is not None
+        talk["communication_agent_enabled"] = True
+        talk["session_ui_mode"] = "communication"
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            talk,
+        )
+
+        sync_communication_goal_progress(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            completed=True,
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertTrue(bool(stored["goal_completed"]))
+        self.assertEqual(stored["goal_progress_state"], "complete")
+
+        sync_communication_goal_progress(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            completed=False,
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertFalse(bool(stored["goal_completed"]))
+        self.assertEqual(stored["goal_progress_state"], "in_progress")
+
+    def test_sync_communication_goal_progress_does_not_complete_continuous_goal(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep Entrance running",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+        talk = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert talk is not None
+        talk["communication_agent_enabled"] = True
+        talk["session_ui_mode"] = "communication"
+        talk["goal_completion_policy"] = "continuous"
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            talk,
+        )
+
+        sync_communication_goal_progress(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            completed=True,
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertEqual(stored["goal_completion_policy"], "continuous")
+        self.assertFalse(bool(stored["goal_completed"]))
+        self.assertEqual(stored["goal_progress_state"], "in_progress")
+
+    def test_append_history_writes_runtime_journal(self) -> None:
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "direction": "event",
+                "ts": "2026-05-06T00:00:00Z",
+                "event_type": "runtime.status_changed",
+                "text": "Runtime executing",
+                "event": {"type": "runtime.status_changed", "runtime_execution_state": "running"},
+            },
+            limit=20,
+        )
+        journal_path = (
+            Path(self.runtime_root)
+            / ".aize-state"
+            / "sessions"
+            / TEST_USERNAME
+            / self.session_id
+            / "runtime_journal.jsonl"
+        )
+        journal = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(journal[-1]["journal_type"], "runtime.event")
+        self.assertEqual(journal[-1]["event_type"], "runtime.status_changed")
+
+    def test_sync_communication_goal_progress_ignores_standard_session(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Handle standard work",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+
+        sync_communication_goal_progress(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            completed=True,
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertFalse(bool(stored["goal_completed"]))
+        self.assertEqual(stored["goal_progress_state"], "in_progress")
 
     def test_goal_updates_append_history_and_expose_active_goal_id(self) -> None:
         from runtime.persistent_state_pkg import update_session_goal
@@ -1244,7 +1702,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(second["goal_history"][1]["goal_text"], "Second goal")
         self.assertEqual(second["goal_history"][1]["previous_goal_id"], first["goal_id"])
 
-    def test_append_history_truncates_oversized_nested_payloads(self) -> None:
+    def test_append_history_externalizes_oversized_text_payloads(self) -> None:
         huge = "x" * 10000
         append_history(
             self.runtime_root,
@@ -1272,8 +1730,88 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertEqual(len(history), 1)
-        self.assertIn("[truncated", history[0]["text"])
-        self.assertIn("[truncated", history[0]["event"]["provider_event"]["item"]["aggregated_output"])
+        self.assertEqual(history[0]["text"], huge)
+        timeline_path = (
+            Path(self.runtime_root)
+            / ".aize-state"
+            / "sessions"
+            / TEST_USERNAME
+            / self.session_id
+            / "timeline.jsonl"
+        )
+        stored_entry = json.loads(timeline_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertFalse(stored_entry["text_inline"])
+        self.assertIn("messages/", stored_entry["text_path"])
+        self.assertIn("[truncated", stored_entry["event"]["provider_event"]["item"]["aggregated_output"])
+
+    def test_append_pending_input_externalizes_and_rehydrates_oversized_text(self) -> None:
+        from runtime.persistent_state_pkg import append_pending_input, load_pending_inputs
+
+        huge = "y" * 10000
+        pending = append_pending_input(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "kind": "user_message",
+                "role": "user",
+                "text": huge,
+            },
+        )
+
+        self.assertEqual(pending[0]["text"], huge)
+        loaded = load_pending_inputs(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual(loaded[0]["text"], huge)
+        pending_path = (
+            Path(self.runtime_root)
+            / ".aize-state"
+            / "sessions"
+            / TEST_USERNAME
+            / self.session_id
+            / "pending"
+            / "session.jsonl"
+        )
+        stored_entry = json.loads(pending_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertFalse(stored_entry["text_inline"])
+        self.assertIn("messages/", stored_entry["text_path"])
+
+    def test_append_goal_manager_pending_input_externalizes_and_rehydrates_oversized_text(self) -> None:
+        from runtime.persistent_state_pkg import (
+            append_goal_manager_pending_input,
+            load_goal_manager_pending_inputs,
+        )
+
+        huge = "z" * 10000
+        pending = append_goal_manager_pending_input(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "kind": "goal_manager_review",
+                "role": "system",
+                "text": huge,
+            },
+        )
+
+        self.assertEqual(pending[0]["text"], huge)
+        loaded = load_goal_manager_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(loaded[0]["text"], huge)
+        pending_path = (
+            Path(self.runtime_root)
+            / ".aize-state"
+            / "sessions"
+            / TEST_USERNAME
+            / self.session_id
+            / "pending"
+            / "goal_manager.jsonl"
+        )
+        stored_entry = json.loads(pending_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertFalse(stored_entry["text_inline"])
+        self.assertIn("messages/", stored_entry["text_path"])
 
     def test_append_history_skips_exact_duplicate_replay(self) -> None:
         entry = {
@@ -1418,7 +1956,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(any(entry.get("event_type") == "service.goal_audit_completed" for entry in history))
         self.assertFalse(any(entry.get("text") == "old aggregate only" for entry in history))
 
-    def test_build_session_ui_history_includes_provider_agent_message_delta(self) -> None:
+    def test_build_session_ui_history_hides_interactive_provider_output_when_final_reply_exists(self) -> None:
         service_id = "service-codex-001"
         join_session_agent(
             self.runtime_root,
@@ -1460,6 +1998,25 @@ class GoalManagerCompactTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        (self.runtime_root / "logs" / "service-http-001.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "message.in",
+                    "ts": "2026-04-06T10:00:03Z",
+                    "service_id": "service-http-001",
+                    "message": {
+                        "from": service_id,
+                        "to": "service-http-001",
+                        "type": "prompt",
+                        "meta": {"conversation": {"username": TEST_USERNAME, "session_id": self.session_id}},
+                        "payload": {"text": "interactive final reply"},
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         history = build_session_ui_history(
             self.runtime_root,
@@ -1468,8 +2025,186 @@ class GoalManagerCompactTests(unittest.TestCase):
             limit=20,
         )
 
-        self.assertTrue(any(entry.get("event_type") == "agent_message.delta" and entry.get("text") == "hel" for entry in history))
-        self.assertTrue(any(entry.get("event_type") == "item.completed" and entry.get("text") == "hello" for entry in history))
+        self.assertTrue(any(entry.get("direction") == "in" and entry.get("text") == "interactive final reply" for entry in history))
+        self.assertFalse(any(entry.get("event_type") == "agent_message.delta" and entry.get("text") == "hel" for entry in history))
+        self.assertFalse(any(entry.get("event_type") == "item.completed" and entry.get("text") == "hello" for entry in history))
+
+    def test_build_session_ui_history_hides_goal_manager_provider_agent_message(self) -> None:
+        service_id = "service-codex-001"
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=service_id,
+            provider="codex",
+            role="goal_manager",
+            transport="goal_manager_review",
+        )
+        (self.runtime_root / "logs" / f"{service_id}.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "service.goal_manager_compact_provider_event",
+                            "ts": "2026-04-06T10:00:01Z",
+                            "service_id": service_id,
+                            "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
+                            "provider_event": {
+                                "type": "item.completed",
+                                "item": {"type": "agent_message", "text": "raw manager text"},
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "service.goal_manager_compact_checked",
+                            "ts": "2026-04-06T10:00:02Z",
+                            "service_id": service_id,
+                            "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
+                            "left_percent": 80,
+                            "compaction": "not_needed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        history = build_session_ui_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            limit=20,
+        )
+
+        self.assertFalse(any(entry.get("text") == "raw manager text" for entry in history))
+        self.assertTrue(any(entry.get("event_type") == "service.goal_manager_compact_checked" for entry in history))
+
+    def test_build_session_ui_history_hides_worker_agent_provider_output(self) -> None:
+        shared_service_id = "service-codex-001"
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=shared_service_id,
+            provider="codex",
+            role="interactive_agent",
+            transport="http_user_dialogue",
+        )
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=shared_service_id,
+            provider="codex",
+            role="worker_agent",
+            transport="interactive_worker_request",
+        )
+        (self.runtime_root / "logs" / f"{shared_service_id}.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "agent.turn_started",
+                            "ts": "2026-04-06T10:00:01Z",
+                            "service_id": shared_service_id,
+                            "session_slot": "worker_agent",
+                            "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "service.event",
+                            "ts": "2026-04-06T10:00:02Z",
+                            "service_id": shared_service_id,
+                            "session_slot": "worker_agent",
+                            "scope": {"username": TEST_USERNAME, "session_id": self.session_id},
+                            "event": {
+                                "type": "item.completed",
+                                "item": {"type": "agent_message", "text": "worker raw result"},
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.runtime_root / "logs" / "service-http-001.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "message.in",
+                    "ts": "2026-04-06T10:00:03Z",
+                    "service_id": "service-http-001",
+                    "message": {
+                        "from": shared_service_id,
+                        "to": "service-http-001",
+                        "type": "prompt",
+                        "meta": {"conversation": {"username": TEST_USERNAME, "session_id": self.session_id}},
+                        "payload": {"text": "interactive summary"},
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        history = build_session_ui_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            limit=20,
+        )
+
+        self.assertTrue(any(entry.get("text") == "interactive summary" and entry.get("direction") == "in" for entry in history))
+        self.assertFalse(any(entry.get("text") == "worker raw result" for entry in history))
+        self.assertFalse(
+            any(
+                entry.get("event_type") == "agent.turn_started"
+                and entry.get("service_id") == shared_service_id
+                for entry in history
+            )
+        )
+
+    def test_build_session_ui_history_keeps_persisted_agent_message_events(self) -> None:
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "direction": "event",
+                "ts": "2026-04-06T10:00:01Z",
+                "service_id": "service-codex-001",
+                "event_type": "item.completed",
+                "text": "persisted reply",
+                "event": {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "persisted reply"},
+                },
+            },
+            limit=500,
+        )
+
+        history = build_session_ui_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            limit=20,
+        )
+
+        self.assertTrue(
+            any(
+                entry.get("event_type") == "item.completed"
+                and entry.get("text") == "persisted reply"
+                for entry in history
+            )
+        )
 
     def test_provider_sessions_are_scoped_by_agent_lot(self) -> None:
         service_id = "service-codex-001"
@@ -1610,35 +2345,105 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(state["state"], "complete")
         self.assertEqual(state["service_id"], "service-codex-002")
 
-    def test_claim_session_restart_resume_allows_only_one_service_per_run(self) -> None:
+    def test_persisted_goal_manager_runtime_state_backfills_service_state_snapshot(self) -> None:
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-002",
+            provider_session_id="worker-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        write_json_file(
+            state_path,
+            {
+                "state": "idle",
+                "service_id": "service-codex-002",
+                "progress_state": "complete",
+                "audit_state": "all_clear",
+                "goal_satisfied": True,
+                "summary": "Completed.",
+                "updated_at": "2026-03-20T12:00:00Z",
+            },
+        )
+
+        state = persisted_goal_manager_runtime_state(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(state["state"], "complete")
+        service_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-002",
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(service_state["status"], "complete")
+        self.assertEqual(service_state["goal_manager"]["progress_state"], "complete")
+        self.assertTrue(service_state["goal_manager"]["goal_satisfied"])
+        self.assertEqual(service_state["provider_sessions"]["worker_agent"]["codex_session_id"], "worker-thread")
+
+    def test_claim_session_restart_resume_allows_multiple_services_with_distinct_run_ids(self) -> None:
         first = claim_session_restart_resume(
             self.runtime_root,
             username=TEST_USERNAME,
             session_id=self.session_id,
-            run_id="run-1",
+            run_id=build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="worker_agent",
+                service_id="service-codex-001",
+            ),
             service_id="service-codex-001",
         )
-        second_same_run = claim_session_restart_resume(
+        second_distinct_service = claim_session_restart_resume(
             self.runtime_root,
             username=TEST_USERNAME,
             session_id=self.session_id,
-            run_id="run-1",
+            run_id=build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="worker_agent",
+                service_id="service-codex-002",
+            ),
             service_id="service-codex-002",
         )
-        third_new_run = claim_session_restart_resume(
+        third_same_service_same_run = claim_session_restart_resume(
             self.runtime_root,
             username=TEST_USERNAME,
             session_id=self.session_id,
-            run_id="run-2",
+            run_id=build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="worker_agent",
+                service_id="service-codex-002",
+            ),
             service_id="service-codex-002",
         )
 
         self.assertTrue(first)
-        self.assertFalse(second_same_run)
-        self.assertTrue(third_new_run)
+        self.assertTrue(second_distinct_service)
+        self.assertFalse(third_same_service_same_run)
         stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         assert stored is not None
-        self.assertEqual(stored["restart_resume_claim_run_id"], "run-2")
+        self.assertEqual(
+            stored["restart_resume_claim_run_id"],
+            build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="worker_agent",
+                service_id="service-codex-002",
+            ),
+        )
         self.assertEqual(stored["restart_resume_claim_service_id"], "service-codex-002")
 
     def test_old_goal_completion_does_not_overwrite_new_active_goal(self) -> None:
@@ -1710,6 +2515,22 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(state["state"], "running")
         self.assertEqual(state["service_id"], "service-codex-002")
 
+    def test_latest_goal_manager_runtime_state_clears_on_goal_audit_completed(self) -> None:
+        history = [
+            {"ts": "2026-03-19T09:00:00Z", "event_type": "service.goal_manager_compact_started", "service_id": "service-codex-002"},
+            {
+                "ts": "2026-03-19T09:00:01Z",
+                "event_type": "service.goal_audit_completed",
+                "service_id": "service-codex-002",
+                "event": {"progress_state": "in_progress", "goal_satisfied": False},
+            },
+        ]
+
+        state = latest_goal_manager_runtime_state(history)
+
+        self.assertEqual(state["state"], "waiting")
+        self.assertEqual(state["service_id"], "service-codex-002")
+
     def test_latest_goal_manager_runtime_state_reports_idle_after_reset(self) -> None:
         history = [
             {"ts": "2026-03-19T09:00:00Z", "event_type": "service.goal_audit_started", "service_id": "service-codex-002"},
@@ -1752,8 +2573,71 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(summary["worker"]["service_id"], "service-codex-002")
         self.assertEqual(summary["worker"]["slot"], 2)
         self.assertEqual(summary["goal_manager_state"], "running")
+        self.assertEqual(summary["runtime_execution_state"], "running")
+        self.assertTrue(summary["runtime_in_progress"])
         self.assertEqual(summary["goal_manager_provider"], "codex")
         self.assertEqual(summary["goal_manager_worker"]["slot"], 2)
+
+    def test_runtime_status_changed_event_records_runtime_execution(self) -> None:
+        entry = runtime_status_changed_event(
+            service_id="service-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            status={
+                "runtime_execution_state": "running",
+                "runtime_in_progress": True,
+                "agent_running": True,
+                "goal_manager_state": "idle",
+                "worker": {"service_id": "service-codex-001"},
+            },
+            previous_status={"runtime_execution_state": "idle"},
+        )
+
+        self.assertEqual(entry["direction"], "event")
+        self.assertEqual(entry["event_type"], "runtime.status_changed")
+        self.assertEqual(entry["event"]["runtime_execution_state"], "running")
+        self.assertTrue(entry["event"]["runtime_in_progress"])
+        self.assertEqual(entry["event"]["previous_runtime_execution_state"], "idle")
+
+    def test_goal_status_changed_event_records_goal_progress(self) -> None:
+        entry = goal_status_changed_event(
+            service_id="service-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            session={
+                "goal_active": True,
+                "goal_completed": False,
+                "goal_progress_state": "in_progress",
+                "goal_text": "keep working",
+                "goal_completion_policy": "continuous",
+            },
+            previous_session={
+                "goal_active": True,
+                "goal_completed": True,
+                "goal_progress_state": "complete",
+            },
+        )
+
+        self.assertEqual(entry["direction"], "event")
+        self.assertEqual(entry["event_type"], "goal.status_changed")
+        self.assertEqual(entry["event"]["goal_progress_state"], "in_progress")
+        self.assertFalse(entry["event"]["goal_completed"])
+        self.assertEqual(entry["event"]["previous_goal_progress_state"], "complete")
+
+    def test_append_goal_status_changed_uses_history_appender(self) -> None:
+        calls: list[tuple[str, str, dict[str, Any]]] = []
+
+        entry = append_goal_status_changed(
+            lambda username, session_id, record: calls.append((username, session_id, record)),
+            service_id="service-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            session={"goal_active": True, "goal_progress_state": "in_progress"},
+            previous_session={"goal_active": True, "goal_progress_state": "complete"},
+        )
+
+        self.assertEqual(calls, [(TEST_USERNAME, self.session_id, entry)])
+        self.assertEqual(entry["event_type"], "goal.status_changed")
 
     def test_goal_state_response_payload_includes_goal_manager_provider(self) -> None:
         talk = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
@@ -1852,6 +2736,37 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert stored_parent is not None
         self.assertTrue(stored_parent["waiting_on_children"])
 
+    def test_create_child_conversation_session_keeps_parent_goal_complete(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Parent goal",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_completed=True,
+            goal_progress_state="complete",
+        )
+
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Subgoal",
+            goal_text="Do child work",
+        )
+
+        assert child is not None
+        stored_parent = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored_parent is not None
+        self.assertTrue(stored_parent["waiting_on_children"])
+        self.assertTrue(stored_parent["goal_active"])
+        self.assertTrue(stored_parent["goal_completed"])
+        self.assertEqual(stored_parent["goal_progress_state"], "complete")
+
     def test_create_conversation_session_defaults_auto_schedule_off(self) -> None:
         talk = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Manual Session")
         self.assertFalse(bool(talk.get("auto_resume_enabled")))
@@ -1903,6 +2818,128 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(history[-1].get("origin_session_id"), self.session_id)
         self.assertEqual(history[-1].get("origin_goal_text"), "Parent goal")
 
+    def test_create_child_conversation_session_rejects_foreign_requester_when_private(self) -> None:
+        foreign = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Foreign Session")
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Blocked Child",
+            requester_session_id=str(foreign["session_id"]),
+        )
+        self.assertIsNone(child)
+
+    def test_create_child_conversation_session_allows_foreign_requester_when_public(self) -> None:
+        foreign = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Foreign Session")
+        updated = update_session_child_sharing(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            child_session_sharing={"mode": "public"},
+        )
+        assert updated is not None
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Shared Child",
+            requester_session_id=str(foreign["session_id"]),
+        )
+        assert child is not None
+        self.assertEqual(child.get("parent_session_id"), self.session_id)
+
+    def test_create_child_conversation_session_allows_allowlisted_session_id(self) -> None:
+        foreign = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Foreign Session")
+        other = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Other Session")
+        updated = update_session_child_sharing(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            child_session_sharing={
+                "mode": "allowlist",
+                "allowed_source_session_ids": [str(foreign["session_id"])],
+            },
+        )
+        assert updated is not None
+        allowed = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Allowed Child",
+            requester_session_id=str(foreign["session_id"]),
+        )
+        denied = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Denied Child",
+            requester_session_id=str(other["session_id"]),
+        )
+        assert allowed is not None
+        self.assertIsNone(denied)
+
+    def test_create_child_conversation_session_allows_allowlisted_template_id(self) -> None:
+        foreign = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Foreign Session")
+        update_session_launcher_profile(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=str(foreign["session_id"]),
+            launcher_template_id="shared.template",
+            launcher_display_name="Shared Template",
+            preferred_provider="codex",
+            selected_agents=["codex"],
+            service_targets=[],
+        )
+        updated = update_session_child_sharing(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            child_session_sharing={
+                "mode": "allowlist",
+                "allowed_source_template_ids": ["shared.template"],
+            },
+        )
+        assert updated is not None
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Template Shared Child",
+            requester_session_id=str(foreign["session_id"]),
+            requester_template_id="shared.template",
+        )
+        assert child is not None
+        self.assertEqual(child.get("parent_session_id"), self.session_id)
+
+    def test_launch_session_template_inherits_child_session_sharing(self) -> None:
+        launched = launch_session_template(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            app={
+                "template_id": "shareable.unit",
+                "display_name": "Shareable Unit",
+                "launcher": {
+                    "default_label": "Shareable Unit Session",
+                    "child_session_sharing": {
+                        "mode": "allowlist",
+                        "allowed_source_template_ids": ["ops.dashboard"],
+                    },
+                },
+            },
+        )
+        session = launched.get("session") if isinstance(launched, dict) else None
+        assert isinstance(session, dict)
+        self.assertEqual(
+            session.get("child_session_sharing"),
+            {
+                "mode": "allowlist",
+                "allowed_source_session_ids": [],
+                "allowed_source_unit_ids": ["ops.dashboard"],
+                "allowed_source_template_ids": ["ops.dashboard"],
+            },
+        )
+
     def test_goalmanager_system_account_is_reserved_and_not_counted_as_bootstrap_user(self) -> None:
         self.assertFalse(auth_has_users(self.runtime_root))
         record = resolve_user_record(self.runtime_root, username="goalmanager")
@@ -1925,7 +2962,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(session.get("created_by_username"), "root")
         self.assertEqual(session.get("session_group"), "root")
         self.assertEqual(session_ui_mode(session), "map_only")
-        self.assertTrue(session_operation_allowed(session, "create_child_session"))
+        self.assertFalse(session_operation_allowed(session, "create_child_session"))
         self.assertFalse(session_operation_allowed(session, "update_goal"))
         self.assertFalse(session_operation_allowed(session, "send_prompt"))
 
@@ -1933,14 +2970,15 @@ class GoalManagerCompactTests(unittest.TestCase):
         ok, _username = bootstrap_root_user(self.runtime_root, password="root-pass")
         self.assertTrue(ok)
         create_session(self.runtime_root, username="root")
-        create_child_conversation_session(
+        child = create_conversation_session(
             self.runtime_root,
             username="root",
-            parent_session_id="default",
             label="UI Verify Child",
             created_by_username="root",
             created_by_type="user",
+            origin_session_id="default",
         )
+        add_session_child(self.runtime_root, username="root", parent_session_id="default", child_session_id=str(child["session_id"]))
         default_session = get_session_settings(self.runtime_root, username="root", session_id="default")
         child_sessions = list_session_children(self.runtime_root, username="root", session_id="default")
         self.assertEqual(len(child_sessions), 1)
@@ -1956,6 +2994,19 @@ class GoalManagerCompactTests(unittest.TestCase):
         context = resolve_session_context(self.runtime_root, token)
         assert context is not None
         self.assertEqual(context.get("session_id"), "default")
+
+    def test_resolve_session_context_returns_root_roles_without_deadlocking(self) -> None:
+        ok, _username = bootstrap_root_user(self.runtime_root, password="root-pass")
+        self.assertTrue(ok)
+
+        token = create_session(self.runtime_root, username="root")
+        context = resolve_session_context(self.runtime_root, token)
+
+        assert context is not None
+        self.assertEqual(context.get("username"), "root")
+        self.assertEqual(context.get("session_id"), "default")
+        self.assertEqual(context.get("role"), "root")
+        self.assertEqual(context.get("roles"), ["root", "superuser"])
 
     def test_materialize_goal_child_sessions_creates_children_with_goalmanager_provenance(self) -> None:
         dispatched_child_sessions: list[str] = []
@@ -2347,6 +3398,95 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert stored_parent is not None
         self.assertFalse(stored_parent["waiting_on_children"])
 
+    def test_supersede_recovery_child_sessions_keeps_only_latest_recovery_active(self) -> None:
+        first = ensure_panic_recovery_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            source_session_id=self.session_id,
+            source_label="Goal Talk",
+            panic_service_id="service-codex-001",
+            event={"type": "service.worker_failed", "error": "boom-1"},
+            preferred_provider="codex",
+        )
+        second = ensure_panic_recovery_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            source_session_id=self.session_id,
+            source_label="Goal Talk",
+            panic_service_id="service-codex-002",
+            event={"type": "service.worker_failed", "error": "boom-2"},
+            preferred_provider="claude",
+        )
+        assert first is not None
+        assert second is not None
+        first_id = str(first["session_id"])
+        second_id = str(second["session_id"])
+
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(
+            list_active_in_progress_child_sessions(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            [second_id],
+        )
+        stored_first = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=first_id)
+        assert stored_first is not None
+        self.assertFalse(stored_first["goal_active"])
+        self.assertTrue(stored_first["goal_completed"])
+        self.assertEqual(stored_first["goal_progress_state"], "complete")
+        self.assertEqual(stored_first.get("recovery_superseded_by_session_id"), second_id)
+
+    def test_complete_recovery_child_after_superseding_siblings_clears_waiting_on_children(self) -> None:
+        older = ensure_panic_recovery_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            source_session_id=self.session_id,
+            source_label="Goal Talk",
+            panic_service_id="service-codex-001",
+            event={"type": "service.worker_failed", "error": "boom-1"},
+            preferred_provider="codex",
+        )
+        newer = ensure_panic_recovery_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            source_session_id=self.session_id,
+            source_label="Goal Talk",
+            panic_service_id="service-codex-002",
+            event={"type": "service.worker_failed", "error": "boom-2"},
+            preferred_provider="claude",
+        )
+        assert older is not None
+        assert newer is not None
+        newer_id = str(newer["session_id"])
+
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=newer_id,
+            goal_completed=True,
+            goal_progress_state="complete",
+        )
+        supersede_recovery_child_sessions(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            keep_session_id=newer_id,
+        )
+        progress = complete_session_child(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            child_session_id=newer_id,
+        )
+
+        assert progress is not None
+        self.assertFalse(progress["waiting_on_children"])
+        stored_parent = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored_parent is not None
+        self.assertFalse(stored_parent["waiting_on_children"])
+
     def test_list_active_in_progress_child_sessions_ignores_inactive_children(self) -> None:
         child = create_child_conversation_session(
             self.runtime_root,
@@ -2383,6 +3523,116 @@ class GoalManagerCompactTests(unittest.TestCase):
                 session_id=self.session_id,
             ),
             [],
+        )
+
+    def test_reconcile_session_waiting_on_children_clears_stale_parent_wait(self) -> None:
+        child = create_child_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=self.session_id,
+            label="Completed child",
+            goal_text="Do child work",
+        )
+        assert child is not None
+        child_id = str(child["session_id"])
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=child_id,
+            goal_active=True,
+            goal_completed=True,
+            goal_progress_state="complete",
+        )
+        stale_parent = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        assert stale_parent is not None
+        stale_parent["waiting_on_children"] = True
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            stale_parent,
+        )
+
+        reconciled = reconcile_session_waiting_on_children(self.runtime_root)
+
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["session_id"], self.session_id)
+        self.assertFalse(reconciled[0]["waiting_on_children"])
+        self.assertEqual(reconciled[0]["remaining_children"], [])
+        stored_parent = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        assert stored_parent is not None
+        self.assertFalse(stored_parent["waiting_on_children"])
+
+    def test_reconcile_session_waiting_on_children_completes_recovery_after_parent_resumes(self) -> None:
+        recovery = ensure_panic_recovery_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            source_session_id=self.session_id,
+            source_label="Goal Talk",
+            panic_service_id="service-codex-001",
+            event={"type": "service.worker_failed", "error": "boom"},
+            preferred_provider="codex",
+        )
+        assert recovery is not None
+        recovery_session_id = str(recovery["session_id"])
+        stored_recovery = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=recovery_session_id,
+        )
+        assert stored_recovery is not None
+        stored_recovery["created_at"] = "2026-03-19T09:00:00Z"
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=recovery_session_id,
+            ),
+            stored_recovery,
+        )
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "direction": "in",
+                "ts": "2026-03-19T09:00:01Z",
+                "service_id": "service-codex-001",
+                "event_type": "item.completed",
+                "text": "Parent resumed.",
+            },
+            limit=200,
+        )
+
+        reconciled = reconcile_session_waiting_on_children(self.runtime_root)
+
+        matching = [item for item in reconciled if item["session_id"] == self.session_id]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["completed_recovery_children"], [recovery_session_id])
+        self.assertFalse(matching[0]["waiting_on_children"])
+        self.assertEqual(matching[0]["remaining_children"], [])
+        stored_recovery = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=recovery_session_id,
+        )
+        assert stored_recovery is not None
+        self.assertFalse(stored_recovery["goal_active"])
+        self.assertTrue(stored_recovery["goal_completed"])
+        self.assertEqual(stored_recovery["goal_progress_state"], "complete")
+        self.assertEqual(
+            stored_recovery.get("recovery_auto_completed_reason"),
+            "parent_resumed_after_recovery_creation",
         )
 
     def test_lease_session_service_keeps_parent_runnable_while_child_goal_in_progress(self) -> None:
@@ -3706,7 +4956,7 @@ printf '%s\\n' '{"type":"turn.completed"}'
             '<input index="1" kind="restart_resume"><role>system</role><text>resume</text></input>'
             "</inputs></aize_input_batch>"
         )
-        self.assertTrue(dispatch_pending_opens_visible_turn(restart_message, restart_batch))
+        self.assertFalse(dispatch_pending_opens_visible_turn(restart_message, restart_batch))
 
         goal_feedback_message = {
             "type": "dispatch_pending",
@@ -3751,6 +5001,102 @@ printf '%s\\n' '{"type":"turn.completed"}'
             "</inputs></aize_input_batch>"
         )
         self.assertFalse(dispatch_pending_opens_visible_turn(goal_manager_review_message, goal_manager_review_batch))
+
+    def test_interactive_dispatch_slots_use_service_pending_to_avoid_races(self) -> None:
+        self.assertTrue(_dispatch_reason_uses_service_pending_only("http_user_dialogue"))
+        self.assertTrue(_dispatch_reason_uses_service_pending_only("interactive_worker_request"))
+        self.assertTrue(_dispatch_reason_uses_service_pending_only("interactive_worker_result"))
+
+    def test_post_turn_followup_detects_interactive_service_pending(self) -> None:
+        agent_id = f"service-codex-001@@{self.session_id}@@interactive_agent"
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="interactive_worker_result",
+                role="system",
+                text="<aize_worker_result><assistant_text>hello</assistant_text></aize_worker_result>",
+            ),
+        )
+
+        followup_agent_id, session_pending, service_pending, has_actionable = _post_turn_followup_pending_state(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            provider_session_slot="interactive_agent",
+        )
+
+        self.assertEqual(followup_agent_id, agent_id)
+        self.assertEqual(session_pending, [])
+        self.assertEqual([item["kind"] for item in service_pending], ["interactive_worker_result"])
+        self.assertTrue(has_actionable)
+
+    def test_dispatch_spawn_initial_prompt_queues_service_pending_followup(self) -> None:
+        manifest = {"node_id": "node-test"}
+        init_registry(
+            self.runtime_root,
+            {
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [
+                    {
+                        "service_id": "service-parent-001",
+                        "kind": "codex",
+                        "display_name": "Parent",
+                        "persona": "parent",
+                        "max_turns": 10,
+                    },
+                    {
+                        "service_id": "service-child-001",
+                        "kind": "codex",
+                        "display_name": "Child",
+                        "persona": "child",
+                        "max_turns": 10,
+                    },
+                ],
+                "routes": [],
+            },
+        )
+        queued_messages: list[dict[str, Any]] = []
+
+        queued = _dispatch_spawn_initial_prompt(
+            runtime_root=self.runtime_root,
+            manifest=manifest,
+            process_id="proc-parent",
+            service_id="service-parent-001",
+            child_service_id="service-child-001",
+            initial_prompt="implement the fix",
+            run_id="run-test",
+            send_tx=queued_messages.append,
+            auth_context={"principal": TEST_USERNAME},
+            scope_username=TEST_USERNAME,
+            scope_session_id=self.session_id,
+        )
+
+        self.assertTrue(queued)
+        pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-child-001",
+            agent_id=f"service-child-001@@{self.session_id}",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual([item["kind"] for item in pending], ["user_message"])
+        self.assertEqual(pending[0]["text"], "implement the fix")
+        self.assertEqual(len(queued_messages), 1)
+        dispatch_message = queued_messages[0]
+        self.assertEqual(dispatch_message["type"], "dispatch_pending")
+        self.assertEqual(dispatch_message["payload"]["reason"], "spawn_initial_prompt")
+        self.assertEqual(dispatch_message["to"], "service-child-001")
+        self.assertEqual(dispatch_message["meta"]["reply_to_service_id"], "service-parent-001")
+        self.assertEqual(
+            dispatch_message["meta"]["session_agent_id"],
+            f"service-child-001@@{self.session_id}",
+        )
 
     def test_active_agent_turn_state_detects_open_turn(self) -> None:
         history = [
@@ -3923,8 +5269,108 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertEqual([item["kind"] for item in pending], ["goal_feedback"])
         self.assertIn("resume work", pending[0]["text"])
         self.assertEqual(len(router.writes), 1)
+        raw_message = router.writes[0]
+        message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
+        self.assertEqual(message["from"], "service-svcmgr-001")
 
-    def test_maybe_resume_after_restart_recovers_orphan_in_progress_child_session(self) -> None:
+    def test_maybe_resume_after_restart_ignores_restart_resume_only_service_pending_for_goal_feedback(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Ship it",
+        )
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        reviews_path = session_goal_manager_reviews_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        reviews_path.write_text(
+            json.dumps(
+                {
+                    "progress_state": "in_progress",
+                    "audit_state": "all_clear",
+                    "continue_xml": "<aize_goal_feedback><summary>resume work</summary></aize_goal_feedback>",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=resolve_session_agent_id(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+                role="worker_agent",
+            ),
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="restart_resume",
+                role="system",
+                text="<aize_restart_resume><reason>system_restart</reason></aize_restart_resume>",
+            ),
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test"},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        pending = load_pending_inputs(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual([item["kind"] for item in pending], ["goal_feedback"])
+        self.assertIn("resume work", pending[0]["text"])
+        raw_service_pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=resolve_session_agent_id(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+                role="worker_agent",
+            ),
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertTrue(raw_service_pending)
+        self.assertTrue(all(item["kind"] == "restart_resume" for item in raw_service_pending))
+        self.assertEqual(len(router.writes), 1)
+
+    def test_maybe_resume_after_restart_routes_orphan_in_progress_child_session_to_goal_manager(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
         child = create_child_conversation_session(
             self.runtime_root,
@@ -3969,7 +5415,7 @@ printf '%s\\n' '{"type":"turn.completed"}'
         stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=child_session_id)
         assert stored is not None
         self.assertEqual(stored.get("service_id"), "service-codex-001")
-        agent_id = f"service-codex-001@@{child_session_id}"
+        agent_id = f"service-codex-001@@{child_session_id}@@goal_manager"
         pending = load_service_pending_inputs(
             self.runtime_root,
             service_id="service-codex-001",
@@ -3977,9 +5423,535 @@ printf '%s\\n' '{"type":"turn.completed"}'
             username=TEST_USERNAME,
             session_id=child_session_id,
         )
-        self.assertEqual([item["kind"] for item in pending], ["restart_resume"])
-        self.assertIn("<recovery_mode>reconstruct_without_session</recovery_mode>", pending[0]["text"])
+        self.assertEqual([item["kind"] for item in pending], ["goal_manager_review"])
+        self.assertIn("restart_goal_review", pending[0]["text"])
+        state = json.loads(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=child_session_id,
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["state"], "queued")
+        self.assertEqual(state["pending_work_items"][0]["kind"], "restart_goal_review")
         self.assertEqual(len(router.writes), 1)
+        raw_message = router.writes[0]
+        message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
+        self.assertEqual(message["payload"]["reason"], "goal_manager_review")
+
+    def test_maybe_resume_after_restart_routes_unreviewed_turn_to_goal_manager(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep the communication session running.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}@@worker_agent",
+            provider="codex",
+            role="worker_agent",
+            transport="local_dispatch",
+            turn_completed_at="2026-03-20T12:35:00Z",
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["goal_manager_last_reviewed_turn_completed_at"] = "2026-03-20T12:30:00Z"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        gm_agent_id = f"service-codex-001@@{self.session_id}@@goal_manager"
+        gm_pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=gm_agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        worker_pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}@@worker_agent",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual([item["kind"] for item in gm_pending], ["goal_manager_review"])
+        self.assertEqual(worker_pending, [])
+        self.assertEqual(len(router.writes), 1)
+        raw_message = router.writes[0]
+        message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
+        self.assertEqual(message["payload"]["reason"], "goal_manager_review")
+        self.assertEqual(message.get("meta", {}).get("agent_profile"), {"session_slot": "goal_manager"})
+
+    def test_maybe_resume_after_restart_ignores_restart_resume_only_service_pending(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Already completed.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=True,
+            goal_progress_state="complete",
+            preferred_provider="codex",
+        )
+        agent_id = f"service-codex-001@@{self.session_id}@@worker_agent"
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="restart_resume",
+                role="system",
+                text="<aize_restart_resume><reason>system_restart</reason></aize_restart_resume>",
+            ),
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        self.assertEqual(router.writes, [])
+        pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual([item["kind"] for item in pending], ["restart_resume"])
+
+    def test_load_service_pending_inputs_reads_legacy_service_queue_for_agent_id(self) -> None:
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="goal_child_session_request",
+                role="system",
+                text=json.dumps({"request": {"label": "legacy", "goal_text": "recover me"}}),
+            ),
+        )
+
+        pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}@@goal_manager",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual([item["kind"] for item in pending], ["goal_child_session_request"])
+
+    def test_drain_service_pending_inputs_clears_legacy_and_agent_specific_queues(self) -> None:
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="goal_child_session_request",
+                role="system",
+                text=json.dumps({"request": {"label": "legacy", "goal_text": "recover me"}}),
+            ),
+        )
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}@@goal_manager",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="goal_manager_review",
+                role="system",
+                text=json.dumps({"kind": "restart_goal_review"}),
+            ),
+        )
+
+        drained = drain_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}@@goal_manager",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(
+            [item["kind"] for item in drained],
+            ["goal_manager_review", "goal_child_session_request"],
+        )
+        remaining = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}@@goal_manager",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(remaining, [])
+
+    def test_maybe_resume_after_restart_treats_goal_audit_completed_as_terminal(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep the communication session running.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            limit=100,
+            entry={
+                "direction": "event",
+                "ts": "2026-03-20T12:35:00Z",
+                "service_id": "service-codex-001",
+                "event_type": "service.goal_manager_compact_started",
+                "text": "GoalManager compact running",
+            },
+        )
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            limit=100,
+            entry={
+                "direction": "agent",
+                "ts": "2026-03-20T12:36:00Z",
+                "service_id": "service-codex-001",
+                "event_type": "service.goal_audit_completed",
+                "text": "GoalManager audit completed",
+            },
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        self.assertEqual(router.writes, [])
+
+    def test_maybe_resume_after_restart_requeues_stale_goal_manager_runtime(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Verify HTTPBridge goal save flow updated",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}",
+            provider="codex",
+            role="agent",
+            transport="local_dispatch",
+            turn_completed_at="2026-03-20T12:35:00Z",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "running",
+                "goal_audit_job_id": "goal-audit-1",
+                "service_id": "service-codex-001",
+                "pending_work_items": [
+                    {
+                        "kind": "turn_completed",
+                        "ts": "2026-03-20T12:35:00Z",
+                        "service_id": "service-codex-001",
+                        "goal_id": "goal-1",
+                    }
+                ],
+                "updated_at": "2026-03-20T12:34:00Z",
+            },
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        state = json.loads(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["state"], "queued")
+        self.assertEqual(len(state["pending_work_items"]), 1)
+        self.assertEqual(state["pending_work_items"][0]["service_id"], "service-codex-001")
+        pending_queue = load_goal_manager_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(len(pending_queue), 1)
+        self.assertEqual(pending_queue[0]["service_id"], "service-codex-001")
+        self.assertTrue(
+            session_goal_manager_pending_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).exists()
+        )
+        log_entries = [
+            json.loads(line)
+            for line in (self.runtime_root / "logs" / "service-codex-001.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(any(entry.get("type") == "service.goal_audit_stale_reset" for entry in log_entries))
+
+    def test_maybe_resume_after_restart_requeues_persisted_running_goal_manager_work(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Verify HTTPBridge goal save flow updated",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{self.session_id}",
+            provider="codex",
+            role="agent",
+            transport="local_dispatch",
+            turn_completed_at="2026-03-20T12:35:00Z",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "running",
+                "goal_audit_job_id": "goal-audit-1",
+                "service_id": "service-codex-001",
+                "pending_work_items": [
+                    {
+                        "kind": "turn_completed",
+                        "ts": "2026-03-20T12:35:00Z",
+                        "service_id": "service-codex-001",
+                        "goal_id": "goal-1",
+                    }
+                ],
+                "updated_at": "2026-03-20T12:36:00Z",
+            },
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        state = json.loads(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["state"], "queued")
+        self.assertEqual(state["stale_reason"], "persisted_pending_work_after_stale_running_state")
+        pending_queue = load_goal_manager_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(len(pending_queue), 1)
+        self.assertEqual(pending_queue[0]["service_id"], "service-codex-001")
 
     def test_provider_context_compaction_support_includes_gemini(self) -> None:
         self.assertTrue(provider_supports_context_compaction("codex"))
@@ -4039,6 +6011,8 @@ printf '%s\\n' '{"type":"turn.completed"}'
             default_provider="codex",
         )
         self.assertFalse(summary["agent_running"])
+        self.assertEqual(summary["runtime_execution_state"], "idle")
+        self.assertFalse(summary["runtime_in_progress"])
         self.assertEqual(summary["worker"]["service_id"], "service-codex-001")
 
     def test_make_aize_pending_input_and_batch_xml_preserve_submitter(self) -> None:

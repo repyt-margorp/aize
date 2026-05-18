@@ -15,6 +15,7 @@ from runtime.persistent_state_pkg import (
     read_json_file,
     save_agent_audit_state,
     session_group_permissions,
+    session_service_state_path,
     session_ui_mode,
     session_goal_manager_reviews_path,
     session_goal_manager_state_path,
@@ -65,9 +66,46 @@ def _persist_goal_manager_runtime_state(
 ) -> None:
     state_path = session_goal_manager_state_path(runtime_root, username=username, session_id=session_id)
     state = read_json_file(state_path) or {}
-    state.update(payload)
+    snapshot_service_id = str(payload.get("_service_snapshot_id") or "").strip()
+    normalized_payload = dict(payload)
+    normalized_payload.pop("_service_snapshot_id", None)
+    state.update(normalized_payload)
     state["updated_at"] = utc_ts()
     write_json_file(state_path, state)
+    service_id = snapshot_service_id or str(state.get("service_id") or "").strip()
+    if not service_id:
+        return
+    service_state_path = session_service_state_path(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=service_id,
+    )
+    service_state = read_json_file(service_state_path) or {"service_id": service_id}
+    progress_state = str(
+        state.get("progress_state", "complete" if bool(state.get("goal_satisfied")) else "in_progress")
+    ).strip().lower()
+    runtime_status = str(state.get("state") or "").strip().lower()
+    if progress_state == "complete":
+        status = "complete"
+    elif runtime_status in {"running", "failed", "idle", "queued"}:
+        status = runtime_status
+    else:
+        status = "in_progress"
+    service_state["status"] = status
+    service_state["updated_at"] = str(state["updated_at"])
+    service_state["goal_manager"] = {
+        "state": runtime_status or "idle",
+        "progress_state": progress_state,
+        "audit_state": str(state.get("audit_state") or "").strip(),
+        "goal_satisfied": bool(state.get("goal_satisfied", False)),
+        "summary": str(state.get("summary") or "").strip(),
+        "pending_work_items": list(state.get("pending_work_items", []))
+        if isinstance(state.get("pending_work_items"), list)
+        else [],
+        "updated_at": str(state["updated_at"]),
+    }
+    write_json_file(service_state_path, service_state)
 
 
 def goal_state_response_payload(
@@ -163,7 +201,7 @@ def goal_audit_history_text(audit: dict[str, Any]) -> str:
     if conversation_session_id:
         review_target = f"{review_target} via conversation session {conversation_session_id}"
     lines = [
-        f"{review_target}: progress={status}, audit={audit_state}",
+        f"{review_target}: progress={status}, review={audit_state}",
     ]
     if audit.get("summary"):
         lines.extend(["", str(audit["summary"])])
@@ -184,6 +222,19 @@ def persist_goal_audit_completion(
     audit: dict[str, Any],
     history_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
+    audit = dict(audit)
+    session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+    if (
+        str(session_settings.get("goal_completion_policy") or "").strip().lower() == "continuous"
+        and str(session_settings.get("goal_text") or audit.get("goal_text") or "").strip()
+        and (
+            str(audit.get("progress_state") or "").strip().lower() == "complete"
+            or bool(audit.get("goal_satisfied", False))
+        )
+    ):
+        audit["progress_state"] = "in_progress"
+        audit["goal_satisfied"] = False
+        audit["continue_xml"] = ""
     append_jsonl(
         session_goal_manager_reviews_path(runtime_root, username=username, session_id=session_id),
         {
@@ -214,6 +265,7 @@ def persist_goal_audit_completion(
         session_id=session_id,
         payload={
             "state": "idle",
+            "service_id": service_id,
             "goal_audit_job_id": goal_audit_job_id,
             "pending_work_items": [],
             "goal_audit_session_id": audit["goal_audit_session_id"],
@@ -314,6 +366,7 @@ def persist_goal_audit_failure(
         session_id=session_id,
         payload={
             "state": "failed",
+            "service_id": service_id,
             "goal_audit_job_id": str(goal_audit_job_id or ""),
             "pending_work_items": [],
             "error": str(error or "").strip(),
@@ -342,7 +395,7 @@ def persist_goal_audit_failure(
         "from": service_id,
         "session_id": session_id,
         "event_type": event["type"],
-        "text": f"GoalManager audit failed: {event['error']}",
+        "text": f"GoalManager review failed: {event['error']}",
         "event": event,
     }
     if history_sink is not None:
@@ -375,6 +428,7 @@ def persist_goal_manager_compact_event(
         session_id=session_id,
         payload={
             "state": "idle" if str(event.get("type") or "").endswith("_checked") else "failed",
+            "service_id": service_id,
             "pending_work_items": [],
             "compact_event": dict(event),
         },
@@ -428,6 +482,7 @@ def persist_goal_manager_compact_started(
         session_id=session_id,
         payload={
             "state": "running",
+            "service_id": service_id,
             "compact_reason": reason,
         },
     )
@@ -485,6 +540,7 @@ def persist_goal_manager_runtime_reset(
             "state": "idle",
             "goal_audit_job_id": "",
             "service_id": "",
+            "_service_snapshot_id": service_id,
             "pending_work_items": [],
             "reset_reason": reason,
         },

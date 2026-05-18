@@ -8,6 +8,8 @@ import tempfile
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
+import re
+import uuid
 from typing import Any
 
 import fcntl
@@ -41,31 +43,195 @@ DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
 GOAL_MANAGER_USERNAME = "goalmanager"
 DEFAULT_SESSION_UI_MODE = "standard"
 SESSION_UI_MODES = {"standard", "map_only", "communication"}
-GOAL_COMPLETION_POLICIES = {"standard", "continuous"}
+GOAL_COMPLETION_POLICIES = {"standard", "continuous", "per_prompt"}
 CONTINUOUS_GOAL_TEMPLATE_IDS = {"entrance.service", "aize-entrance"}
 SESSION_GROUP_DEFAULT_PERMISSIONS = {
     "root": {
-        "create_child_session": True,
+        "create_session": False,
+        "create_child_session": False,
+        "update_session_goal": False,
         "update_goal": False,
+        "send_user_prompt": False,
         "send_prompt": False,
         "auto_spawn_recovery": True,
         "auto_resume": True,
     },
     "user": {
+        "create_session": True,
         "create_child_session": True,
+        "update_session_goal": True,
         "update_goal": True,
+        "send_user_prompt": True,
         "send_prompt": True,
         "auto_spawn_recovery": True,
         "auto_resume": True,
     },
     "error": {
+        "create_session": False,
         "create_child_session": False,
+        "update_session_goal": False,
         "update_goal": False,
+        "send_user_prompt": False,
         "send_prompt": False,
         "auto_spawn_recovery": False,
         "auto_resume": True,
     },
 }
+
+
+def normalize_child_session_sharing_policy(policy: Any) -> dict[str, Any]:
+    record = dict(policy or {}) if isinstance(policy, dict) else {}
+    mode = str(record.get("mode") or "").strip().lower()
+    if mode not in {"private", "public", "allowlist"}:
+        mode = "private"
+
+    def _normalize_id_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    return {
+        "mode": mode,
+        "allowed_source_session_ids": _normalize_id_list(record.get("allowed_source_session_ids")),
+        "allowed_source_unit_ids": _normalize_id_list(
+            record.get("allowed_source_unit_ids") or record.get("allowed_source_template_ids")
+        ),
+        "allowed_source_template_ids": _normalize_id_list(
+            record.get("allowed_source_template_ids") or record.get("allowed_source_unit_ids")
+        ),
+    }
+
+
+def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    def _normalize_skill_scope(raw_value: Any) -> str:
+        value = str(raw_value or "").strip().lower()
+        if value in {"unit", "unit_skill", "unitskill", "template", "template_skill", "templateskill"}:
+            return "unit"
+        if value in {"adaptive", "adaptive_skill", "adaptiveskill", "session"}:
+            return "adaptive"
+        return ""
+
+    def _normalize_text_list(raw_value: Any) -> list[str]:
+        if not isinstance(raw_value, list):
+            return []
+        items: list[str] = []
+        seen: set[str] = set()
+        for item in raw_value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            items.append(text)
+        return items
+
+    def _normalize_file_entry(raw_item: Any) -> dict[str, str] | None:
+        def _normalize_relative_path(raw_path: str) -> str:
+            safe_parts = [
+                part
+                for part in Path(str(raw_path or "").lstrip("/")).parts
+                if part not in {"", ".", ".."}
+            ]
+            return Path(*safe_parts).as_posix() if safe_parts else ""
+
+        if isinstance(raw_item, str):
+            path = _normalize_relative_path(raw_item)
+            return {"path": path} if path else None
+        if not isinstance(raw_item, dict):
+            return None
+        path = _normalize_relative_path(str(raw_item.get("path") or raw_item.get("name") or ""))
+        if not path:
+            return None
+        entry = {"path": path}
+        content = raw_item.get("content")
+        if isinstance(content, str):
+            entry["content"] = content
+        description = str(raw_item.get("description") or "").strip()
+        if description:
+            entry["description"] = description
+        return entry
+
+    normalized: list[dict[str, Any]] = []
+    seen_skill_ids: set[str] = set()
+    for raw_item in value:
+        if isinstance(raw_item, str):
+            raw_item = {"skill_id": raw_item}
+        if not isinstance(raw_item, dict):
+            continue
+        skill_id = str(
+            raw_item.get("skill_id")
+            or raw_item.get("id")
+            or raw_item.get("name")
+            or ""
+        ).strip()
+        if not skill_id or skill_id in seen_skill_ids:
+            continue
+        seen_skill_ids.add(skill_id)
+        skill: dict[str, Any] = {
+            "skill_id": skill_id,
+            "kind": str(raw_item.get("kind") or "general").strip().lower() or "general",
+            "skill_scope": _normalize_skill_scope(
+                raw_item.get("skill_scope")
+                or raw_item.get("scope")
+                or raw_item.get("skill_class")
+            ),
+            "title": str(raw_item.get("title") or skill_id).strip() or skill_id,
+            "description": str(raw_item.get("description") or raw_item.get("summary") or "").strip(),
+            "prompt": str(raw_item.get("prompt") or "").strip(),
+            "usage": str(
+                raw_item.get("usage")
+                or raw_item.get("how_to_use")
+                or raw_item.get("instructions")
+                or ""
+            ).strip(),
+            "when_to_use": str(
+                raw_item.get("when_to_use")
+                or raw_item.get("use_when")
+                or ""
+            ).strip(),
+            "routing_tags": _normalize_text_list(raw_item.get("routing_tags")),
+            "canonical_session_key": str(raw_item.get("canonical_session_key") or "").strip(),
+            "routing_mode": str(raw_item.get("routing_mode") or "").strip().lower(),
+            "handler_file": str(
+                raw_item.get("handler_file")
+                or raw_item.get("entrypoint")
+                or raw_item.get("handler")
+                or ""
+            ).strip(),
+            "target_session_id": str(raw_item.get("target_session_id") or "").strip(),
+            "target_unit_id": str(raw_item.get("target_unit_id") or raw_item.get("target_template_id") or "").strip(),
+            "target_template_id": str(raw_item.get("target_template_id") or raw_item.get("target_unit_id") or "").strip(),
+            "target_label": str(raw_item.get("target_label") or "").strip(),
+            "target_child_label": str(raw_item.get("target_child_label") or "").strip(),
+            "target_goal_text": str(raw_item.get("target_goal_text") or "").strip(),
+            "preferred_provider": str(raw_item.get("preferred_provider") or "").strip().lower(),
+            "session_ui_mode": str(raw_item.get("session_ui_mode") or "").strip().lower(),
+            "communication_agent_enabled": bool(raw_item.get("communication_agent_enabled", False)),
+            "create_as_child": bool(raw_item.get("create_as_child", True)),
+            "selected_agents": _normalize_text_list(raw_item.get("selected_agents")),
+            "allowed_source_template_ids": _normalize_text_list(raw_item.get("allowed_source_template_ids")),
+        }
+        spawn_session_skills = raw_item.get("spawn_session_skills")
+        if isinstance(spawn_session_skills, list):
+            skill["spawn_session_skills"] = normalize_session_skills(spawn_session_skills)
+        files: list[dict[str, str]] = []
+        for raw_file in raw_item.get("files", []):
+            entry = _normalize_file_entry(raw_file)
+            if entry is not None:
+                files.append(entry)
+        skill["files"] = files
+        normalized.append(skill)
+    return normalized
 
 
 def normalize_auto_compact_threshold_left_percent(value: Any) -> int:
@@ -296,6 +462,24 @@ def session_goal_manager_dir(runtime_root: Path, *, username: str, session_id: s
     return session_dir(runtime_root, username=username, session_id=session_id) / "goal_manager"
 
 
+def session_messages_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "messages"
+
+
+def session_message_dir(runtime_root: Path, *, username: str, session_id: str, message_id: str) -> Path:
+    return session_messages_dir(runtime_root, username=username, session_id=session_id) / message_id
+
+
+def session_message_attachments_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    message_id: str,
+) -> Path:
+    return session_message_dir(runtime_root, username=username, session_id=session_id, message_id=message_id) / "attachments"
+
+
 def session_dag_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
     return session_dir(runtime_root, username=username, session_id=session_id) / "dag"
 
@@ -312,12 +496,24 @@ def session_goal_attachments_dir(runtime_root: Path, *, username: str, session_i
     return session_goal_dir(runtime_root, username=username, session_id=session_id, goal_id=goal_id) / "attachments"
 
 
+def session_message_meta_path(runtime_root: Path, *, username: str, session_id: str, message_id: str) -> Path:
+    return session_message_dir(runtime_root, username=username, session_id=session_id, message_id=message_id) / "meta.json"
+
+
+def session_message_body_path(runtime_root: Path, *, username: str, session_id: str, message_id: str) -> Path:
+    return session_message_dir(runtime_root, username=username, session_id=session_id, message_id=message_id) / "body.txt"
+
+
 def session_metadata_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
     return session_dir(runtime_root, username=username, session_id=session_id) / "session.json"
 
 
 def session_timeline_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
     return session_dir(runtime_root, username=username, session_id=session_id) / "timeline.jsonl"
+
+
+def session_runtime_journal_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "runtime_journal.jsonl"
 
 
 def session_pending_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
@@ -397,7 +593,32 @@ def safe_template_id_for_path(template_id: str) -> str:
     return str(template_id or "").replace("/", "_").replace("\\", "_").replace("..", "_").strip() or "app"
 
 
+def safe_unit_id_for_path(unit_id: str) -> str:
+    return safe_template_id_for_path(unit_id)
+
+
+def units_dir(runtime_root: Path) -> Path:
+    return state_dir(runtime_root) / "units"
+
+
+def unit_user_dir(runtime_root: Path, *, username: str) -> Path:
+    return units_dir(runtime_root) / normalize_username(username)
+
+
+def unit_dir(runtime_root: Path, *, username: str, unit_id: str) -> Path:
+    return unit_user_dir(runtime_root, username=username) / safe_unit_id_for_path(unit_id)
+
+
+def unit_workspace_dir(runtime_root: Path, *, username: str, unit_id: str) -> Path:
+    return unit_dir(runtime_root, username=username, unit_id=unit_id) / "workspace"
+
+
+def unit_metadata_path(runtime_root: Path, *, username: str, unit_id: str) -> Path:
+    return unit_dir(runtime_root, username=username, unit_id=unit_id) / "unit.json"
+
+
 def session_templates_dir(runtime_root: Path) -> Path:
+    # Legacy state root for UnitFile-launched workspaces.
     return state_dir(runtime_root) / "apps"
 
 
@@ -415,6 +636,30 @@ def session_template_workspace_dir(runtime_root: Path, *, username: str, templat
 
 def session_template_metadata_path(runtime_root: Path, *, username: str, template_id: str) -> Path:
     return session_template_dir(runtime_root, username=username, template_id=template_id) / "unit.json"
+
+
+def session_skills_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "skills"
+
+
+def session_skills_manifest_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_skills_dir(runtime_root, username=username, session_id=session_id) / "manifest.json"
+
+
+def session_skill_file_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    relative_path: str,
+) -> Path:
+    safe_parts = [
+        part
+        for part in Path(str(relative_path or "").lstrip("/")).parts
+        if part not in {"", ".", ".."}
+    ]
+    safe_relative = Path(*safe_parts).as_posix() if safe_parts else ""
+    return session_skills_dir(runtime_root, username=username, session_id=session_id) / safe_relative
 
 
 def session_agent_entry_files_dir(
@@ -543,6 +788,79 @@ def read_json_file(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _write_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def write_session_skills(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    skills: list[dict[str, Any]],
+) -> None:
+    normalized_username = normalize_username(username)
+    normalized_session_id = str(session_id or "").strip()
+    normalized_skills = normalize_session_skills(skills)
+    skills_dir = session_skills_dir(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_session_id,
+    )
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    manifest_payload = {"skills": normalized_skills}
+    write_json_file(
+        session_skills_manifest_path(
+            runtime_root,
+            username=normalized_username,
+            session_id=normalized_session_id,
+        ),
+        manifest_payload,
+    )
+    for skill in normalized_skills:
+        for file_entry in skill.get("files", []):
+            if not isinstance(file_entry, dict):
+                continue
+            path = str(file_entry.get("path") or "").strip()
+            if not path or "content" not in file_entry:
+                continue
+            _write_text_file(
+                session_skill_file_path(
+                    runtime_root,
+                    username=normalized_username,
+                    session_id=normalized_session_id,
+                    relative_path=path,
+                ),
+                str(file_entry.get("content") or ""),
+            )
+
+
+def load_session_skills(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    manifest = read_json_file(
+        session_skills_manifest_path(
+            runtime_root,
+            username=normalize_username(username),
+            session_id=str(session_id or "").strip(),
+        )
+    ) or {}
+    return normalize_session_skills(manifest.get("skills"))
+
+
 def ensure_session_template_workspace(
     runtime_root: Path,
     *,
@@ -554,9 +872,9 @@ def ensure_session_template_workspace(
 ) -> Path:
     normalized_username = normalize_username(username)
     normalized_template_id = str(template_id or "").strip()
-    target_dir = session_template_workspace_dir(runtime_root, username=normalized_username, template_id=normalized_template_id)
+    target_dir = unit_workspace_dir(runtime_root, username=normalized_username, unit_id=normalized_template_id)
     target_dir.mkdir(parents=True, exist_ok=True)
-    metadata_path = session_template_metadata_path(runtime_root, username=normalized_username, template_id=normalized_template_id)
+    metadata_path = unit_metadata_path(runtime_root, username=normalized_username, unit_id=normalized_template_id)
     current = read_json_file(metadata_path) or {}
     created_at = str(current.get("created_at") or utc_ts())
     payload = dict(current)
@@ -642,6 +960,7 @@ def ensure_session_storage_unlocked(
     session_services_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
     session_goal_manager_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
     session_dag_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
+    session_skills_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
     session_payload = dict(session)
     if not str(session_payload.get("created_by_username") or "").strip():
         session_payload["created_by_username"] = normalized
@@ -650,7 +969,14 @@ def ensure_session_storage_unlocked(
     if session_id == "default" and str(session_payload.get("label") or "").strip() in {"", "Default"}:
         session_payload["label"] = "Root"
     session_payload["_runtime_root"] = str(runtime_root)
+    session_payload["session_skills"] = normalize_session_skills(session_payload.get("session_skills"))
     write_json_file(session_metadata_path(runtime_root, username=normalized, session_id=session_id), session_payload)
+    write_session_skills(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        skills=session_payload.get("session_skills", []),
+    )
     goal_manager_state_path = session_goal_manager_state_path(runtime_root, username=normalized, session_id=session_id)
     if not goal_manager_state_path.exists():
         write_json_file(
@@ -881,6 +1207,10 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
         else:
             normalized_permissions[operation_name] = bool(default_value)
     session["session_permissions"] = normalized_permissions
+    session["child_session_sharing"] = normalize_child_session_sharing_policy(
+        session.get("child_session_sharing")
+    )
+    session["session_skills"] = normalize_session_skills(session.get("session_skills"))
     requested_ui_mode = str(session.get("session_ui_mode") or "").strip().lower()
     is_recovery_session = bool(str(session.get("recovery_source_session_id") or "").strip()) or (
         group == "error"
@@ -937,12 +1267,20 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("user_response_wait_last_timeout_at", "")
     if not isinstance(session.get("user_response_wait_requests"), list):
         session["user_response_wait_requests"] = []
-    session.setdefault("launcher_template_id", "")
+    session.setdefault("launcher_unit_id", str(session.get("launcher_template_id") or "").strip())
+    session.setdefault("launcher_template_id", str(session.get("launcher_unit_id") or "").strip())
     session.setdefault("launcher_display_name", "")
     session.setdefault("launcher_preferred_provider", "")
     session.setdefault("launcher_workspace_scope", "none")
     session.setdefault("launcher_workspace_path", "")
     requested_completion_policy = str(session.get("goal_completion_policy") or "").strip().lower()
+    session_ui_mode = str(session.get("session_ui_mode") or "standard").strip().lower() or "standard"
+    requested_session_interactive = bool(
+        session.get("session_interactive", session_ui_mode == "communication")
+    )
+    requested_communication_agent_enabled = bool(
+        session.get("communication_agent_enabled", requested_session_interactive)
+    )
     launcher_template_id = str(session.get("launcher_template_id") or "").strip()
     if requested_completion_policy in GOAL_COMPLETION_POLICIES:
         session["goal_completion_policy"] = requested_completion_policy
@@ -953,7 +1291,7 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     if "session_interactive" in session:
         session["session_interactive"] = bool(session.get("session_interactive", False))
     else:
-        session["session_interactive"] = session["session_ui_mode"] == "communication"
+        session["session_interactive"] = session_ui_mode == "communication"
     if "communication_agent_enabled" in session:
         session["communication_agent_enabled"] = bool(session.get("communication_agent_enabled", False))
     else:
@@ -1100,6 +1438,16 @@ def _guess_attachment_content_type(filename: str) -> str:
         "gif": "image/gif",
         "webp": "image/webp",
         "svg": "image/svg+xml",
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "m4a": "audio/mp4",
+        "ogg": "audio/ogg",
+        "flac": "audio/flac",
+        "aac": "audio/aac",
+        "webm": "video/webm",
+        "mp4": "video/mp4",
+        "mov": "video/quicktime",
+        "mkv": "video/x-matroska",
         "pdf": "application/pdf",
     }.get(ext, "application/octet-stream")
 
@@ -1165,6 +1513,87 @@ def save_goal_attachment(
             counter += 1
     target.write_bytes(data)
     return target.name
+
+
+def save_session_message_artifacts(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    text: str,
+    attachments: list[dict[str, Any]] | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist a user message body and any uploaded attachments under a message directory."""
+    normalized = normalize_username(username)
+    resolved_message_id = str(message_id or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
+    message_dir = session_message_dir(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        message_id=resolved_message_id,
+    )
+    message_dir.mkdir(parents=True, exist_ok=True)
+    body_path = session_message_body_path(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        message_id=resolved_message_id,
+    )
+    body_text = str(text or "")
+    body_path.write_text(body_text, encoding="utf-8")
+    body_relpath = body_path.relative_to(session_dir(runtime_root, username=normalized, session_id=session_id)).as_posix()
+    saved_attachments: list[dict[str, Any]] = []
+    attachments_dir = session_message_attachments_dir(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        message_id=resolved_message_id,
+    )
+    if attachments:
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+    for raw_item in attachments or []:
+        filename = str(raw_item.get("filename") or "attachment").strip() or "attachment"
+        data = raw_item.get("data") or b""
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            continue
+        safe_name = re.sub(r"[^\w.\-]", "_", filename)[:120] or "attachment"
+        target = attachments_dir / safe_name
+        if target.exists():
+            stem = safe_name.rsplit(".", 1)
+            counter = 1
+            while target.exists():
+                candidate = f"{stem[0]}_{counter}.{stem[1]}" if len(stem) == 2 else f"{safe_name}_{counter}"
+                target = attachments_dir / candidate
+                counter += 1
+        target.write_bytes(bytes(data))
+        relpath = target.relative_to(session_dir(runtime_root, username=normalized, session_id=session_id)).as_posix()
+        saved_attachments.append(
+            {
+                "filename": target.name,
+                "original_filename": filename,
+                "size": target.stat().st_size,
+                "content_type": str(raw_item.get("content_type") or _guess_attachment_content_type(target.name)),
+                "relpath": relpath,
+            }
+        )
+    meta = {
+        "message_id": resolved_message_id,
+        "created_at": utc_ts(),
+        "text_relpath": body_relpath,
+        "text_size": len(body_text.encode("utf-8")),
+        "attachments": saved_attachments,
+    }
+    write_json_file(
+        session_message_meta_path(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+            message_id=resolved_message_id,
+        ),
+        meta,
+    )
+    return meta
 
 
 def ensure_state(runtime_root: Path) -> dict[str, Any]:

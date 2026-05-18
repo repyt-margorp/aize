@@ -16,29 +16,37 @@ if str(SRC) not in sys.path:
 
 from session_template import (
     describe_app_schedule,
+    describe_session_template_schedule,
+    ensure_auto_scheduled_root_unit_states,
     get_launchable_session_template,
+    get_registered_unit_state,
     launch_session_template,
     list_launchable_session_templates,
     list_registered_session_template_states,
+    list_registered_unit_states,
+    resolve_session_template_launch_parent_session_id,
+    update_registered_session_template_state,
 )
 from runtime.persistent_state_pkg import (
     create_conversation_session,
     ensure_state,
     get_session_settings,
+    load_session_skills,
+    session_skill_file_path,
     update_session_goal_flags,
 )
 
 
-class AppLauncherTests(unittest.TestCase):
+class SessionTemplateLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin_dir = Path(tempfile.mkdtemp(prefix="test_launcher_", dir=ROOT / "plugins"))
         (self.plugin_dir / "plugin.json").write_text(
             json.dumps({"plugin_id": self.plugin_dir.name, "display_name": "Launcher Plugin"}) + "\n",
             encoding="utf-8",
         )
-        session_template_dir = self.plugin_dir / "apps" / "research_launcher"
+        session_template_dir = self.plugin_dir / "units" / "research_launcher"
         session_template_dir.mkdir(parents=True, exist_ok=True)
-        (session_template_dir / "session-template.json").write_text(
+        (session_template_dir / "unit.json").write_text(
             json.dumps(
                 {
                     "template_id": "research_launcher",
@@ -51,7 +59,7 @@ class AppLauncherTests(unittest.TestCase):
                         "preferred_provider": "claude",
                         "selected_agents": ["claude_pool"],
                         "session_group": "user",
-                        "workspace_scope": "app",
+                        "workspace_scope": "unit",
                         "schedule": {
                             "enabled": True,
                             "kind": "daily",
@@ -64,9 +72,9 @@ class AppLauncherTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        communication_template_dir = self.plugin_dir / "apps" / "communication_launcher"
+        communication_template_dir = self.plugin_dir / "units" / "communication_launcher"
         communication_template_dir.mkdir(parents=True, exist_ok=True)
-        (communication_template_dir / "session-template.json").write_text(
+        (communication_template_dir / "unit.json").write_text(
             json.dumps(
                 {
                     "template_id": "communication_launcher",
@@ -111,20 +119,20 @@ class AppLauncherTests(unittest.TestCase):
 
     def test_catalog_returns_launch_plan(self) -> None:
         with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-            apps = list_launchable_session_templates(default_provider="codex")
-            app = get_launchable_session_template("research_launcher", default_provider="codex")
+            templates = list_launchable_session_templates(default_provider="codex")
+            template = get_launchable_session_template("research_launcher", default_provider="codex")
 
-        self.assertTrue(any(item["template_id"] == "research_launcher" for item in apps))
-        self.assertEqual(app["launcher"]["preferred_provider"], "claude")
-        self.assertEqual(app["launcher"]["selected_agents"], ["claude_pool"])
+        self.assertTrue(any(item["template_id"] == "research_launcher" for item in templates))
+        self.assertEqual(template["launcher"]["preferred_provider"], "claude")
+        self.assertEqual(template["launcher"]["selected_agents"], ["claude_pool"])
         self.assertEqual(
-            app["launcher"]["service_targets"],
+            template["launcher"]["service_targets"],
             [{"mode": "pool", "provider": "claude", "target": "claude_pool"}],
         )
-        self.assertEqual(app["launcher"]["workspace_scope"], "app")
-        self.assertEqual(app["launcher"]["schedule"]["timezone"], "America/New_York")
-        self.assertEqual(app["launcher"]["schedule"]["daily_time"], "05:42")
-        self.assertTrue(bool(app["launcher"]["schedule"]["enabled"]))
+        self.assertEqual(template["launcher"]["workspace_scope"], "unit")
+        self.assertEqual(template["launcher"]["schedule"]["timezone"], "America/New_York")
+        self.assertEqual(template["launcher"]["schedule"]["daily_time"], "05:42")
+        self.assertTrue(bool(template["launcher"]["schedule"]["enabled"]))
 
     def test_launch_session_template_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -149,29 +157,36 @@ class AppLauncherTests(unittest.TestCase):
             self.assertEqual(stored["goal_text"], "Collect private feature requirements")
             self.assertEqual(stored["preferred_provider"], "claude")
             self.assertEqual(stored["selected_agents"], ["claude_pool"])
+            self.assertEqual(stored["launcher_unit_id"], "research_launcher")
             self.assertEqual(stored["launcher_template_id"], "research_launcher")
             self.assertEqual(
                 stored["launcher_service_targets"],
                 [{"mode": "pool", "provider": "claude", "target": "claude_pool"}],
             )
-            self.assertEqual(stored["launcher_workspace_scope"], "app")
+            self.assertEqual(stored["launcher_workspace_scope"], "unit")
             workspace_path = Path(stored["launcher_workspace_path"])
             self.assertTrue(workspace_path.exists())
             self.assertTrue(workspace_path.is_dir())
             self.assertEqual(
                 workspace_path,
-                runtime_root / ".aize-state" / "apps" / "repyt" / "research_launcher" / "workspace",
+                runtime_root / ".aize-state" / "units" / "repyt" / "research_launcher" / "workspace",
             )
-            self.assertEqual(launched["launch_plan"]["workspace_scope"], "app")
+            self.assertEqual(launched["launch_plan"]["workspace_scope"], "unit")
             self.assertEqual(launched["launch_plan"]["workspace_path"], str(workspace_path))
             self.assertIn(str(workspace_path), launched["launch_plan"]["initial_prompt"])
             self.assertIn("durable code, scripts, notes, and stock", launched["launch_plan"]["initial_prompt"])
-            registered_apps = list_registered_session_template_states(runtime_root)
-            app_state = next(item for item in registered_apps if item["template_id"] == "research_launcher")
-            self.assertEqual(app_state["last_session_id"], str(session["session_id"]))
-            self.assertEqual(app_state["last_parent_session_id"], str(parent["session_id"]))
+            registered_templates = list_registered_session_template_states(runtime_root)
+            template_state = next(item for item in registered_templates if item["template_id"] == "research_launcher")
+            self.assertEqual(template_state["last_session_id"], str(session["session_id"]))
+            self.assertEqual(template_state["last_parent_session_id"], str(parent["session_id"]))
+            registered_units = list_registered_unit_states(runtime_root)
+            unit_state = get_registered_unit_state(runtime_root, username="repyt", unit_id="research_launcher")
+            self.assertTrue(any(item["unit_id"] == "research_launcher" for item in registered_units))
+            self.assertIsNotNone(unit_state)
+            assert unit_state is not None
+            self.assertEqual(unit_state["last_session_id"], str(session["session_id"]))
 
-    def test_launch_session_template_reuses_app_workspace_across_sessions(self) -> None:
+    def test_launch_session_template_reuses_template_workspace_across_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
@@ -246,7 +261,397 @@ class AppLauncherTests(unittest.TestCase):
             self.assertFalse(refreshed["goal_completed"])
             self.assertEqual(refreshed["goal_progress_state"], "in_progress")
 
-    def test_describe_app_schedule_marks_due_once_per_occurrence(self) -> None:
+    def test_bug_hunting_unit_provisions_canonical_session_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template("aize-development.bug-hunting", default_provider="codex")
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=unit,
+                )
+
+            self.assertEqual(unit["display_name"], "AIze Bug Hunting")
+            self.assertEqual(unit["launcher"]["workspace_scope"], "unit")
+            self.assertEqual(unit["launcher"]["resident_parent_session_id"], "default")
+            self.assertEqual(unit["launcher"]["session_group"], "root")
+            self.assertEqual(unit["launcher"]["selected_agents"], ["codex_pool"])
+            self.assertIn("canonical non-UI AIzeDevelopment parent session", unit["launcher"]["goal_text"])
+            self.assertIn("separate port or isolated runtime", unit["launcher"]["goal_text"])
+            self.assertIn("stop-and-migrate", unit["launcher"]["goal_text"])
+            self.assertIn("Treat Entrance as IO/management only", unit["launcher"]["initial_prompt"])
+            self.assertEqual(unit["launcher"]["skills"][0]["canonical_session_key"], "aize.development")
+            self.assertIn("persistent AIzeDevelopment parent workflow", unit["launcher"]["skills"][0]["description"])
+            self.assertIn("parent coordinator", unit["launcher"]["skills"][0]["when_to_use"])
+            self.assertIn("separate port or isolated runtime", unit["launcher"]["skills"][0]["usage"])
+            self.assertIn("delegated child task", unit["launcher"]["skills"][0]["prompt"])
+            self.assertEqual(unit["launcher"]["skills"][0]["files"][0]["path"], "README.md")
+            self.assertEqual(launched["session"]["parent_session_id"], "default")
+            self.assertEqual(launched["session"]["session_group"], "root")
+            session_id = str(launched["session"]["session_id"])
+            skills = load_session_skills(runtime_root, username="repyt", session_id=session_id)
+            self.assertEqual(skills[0]["skill_id"], "aize-development-session")
+            self.assertEqual(skills[0]["canonical_session_key"], "aize.development")
+            self.assertEqual(skills[1]["skill_id"], "unit-file-migration-audit")
+            self.assertIn(
+                "separate port or isolated runtime",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="README.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "canonical non-UI AIzeDevelopment parent workflow",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="README.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "Stop the currently running AIze runtime",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="development-cycle.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "compatibility inputs only",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="migration-audit.md",
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_minix_refactor_unit_is_scheduled_development_child(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            entrance = create_conversation_session(runtime_root, username="repyt", label="Entrance")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                development_unit = get_launchable_session_template("aize-development.bug-hunting", default_provider="codex")
+                development = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=development_unit,
+                    label="AIze Development",
+                )
+                minix_unit = get_launchable_session_template("aize-development.minix-refactor", default_provider="codex")
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=minix_unit,
+                )
+
+            self.assertEqual(minix_unit["launcher"]["parent_unit_id"], "aize-development.bug-hunting")
+            self.assertEqual(minix_unit["launcher"]["schedule"]["kind"], "interval")
+            self.assertEqual(minix_unit["launcher"]["schedule"]["every_hours"], 4)
+            self.assertEqual(minix_unit["launcher"]["child_session_sharing"]["mode"], "private")
+            self.assertIn("child session", minix_unit["launcher"]["goal_text"].lower())
+            self.assertIn("Entrance is IO/management only", minix_unit["launcher"]["initial_prompt"])
+            self.assertIn("skill-created delegated sessions", minix_unit["launcher"]["initial_prompt"])
+            self.assertIn("child session", minix_unit["launcher"]["initial_prompt"].lower())
+            self.assertIn("verification", minix_unit["launcher"]["initial_prompt"].lower())
+            self.assertIn("report", minix_unit["launcher"]["initial_prompt"].lower())
+            self.assertEqual(
+                launched["session"]["parent_session_id"],
+                development["session"]["session_id"],
+            )
+            self.assertNotEqual(launched["session"]["parent_session_id"], entrance["session_id"])
+            self.assertIn("Persistent unit workspace directory", launched["launch_plan"]["initial_prompt"])
+            session_id = str(launched["session"]["session_id"])
+            skills = load_session_skills(runtime_root, username="repyt", session_id=session_id)
+            self.assertEqual(skills[0]["skill_id"], "aize-minix-incremental-refactor")
+            self.assertEqual(skills[0]["canonical_session_key"], "aize.development.minix-refactor")
+            self.assertIn("never inside Entrance", skills[0]["prompt"])
+            self.assertIn(
+                "Crawl Record",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="crawl-record.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "Delegation Log",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="delegation-log.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "spawn one narrow child session for implementation",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="README.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "Entrance is IO/management only",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="README.md",
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_system_diagnostics_unit_is_hourly_root_child(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            root = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Root",
+                session_group="root",
+            )
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                diagnostics_unit = get_launchable_session_template(
+                    "aize-development.system-diagnostics",
+                    default_provider="codex",
+                )
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(root["session_id"]),
+                    app=diagnostics_unit,
+                )
+
+            self.assertEqual(diagnostics_unit["launcher"]["parent_unit_id"], "")
+            self.assertEqual(diagnostics_unit["launcher"]["session_group"], "root")
+            self.assertEqual(diagnostics_unit["lifecycle"], "auto")
+            self.assertEqual(diagnostics_unit["launcher"]["schedule"]["kind"], "interval")
+            self.assertEqual(diagnostics_unit["launcher"]["schedule"]["every_hours"], 1)
+            self.assertEqual(launched["session"]["parent_session_id"], root["session_id"])
+            self.assertEqual(launched["session"]["session_group"], "root")
+            self.assertIn("Persistent unit workspace directory", launched["launch_plan"]["initial_prompt"])
+            self.assertIn("pending-input queues", launched["launch_plan"]["initial_prompt"])
+            self.assertIn("probe_restart.py", launched["launch_plan"]["initial_prompt"])
+            session_id = str(launched["session"]["session_id"])
+            skills = load_session_skills(runtime_root, username="repyt", session_id=session_id)
+            self.assertEqual(skills[0]["skill_id"], "aize-system-diagnostics-hourly-audit")
+            self.assertEqual(skills[0]["canonical_session_key"], "aize.system-diagnostics")
+            self.assertIn(
+                "Diagnostics Log",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="diagnostics-log.md",
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_system_diagnostics_unit_auto_registers_for_root_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                registered = ensure_auto_scheduled_root_unit_states(
+                    runtime_root,
+                    default_provider="codex",
+                    username="root",
+                )
+
+            diagnostics = [
+                record
+                for record in registered
+                if str(record.get("unit_id") or record.get("template_id") or "") == "aize-development.system-diagnostics"
+            ]
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(diagnostics[0]["last_parent_session_id"], "default")
+            self.assertIsNotNone(get_session_settings(runtime_root, username="root", session_id="default"))
+
+    def test_system_monitor_unit_is_hourly_root_child(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            root = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Root",
+                session_group="root",
+            )
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                monitor_unit = get_launchable_session_template(
+                    "aize-development.system-monitor",
+                    default_provider="codex",
+                )
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(root["session_id"]),
+                    app=monitor_unit,
+                )
+
+            self.assertEqual(monitor_unit["launcher"]["parent_unit_id"], "")
+            self.assertEqual(monitor_unit["launcher"]["session_group"], "root")
+            self.assertEqual(monitor_unit["launcher"]["schedule"]["kind"], "interval")
+            self.assertEqual(monitor_unit["launcher"]["schedule"]["every_hours"], 1)
+            self.assertEqual(launched["session"]["parent_session_id"], root["session_id"])
+            self.assertEqual(launched["session"]["session_group"], "root")
+            self.assertIn("runtime.system_monitor", launched["launch_plan"]["initial_prompt"])
+            self.assertIn("probe_restart.py", launched["launch_plan"]["initial_prompt"])
+            session_id = str(launched["session"]["session_id"])
+            skills = load_session_skills(runtime_root, username="repyt", session_id=session_id)
+            self.assertEqual(skills[0]["skill_id"], "aize-system-monitor")
+            self.assertEqual(skills[0]["canonical_session_key"], "aize.system-monitor")
+            self.assertIn(
+                "AIze System Monitor",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="monitor-record.md",
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_system_monitor_unit_auto_registers_for_root_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                registered = ensure_auto_scheduled_root_unit_states(
+                    runtime_root,
+                    default_provider="codex",
+                    username="root",
+                )
+
+            monitor = [
+                record
+                for record in registered
+                if str(record.get("unit_id") or record.get("template_id") or "") == "aize-development.system-monitor"
+            ]
+            self.assertEqual(len(monitor), 1)
+            self.assertEqual(monitor[0]["last_parent_session_id"], "default")
+            self.assertIsNotNone(get_session_settings(runtime_root, username="root", session_id="default"))
+
+    def test_interval_schedule_marks_due_on_four_hour_cadence(self) -> None:
+        app = {
+            "unit_id": "aize-development.minix-refactor",
+            "launcher": {
+                "schedule": {
+                    "enabled": True,
+                    "kind": "interval",
+                    "every_hours": 4,
+                    "timezone": "UTC",
+                }
+            },
+        }
+        template_state = {
+            "created_at": "2026-04-20T08:00:00Z",
+            "schedule_state": {},
+        }
+        schedule_info = describe_session_template_schedule(
+            app,
+            template_state=template_state,
+            now=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+        )
+        self.assertTrue(bool(schedule_info["due"]))
+        self.assertEqual(schedule_info["scheduled_for_utc"], "2026-04-20T12:00:00Z")
+        self.assertEqual(schedule_info["next_due_at"], "2026-04-20T16:00:00Z")
+
+        template_state["schedule_state"] = {"last_triggered_occurrence_at": "2026-04-20T12:00:00Z"}
+        schedule_info = describe_session_template_schedule(
+            app,
+            template_state=template_state,
+            now=datetime(2026, 4, 20, 13, 0, tzinfo=UTC),
+        )
+        self.assertFalse(bool(schedule_info["due"]))
+        self.assertEqual(schedule_info["scheduled_for_utc"], "2026-04-20T16:00:00Z")
+
+    def test_scheduled_minix_refactor_resolves_registered_development_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            entrance = create_conversation_session(runtime_root, username="repyt", label="Entrance")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                development_unit = get_launchable_session_template("aize-development.bug-hunting", default_provider="codex")
+                development = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=development_unit,
+                    label="AIze Development",
+                )
+                minix_unit = get_launchable_session_template("aize-development.minix-refactor", default_provider="codex")
+
+            update_registered_session_template_state(
+                runtime_root,
+                username="repyt",
+                template_id="aize-development.minix-refactor",
+                updates={
+                    "created_at": "2026-04-20T08:00:00Z",
+                    "schedule_state": {},
+                },
+            )
+            parent_session_id = resolve_session_template_launch_parent_session_id(
+                runtime_root,
+                username="repyt",
+                template_state=get_registered_unit_state(
+                    runtime_root,
+                    username="repyt",
+                    unit_id="aize-development.minix-refactor",
+                ),
+                session_template=minix_unit,
+            )
+            self.assertEqual(parent_session_id, development["session"]["session_id"])
+
+    def test_entrance_unit_provisions_code_based_interactive_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template("entrance.service", default_provider="codex")
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=unit,
+                )
+
+            session_id = str(launched["session"]["session_id"])
+            skills = load_session_skills(runtime_root, username="repyt", session_id=session_id)
+            lightweight = next(skill for skill in skills if skill["skill_id"] == "entrance-lightweight-response")
+            self.assertEqual(lightweight["kind"], "interactive")
+            self.assertEqual(lightweight["routing_mode"], "handle_user_message")
+            self.assertEqual(lightweight["handler_file"], "entrance_lightweight_response.py")
+            self.assertIn("IO/management layer only", unit["launcher"]["goal_text"])
+            self.assertIn("delegated sessions created or selected by session skills", unit["launcher"]["initial_prompt"])
+            route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
+            self.assertIn("development-cycle goal", route["description"])
+            self.assertIn("separate port or isolated runtime", route["target_goal_text"])
+            self.assertIn("final stop-and-migrate coordination", route["spawn_session_skills"][0]["prompt"])
+            self.assertIn(
+                "def handle(context):",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="entrance_lightweight_response.py",
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_describe_session_template_schedule_marks_due_once_per_occurrence(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
@@ -261,16 +666,27 @@ class AppLauncherTests(unittest.TestCase):
                 )
 
             now = datetime(2026, 4, 20, 9, 42, tzinfo=UTC)
-            registered_apps = list_registered_session_template_states(runtime_root)
-            app_state = next(item for item in registered_apps if item["template_id"] == "research_launcher")
-            schedule_info = describe_app_schedule(app, app_state=app_state, now=now)
+            registered_templates = list_registered_session_template_states(runtime_root)
+            template_state = next(item for item in registered_templates if item["template_id"] == "research_launcher")
+            schedule_info = describe_session_template_schedule(app, template_state=template_state, now=now)
             self.assertTrue(bool(schedule_info["due"]))
+            self.assertTrue(bool(schedule_info["template_registered"]))
             self.assertEqual(schedule_info["scheduled_for_utc"], "2026-04-20T09:42:00Z")
             self.assertEqual(schedule_info["next_due_at"], "2026-04-21T09:42:00Z")
 
-            app_state["schedule_state"] = {"last_triggered_occurrence_at": "2026-04-20T09:42:00Z"}
-            schedule_info = describe_app_schedule(app, app_state=app_state, now=now)
+            template_state["schedule_state"] = {"last_triggered_occurrence_at": "2026-04-20T09:42:00Z"}
+            schedule_info = describe_session_template_schedule(app, template_state=template_state, now=now)
             self.assertFalse(bool(schedule_info["due"]))
+
+    def test_describe_app_schedule_alias_remains_compatible(self) -> None:
+        schedule_info = describe_app_schedule(
+            {"launcher": {"schedule": {"enabled": False}}},
+            app_state={"schedule_state": {}},
+            now=datetime(2026, 4, 20, 9, 42, tzinfo=UTC),
+        )
+
+        self.assertTrue(bool(schedule_info["unit_registered"]))
+        self.assertTrue(bool(schedule_info["app_registered"]))
 
 if __name__ == "__main__":
     unittest.main()

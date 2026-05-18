@@ -1,8 +1,8 @@
 # AIze Notes
 
 ## Restart Debug
-- Use `./restart_codex_http_mesh.sh` for normal restarts. This is the repo-root entrypoint for the synchronous restart flow.
-- `./scripts/restart_codex_http_mesh.sh` remains as the script wrapper variant, but the root script should be treated as canonical when operating from the repo root.
+- Use `./restart_aize_unit.sh` for normal restarts. This is the repo-root entrypoint for the synchronous restart flow.
+- `./scripts/restart_aize_unit.sh` remains as the script wrapper variant, but the root script should be treated as canonical when operating from the repo root.
 - Normal restart calls self-detach into a supervisor so restart can continue after the old Unit runtime is terminated.
 - Restart diagnostics logs live under `.temp/restart-debug/` (runtime state — not tracked in source).
 - Run `python3 scripts/diagnostics/probe_restart.py` from the repo root to capture a restart report.
@@ -14,12 +14,21 @@ Operational and diagnostic scripts live under `./scripts/`:
 
 | Script | Purpose |
 |---|---|
-| `restart_codex_http_mesh.sh` | Canonical repo-root restart entrypoint |
-| `scripts/restart_codex_http_mesh.sh` | Dispatch wrapper for detached synchronous restart |
+| `restart_aize_unit.sh` | Canonical repo-root restart entrypoint |
+| `scripts/restart_aize_unit.sh` | Dispatch wrapper for detached synchronous restart |
 | `scripts/diagnostics/probe_restart.py` | Restart diagnostics probe — records PID transitions and health |
 | `scripts/check_codex_context_window.sh` | Inspect remaining context % for a Codex session |
 | `scripts/check_claude_context_window.sh` | Inspect remaining context % for a Claude session |
 | `scripts/register_user.sh` | Securely register a new user (see User Registration below) |
+
+## Routing / Execution Policy
+- Do not gate core runtime behavior on implicit text heuristics. If a SessionUnit mode promises
+  a role or agent path, dispatch that role deterministically from explicit session settings.
+- In particular, an Interactive Session with `communication_agent_enabled=true` must start both
+  the InteractiveAgent and WorkerAgent for user input. Do not decide WorkerAgent dispatch from
+  keyword matching, prompt classification, or "looks like work" checks.
+- If conditional behavior is needed, add an explicit persisted setting or schema field and document
+  that setting. Avoid hidden fallback behavior that makes runtime state hard to reason about.
 
 ## User Registration
 The web `/register` endpoint requires a superuser session. To create users without exposing passwords through the web UI, use the interactive script:
@@ -39,7 +48,7 @@ Passwords are never passed as command-line arguments and do not appear in proces
 
 ## HTTPS / TLS Setup
 
-The HTTP Unit runtime runs on **HTTPS by default** using a self-signed certificate (オレオレ認証)
+The AIze Unit runtime runs on **HTTPS by default** using a self-signed certificate (オレオレ認証)
 for the Web UI. Cert generation is handled automatically on start, but can also be run manually.
 
 ### Certificate location
@@ -87,7 +96,7 @@ at startup, the adapter regenerates them automatically.
 Set the environment variable before restart:
 
 ```bash
-AIZE_TLS=false ./restart_codex_http_mesh.sh
+AIZE_TLS=false ./restart_aize_unit.sh
 ```
 
 Or add `"tls_enabled": false` to the `config` block of `service-http-001` in `manifest.json`.
@@ -95,13 +104,13 @@ Or add `"tls_enabled": false` to the `config` block of `service-http-001` in `ma
 ### Custom cert paths
 
 ```bash
-AIZE_TLS_CERT=/path/to/server.crt AIZE_TLS_KEY=/path/to/server.key ./restart_codex_http_mesh.sh
+AIZE_TLS_CERT=/path/to/server.crt AIZE_TLS_KEY=/path/to/server.key ./restart_aize_unit.sh
 ```
 
 ### Custom SAN hosts
 
 ```bash
-AIZE_TLS_HOSTS=example.local,2001:db8::10 ./restart_codex_http_mesh.sh
+AIZE_TLS_HOSTS=example.local,2001:db8::10 ./restart_aize_unit.sh
 ```
 
 Set `AIZE_TLS_AUTO_HOSTS=false` to disable automatic local IPv4/IPv6 and hostname discovery.
@@ -113,7 +122,7 @@ Import `.aize-runtime/tls/server.crt` into your browser's trust store
 
 ### Scripts / health checks
 
-`restart_codex_http_mesh.sh` uses `curl -k` to skip cert verification when polling
+`restart_aize_unit.sh` uses `curl -k` to skip cert verification when polling
 `https://127.0.0.1:4123/health`.  `scripts/diagnostics/probe_restart.py` does the same
 via a custom `ssl.SSLContext` with `CERT_NONE`.
 

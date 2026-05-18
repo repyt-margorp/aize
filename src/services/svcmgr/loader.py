@@ -95,6 +95,13 @@ def expand_descriptor(desc: dict) -> list[dict]:
     """Expand a service descriptor into one or more concrete service specs."""
     kind = desc["kind"]
 
+    def _apply_optional_fields(spec: dict) -> dict:
+        for key in ("response_schema_id", "owner_principal", "owner_roles", "owner_capabilities"):
+            value = desc.get(key)
+            if value is not None:
+                spec[key] = value
+        return spec
+
     if "id" in desc:
         # Single fixed-ID service
         config = _resolve_config_env(desc.get("config_env", {}))
@@ -107,8 +114,7 @@ def expand_descriptor(desc: dict) -> list[dict]:
             "max_turns": desc.get("max_turns", 100),
             "spawn_order": desc.get("spawn_order", 100),
         }
-        if rsi := desc.get("response_schema_id"):
-            spec["response_schema_id"] = rsi
+        spec = _apply_optional_fields(spec)
         if config:
             spec["config"] = config
         return [spec]
@@ -134,8 +140,7 @@ def expand_descriptor(desc: dict) -> list[dict]:
             "max_turns": desc.get("max_turns", 100),
             "spawn_order": desc.get("spawn_order", 100),
         }
-        if rsi := desc.get("response_schema_id"):
-            spec["response_schema_id"] = rsi
+        spec = _apply_optional_fields(spec)
         if config:
             spec["config"] = config
         specs.append(spec)

@@ -31,6 +31,8 @@ from ._core import (
     digest_token,
     normalize_agent_priority,
     normalize_goal_manager_priority,
+    normalize_child_session_sharing_policy,
+    normalize_session_skills,
     ensure_session_storage_unlocked,
     normalize_auto_compact_threshold_left_percent,
     normalize_username,
@@ -109,7 +111,61 @@ def session_operation_allowed(session: dict[str, Any] | None, operation: str) ->
     if not operation_name:
         return False
     permissions = session_group_permissions(session)
-    return bool(permissions.get(operation_name, False))
+    aliases = {
+        "create_child_session": ("create_child_session", "create_session"),
+        "create_session": ("create_session", "create_child_session"),
+        "update_goal": ("update_goal", "update_session_goal"),
+        "update_session_goal": ("update_session_goal", "update_goal"),
+        "send_prompt": ("send_prompt", "send_user_prompt"),
+        "send_user_prompt": ("send_user_prompt", "send_prompt"),
+    }
+    for key in aliases.get(operation_name, (operation_name,)):
+        if key in permissions:
+            return bool(permissions.get(key))
+    return False
+
+
+def session_child_sharing_policy(session: dict[str, Any] | None) -> dict[str, Any]:
+    record = dict(session or {})
+    _ensure_session_defaults_unlocked(record)
+    return normalize_child_session_sharing_policy(record.get("child_session_sharing"))
+
+
+def session_allows_child_session_creator(
+    parent_session: dict[str, Any] | None,
+    *,
+    requester_session_id: str | None = None,
+    requester_unit_id: str | None = None,
+    requester_template_id: str | None = None,
+) -> bool:
+    parent = dict(parent_session or {})
+    _ensure_session_defaults_unlocked(parent)
+    if not session_operation_allowed(parent, "create_child_session"):
+        return False
+    parent_session_id = str(parent.get("session_id") or "").strip()
+    requester_session = str(requester_session_id or "").strip()
+    if not requester_session or requester_session == parent_session_id:
+        return True
+    policy = session_child_sharing_policy(parent)
+    mode = str(policy.get("mode") or "private").strip().lower()
+    if mode == "public":
+        return True
+    if mode != "allowlist":
+        return False
+    allowed_session_ids = {
+        str(item).strip()
+        for item in policy.get("allowed_source_session_ids", [])
+        if str(item).strip()
+    }
+    if requester_session and requester_session in allowed_session_ids:
+        return True
+    requester_unit = str(requester_unit_id or requester_template_id or "").strip()
+    allowed_unit_ids = {
+        str(item).strip()
+        for item in policy.get("allowed_source_unit_ids", policy.get("allowed_source_template_ids", []))
+        if str(item).strip()
+    }
+    return bool(requester_unit and requester_unit in allowed_unit_ids)
 
 
 def _list_session_records(runtime_root: Path, *, username: str) -> list[dict[str, Any]]:
@@ -122,7 +178,6 @@ def _list_session_records(runtime_root: Path, *, username: str) -> list[dict[str
         if not isinstance(stored, dict):
             continue
         _ensure_session_defaults_unlocked(stored)
-        ensure_session_storage_unlocked(runtime_root, username=username, session=stored)
         sessions.append(dict(stored))
     return sessions
 
@@ -132,6 +187,7 @@ def list_sessions(runtime_root: Path, *, username: str) -> list[dict[str, Any]]:
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         _ensure_default_session_unlocked(state, normalized)
+    with state_read_lock(runtime_root):
         return _list_session_records(runtime_root, username=normalized)
 
 
@@ -142,6 +198,7 @@ def list_sessions_with_histories(
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         _ensure_default_session_unlocked(state, normalized)
+    with state_read_lock(runtime_root):
         sessions = _list_session_records(runtime_root, username=normalized)
         histories: dict[str, list[dict[str, Any]]] = {}
         for session in sessions:
@@ -441,6 +498,8 @@ def create_conversation_session(
     session_interactive: bool = False,
     communication_agent_enabled: bool = False,
     communication_agent_priority: list[str] | None = None,
+    child_session_sharing: dict[str, Any] | None = None,
+    session_skills: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_username(username)
     with state_lock(runtime_root):
@@ -475,6 +534,8 @@ def create_conversation_session(
                 if isinstance(item, dict) or str(item).strip()
             ],
             "session_permissions": normalized_permissions,
+            "child_session_sharing": normalize_child_session_sharing_policy(child_session_sharing),
+            "session_skills": normalize_session_skills(session_skills),
             "auto_resume_enabled": False,
             "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
             "created_at": utc_ts(),
@@ -648,6 +709,58 @@ def release_nonrunnable_session_services(runtime_root: Path) -> list[dict[str, s
                     talk["updated_at"] = utc_ts()
                     write_json_file(session_path, talk)
     return released
+
+
+def reconcile_session_waiting_on_children(runtime_root: Path) -> list[dict[str, Any]]:
+    reconciled: list[dict[str, Any]] = []
+    with state_lock(runtime_root):
+        sessions_root = sessions_dir(runtime_root)
+        if not sessions_root.exists():
+            return reconciled
+        for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir()):
+            username = normalize_username(user_dir.name)
+            for talk_dir in sorted(path for path in user_dir.iterdir() if path.is_dir()):
+                session_path = session_metadata_path(
+                    runtime_root,
+                    username=username,
+                    session_id=talk_dir.name,
+                )
+                talk = read_json_file(session_path)
+                if not isinstance(talk, dict):
+                    continue
+                _ensure_session_defaults_unlocked(talk)
+                session_id = str(talk.get("session_id") or talk_dir.name).strip()
+                if not session_id:
+                    continue
+                completed_recovery_children = _complete_resumed_recovery_children_unlocked(
+                    runtime_root,
+                    username=username,
+                    parent_session_id=session_id,
+                )
+                remaining_children = _list_active_in_progress_child_sessions_unlocked(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                )
+                expected_waiting = bool(remaining_children)
+                if (
+                    bool(talk.get("waiting_on_children", False)) == expected_waiting
+                    and not completed_recovery_children
+                ):
+                    continue
+                talk["waiting_on_children"] = expected_waiting
+                talk["updated_at"] = utc_ts()
+                ensure_session_storage_unlocked(runtime_root, username=username, session=talk)
+                reconciled.append(
+                    {
+                        "username": username,
+                        "session_id": session_id,
+                        "waiting_on_children": expected_waiting,
+                        "remaining_children": remaining_children,
+                        "completed_recovery_children": completed_recovery_children,
+                    }
+                )
+    return reconciled
 
 
 def get_session_settings(runtime_root: Path, *, username: str, session_id: str) -> dict[str, Any] | None:
@@ -920,6 +1033,36 @@ def update_session_goal_flags(
                     write_goal_dir(runtime_root, username=normalized, session_id=session_id, revision=target_revision)
                 return dict(talk)
         return None
+
+
+def sync_communication_goal_progress(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    completed: bool,
+    session: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    talk = dict(session or get_session_settings(runtime_root, username=username, session_id=session_id) or {})
+    if not talk:
+        return None
+    if not str(talk.get("goal_text") or "").strip() or not bool(talk.get("goal_active", False)):
+        return None
+    if not (
+        bool(talk.get("session_interactive", False))
+        or bool(talk.get("communication_agent_enabled", False))
+        or session_ui_mode(talk) == "communication"
+    ):
+        return None
+    if completed and str(talk.get("goal_completion_policy") or "").strip().lower() == "continuous":
+        return talk
+    return update_session_goal_flags(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        goal_completed=bool(completed),
+        goal_progress_state="complete" if completed else "in_progress",
+    )
 
 
 def update_session_user_response_wait(
@@ -1220,6 +1363,12 @@ def record_session_agent_contact(
     if not normalized_service_id:
         return None
     normalized_provider = str(provider or "").strip().lower()
+    normalized_join_role = str(join_role or "").strip().lower()
+    if (
+        not normalized_agent_id
+        and normalized_join_role in {"interactive_agent", "worker_agent", "goal_manager"}
+    ):
+        normalized_agent_id = f"{normalized_service_id}@@{session_id}@@{normalized_join_role}"
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         if not _ensure_session_exists_unlocked(state, normalized, session_id):
@@ -1242,17 +1391,33 @@ def record_session_agent_contact(
                         if not (
                                 isinstance(item, dict)
                                 and (
+                                    str(item.get("join_role") or "").strip().lower() == normalized_join_role
+                                    and
+                                    (
                                     str(item.get("provider") or "").strip().lower() in native_provider_kinds
                                     or any(
                                         str(item.get("service_id") or "").strip().startswith(f"service-{kind}-")
                                         for kind in native_provider_kinds
+                                    )
                                     )
                                 )
                             )
                         ]
                 existing: dict[str, Any] | None = None
                 for item in welcomed_agents:
-                    if isinstance(item, dict) and str(item.get("service_id") or "").strip() == normalized_service_id:
+                    if not isinstance(item, dict):
+                        continue
+                    item_service_id = str(item.get("service_id") or "").strip()
+                    item_agent_id = str(item.get("agent_id") or "").strip()
+                    item_role = str(item.get("join_role") or "").strip().lower()
+                    if normalized_agent_id and item_agent_id == normalized_agent_id:
+                        existing = item
+                        break
+                    if (
+                        not normalized_agent_id
+                        and item_service_id == normalized_service_id
+                        and item_role == normalized_join_role
+                    ):
                         existing = item
                         break
                 now = utc_ts()
@@ -1277,7 +1442,6 @@ def record_session_agent_contact(
                         existing["agent_id"] = normalized_agent_id or f"{normalized_service_id}@@{session_id}"
                 if normalized_provider:
                     existing["provider"] = normalized_provider
-                normalized_join_role = str(join_role or "").strip().lower()
                 if normalized_join_role:
                     existing["join_role"] = normalized_join_role
                 normalized_join_transport = str(join_transport or "").strip().lower()
@@ -1332,11 +1496,31 @@ def resolve_session_agent_id(
     username: str,
     session_id: str,
     service_id: str,
+    role: str | None = None,
 ) -> str:
     normalized_service_id = str(service_id or "").strip()
     if not normalized_service_id:
         return ""
+    normalized_role = str(role or "").strip().lower()
+    role_agent_id = (
+        f"{normalized_service_id}@@{session_id}@@{normalized_role}"
+        if normalized_role in {"interactive_agent", "worker_agent", "goal_manager"}
+        else ""
+    )
     welcomed_agents = list_session_agent_contacts(runtime_root, username=username, session_id=session_id)
+    if role_agent_id:
+        for item in welcomed_agents:
+            if (
+                str(item.get("service_id") or "").strip() == normalized_service_id
+                and (
+                    str(item.get("agent_id") or "").strip() == role_agent_id
+                    or str(item.get("join_role") or "").strip().lower() == normalized_role
+                )
+            ):
+                agent_id = str(item.get("agent_id") or "").strip()
+                if agent_id:
+                    return agent_id
+        return role_agent_id
     for item in welcomed_agents:
         if str(item.get("service_id") or "").strip() == normalized_service_id:
             agent_id = str(item.get("agent_id") or "").strip()
@@ -1530,6 +1714,210 @@ def list_active_in_progress_child_sessions(
         )
 
 
+def _parent_resumed_after_recovery_created_unlocked(
+    runtime_root: Path,
+    *,
+    username: str,
+    parent_session_id: str,
+    recovery_session: dict[str, Any],
+) -> bool:
+    recovery_created_at = _parse_utc_ts(recovery_session.get("created_at"))
+    if recovery_created_at is None:
+        return False
+    parent_history = read_jsonl(
+        session_timeline_path(runtime_root, username=username, session_id=parent_session_id)
+    )
+    for entry in parent_history:
+        entry_ts = _parse_utc_ts((entry or {}).get("ts"))
+        if entry_ts is None or entry_ts <= recovery_created_at:
+            continue
+        direction = str((entry or {}).get("direction") or "")
+        event_type = str((entry or {}).get("event_type") or "")
+        if direction == "in":
+            return True
+        if event_type in {
+            "agent.turn_started",
+            "turn.completed",
+            "service.panic_cleared_after_successful_turn",
+        }:
+            return True
+    return False
+
+
+def _complete_recovery_session_unlocked(
+    runtime_root: Path,
+    *,
+    username: str,
+    recovery_session: dict[str, Any],
+    completed_at: str,
+    reason: str,
+) -> dict[str, Any]:
+    _ensure_session_defaults_unlocked(recovery_session)
+    recovery_session["goal_active"] = False
+    recovery_session["goal_completed"] = True
+    recovery_session["goal_progress_state"] = "complete"
+    recovery_session["recovery_auto_completed_at"] = completed_at
+    recovery_session["recovery_auto_completed_reason"] = reason
+    recovery_session["updated_at"] = completed_at
+    active_revision = _active_goal_revision_unlocked(recovery_session)
+    if active_revision is not None:
+        active_revision["goal_active"] = False
+        active_revision["goal_completed"] = True
+        active_revision["goal_progress_state"] = "complete"
+        active_revision["updated_at"] = completed_at
+    _apply_active_goal_snapshot_unlocked(recovery_session)
+    ensure_session_storage_unlocked(runtime_root, username=username, session=recovery_session)
+    if active_revision is not None:
+        write_goal_dir(
+            runtime_root,
+            username=username,
+            session_id=str(recovery_session.get("session_id") or ""),
+            revision=active_revision,
+        )
+    return recovery_session
+
+
+def _complete_resumed_recovery_children_unlocked(
+    runtime_root: Path,
+    *,
+    username: str,
+    parent_session_id: str,
+) -> list[str]:
+    completed: list[str] = []
+    now = utc_ts()
+    for child_session_id in _list_session_children_unlocked(
+        runtime_root,
+        username=username,
+        session_id=parent_session_id,
+    ):
+        child_session = read_json_file(
+            session_metadata_path(runtime_root, username=username, session_id=child_session_id)
+        ) or {}
+        _ensure_session_defaults_unlocked(child_session)
+        if str(child_session.get("session_group") or "").strip().lower() != "error":
+            continue
+        child_source_session_id = str(
+            child_session.get("recovery_source_session_id")
+            or child_session.get("source_session_id")
+            or child_session.get("parent_session_id")
+            or ""
+        ).strip()
+        if child_source_session_id != parent_session_id:
+            continue
+        child_goal_active = bool(child_session.get("goal_active", False))
+        child_goal_progress_state = str(
+            child_session.get(
+                "goal_progress_state",
+                "complete" if bool(child_session.get("goal_completed", False)) else "in_progress",
+            )
+        ).strip().lower()
+        if not (child_goal_active and child_goal_progress_state == "in_progress"):
+            continue
+        if not _parent_resumed_after_recovery_created_unlocked(
+            runtime_root,
+            username=username,
+            parent_session_id=parent_session_id,
+            recovery_session=child_session,
+        ):
+            continue
+        _complete_recovery_session_unlocked(
+            runtime_root,
+            username=username,
+            recovery_session=child_session,
+            completed_at=now,
+            reason="parent_resumed_after_recovery_creation",
+        )
+        completed.append(child_session_id)
+    return completed
+
+
+def supersede_recovery_child_sessions(
+    runtime_root: Path,
+    *,
+    username: str,
+    parent_session_id: str,
+    keep_session_id: str,
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    if not keep_session_id:
+        return None
+    now = utc_ts()
+    superseded_children: list[str] = []
+    for child_session_id in list_session_children(
+        runtime_root,
+        username=normalized,
+        session_id=parent_session_id,
+    ):
+        if child_session_id == keep_session_id:
+            continue
+        child_session = get_session_settings(
+            runtime_root,
+            username=normalized,
+            session_id=child_session_id,
+        )
+        if not isinstance(child_session, dict):
+            continue
+        if str(child_session.get("session_group") or "").strip().lower() != "error":
+            continue
+        child_source_session_id = str(
+            child_session.get("recovery_source_session_id")
+            or child_session.get("source_session_id")
+            or child_session.get("parent_session_id")
+            or ""
+        ).strip()
+        if child_source_session_id != parent_session_id:
+            continue
+        child_goal_active = bool(child_session.get("goal_active", False))
+        child_goal_progress_state = str(
+            child_session.get(
+                "goal_progress_state",
+                "complete" if bool(child_session.get("goal_completed", False)) else "in_progress",
+            )
+        ).strip().lower()
+        if not (child_goal_active and child_goal_progress_state == "in_progress"):
+            continue
+        updated = update_session_goal_flags(
+            runtime_root,
+            username=normalized,
+            session_id=child_session_id,
+            goal_active=False,
+            goal_completed=True,
+            goal_progress_state="complete",
+        )
+        child_session = updated or child_session
+        child_session["recovery_superseded_at"] = now
+        child_session["recovery_superseded_by_session_id"] = keep_session_id
+        child_session["updated_at"] = now
+        write_json_file(
+            session_metadata_path(runtime_root, username=normalized, session_id=child_session_id),
+            child_session,
+        )
+        superseded_children.append(child_session_id)
+    remaining_children = list_active_in_progress_child_sessions(
+        runtime_root,
+        username=normalized,
+        session_id=parent_session_id,
+    )
+    parent_session = get_session_settings(
+        runtime_root,
+        username=normalized,
+        session_id=parent_session_id,
+    ) or {}
+    parent_session["waiting_on_children"] = bool(remaining_children)
+    parent_session["updated_at"] = now
+    write_json_file(
+        session_metadata_path(runtime_root, username=normalized, session_id=parent_session_id),
+        parent_session,
+    )
+    return {
+        "parent_session_id": parent_session_id,
+        "keep_session_id": keep_session_id,
+        "superseded_children": superseded_children,
+        "waiting_on_children": bool(remaining_children),
+        "remaining_children": remaining_children,
+    }
+
+
 def add_session_child(
     runtime_root: Path,
     *,
@@ -1588,9 +1976,6 @@ def add_session_child(
             )
         )
         parent_session["updated_at"] = utc_ts()
-        if isinstance(parent_session.get("goal_progress_state"), str) and parent_session.get("goal_progress_state") == "complete":
-            parent_session["goal_progress_state"] = "in_progress"
-            parent_session["goal_completed"] = False
         ensure_session_storage_unlocked(runtime_root, username=normalized, session=parent_session)
         child_session = read_json_file(
             session_metadata_path(runtime_root, username=normalized, session_id=child_session_id)
@@ -1619,12 +2004,27 @@ def create_child_conversation_session(
     session_interactive: bool = False,
     communication_agent_enabled: bool = False,
     communication_agent_priority: list[str] | None = None,
+    child_session_sharing: dict[str, Any] | None = None,
+    session_skills: list[dict[str, Any]] | None = None,
+    requester_session_id: str | None = None,
+    requester_unit_id: str | None = None,
+    requester_template_id: str | None = None,
 ) -> dict[str, Any] | None:
     normalized = normalize_username(username)
     parent = get_session_settings(runtime_root, username=username, session_id=parent_session_id)
     if not isinstance(parent, dict):
         return None
-    if not session_operation_allowed(parent, "create_child_session"):
+    system_root_unit_child = (
+        str(parent.get("session_group") or "").strip().lower() == "root"
+        and str(created_by_type or "").strip().lower() == "unit"
+        and bool(str(requester_unit_id or requester_template_id or "").strip())
+    )
+    if not session_allows_child_session_creator(
+        parent,
+        requester_session_id=requester_session_id or origin_session_id or parent_session_id,
+        requester_unit_id=requester_unit_id,
+        requester_template_id=requester_template_id,
+    ) and not system_root_unit_child:
         return None
     child = create_conversation_session(
         runtime_root,
@@ -1641,6 +2041,8 @@ def create_child_conversation_session(
         session_interactive=session_interactive,
         communication_agent_enabled=communication_agent_enabled,
         communication_agent_priority=communication_agent_priority,
+        child_session_sharing=child_session_sharing,
+        session_skills=session_skills,
     )
     if goal_text:
         update_session_goal(
@@ -1661,6 +2063,54 @@ def create_child_conversation_session(
         child_session_id=str(child["session_id"]),
     )
     return get_session_settings(runtime_root, username=username, session_id=str(child["session_id"]))
+
+
+def update_session_child_sharing(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    child_session_sharing: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    policy = normalize_child_session_sharing_policy(child_session_sharing)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if isinstance(talk, dict) and str(talk.get("session_id") or "") == session_id:
+                _ensure_session_defaults_unlocked(talk)
+                talk["child_session_sharing"] = policy
+                talk["updated_at"] = utc_ts()
+                ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+                write_state(runtime_root, state)
+                return dict(talk)
+    return None
+
+
+def update_session_skills(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    session_skills: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    normalized_skills = normalize_session_skills(session_skills)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if isinstance(talk, dict) and str(talk.get("session_id") or "") == session_id:
+                _ensure_session_defaults_unlocked(talk)
+                talk["session_skills"] = normalized_skills
+                talk["updated_at"] = utc_ts()
+                ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+                write_state(runtime_root, state)
+                return dict(talk)
+    return None
 
 
 def session_goal_context(
@@ -1858,7 +2308,9 @@ def update_session_launcher_profile(
         for talk in _conversation_sessions(state).get(normalized, []):
             if isinstance(talk, dict) and str(talk.get("session_id")) == session_id:
                 _ensure_session_defaults_unlocked(talk)
-                talk["launcher_template_id"] = str(launcher_template_id or "").strip()
+                launcher_unit_id = str(launcher_template_id or "").strip()
+                talk["launcher_unit_id"] = launcher_unit_id
+                talk["launcher_template_id"] = launcher_unit_id
                 talk["launcher_display_name"] = str(launcher_display_name or "").strip()
                 talk["launcher_preferred_provider"] = str(preferred_provider or "").strip().lower()
                 talk["launcher_selected_agents"] = [str(agent) for agent in selected_agents if str(agent).strip()]
@@ -1866,7 +2318,9 @@ def update_session_launcher_profile(
                 talk["launcher_workspace_path"] = str(workspace_path or "").strip()
                 completion_policy = str(goal_completion_policy or "standard").strip().lower()
                 talk["goal_completion_policy"] = (
-                    completion_policy if completion_policy in {"standard", "continuous"} else "standard"
+                    completion_policy
+                    if completion_policy in {"standard", "continuous", "per_prompt"}
+                    else "standard"
                 )
                 talk["launcher_service_targets"] = [
                     {

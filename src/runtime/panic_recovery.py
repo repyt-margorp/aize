@@ -10,15 +10,110 @@ from runtime.persistent_state_pkg import (
     add_session_child,
     create_conversation_session,
     get_session_settings,
+    list_session_children,
     read_json_file,
     session_operation_allowed,
     session_goal_manager_dir,
     session_metadata_path,
+    supersede_recovery_child_sessions,
     update_session_goal,
     update_session_goal_flags,
     write_json_file,
 )
 from wire.protocol import utc_ts
+
+
+def _provider_from_service_id(service_id: str) -> str:
+    normalized = str(service_id or "").strip().lower()
+    if normalized.startswith("service-"):
+        parts = normalized.split("-")
+        if len(parts) >= 3 and parts[1] in {"codex", "claude", "gemini"}:
+            return parts[1]
+    return ""
+
+
+def _transport_like_panic(event: dict[str, Any] | None) -> bool:
+    event = dict(event or {})
+    text = " ".join(
+        str(event.get(key) or "").strip().lower()
+        for key in ("reason", "error", "text", "message", "compaction", "wait_status")
+    )
+    if not text:
+        return False
+    markers = (
+        "transport channel closed",
+        "worker quit with fatal",
+        "http/request failed",
+        "error sending request for url",
+        "remote compaction failed",
+        "failed to run pre-sampling compact",
+        "stream disconnected before completion",
+        "unexpected status 403",
+        "broken pipe",
+        "timeout waiting for child process to exit",
+        "reconnecting...",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _select_recovery_provider(
+    *,
+    panic_service_id: str,
+    event: dict[str, Any] | None,
+    preferred_provider: str,
+) -> str:
+    normalized_preferred = str(preferred_provider or "").strip().lower()
+    panic_provider = _provider_from_service_id(panic_service_id)
+    if normalized_preferred not in {"codex", "claude", "gemini"}:
+        normalized_preferred = panic_provider or "codex"
+    if panic_provider and _transport_like_panic(event):
+        for candidate in ("claude", "gemini", "codex"):
+            if candidate != panic_provider:
+                return candidate
+    return normalized_preferred or panic_provider or "codex"
+
+
+def _recovery_goal_in_progress(session: dict[str, Any] | None) -> bool:
+    if not isinstance(session, dict):
+        return False
+    if not bool(session.get("goal_active", False)):
+        return False
+    progress_state = str(
+        session.get(
+            "goal_progress_state",
+            "complete" if bool(session.get("goal_completed", False)) else "in_progress",
+        )
+    ).strip().lower()
+    return progress_state == "in_progress"
+
+
+def _find_active_recovery_session(
+    runtime_root: Path,
+    *,
+    username: str,
+    source_session_id: str,
+    panic_service_id: str,
+) -> dict[str, Any] | None:
+    for child_session_id in list_session_children(
+        runtime_root,
+        username=username,
+        session_id=source_session_id,
+    ):
+        child = get_session_settings(runtime_root, username=username, session_id=child_session_id)
+        if not isinstance(child, dict):
+            continue
+        if str(child.get("session_group") or "").strip().lower() != "error":
+            continue
+        child_source = str(
+            child.get("recovery_source_session_id")
+            or child.get("source_session_id")
+            or child.get("parent_session_id")
+            or ""
+        ).strip()
+        child_panic_service_id = str(child.get("recovery_panic_service_id") or "").strip()
+        if child_source == source_session_id and child_panic_service_id == panic_service_id and _recovery_goal_in_progress(child):
+            return child
+    return None
 
 
 def panic_recovery_goal_text(
@@ -104,6 +199,11 @@ def ensure_panic_recovery_session(
     )
     recovery_record_path = recovery_dir / f"panic_recovery.{panic_service_id or 'unknown'}.json"
     event = dict(event or {})
+    selected_provider = _select_recovery_provider(
+        panic_service_id=panic_service_id,
+        event=event,
+        preferred_provider=preferred_provider,
+    )
     signature = {
         "event_type": str(event.get("type") or ""),
         "reason": str(event.get("reason") or event.get("error") or ""),
@@ -114,6 +214,15 @@ def ensure_panic_recovery_session(
     existing = read_json_file(recovery_record_path) or {}
     existing_session_id = str(existing.get("recovery_session_id") or "").strip()
     existing_signature = existing.get("panic_signature")
+    active_recovery_session = _find_active_recovery_session(
+        runtime_root,
+        username=username,
+        source_session_id=source_session_id,
+        panic_service_id=panic_service_id,
+    )
+    if isinstance(active_recovery_session, dict):
+        existing_session_id = str(active_recovery_session.get("session_id") or "").strip()
+        existing_signature = signature
     if existing_session_id and existing_signature == signature:
         existing_session = get_session_settings(
             runtime_root,
@@ -145,7 +254,24 @@ def ensure_panic_recovery_session(
                 goal_active=True,
                 goal_completed=False,
                 goal_progress_state="in_progress",
-                preferred_provider=preferred_provider,
+                preferred_provider=selected_provider,
+            )
+            write_json_file(
+                recovery_record_path,
+                {
+                    "recovery_session_id": existing_session_id,
+                    "source_session_id": source_session_id,
+                    "panic_service_id": panic_service_id,
+                    "panic_signature": signature,
+                    "updated_at": utc_ts(),
+                    "reused_active_recovery": True,
+                },
+            )
+            supersede_recovery_child_sessions(
+                runtime_root,
+                username=username,
+                parent_session_id=source_session_id,
+                keep_session_id=existing_session_id,
             )
             return get_session_settings(runtime_root, username=username, session_id=existing_session_id)
     goal_text = panic_recovery_goal_text(
@@ -217,7 +343,7 @@ def ensure_panic_recovery_session(
         goal_active=True,
         goal_completed=False,
         goal_progress_state="in_progress",
-        preferred_provider=preferred_provider,
+        preferred_provider=selected_provider,
     )
     write_json_file(
         recovery_record_path,
@@ -228,5 +354,11 @@ def ensure_panic_recovery_session(
             "panic_signature": signature,
             "updated_at": utc_ts(),
         },
+    )
+    supersede_recovery_child_sessions(
+        runtime_root,
+        username=username,
+        parent_session_id=source_session_id,
+        keep_session_id=recovery_session_id,
     )
     return get_session_settings(runtime_root, username=username, session_id=recovery_session_id)

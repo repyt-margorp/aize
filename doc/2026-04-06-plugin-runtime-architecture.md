@@ -42,9 +42,9 @@ In practice:
 
 - `service.json` defines executable service kinds.
 - `unit.json` defines kernel-managed UnitFiles for humans, schedulers, and interfaces.
-- `unit.json` may also declare unit-level persistence policy such as `"workspace_scope": "app"` for durable unit-local files.
+- `unit.json` may also declare unit-level persistence policy such as `"workspace_scope": "unit"` for durable unit-local files. Legacy `"app"` remains accepted as a compatibility alias.
 - `spawn_requests` stays the runtime mechanism for creating new session processes.
-- The current minimum UnitFile contract is documented in `./src/runtime/schemas/plugin_session_template_v1.json`.
+- The current minimum UnitFile contract is documented in `./src/runtime/schemas/unit_file_v1.json`; `plugin_session_template_v1.json` remains as a compatibility filename.
 
 ## What changed
 

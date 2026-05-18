@@ -7,5 +7,6 @@
   "persona": "You are ClaudeCode running inside the AIze Unit runtime. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
   "max_turns": 100,
   "response_schema_id": "service_control_v1",
+  "owner_capabilities": ["spawn_service"],
   "enabled": true
 }

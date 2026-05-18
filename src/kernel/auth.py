@@ -7,9 +7,35 @@ from wire.protocol import utc_ts
 
 
 ROLE_CAPABILITIES: dict[str, set[str]] = {
-    "root": {"spawn_service", "manage_users", "control_service", "read_service_status", "superuser"},
-    "superuser": {"spawn_service", "manage_users", "control_service", "read_service_status", "superuser"},
-    "user": set(),
+    "root": {
+        "spawn_service",
+        "manage_users",
+        "control_service",
+        "read_service_status",
+        "superuser",
+        "create_session",
+        "update_session_goal",
+        "send_user_prompt",
+        "launch_unit",
+        "launch_session_template",
+    },
+    "superuser": {
+        "spawn_service",
+        "manage_users",
+        "control_service",
+        "read_service_status",
+        "superuser",
+        "create_session",
+        "update_session_goal",
+        "send_user_prompt",
+        "launch_unit",
+        "launch_session_template",
+    },
+    "user": {"create_session", "update_session_goal", "send_user_prompt", "launch_unit", "launch_session_template"},
+    "agent": set(),
+    "goal_manager": {"update_session_goal", "send_user_prompt"},
+    "interactive_agent": {"send_user_prompt"},
+    "worker_agent": set(),
     "system": set(),
 }
 

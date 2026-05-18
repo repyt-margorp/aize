@@ -24,24 +24,24 @@ Session storage alone was not a good fit because:
 UnitFiles may now declare:
 
 ```json
-"workspace_scope": "app"
+"workspace_scope": "unit"
 ```
 
 When enabled, AIze creates a persistent workspace here:
 
 ```text
-.aize-state/session-templates/<username>/<unit_id>/workspace/
+.aize-state/units/<username>/<unit_id>/workspace/
 ```
 
 It also records metadata in:
 
 ```text
-.aize-state/session-templates/<username>/<unit_id>/unit.json
+.aize-state/units/<username>/<unit_id>/unit.json
 ```
 
 The launched session then receives:
 
-- `launcher_workspace_scope`
+- `launcher_workspace_scope` (`"unit"`; legacy `"app"` may still appear in older persisted sessions)
 - `launcher_workspace_path`
 
 and the launch plan prepends a prompt note telling the agent to use that directory for durable unit-local assets.

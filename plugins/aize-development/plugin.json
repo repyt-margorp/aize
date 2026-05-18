@@ -1,0 +1,6 @@
+{
+  "plugin_id": "aize-development",
+  "package_id": "aize-development",
+  "display_name": "AIze Development",
+  "description": "Development-focused UnitFiles for bug hunting, refactoring, and message-system work."
+}

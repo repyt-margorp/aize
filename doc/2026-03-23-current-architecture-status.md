@@ -41,7 +41,7 @@ This is not a purely in-memory actor system. It is a hybrid:
 
 ## Boot Sequence
 
-The canonical entrypoint for the current HTTP Unit runtime is `src/cli/run_codex_http_mesh.py`.
+The canonical entrypoint for the current AIze Unit runtime is `src/cli/run_aize_unit.py`.
 
 At startup it does the following:
 

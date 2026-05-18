@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import html
 import json
 import os
@@ -66,6 +67,7 @@ from runtime.persistent_state_pkg import (
     list_all_sessions_with_users,
     release_session_service,
     release_nonrunnable_session_services,
+    reconcile_session_waiting_on_children,
     load_agent_audit_state,
     load_pending_inputs,
     load_service_pending_inputs,
@@ -102,6 +104,7 @@ from runtime.service_control import (
     parse_service_response,
     parse_service_response_with_fallback,
 )
+from runtime.status_gateway import build_runtime_status, runtime_status_changed_event
 from wire.protocol import (
     decode_line,
     encode_line,
@@ -266,7 +269,9 @@ viewSessionMapButton.textContent = sessionMapOpen ? 'Talk' : 'Sessions';
 viewSessionMapButton.onclick = (event) => { event.preventDefault(); toggleSessionMap(); };
 const captureElementScrollState = (element) => element ? ({
 const restoreElementScrollPosition = (element, state) => {
-initial_session_map_open = requested_session_id(self, query=query) is None
+            # Match HttpBridge: do not preload the session map on plain GET /.
+            # The workspace remains the primary view, and the session map loads lazily.
+            initial_session_map_open = False
 f"let sessionMapOpen = {json.dumps(initial_session_map_open)};"
 previous_goal = str(old_talk.get("goal_text", "")).strip()
 previous_goal_id = str(old_talk.get("active_goal_id") or old_talk.get("goal_id") or "").strip() or None
@@ -348,6 +353,7 @@ def run_http_service(
     pending: queue.Queue[dict[str, str]] = queue.Queue()
     awaiting_replies: deque[dict[str, str]] = deque()
     rx_buffer = ""
+    rx_decoder = codecs.getincrementaldecoder("utf-8")()
     subscribers: dict[str, set[queue.Queue[dict[str, Any]]]] = defaultdict(set)
     subscribers_lock = threading.Lock()
     stopped = threading.Event()
@@ -357,10 +363,22 @@ def run_http_service(
     # Overview tracking: agent service currently running per "username::session_id"
     _active_agent_turns: dict[str, dict[str, Any]] = {}
     _active_agent_turns_lock = threading.Lock()
+    _last_runtime_status: dict[str, dict[str, Any]] = {}
     from kernel.ipc import connect_to_router as _connect_to_router
     if router_conn is None:
         router_conn = _connect_to_router(runtime_root, self_service["service_id"])
     ensure_state(runtime_root)
+    for reconciled in reconcile_session_waiting_on_children(runtime_root):
+        write_jsonl(
+            log_path,
+            {
+                "type": "http.reconciled_session_waiting_on_children",
+                "ts": utc_ts(),
+                "service_id": self_service["service_id"],
+                "process_id": process_id,
+                **reconciled,
+            },
+        )
     for released in release_nonrunnable_session_services(runtime_root):
         write_jsonl(
             log_path,
@@ -374,6 +392,17 @@ def run_http_service(
         )
 
     def release_stale_session_bindings() -> None:
+        for reconciled in reconcile_session_waiting_on_children(runtime_root):
+            write_jsonl(
+                log_path,
+                {
+                    "type": "http.reconciled_session_waiting_on_children",
+                    "ts": utc_ts(),
+                    "service_id": self_service["service_id"],
+                    "process_id": process_id,
+                    **reconciled,
+                },
+            )
         for released in release_nonrunnable_session_services(runtime_root):
             write_jsonl(
                 log_path,
@@ -392,9 +421,53 @@ def run_http_service(
     def append_history(username: str, session_id: str, record: dict[str, Any]) -> None:
         append_user_history(runtime_root, username=username, session_id=session_id, entry=record, limit=history_limit)
 
+    def broadcast_runtime_status(username: str, session_id: str) -> None:
+        scope_key = f"{username}::{session_id}"
+        with _active_agent_turns_lock:
+            active_turn = dict(_active_agent_turns.get(scope_key) or {})
+        with _active_goal_audits_lock:
+            active_goal_audit = dict(_active_goal_audits.get(scope_key) or {})
+        agent_running = bool(active_turn)
+        goal_manager_state = "running" if active_goal_audit else "idle"
+        status = build_runtime_status(
+            agent_running=agent_running,
+            goal_manager_state=goal_manager_state,
+            worker={"service_id": str(active_turn.get("service_id") or "")} if active_turn else None,
+            goal_manager_worker={"service_id": str(active_goal_audit.get("service_id") or "")} if active_goal_audit else None,
+        )
+        previous = _last_runtime_status.get(scope_key)
+        if (
+            previous
+            and previous.get("runtime_execution_state") == status.get("runtime_execution_state")
+            and previous.get("agent_running") == status.get("agent_running")
+            and previous.get("goal_manager_state") == status.get("goal_manager_state")
+        ):
+            return
+        _last_runtime_status[scope_key] = dict(status)
+        append_history(
+            username,
+            session_id,
+            runtime_status_changed_event(
+                service_id=str(self_service.get("service_id") or ""),
+                username=username,
+                session_id=session_id,
+                status=status,
+                previous_status=previous,
+            ),
+        )
+
     def send_router_control(message: dict[str, Any]) -> bool:
+        target_service_id = str(message.get("to") or "")
         try:
-            router_conn.write(encode_line(message))
+            # HTTP-triggered dispatches should not depend on a long-lived router
+            # socket remaining writable across repeated runtime restarts.
+            if self_service.get("kind") == "http":
+                from kernel.ipc import connect_to_router as _connect_to_router
+
+                with _connect_to_router(runtime_root, self_service["service_id"]) as transient_router_conn:
+                    transient_router_conn.write(encode_line(message))
+            else:
+                router_conn.write(encode_line(message))
             return True
         except OSError as exc:
             write_jsonl(
@@ -405,7 +478,7 @@ def run_http_service(
                     "service_id": self_service["service_id"],
                     "process_id": process_id,
                     "reason": str(exc),
-                    "to_service_id": str(message.get("to")),
+                    "to_service_id": target_service_id,
                 },
             )
             return False
@@ -1247,8 +1320,12 @@ def run_http_service(
                 "role": base_context.get("role", "user"),
                 "is_superuser": is_superuser,
             }
-        sessions = list_sessions(runtime_root, username=base_context.get("username", ""))
-        if not any(str(session.get("session_id")) == explicit_session_id for session in sessions):
+        direct_session = get_session_settings(
+            runtime_root,
+            username=base_context.get("username", ""),
+            session_id=explicit_session_id,
+        )
+        if not isinstance(direct_session, dict):
             if not is_superuser:
                 return None
             for session in list_all_sessions_with_users(runtime_root):
@@ -1487,9 +1564,10 @@ def run_http_service(
             ready, _, _ = select.select([rx_fd], [], [], 0.5)
             if not ready:
                 continue
-            chunk = os.read(rx_fd, 65536).decode("utf-8")
-            if not chunk:
+            chunk_bytes = os.read(rx_fd, 65536)
+            if not chunk_bytes:
                 continue
+            chunk = rx_decoder.decode(chunk_bytes)
             rx_buffer += chunk
             if "\n" not in rx_buffer:
                 continue
@@ -1509,21 +1587,30 @@ def run_http_service(
                         _ov_evt = str(entry.get("event_type") or "")
                         _ov_svc = str(entry.get("service_id") or message.get("from") or "")
                         if _ov_evt == "agent.turn_started":
-                            with _active_agent_turns_lock:
-                                _active_agent_turns[_ov_key] = {"service_id": _ov_svc, "started_at": utc_ts()}
+                            _ov_event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+                            if not bool(_ov_event.get("goal_manager", False)):
+                                with _active_agent_turns_lock:
+                                    _active_agent_turns[_ov_key] = {"service_id": _ov_svc, "started_at": utc_ts()}
+                                broadcast_runtime_status(scope_username, scope_session_id)
                         elif _ov_evt == "turn.completed" or str(entry.get("direction") or "") == "in":
                             with _active_agent_turns_lock:
                                 _active_agent_turns.pop(_ov_key, None)
-                        if _ov_evt == "service.goal_audit_started":
+                            broadcast_runtime_status(scope_username, scope_session_id)
+                        if _ov_evt == "service.goal_manager_compact_started":
                             _ov_job = str((entry.get("event") or {}).get("goal_audit_job_id") or "")
                             with _active_goal_audits_lock:
                                 _active_goal_audits[_ov_key] = {"job_id": _ov_job, "service_id": _ov_svc, "started_at": utc_ts()}
+                            broadcast_runtime_status(scope_username, scope_session_id)
                         elif _ov_evt in {
-                            "service.goal_audit_completed", "service.goal_audit_failed",
-                            "service.goal_manager_compact_checked", "service.goal_manager_compact_failed",
+                            "service.goal_audit_completed",
+                            "service.goal_audit_failed",
+                            "service.goal_manager_compact_completed",
+                            "service.goal_manager_compact_failed",
+                            "service.goal_manager_compact_checked",
                         }:
                             with _active_goal_audits_lock:
                                 _active_goal_audits.pop(_ov_key, None)
+                            broadcast_runtime_status(scope_username, scope_session_id)
                     continue
                 if message.get("type") != "prompt":
                     continue
@@ -1531,6 +1618,7 @@ def run_http_service(
                 username, session_id = resolve_http_reply_scope(message, awaiting_replies)
                 with _active_agent_turns_lock:
                     _active_agent_turns.pop(f"{username}::{session_id}", None)
+                broadcast_runtime_status(username, session_id)
                 append_history(
                     username,
                     session_id,
@@ -1603,6 +1691,22 @@ def main() -> int:
     from kernel.ipc import connect_to_router
     router_conn = connect_to_router(runtime_root, args.service_id)
 
+    def start_restart_resume_scan(*, service_kind: str) -> None:
+        threading.Thread(
+            target=maybe_resume_after_restart,
+            kwargs={
+                "runtime_root": runtime_root,
+                "manifest": manifest,
+                "self_service": self_service,
+                "process_id": process_id,
+                "log_path": log_path,
+                "service_id": args.service_id,
+                "router_conn": router_conn,
+                "service_kind": service_kind,
+            },
+            daemon=True,
+        ).start()
+
     if self_service["kind"] == "codex":
         ensure_state(runtime_root)
         update_process_fields(
@@ -1610,32 +1714,14 @@ def main() -> int:
             process_id=process_id,
             fields={"codex_session_id": load_codex_session(runtime_root, service_id=args.service_id)},
         )
-        maybe_resume_after_restart(
-            runtime_root=runtime_root,
-            manifest=manifest,
-            self_service=self_service,
-            process_id=process_id,
-            log_path=log_path,
-            service_id=args.service_id,
-            router_conn=router_conn,
-            service_kind="codex",
-        )
+        start_restart_resume_scan(service_kind="codex")
     elif self_service["kind"] == "claude":
         update_process_fields(
             runtime_root,
             process_id=process_id,
             fields={"claude_session_id": load_claude_session(runtime_root, service_id=args.service_id)},
         )
-        maybe_resume_after_restart(
-            runtime_root=runtime_root,
-            manifest=manifest,
-            self_service=self_service,
-            process_id=process_id,
-            log_path=log_path,
-            service_id=args.service_id,
-            router_conn=router_conn,
-            service_kind="claude",
-        )
+        start_restart_resume_scan(service_kind="claude")
 
     write_jsonl(
         log_path,

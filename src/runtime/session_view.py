@@ -6,6 +6,7 @@ from typing import Any
 
 from runtime.event_log import make_history_event_entry
 from runtime.message_builder import make_aize_pending_input
+from runtime.status_gateway import merge_runtime_status
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_pending_input,
@@ -13,7 +14,9 @@ from runtime.persistent_state_pkg import (
     load_pending_inputs,
     read_json_file,
     session_goal_manager_state_path,
+    session_service_state_path,
     session_ui_mode,
+    write_json_file,
 )
 from wire.protocol import utc_ts, write_jsonl
 
@@ -46,8 +49,8 @@ def active_agent_turn_state(history_entries: list[dict[str, Any]]) -> dict[str, 
                 active_started_ts = ""
                 continue
         if event_type in {
-            "service.goal_audit_completed",
-            "service.goal_audit_failed",
+            "service.goal_manager_compact_completed",
+            "service.goal_manager_compact_failed",
             "service.goal_manager_reset",
             "service.goal_manager_compact_failed",
             "service.post_turn_followup_failed",
@@ -102,6 +105,35 @@ def worker_slot_badge(
     }
 
 
+def session_registration_metadata(talk: dict[str, Any] | None) -> dict[str, Any]:
+    session = talk if isinstance(talk, dict) else {}
+    session_group = str(session.get("session_group") or "user").strip().lower() or "user"
+    ui_mode = session_ui_mode(session)
+    launcher_unit_id = str(session.get("launcher_unit_id") or session.get("launcher_template_id") or "").strip()
+    launcher_template_id = str(session.get("launcher_template_id") or launcher_unit_id).strip()
+    registered_at = str(session.get("registered_at") or session.get("created_at") or "").strip()
+    goal_updated_at = str(
+        session.get("goal_updated_at")
+        or session.get("updated_at")
+        or session.get("created_at")
+        or ""
+    ).strip()
+    resident = session_group in {"root", "unit", "resident", "system"} or ui_mode in {
+        "session_map",
+        "sessionmap",
+        "map_only",
+    }
+    return {
+        "registered_at": registered_at,
+        "goal_updated_at": goal_updated_at,
+        "resident_unit_session": bool(resident),
+        "associated_unit_id": launcher_unit_id,
+        "associated_template_id": launcher_template_id,
+        "associated_unit_display_name": str(session.get("launcher_display_name") or "").strip(),
+        "has_associated_unit_file": bool(launcher_unit_id or launcher_template_id),
+    }
+
+
 def latest_goal_manager_runtime_state(history_entries: list[dict[str, Any]]) -> dict[str, Any]:
     for entry in sorted(history_entries, key=lambda item: str(item.get("ts") or ""), reverse=True):
         event_type = str(entry.get("event_type") or "")
@@ -114,7 +146,7 @@ def latest_goal_manager_runtime_state(history_entries: list[dict[str, Any]]) -> 
             return {"state": "running", "service_id": service_id}
         if event_type == "service.goal_manager_reset":
             return {"state": "idle", "service_id": ""}
-        if event_type == "service.goal_audit_completed":
+        if event_type in {"service.goal_audit_completed", "service.goal_manager_compact_completed"}:
             event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
             progress_state = str(
                 event.get("progress_state", "complete" if bool(event.get("goal_satisfied")) else "in_progress")
@@ -144,11 +176,44 @@ def persisted_goal_manager_runtime_state(
     ) or {}
     service_id = str(state.get("service_id") or bound_service_id or "").strip()
     runtime_state = str(state.get("state") or "idle").strip().lower()
+    progress_state = str(state.get("progress_state") or "").strip().lower()
+    if service_id and progress_state in {"complete", "in_progress"}:
+        service_state_path = session_service_state_path(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            service_id=service_id,
+        )
+        service_state = read_json_file(service_state_path) or {"service_id": service_id}
+        goal_manager_state = service_state.get("goal_manager")
+        if not isinstance(goal_manager_state, dict):
+            goal_manager_state = {}
+        current_progress_state = str(goal_manager_state.get("progress_state") or "").strip().lower()
+        if current_progress_state != progress_state:
+            if progress_state == "complete":
+                service_status = "complete"
+            elif runtime_state in {"running", "failed", "idle", "queued"}:
+                service_status = runtime_state
+            else:
+                service_status = "in_progress"
+            service_state["status"] = service_status
+            service_state["updated_at"] = str(state.get("updated_at") or utc_ts())
+            service_state["goal_manager"] = {
+                "state": runtime_state or "idle",
+                "progress_state": progress_state,
+                "audit_state": str(state.get("audit_state") or "").strip(),
+                "goal_satisfied": bool(state.get("goal_satisfied", False)),
+                "summary": str(state.get("summary") or "").strip(),
+                "pending_work_items": list(state.get("pending_work_items", []))
+                if isinstance(state.get("pending_work_items"), list)
+                else [],
+                "updated_at": str(state.get("updated_at") or utc_ts()),
+            }
+            write_json_file(service_state_path, service_state)
     if runtime_state == "running":
         return {"state": "running", "service_id": service_id}
     if runtime_state == "failed":
         return {"state": "failed", "service_id": service_id}
-    progress_state = str(state.get("progress_state") or "").strip().lower()
     if progress_state == "complete":
         return {"state": "complete", "service_id": service_id}
     if progress_state == "in_progress":
@@ -208,13 +273,17 @@ def build_session_runtime_summary(
     goal_progress_state = str(
         talk.get("goal_progress_state", "complete" if goal_completed else "in_progress")
     ).strip().lower()
-    return {
+    return merge_runtime_status({
         "session_id": session_id,
         "label": str(talk.get("label", session_id)),
+        "created_at": str(talk.get("created_at", "") or ""),
+        "updated_at": str(talk.get("updated_at", "") or ""),
+        **session_registration_metadata(talk),
         "goal_text": goal_text,
         "goal_active": bool(talk.get("goal_active", False)),
         "goal_completed": goal_completed,
         "goal_progress_state": goal_progress_state,
+        "goal_audit_state": str(talk.get("goal_audit_state", "all_clear") or "all_clear"),
         "agent_welcome_enabled": bool(talk.get("agent_welcome_enabled", False)),
         "preferred_provider": preferred_provider,
         "bound_service_id": bound_service_id,
@@ -241,7 +310,10 @@ def build_session_runtime_summary(
         "session_permissions": dict(talk.get("session_permissions", {}))
         if isinstance(talk.get("session_permissions"), dict)
         else {},
-    }
+        "child_session_sharing": dict(talk.get("child_session_sharing", {}))
+        if isinstance(talk.get("child_session_sharing"), dict)
+        else {},
+    })
 
 
 def build_worker_count_summary(

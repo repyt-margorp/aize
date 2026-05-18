@@ -214,6 +214,8 @@ def build_aize_input_batch_xml(
         date_attr = ""
         submitted_by_attr = ""
         request_id_lines: list[str] = []
+        message_meta_lines: list[str] = []
+        attachment_lines: list[str] = []
         raw_date = item.get("date")
         if isinstance(raw_date, str) and raw_date.strip():
             date_attr = f' date="{html.escape(raw_date.strip(), quote=True)}"'
@@ -234,12 +236,76 @@ def build_aize_input_batch_xml(
                     ],
                     "      </user_response_request_ids>",
                 ]
+        message_id = str(item.get("message_id") or "").strip()
+        text_relpath = str(item.get("message_text_relpath") or "").strip()
+        text_size = item.get("message_text_size")
+        if message_id or text_relpath or text_size is not None:
+            message_meta_lines.extend(
+                [
+                    "      <message>",
+                    *( [f"        <message_id>{html.escape(message_id)}</message_id>"] if message_id else [] ),
+                    *( [f"        <text_relpath>{html.escape(text_relpath)}</text_relpath>"] if text_relpath else [] ),
+                    *(
+                        [f"        <text_size>{html.escape(str(text_size))}</text_size>"]
+                        if text_size is not None
+                        else []
+                    ),
+                    "      </message>",
+                ]
+            )
+        raw_attachments = item.get("attachments")
+        if isinstance(raw_attachments, list):
+            normalized_attachments = []
+            for raw_attachment in raw_attachments:
+                if not isinstance(raw_attachment, dict):
+                    continue
+                filename = str(raw_attachment.get("filename") or "").strip()
+                if not filename:
+                    continue
+                normalized_attachments.append(
+                    {
+                        "filename": filename,
+                        "original_filename": str(raw_attachment.get("original_filename") or filename).strip() or filename,
+                        "content_type": str(raw_attachment.get("content_type") or "").strip(),
+                        "size": raw_attachment.get("size"),
+                        "relpath": str(raw_attachment.get("relpath") or "").strip(),
+                    }
+                )
+            if normalized_attachments:
+                attachment_lines = ["      <attachments>"]
+                for attachment in normalized_attachments:
+                    attachment_lines.extend(
+                        [
+                            "        <attachment>",
+                            f"          <filename>{html.escape(attachment['filename'])}</filename>",
+                            f"          <original_filename>{html.escape(attachment['original_filename'])}</original_filename>",
+                            *(
+                                [f"          <content_type>{html.escape(attachment['content_type'])}</content_type>"]
+                                if attachment["content_type"]
+                                else []
+                            ),
+                            *(
+                                [f"          <size>{html.escape(str(attachment['size']))}</size>"]
+                                if attachment["size"] is not None
+                                else []
+                            ),
+                            *(
+                                [f"          <relpath>{html.escape(attachment['relpath'])}</relpath>"]
+                                if attachment["relpath"]
+                                else []
+                            ),
+                            "        </attachment>",
+                        ]
+                    )
+                attachment_lines.append("      </attachments>")
         lines.extend(
             [
                 f"    <input index=\"{index}\" kind=\"{kind}\"{date_attr}{submitted_by_attr}>",
                 f"      <role>{role}</role>",
                 f"      <text>{text}</text>",
                 *request_id_lines,
+                *message_meta_lines,
+                *attachment_lines,
                 "    </input>",
             ]
         )
@@ -297,6 +363,10 @@ def make_aize_pending_input(
     date: str | None = None,
     submitted_by_username: str | None = None,
     user_response_request_ids: list[str] | None = None,
+    message_id: str | None = None,
+    message_text_relpath: str | None = None,
+    message_text_size: int | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     date_value = date.strip() if isinstance(date, str) and date.strip() else utc_ts()
     entry = {
@@ -311,6 +381,16 @@ def make_aize_pending_input(
         request_ids = [str(value).strip() for value in user_response_request_ids if str(value).strip()]
         if request_ids:
             entry["user_response_request_ids"] = request_ids
+    if isinstance(message_id, str) and message_id.strip():
+        entry["message_id"] = message_id.strip()
+    if isinstance(message_text_relpath, str) and message_text_relpath.strip():
+        entry["message_text_relpath"] = message_text_relpath.strip()
+    if isinstance(message_text_size, int) and message_text_size >= 0:
+        entry["message_text_size"] = message_text_size
+    if isinstance(attachments, list):
+        normalized_attachments = [dict(item) for item in attachments if isinstance(item, dict) and str(item.get("filename") or "").strip()]
+        if normalized_attachments:
+            entry["attachments"] = normalized_attachments
     return entry
 
 
@@ -334,6 +414,8 @@ def dispatch_pending_opens_visible_turn(message: dict[str, Any], incoming_text: 
         "goal_feedback",
         "goal_manager_review",
         "interactive_worker_request",
+        "restart_resume",
+        "scheduled_resume",
         "turn_completed",
         "child_session_created",
         "child_session_completed",

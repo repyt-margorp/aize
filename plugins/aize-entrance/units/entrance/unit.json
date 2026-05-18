@@ -25,8 +25,8 @@
   "launcher": {
     "create_as_child": true,
     "default_label": "Entrance",
-    "goal_text": "Operate as the AIze Entrance communication layer only. Keep the session focused on direct user communication and routing user feedback or requests to the appropriate SessionUnit. Answer lightweight questions quickly, infer the target SessionUnit from context when possible, submit the user's input as a UserPrompt on their behalf, and report routing status back to the user. Never perform implementation work, edits, debugging, or other goal completion inside Entrance itself. If a task needs real work, route it to the proper SessionUnit and keep the goal active until the communication layer is explicitly retired.",
-    "initial_prompt": "You are the AIze Entrance communication layer only. This session exists to communicate with the user and route user feedback or requests to the appropriate SessionUnit. Keep replies concise and operational. Answer simple questions directly, ask a short clarifying question only when the target SessionUnit cannot be inferred, and otherwise forward the user's input to the best matching SessionUnit as a UserPrompt on their behalf. Track whether the routed input reached the target and explain the current status to the user. Do not do implementation work, editing, debugging, or worker-style task execution inside Entrance. Do not mark the goal complete just because you answered or routed one message.",
+    "goal_text": "Operate as the AIze Entrance IO/management layer only. Keep the session focused on direct user communication, target selection, routing, and status reporting. Answer lightweight questions quickly, infer the target SessionUnit from context when possible, submit the user's input as a UserPrompt on their behalf, and report routing status back to the user. Never perform implementation work, edits, debugging, or other goal completion inside Entrance itself. If a task needs real work, route it through a unit/session skill into the proper delegated SessionUnit and do not continue the implementation locally in Entrance. Keep the goal active until the communication layer is explicitly retired.",
+    "initial_prompt": "You are the AIze Entrance IO/management layer only. This session exists to communicate with the user and route user feedback or requests to the appropriate SessionUnit. Keep replies concise and operational. Answer simple questions directly, ask a short clarifying question only when the target SessionUnit cannot be inferred, and otherwise forward the user's input to the best matching SessionUnit as a UserPrompt on their behalf. Track whether the routed input reached the target and explain the current status to the user. Do not do implementation work, editing, debugging, or worker-style task execution inside Entrance. Implementation must happen in delegated sessions created or selected by session skills; after routing, do not continue the implementation locally in Entrance. Do not mark the goal complete just because you answered or routed one message.",
     "preferred_provider": "codex",
     "selected_agents": [],
     "session_group": "user",
@@ -44,7 +44,55 @@
         "ephemeral": true
       }
     ],
-    "workspace_scope": "app",
+    "skills": [
+      {
+        "skill_id": "entrance-lightweight-response",
+        "kind": "interactive",
+        "skill_scope": "unit",
+        "title": "Entrance Lightweight Response",
+        "description": "Code-based Entrance response handler for lightweight status/help/ping messages. Declines work-bearing prompts so skill-based routing can delegate implementation outside Entrance.",
+        "routing_mode": "handle_user_message",
+        "handler_file": "entrance_lightweight_response.py",
+        "files": [
+          {
+            "path": "entrance_lightweight_response.py",
+            "description": "Small distributable interactive handler for immediate Entrance replies.",
+            "content": "def handle(context):\n    text = str(context.get('prompt_text') or '').strip()\n    normalized = ' '.join(text.lower().split())\n    if not normalized:\n        return {'handled': True, 'assistant_text': 'Send a message and I will route it to the right session when needed.'}\n    if normalized in {'ping', 'hello', 'hi', 'help', 'status'} or normalized.startswith('status '):\n        return {'handled': True, 'assistant_text': 'Entrance is active as IO/management only. Lightweight messages can be answered here; work requests are routed by skill to delegated sessions.'}\n    return {'handled': False}\n"
+          }
+        ]
+      },
+      {
+        "skill_id": "canonical-development-routing",
+        "kind": "routing",
+        "skill_scope": "unit",
+        "title": "Canonical Development Routing",
+        "description": "Route implementation requests into the canonical non-UI AIzeDevelopment parent Unit, which keeps the development-cycle goal and materializes each concrete request as a delegated child session under that parent.",
+        "routing_mode": "create_child_session",
+        "routing_tags": ["development", "dev", "implementation", "implement", "code", "fix", "debug", "refactor", "test", "開発"],
+        "canonical_session_key": "aize.development",
+        "target_unit_id": "aize-development.bug-hunting",
+        "target_template_id": "aize-development.bug-hunting",
+        "target_label": "AIze Development",
+        "target_child_label": "AIze Development Task",
+        "target_goal_text": "Operate as the canonical non-UI AIzeDevelopment parent goal session for implementation work routed out of Entrance by skill. Keep the development-cycle contract explicit: route each concrete request into a child task session under this parent, require verification on a separate port or isolated runtime before touching the active AIze runtime, and only stop-and-migrate to the newly verified system when the transition can be done carefully.",
+        "preferred_provider": "codex",
+        "selected_agents": ["codex_pool"],
+        "spawn_session_skills": [
+          {
+            "skill_id": "aize-development-session",
+            "kind": "development",
+            "skill_scope": "unit",
+            "title": "AIze Development Session",
+            "canonical_session_key": "aize.development",
+            "description": "Canonical delegated child implementation session for AIze development work routed out of Entrance through the persistent AIzeDevelopment parent workflow.",
+            "when_to_use": "Use this skill when the request requires real implementation work such as code edits, debugging, refactoring, or targeted test fixes. Do not keep that work inside Entrance or in the AIzeDevelopment parent coordinator.",
+            "usage": "Treat this session as the delegated implementation workspace under the AIzeDevelopment parent workflow. Read the active goal and this skill guidance together, perform the code changes here, verify on a separate port or isolated runtime before any cutover, and report concrete results back without sending the implementation work back to Entrance.",
+            "prompt": "This session is a delegated AIze development child task under the canonical parent workflow routed out of Entrance by skill. Execute the requested changes here, verify them on a separate port or isolated runtime, and leave final stop-and-migrate coordination to the parent session."
+          }
+        ]
+      }
+    ],
+    "workspace_scope": "unit",
     "auto_select_session": true,
     "auto_send_initial_prompt": false,
     "ui_url": "/units/entrance"

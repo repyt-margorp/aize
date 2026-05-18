@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from runtime.panic_recovery import (
 )
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
+    append_goal_manager_pending_input,
     append_pending_input,
     append_service_pending_input,
     claim_session_restart_resume,
@@ -29,6 +31,7 @@ from runtime.persistent_state_pkg import (
     load_codex_session,
     load_claude_session,
     load_gemini_session,
+    load_goal_manager_pending_inputs,
     load_pending_inputs,
     read_json_file,
     load_service_pending_inputs,
@@ -59,6 +62,35 @@ from runtime.providers import (
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
+DEFAULT_RESTART_RESUME_STARTUP_BUDGET = 0
+RESTART_RESUME_ONLY_KINDS = {"restart_resume", "scheduled_resume", "turn_completed"}
+GOAL_MANAGER_RUNNING_STALE_SECONDS = 120
+
+
+def _restart_resume_startup_budget(self_service: dict[str, Any]) -> int:
+    config = self_service.get("config")
+    raw_budget: Any = None
+    if isinstance(config, dict):
+        raw_budget = config.get("restart_resume_startup_budget")
+    if raw_budget is None:
+        raw_budget = DEFAULT_RESTART_RESUME_STARTUP_BUDGET
+    try:
+        return max(0, int(raw_budget))
+    except (TypeError, ValueError):
+        return DEFAULT_RESTART_RESUME_STARTUP_BUDGET
+
+
+def _utc_ts_age_seconds(ts: str) -> float | None:
+    text = str(ts or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return max(0.0, datetime.now(UTC).timestamp() - parsed.timestamp())
 
 
 def _fallback_codex_session_id_for_conversation(
@@ -120,6 +152,19 @@ def _fallback_codex_session_id_for_conversation(
             if isinstance(provider_session_id, str) and provider_session_id.strip():
                 return provider_session_id.strip()
     return None
+
+
+def build_restart_resume_claim_run_id(
+    *,
+    restart_generation_id: str,
+    scope_session_id: str,
+    restart_claim_slot: str,
+    service_id: str,
+) -> str:
+    return (
+        f"system-restart-{restart_generation_id}-{scope_session_id}-"
+        f"{restart_claim_slot}-{service_id}"
+    )
 
 
 def _latest_goal_manager_review(runtime_root: Path, *, username: str, session_id: str) -> dict[str, Any] | None:
@@ -366,12 +411,14 @@ def maybe_resume_after_restart(
             "username": username,
             "conversation_session_id": session_id,
             "service_id": service_id,
-            "recovery_mode": "reconstruct_without_session",
+            "recovery_mode": "goal_manager_review_only",
             "orphan_in_progress_session": "true",
         }
         candidate_entries.append(session_entry_map[(username, session_id)])
     if not candidate_entries:
         return
+    restart_resume_startup_budget = _restart_resume_startup_budget(self_service)
+    restart_resume_startup_count = 0
 
     def has_unfinished_turn(username: str, session_id: str) -> bool:
         history = get_user_history(runtime_root, username=username, session_id=session_id)
@@ -385,7 +432,6 @@ def maybe_resume_after_restart(
             if direction == "out":
                 last_user_out_ts = ts
             if event_type in {
-                "agent.turn_started",
                 "thread.started",
                 "turn.started",
                 "item.started",
@@ -406,7 +452,16 @@ def maybe_resume_after_restart(
         return last_user_out_ts > last_turn_completed_ts
 
     def has_actionable_pending_inputs(pending_inputs: list[dict[str, Any]]) -> bool:
-        return any(str(item.get("kind", "")) not in {"turn_completed", "scheduled_resume"} for item in pending_inputs)
+        return any(
+            str(item.get("kind", "")).strip().lower() not in RESTART_RESUME_ONLY_KINDS
+            for item in pending_inputs
+        )
+
+    def has_live_actionable_pending_inputs(pending_inputs: list[dict[str, Any]]) -> bool:
+        return any(
+            str(item.get("kind", "")).strip().lower() not in RESTART_RESUME_ONLY_KINDS
+            for item in pending_inputs
+        )
 
     def has_dangling_goal_audit(username: str, session_id: str) -> bool:
         history = get_user_history(runtime_root, username=username, session_id=session_id)
@@ -415,18 +470,23 @@ def maybe_resume_after_restart(
         for record in history:
             event_type = str(record.get("event_type") or "")
             ts = str(record.get("ts") or "")
-            if event_type == "service.goal_audit_started":
+            if event_type == "service.goal_manager_compact_started":
                 last_started_ts = ts
-            elif event_type in {"service.goal_audit_completed", "service.goal_audit_failed"}:
+            elif event_type in {
+                "service.goal_manager_compact_completed",
+                "service.goal_manager_compact_failed",
+                "service.goal_audit_completed",
+                "service.goal_audit_failed",
+            }:
                 last_terminal_ts = ts
         return bool(last_started_ts) and last_started_ts > last_terminal_ts
 
     def latest_goal_manager_failure(history: list[dict[str, Any]]) -> dict[str, Any] | None:
         for record in reversed(history):
             event_type = str(record.get("event_type") or "").strip()
-            if event_type in {"service.goal_audit_failed", "service.goal_manager_compact_failed"}:
+            if event_type in {"service.goal_manager_compact_failed"}:
                 return record
-            if event_type in {"service.goal_audit_completed", "turn.completed"}:
+            if event_type in {"service.goal_manager_compact_completed", "turn.completed"}:
                 return None
         return None
 
@@ -472,15 +532,50 @@ def maybe_resume_after_restart(
         latest_turn_completed = latest_agent_turn_completed_at(talk)
         review_cursor = review_cursor_for_session(username, session_id, talk)
         updated_at = str(goal_manager_state.get("updated_at") or "").strip()
-        if (
+        updated_age_seconds = _utc_ts_age_seconds(updated_at)
+        running_state_is_stale = updated_age_seconds is None or updated_age_seconds >= GOAL_MANAGER_RUNNING_STALE_SECONDS
+        pending_work_items = goal_manager_state.get("pending_work_items")
+        has_persisted_pending_work = isinstance(pending_work_items, list) and bool(pending_work_items)
+        should_requeue_running_state = bool(
             should_standard_goal_route
-            and latest_turn_completed
-            and latest_turn_completed > review_cursor
-            and (not updated_at or updated_at < latest_turn_completed)
-        ):
-            goal_manager_state["state"] = "idle"
-            goal_manager_state["pending_work_items"] = []
-            goal_manager_state["stale_reason"] = "unreviewed_turn_completed_after_stale_running_state"
+            and running_state_is_stale
+            and (
+                has_persisted_pending_work
+                or (
+                    latest_turn_completed
+                    and latest_turn_completed > review_cursor
+                    and (not updated_at or updated_at < latest_turn_completed)
+                )
+            )
+        )
+        if should_requeue_running_state:
+            if not has_persisted_pending_work:
+                pending_work_items = [
+                    {
+                        "kind": "turn_completed",
+                        "ts": latest_turn_completed,
+                        "service_id": str(goal_manager_state.get("service_id") or ""),
+                        "goal_id": str(
+                            talk.get("active_goal_id")
+                            or talk.get("goal_id")
+                            or ""
+                        ).strip(),
+                    }
+                ]
+            for pending_work_item in pending_work_items:
+                append_goal_manager_pending_input(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    entry=dict(pending_work_item),
+                )
+            goal_manager_state["state"] = "queued"
+            goal_manager_state["pending_work_items"] = pending_work_items
+            goal_manager_state["stale_reason"] = (
+                "persisted_pending_work_after_stale_running_state"
+                if has_persisted_pending_work
+                else "unreviewed_turn_completed_after_stale_running_state"
+            )
             goal_manager_state["updated_at"] = utc_ts()
             write_json_file(goal_manager_state_path, goal_manager_state)
             write_jsonl(
@@ -494,9 +589,14 @@ def maybe_resume_after_restart(
                     "previous_state": runtime_state,
                     "latest_turn_completed_at": latest_turn_completed,
                     "last_reviewed_turn_completed_at": review_cursor,
+                    "new_state": "queued",
+                    "requeued_pending_count": len(pending_work_items),
+                    "updated_at": updated_at,
+                    "updated_age_seconds": updated_age_seconds,
+                    "stale_after_seconds": GOAL_MANAGER_RUNNING_STALE_SECONDS,
                 },
             )
-            return True, "idle"
+            return True, "queued"
         return False, runtime_state
 
     for entry in candidate_entries:
@@ -505,8 +605,14 @@ def maybe_resume_after_restart(
         scope_session_id = entry.get("conversation_session_id") or entry.get("session_id")
         if not isinstance(scope_username, str) or not isinstance(scope_session_id, str):
             continue
+        session_slot = str(entry.get("slot") or "").strip().lower()
         recovery_mode = str(entry.get("recovery_mode") or ("resume" if session_id else "reconstruct_without_session"))
         pending_inputs = load_pending_inputs(runtime_root, username=scope_username, session_id=scope_session_id)
+        goal_manager_pending_inputs = load_goal_manager_pending_inputs(
+            runtime_root,
+            username=scope_username,
+            session_id=scope_session_id,
+        )
         talk = get_session_settings(runtime_root, username=scope_username, session_id=scope_session_id) or {}
         due_auto_resume = consume_session_due_auto_resume(
             runtime_root,
@@ -531,6 +637,7 @@ def maybe_resume_after_restart(
                 username=scope_username,
                 session_id=scope_session_id,
                 service_id=service_id_for_entry,
+                role=session_slot or None,
             ),
             username=scope_username,
             session_id=scope_session_id,
@@ -545,6 +652,7 @@ def maybe_resume_after_restart(
         gm_failure_entry = latest_goal_manager_failure(history)
         unfinished_turn = has_unfinished_turn(scope_username, scope_session_id)
         has_actionable_pending = has_actionable_pending_inputs(pending_inputs) or has_actionable_pending_inputs(service_pending_inputs)
+        has_live_actionable_pending = has_live_actionable_pending_inputs(pending_inputs) or has_live_actionable_pending_inputs(service_pending_inputs)
         should_standard_goal_route = bool(
             goal_text
             and goal_active
@@ -565,6 +673,7 @@ def maybe_resume_after_restart(
             and str(latest_review.get("progress_state") or "").strip().lower() == "in_progress"
             and str(latest_review.get("audit_state") or "").strip().lower() == "all_clear"
         ):
+            continue_feedback_enqueued = False
             continue_xml = str(latest_review.get("continue_xml") or "").strip()
             if continue_xml:
                 append_pending_input(
@@ -577,12 +686,14 @@ def maybe_resume_after_restart(
                         text=continue_xml,
                     ),
                 )
+                continue_feedback_enqueued = True
                 pending_inputs = load_pending_inputs(
                     runtime_root,
                     username=scope_username,
                     session_id=scope_session_id,
                 )
-                has_actionable_pending = has_actionable_pending_inputs(pending_inputs) or has_actionable_pending_inputs(service_pending_inputs)
+        else:
+            continue_feedback_enqueued = False
         stale_goal_manager_reset, _goal_manager_runtime_state = reconcile_stale_goal_manager_runtime(
             scope_username,
             scope_session_id,
@@ -597,26 +708,36 @@ def maybe_resume_after_restart(
             and latest_turn_completed_at > last_reviewed_turn_completed_at
         )
         dangling_goal_audit = should_standard_goal_route and has_dangling_goal_audit(scope_username, scope_session_id)
+        goal_manager_review_reasons: list[str] = []
+        if recovery_mode == "goal_manager_review_only":
+            goal_manager_review_reasons.append("orphan_in_progress_goal")
+        if dangling_goal_audit:
+            goal_manager_review_reasons.append("dangling_goal_audit")
+        if has_unreviewed_turn_completed:
+            goal_manager_review_reasons.append("unreviewed_turn_completed")
+        if stale_goal_manager_reset:
+            goal_manager_review_reasons.append("stale_goal_manager_runtime")
+        if goal_manager_pending_inputs:
+            goal_manager_review_reasons.append("goal_manager_pending")
+        restart_goal_manager_review_only = bool(
+            should_standard_goal_route
+            and not goal_completed
+            and not unfinished_turn
+            and not has_actionable_pending
+            and not isinstance(due_auto_resume, dict)
+            and recovery_mode != "reconstruct_without_session"
+            and goal_manager_review_reasons
+        )
         should_resume_unfinished = (
             not goal_completed
             and (
                 unfinished_turn
                 or has_actionable_pending
-                or dangling_goal_audit
-                or has_unreviewed_turn_completed
+                or restart_goal_manager_review_only
                 or isinstance(due_auto_resume, dict)
+                or continue_feedback_enqueued
             )
         )
-        # If the provider session itself is gone after restart, an active in-progress talk still
-        # needs a reconstructive restart turn even when no pending queue entry survived.
-        if (
-            not should_resume_unfinished
-            and recovery_mode == "reconstruct_without_session"
-            and goal_active
-            and not goal_completed
-            and goal_progress_state == "in_progress"
-        ):
-            should_resume_unfinished = True
         if (
             not should_resume_unfinished
             and goal_active
@@ -629,7 +750,7 @@ def maybe_resume_after_restart(
             panic_event = dict(gm_failure_entry.get("event") or {})
             if not panic_event:
                 panic_event = {
-                    "type": str(gm_failure_entry.get("event_type") or "service.goal_audit_failed"),
+                    "type": str(gm_failure_entry.get("event_type") or "service.goal_manager_compact_failed"),
                     "error": str(gm_failure_entry.get("text") or "").strip(),
                 }
             session_label = str(talk.get("label") or scope_session_id)
@@ -683,7 +804,7 @@ def maybe_resume_after_restart(
                     )
                     dispatch_message = make_dispatch_pending_message(
                         manifest=manifest,
-                        from_service_id="service-http-001",
+                        from_service_id="service-svcmgr-001",
                         to_service_id=service_id,
                         process_id=process_id,
                         run_id=f"restart-recovery-{int(time.time())}",
@@ -740,7 +861,43 @@ def maybe_resume_after_restart(
                 },
             )
             continue
-        run_id = f"system-restart-{int(time.time())}"
+        is_startup_recovery_only = bool(
+            not has_live_actionable_pending
+            and not isinstance(due_auto_resume, dict)
+            and not should_standard_goal_route
+            and recovery_mode != "reconstruct_without_session"
+        )
+        if is_startup_recovery_only and restart_resume_startup_count >= restart_resume_startup_budget:
+            write_jsonl(
+                log_path,
+                {
+                    "type": "service.restart_resume_skipped",
+                    "ts": utc_ts(),
+                    "service_id": service_id,
+                    "process_id": process_id,
+                    "scope": {"username": scope_username, "session_id": scope_session_id},
+                    "session_id": session_id,
+                    "recovery_mode": recovery_mode,
+                    "reason": "restart_resume_startup_budget_exhausted",
+                    "restart_resume_startup_budget": restart_resume_startup_budget,
+                    "unfinished_turn": unfinished_turn,
+                    "has_actionable_pending": has_actionable_pending,
+                    "has_live_actionable_pending": has_live_actionable_pending,
+                    "dangling_goal_audit": dangling_goal_audit,
+                    "has_unreviewed_turn_completed": has_unreviewed_turn_completed,
+                    "due_auto_resume": bool(isinstance(due_auto_resume, dict)),
+                    "should_standard_goal_route": should_standard_goal_route,
+                },
+            )
+            continue
+        restart_generation_id = str(manifest.get("run_id") or manifest.get("node_id") or "system-restart").strip()
+        restart_claim_slot = "goal_manager" if restart_goal_manager_review_only else (session_slot or "agent")
+        run_id = build_restart_resume_claim_run_id(
+            restart_generation_id=restart_generation_id,
+            scope_session_id=scope_session_id,
+            restart_claim_slot=restart_claim_slot,
+            service_id=service_id,
+        )
         if not claim_session_restart_resume(
             runtime_root,
             username=scope_username,
@@ -772,11 +929,13 @@ def maybe_resume_after_restart(
             )
             continue
         if (
-            unfinished_turn
-            or has_actionable_pending
-            or dangling_goal_audit
-            or isinstance(due_auto_resume, dict)
-            or recovery_mode == "reconstruct_without_session"
+            not restart_goal_manager_review_only
+            and (
+                unfinished_turn
+                or has_actionable_pending
+                or isinstance(due_auto_resume, dict)
+                or recovery_mode == "reconstruct_without_session"
+            )
         ):
             scope_session_dir = session_dir(
                 runtime_root,
@@ -796,6 +955,7 @@ def maybe_resume_after_restart(
                     username=scope_username,
                     session_id=scope_session_id,
                     service_id=service_id,
+                    role=session_slot or None,
                 ),
                 username=scope_username,
                 session_id=scope_session_id,
@@ -826,24 +986,73 @@ def maybe_resume_after_restart(
                     ),
                 ),
             )
+        if restart_goal_manager_review_only:
+            goal_manager_work_item = {
+                "kind": "restart_goal_review",
+                "ts": utc_ts(),
+                "service_id": service_id,
+                "goal_id": str(talk.get("active_goal_id") or talk.get("goal_id") or "").strip(),
+                "reason": "system_restart_in_progress_goal",
+            }
+            append_service_pending_input(
+                runtime_root,
+                service_id=service_id,
+                agent_id=resolve_session_agent_id(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                    service_id=service_id,
+                    role="goal_manager",
+                ),
+                username=scope_username,
+                session_id=scope_session_id,
+                entry=make_aize_pending_input(
+                    kind="goal_manager_review",
+                    role="system",
+                    text=json.dumps(goal_manager_work_item, ensure_ascii=False),
+                ),
+            )
+            goal_manager_state_path = session_goal_manager_state_path(
+                runtime_root,
+                username=scope_username,
+                session_id=scope_session_id,
+            )
+            goal_manager_state = read_json_file(goal_manager_state_path) or {}
+            goal_manager_state.update(
+                {
+                    "state": "queued",
+                    "service_id": service_id,
+                    "pending_work_items": [goal_manager_work_item],
+                    "updated_at": utc_ts(),
+                }
+            )
+            write_json_file(goal_manager_state_path, goal_manager_state)
         dispatch_message = make_dispatch_pending_message(
             manifest=manifest,
-            from_service_id="service-http-001",
+            from_service_id="service-svcmgr-001",
             to_service_id=service_id,
             process_id=process_id,
             run_id=run_id,
             username=scope_username,
             session_id=scope_session_id,
             auth_context=None,
-            reason="restart_resume",
+            reason="goal_manager_review" if restart_goal_manager_review_only else "restart_resume",
             session_agent_id=resolve_session_agent_id(
                 runtime_root,
                 username=scope_username,
                 session_id=scope_session_id,
                 service_id=service_id,
+                role="goal_manager" if restart_goal_manager_review_only else (session_slot or None),
+            ),
+            agent_profile=(
+                {"session_slot": "goal_manager"}
+                if restart_goal_manager_review_only
+                else ({"session_slot": session_slot} if session_slot else None)
             ),
         )
         router_conn.write(encode_line(dispatch_message))
+        if is_startup_recovery_only:
+            restart_resume_startup_count += 1
         restart_resume_event = {
             "type": "service.restart_resume_enqueued",
             "ts": utc_ts(),
@@ -859,49 +1068,36 @@ def maybe_resume_after_restart(
             "latest_turn_completed_at": latest_turn_completed_at,
             "last_reviewed_turn_completed_at": last_reviewed_turn_completed_at,
             "stale_goal_manager_reset": stale_goal_manager_reset,
+            "goal_manager_review_only": restart_goal_manager_review_only,
+            "goal_manager_review_reasons": goal_manager_review_reasons,
             "due_auto_resume": bool(isinstance(due_auto_resume, dict)),
             "goal_standard_route": should_standard_goal_route,
+            "startup_recovery_only": is_startup_recovery_only,
+            "restart_resume_startup_budget": restart_resume_startup_budget,
         }
         write_jsonl(log_path, restart_resume_event)
-        # Emit a virtual agent turn so the UI shows a restart agent box, separate from the
-        # continuation turn that will follow when the agent processes the queued restart_resume input.
-        restart_turn_started = {
-            "type": "agent.turn_started",
-            "ts": utc_ts(),
-            "service_id": service_id,
-            "process_id": process_id,
-            "run_id": f"system-restart-{process_id}",
-            "reply_index": 0,
-            "scope": {"username": scope_username, "session_id": scope_session_id},
-        }
-        append_user_history(
-            runtime_root,
-            username=scope_username,
-            session_id=scope_session_id,
-            entry={
-                "direction": "event",
-                "ts": utc_ts(),
-                "service_id": service_id,
-                "event_type": "agent.turn_started",
-                "text": f"Agent {service_id} started responding",
-                "event": restart_turn_started,
-            },
-            limit=GOAL_AUDIT_HISTORY_LIMIT,
-        )
         append_user_history(
             runtime_root,
             username=scope_username,
             session_id=scope_session_id,
             entry={
                 "direction": "session_input",
-                "kind": "scheduled_resume" if isinstance(due_auto_resume, dict) else "restart_resume",
+                "kind": (
+                    "goal_manager_review"
+                    if restart_goal_manager_review_only
+                    else ("scheduled_resume" if isinstance(due_auto_resume, dict) else "restart_resume")
+                ),
                 "ts": utc_ts(),
                 "service_id": service_id,
                 "to": service_id,
                 "text": (
-                    "自動再開時刻に到達したため、最新 Goal を再開する指示を自分のFIFOへ送りました。"
-                    if isinstance(due_auto_resume, dict)
-                    else f"システムが再起動しました。前の作業を続けるため、自分のFIFOに継続指示を送りました（process {previous_process_id} → {process_id}）。"
+                    "システム再起動後に未完了Goalの状態を確認するため、GoalManagerレビューをキューに入れました。"
+                    if restart_goal_manager_review_only
+                    else (
+                        "自動再開時刻に到達したため、最新 Goal を再開する指示を自分のFIFOへ送りました。"
+                        if isinstance(due_auto_resume, dict)
+                        else f"システムが再起動しました。前の作業を続けるため、自分のFIFOに継続指示を送りました（process {previous_process_id} → {process_id}）。"
+                    )
                 ),
             },
             limit=GOAL_AUDIT_HISTORY_LIMIT,

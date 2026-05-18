@@ -114,6 +114,16 @@ def update_service_process(
     with registry_lock(runtime_root):
         state = _load_registry_unlocked(runtime_root)
         service = state["services"][service_id]
+        current_process_id = str(service.get("current_process_id") or "").strip()
+        next_process_id = str(process_id or "").strip()
+        terminal_statuses = {"stopped", "failed", "crashed", "dead", "exited"}
+        if (
+            status in terminal_statuses
+            and current_process_id
+            and next_process_id
+            and current_process_id != next_process_id
+        ):
+            return state
         service["current_process_id"] = process_id
         service["status"] = status
         service["updated_at"] = utc_ts()

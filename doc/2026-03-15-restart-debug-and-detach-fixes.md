@@ -2,14 +2,14 @@
 
 ## Summary
 
-This note records the restart-related fixes made while stabilizing the AIze HTTP Unit runtime.
+This note records the restart-related fixes made while stabilizing the AIze AIze Unit runtime.
 
 ## What Was Changed
 
 - Moved restart/debug references from `./temp/...` to `./.temp/...`.
 - Fixed `.temp/restart-debug/probe_restart.py` so it reads and writes under `.temp/restart-debug/` instead of the old `temp/` path.
 - Updated `.temp/restart-debug/AGENTS.md` so the documented commands match the actual restart layout.
-- Hardened `restart_codex_http_mesh.sh` so the newly launched parent process is started with:
+- Hardened `restart_aize_unit.sh` so the newly launched parent process is started with:
   - `nohup`
   - `setsid` when available
   - stdin detached from the caller
@@ -41,7 +41,7 @@ There were two different problems mixed together:
 
 - The detached restart path now matches the documented `.temp` layout.
 - The new parent launch path is more aggressively detached.
-- A direct restart test through `./.temp/restart_codex_http_mesh.sh` completed with `4123/health` returning `ok: true`.
+- A direct restart test through `./.temp/restart_aize_unit.sh` completed with `4123/health` returning `ok: true`.
 
 ## Remaining Risk
 

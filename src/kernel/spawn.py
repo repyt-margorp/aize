@@ -61,14 +61,29 @@ class SpawnManager:
         allowed_peers = list(payload.get("allowed_peers") or [])
         if message.get("from") not in ("user.local", "kernel.local"):
             allowed_peers = sorted({*allowed_peers, str(message["from"])})
+        reply_to_service_id = str(message_meta_get(message, "reply_to_service_id") or "").strip()
+        if reply_to_service_id.startswith("service-"):
+            allowed_peers = sorted({*allowed_peers, reply_to_service_id})
 
         service_record = register_service(
             self.runtime_root,
             service_spec=service_spec,
             allowed_peers=allowed_peers,
-            owner_principal=str(auth.get("principal")) if auth.get("principal") else sender,
-            owner_roles=[str(item) for item in auth.get("roles", []) if isinstance(item, str)],
-            owner_capabilities=[str(item) for item in auth.get("capabilities", []) if isinstance(item, str)],
+            owner_principal=str(auth.get("principal"))
+            if auth.get("principal")
+            else str(service_spec.get("owner_principal") or sender),
+            owner_roles=[
+                str(item) for item in auth.get("roles", []) if isinstance(item, str)
+            ]
+            or [
+                str(item) for item in service_spec.get("owner_roles", []) if isinstance(item, str)
+            ],
+            owner_capabilities=[
+                str(item) for item in auth.get("capabilities", []) if isinstance(item, str)
+            ]
+            or [
+                str(item) for item in service_spec.get("owner_capabilities", []) if isinstance(item, str)
+            ],
         )
         self._create_service_ports(service_record)
         self._add_reverse_routes(service_record["service_id"], allowed_peers)

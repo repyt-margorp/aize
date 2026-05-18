@@ -15,10 +15,11 @@ from urllib.parse import urlsplit
 from runtime.persistent_state_pkg import (
     get_session_settings,
     list_session_agent_contacts,
+    load_goal_manager_pending_inputs,
+    load_pending_inputs,
     session_dir,
     session_goal_context,
     session_timeline_path,
-    load_pending_inputs,
 )
 from wire.protocol import message_meta_get
 
@@ -220,18 +221,40 @@ def pending_turn_completed_inputs_since_last_review(
     session_id: str,
     last_reviewed_turn_completed_at: str,
 ) -> list[dict[str, str]]:
-    pending_inputs = load_pending_inputs(runtime_root, username=username, session_id=session_id)
     pending: list[dict[str, str]] = []
     cursor = str(last_reviewed_turn_completed_at or "").strip()
+
+    def append_if_pending(parsed: dict[str, str]) -> None:
+        completed_at = str(parsed.get("completed_at") or "").strip()
+        if cursor and completed_at and completed_at <= cursor:
+            return
+        if parsed.get("service_id"):
+            pending.append(parsed)
+
+    pending_inputs = load_pending_inputs(runtime_root, username=username, session_id=session_id)
     for item in pending_inputs:
         if str(item.get("kind") or "") != "turn_completed":
             continue
-        parsed = parse_turn_completed_input_xml(str(item.get("text") or ""))
-        completed_at = str(parsed.get("completed_at") or "").strip()
-        if cursor and completed_at and completed_at <= cursor:
+        append_if_pending(parse_turn_completed_input_xml(str(item.get("text") or "")))
+
+    goal_manager_inputs = load_goal_manager_pending_inputs(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    )
+    for item in goal_manager_inputs:
+        if str(item.get("kind") or "").strip().lower() != "turn_completed":
             continue
-        if parsed.get("service_id"):
-            pending.append(parsed)
+        append_if_pending(
+            {
+                "service_id": str(item.get("service_id") or "").strip(),
+                "reply_index": str(item.get("reply_index") or "").strip(),
+                "process_id": str(item.get("process_id") or "").strip(),
+                "run_id": str(item.get("run_id") or "").strip(),
+                "completed_at": str(item.get("completed_at") or item.get("ts") or "").strip(),
+                "latest_reply": str(item.get("latest_reply") or "").strip(),
+            }
+        )
     return pending
 
 
@@ -396,6 +419,9 @@ def build_goal_audit_prompt(
             "Assess whether the goal has been achieved based on the conversation so far.",
             "You must verify against the full scoped JSONL log bundle before deciding, not just the conversation excerpt.",
             "Read the bundle as the source of truth for what actually happened in this session, including prior GoalManager feedback, retries, and compact-related events.",
+            "Do NOT load the entire JSONL bundle in one read call when it may be large.",
+            "Use targeted inspection first: grep for relevant event types, then read only narrow sections with head/tail/sed-style ranges or offset/limit reads.",
+            "If a file-read tool reports size or token limits, switch to targeted searches and partial reads instead of retrying the same full-file read.",
             "This session may involve multiple agents mixed together under one goal; reason across the whole session, not only the current worker.",
             f"Session-level additional-agent welcome signal: {'enabled' if agent_welcome_enabled else 'disabled'}.",
             "Treat the welcomed agent roster as the set of agents that may receive follow-up work for this goal.",
@@ -612,26 +638,62 @@ def run_goal_audit(
         normalized_provider_kind = preferred_provider
     else:
         normalized_provider_kind = requested_provider_kind
+    provider_candidates: list[str] = []
+    for candidate in (
+        normalized_provider_kind,
+        preferred_provider,
+        requested_provider_kind,
+        "codex",
+        "claude",
+        "gemini",
+    ):
+        normalized_candidate = str(candidate or "").strip().lower()
+        if normalized_candidate in {"codex", "claude", "gemini"} and normalized_candidate not in provider_candidates:
+            provider_candidates.append(normalized_candidate)
+    if not provider_candidates:
+        provider_candidates = ["codex", "claude", "gemini"]
     # JSONL output: no JSON schema enforcement — the prompt instructs the format
-    if normalized_provider_kind == "claude":
-        final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_claude(
-            prompt,
-            session_id=None,
-            response_schema_id=None,
-            on_event=on_event,
-        )
-    elif normalized_provider_kind == "gemini":
-        final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_gemini(
-            prompt,
-            session_id=None,
-            response_schema_id=None,
-            on_event=on_event,
-        )
+    last_provider_error: FileNotFoundError | None = None
+    selected_provider_kind = provider_candidates[0]
+    final_text = ""
+    audit_session_id: str | None = None
+    for candidate_provider in provider_candidates:
+        try:
+            selected_provider_kind = candidate_provider
+            if candidate_provider == "claude":
+                final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_claude(
+                    prompt,
+                    session_id=None,
+                    response_schema_id=None,
+                    on_event=on_event,
+                )
+            elif candidate_provider == "gemini":
+                final_text, _events, audit_session_id = _runtime_cli_service_adapter.run_gemini(
+                    prompt,
+                    session_id=None,
+                    response_schema_id=None,
+                    on_event=on_event,
+                )
+            else:
+                final_text, _events, audit_session_id = _run_codex_goal_audit(
+                    prompt,
+                    request_session_id=None,
+                )
+            break
+        except FileNotFoundError as exc:
+            last_provider_error = exc
+            if on_event:
+                on_event(
+                    {
+                        "type": "service.goal_audit_provider_unavailable",
+                        "provider": candidate_provider,
+                        "error": repr(exc),
+                    }
+                )
     else:
-        final_text, _events, audit_session_id = _run_codex_goal_audit(
-            prompt,
-            request_session_id=None,
-        )
+        if last_provider_error is not None:
+            raise last_provider_error
+        raise RuntimeError("goal_audit_no_provider_available")
     max_parse_retries = 2
     retry_final_text = final_text
     retry_session_id = audit_session_id
@@ -650,7 +712,7 @@ def run_goal_audit(
             break
         if on_event:
             on_event({
-                "type": "service.goal_audit_parse_retry",
+                "type": "service.goal_manager_compact_parse_retry",
                 "attempt": parse_attempt + 1,
                 "error": parse_error_detail,
             })
@@ -667,14 +729,14 @@ def run_goal_audit(
             "These lines are optional. Omit them when no agent should receive immediate follow-up.\n"
             "When progress_state is 'complete', output ONLY the goal_state line."
         )
-        if normalized_provider_kind == "claude":
+        if selected_provider_kind == "claude":
             retry_final_text, _, retry_session_id = _runtime_cli_service_adapter.run_claude(
                 retry_prompt,
                 session_id=retry_session_id,
                 response_schema_id=None,
                 on_event=on_event,
             )
-        elif normalized_provider_kind == "gemini":
+        elif selected_provider_kind == "gemini":
             retry_final_text, _, retry_session_id = _runtime_cli_service_adapter.run_gemini(
                 retry_prompt,
                 session_id=retry_session_id,

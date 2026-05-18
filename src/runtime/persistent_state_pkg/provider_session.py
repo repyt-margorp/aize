@@ -118,80 +118,69 @@ def _save_session(
         write_json_file(service_state_path, service_state)
 
 
-def load_claude_session(
-    runtime_root: Path,
-    *,
-    service_id: str,
-    username: str | None = None,
-    session_id: str | None = None,
-    slot: str | None = None,
-) -> str | None:
-    return _load_session(
-        runtime_root,
-        provider="claude",
-        service_id=service_id,
-        username=username,
-        session_id=session_id,
-        slot=slot,
-    )
+def _resolve_slot_argument(slot: str | None, session_slot: str | None) -> str | None:
+    if slot is None:
+        return session_slot
+    return slot
 
 
-def load_gemini_session(
-    runtime_root: Path,
-    *,
-    service_id: str,
-    username: str | None = None,
-    session_id: str | None = None,
-    slot: str | None = None,
-) -> str | None:
-    return _load_session(
-        runtime_root,
-        provider="gemini",
-        service_id=service_id,
-        username=username,
-        session_id=session_id,
-        slot=slot,
-    )
+def _build_load_session(provider: str):
+    def load_provider_session(
+        runtime_root: Path,
+        *,
+        service_id: str,
+        username: str | None = None,
+        session_id: str | None = None,
+        slot: str | None = None,
+    ) -> str | None:
+        return _load_session(
+            runtime_root,
+            provider=provider,
+            service_id=service_id,
+            username=username,
+            session_id=session_id,
+            slot=slot,
+        )
+
+    load_provider_session.__name__ = f"load_{provider}_session"
+    return load_provider_session
 
 
-def save_claude_session(
-    runtime_root: Path,
-    *,
-    service_id: str,
-    provider_session_id: str | None,
-    username: str | None = None,
-    session_id: str | None = None,
-    slot: str | None = None,
-) -> None:
-    _save_session(
-        runtime_root,
-        provider="claude",
-        service_id=service_id,
-        provider_session_id=provider_session_id,
-        username=username,
-        session_id=session_id,
-        slot=slot,
-    )
+def _build_list_sessions(provider: str):
+    def list_provider_sessions(runtime_root: Path, *, service_id: str) -> list[dict[str, str | None]]:
+        return _list_provider_sessions(runtime_root, service_id=service_id, provider=provider)
+
+    list_provider_sessions.__name__ = f"list_{provider}_sessions"
+    return list_provider_sessions
 
 
-def save_gemini_session(
-    runtime_root: Path,
-    *,
-    service_id: str,
-    provider_session_id: str | None,
-    username: str | None = None,
-    session_id: str | None = None,
-    slot: str | None = None,
-) -> None:
-    _save_session(
-        runtime_root,
-        provider="gemini",
-        service_id=service_id,
-        provider_session_id=provider_session_id,
-        username=username,
-        session_id=session_id,
-        slot=slot,
-    )
+def _build_save_session(provider: str):
+    def save_provider_session(
+        runtime_root: Path,
+        *,
+        service_id: str,
+        provider_session_id: str | None,
+        username: str | None = None,
+        session_id: str | None = None,
+        slot: str | None = None,
+        session_slot: str | None = None,
+    ) -> None:
+        _save_session(
+            runtime_root,
+            provider=provider,
+            service_id=service_id,
+            provider_session_id=provider_session_id,
+            username=username,
+            session_id=session_id,
+            slot=_resolve_slot_argument(slot, session_slot),
+        )
+
+    save_provider_session.__name__ = f"save_{provider}_session"
+    return save_provider_session
+
+
+load_claude_session = _build_load_session("claude")
+load_gemini_session = _build_load_session("gemini")
 
 
 def clear_session_service_runtime(
@@ -226,22 +215,7 @@ def clear_session_service_runtime(
                 continue
 
 
-def load_codex_session(
-    runtime_root: Path,
-    *,
-    service_id: str,
-    username: str | None = None,
-    session_id: str | None = None,
-    slot: str | None = None,
-) -> str | None:
-    return _load_session(
-        runtime_root,
-        provider="codex",
-        service_id=service_id,
-        username=username,
-        session_id=session_id,
-        slot=slot,
-    )
+load_codex_session = _build_load_session("codex")
 
 
 def _iter_provider_session_items(
@@ -309,33 +283,10 @@ def _list_provider_sessions(
         return sessions
 
 
-def list_codex_sessions(runtime_root: Path, *, service_id: str) -> list[dict[str, str | None]]:
-    return _list_provider_sessions(runtime_root, service_id=service_id, provider="codex")
+list_codex_sessions = _build_list_sessions("codex")
+list_claude_sessions = _build_list_sessions("claude")
+list_gemini_sessions = _build_list_sessions("gemini")
 
-
-def list_claude_sessions(runtime_root: Path, *, service_id: str) -> list[dict[str, str | None]]:
-    return _list_provider_sessions(runtime_root, service_id=service_id, provider="claude")
-
-
-def list_gemini_sessions(runtime_root: Path, *, service_id: str) -> list[dict[str, str | None]]:
-    return _list_provider_sessions(runtime_root, service_id=service_id, provider="gemini")
-
-
-def save_codex_session(
-    runtime_root: Path,
-    *,
-    service_id: str,
-    provider_session_id: str | None,
-    username: str | None = None,
-    session_id: str | None = None,
-    slot: str | None = None,
-) -> None:
-    _save_session(
-        runtime_root,
-        provider="codex",
-        service_id=service_id,
-        provider_session_id=provider_session_id,
-        username=username,
-        session_id=session_id,
-        slot=slot,
-    )
+save_claude_session = _build_save_session("claude")
+save_gemini_session = _build_save_session("gemini")
+save_codex_session = _build_save_session("codex")
