@@ -3,14 +3,14 @@
 ## Summary
 
 AIze previously persisted state at the session level, but it did not provide a durable filesystem workspace at the unit level.
-That meant a UnitFile could repeatedly create useful sessions while still lacking a stable place to accumulate code,
+That meant a unit could repeatedly create useful sessions while still lacking a stable place to accumulate code,
 scripts, prompts, notes, and artifacts across launches.
 
-This change adds an optional **unit-scoped persistent workspace** for UnitFiles.
+This change adds an optional **unit-scoped persistent workspace** for units.
 
 ## Why This Was Needed
 
-The immediate driver was a UnitFile that needed more than one-shot session startup behavior.
+The immediate driver was a unit that needed more than one-shot session startup behavior.
 It needed a durable place to keep evolving operational code and supporting artifacts across multiple launches.
 
 Session storage alone was not a good fit because:
@@ -21,7 +21,7 @@ Session storage alone was not a good fit because:
 
 ## What This Adds
 
-UnitFiles may now declare:
+Units may now declare:
 
 ```json
 "workspace_scope": "unit"
@@ -56,6 +56,6 @@ That primitive is enough to support durable unit code stock while keeping the ex
 
 ## Impact
 
-- UnitFiles can now keep durable code and artifacts without depending on one specific session directory
+- Units can now keep durable code and artifacts without depending on one specific session directory
 - unit behavior can evolve across launches without losing local context
 - operational units now have a clean place to keep their unit-specific implementation state
