@@ -2,9 +2,15 @@
 
 ## Behavior changed
 
-- Entrance launcher template routing no longer treats every unhandled input as AIze Development work.
-- The canonical development routing skill remains present but `route_when_unhandled` stays disabled, so ordinary Entrance conversation remains in Entrance.
-- Explicit session-level default routes still work when a session deliberately has a routing skill with `route_when_unhandled=true`.
+- Entrance launcher sessions no longer use `route_when_unhandled=true` as a blanket default route into `AIze Development`.
+- Messages sent to Entrance now stay in the Entrance conversation first. The lightweight handler only answers empty/status/help/ping-style messages; other text is declined so the Entrance communication agents can decide whether to answer, clarify, or delegate.
+- Explicit session-level routing skills that already persist `route_when_unhandled=true` still work for compatibility. The fix is scoped to the shipped Entrance launcher template so new/manual Entrance instances do not bypass their own GoalManager/agents.
+
+## Root cause
+
+- The active Entrance history showed ordinary messages and UI/design feedback getting an immediate `Routed to AIze Development...` acknowledgement.
+- The shipped Entrance unit had `canonical-development-routing.route_when_unhandled=true`.
+- `_matching_communication_skill_routes()` falls back from empty `session_skills` to launcher-template skills, so a new Entrance instance with no persisted skills still matched the canonical development route before Entrance could reason about the message.
 
 ## Files touched
 
@@ -18,4 +24,4 @@
 
 ## Residual risk
 
-- Requests that truly need implementation must be handled by Entrance/WorkerAgent progress management or by an explicit routing skill, not by blanket launcher fallback.
+- Existing persisted Entrance sessions that already saved a default routing skill can still preserve their stored behavior. The live session used in the reported history had an empty persisted skill list, so it follows the launcher-template fix after restart/reload.

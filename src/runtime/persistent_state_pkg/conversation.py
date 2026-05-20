@@ -2370,6 +2370,9 @@ def update_session_launcher_profile(
     preferred_provider: str,
     selected_agents: list[str],
     service_targets: list[dict[str, str]],
+    launcher_unit_kind: str = "",
+    launcher_unit_class: str = "",
+    launcher_instance_policy: str = "",
     workspace_scope: str = "none",
     workspace_path: str = "",
     goal_completion_policy: str = "standard",
@@ -2386,6 +2389,9 @@ def update_session_launcher_profile(
                 talk["launcher_unit_id"] = launcher_unit_id
                 talk["launcher_template_id"] = launcher_unit_id
                 talk["launcher_display_name"] = str(launcher_display_name or "").strip()
+                talk["launcher_unit_kind"] = str(launcher_unit_kind or "").strip().lower()
+                talk["launcher_unit_class"] = str(launcher_unit_class or "").strip().lower()
+                talk["launcher_instance_policy"] = str(launcher_instance_policy or "").strip().lower()
                 talk["launcher_preferred_provider"] = str(preferred_provider or "").strip().lower()
                 talk["launcher_selected_agents"] = [str(agent) for agent in selected_agents if str(agent).strip()]
                 talk["launcher_workspace_scope"] = str(workspace_scope or "none").strip().lower() or "none"

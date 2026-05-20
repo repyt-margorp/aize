@@ -735,12 +735,58 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(lightweight["kind"], "interactive")
             self.assertEqual(lightweight["routing_mode"], "handle_user_message")
             self.assertEqual(lightweight["handler_file"], "entrance_lightweight_response.py")
-            self.assertIn("IO/management layer only", unit["launcher"]["goal_text"])
-            self.assertIn("delegated sessions created or selected by session skills", unit["launcher"]["initial_prompt"])
+            self.assertEqual(unit["instance_policy"], "multi")
+            stored = get_session_settings(runtime_root, username="repyt", session_id=session_id)
+            self.assertIsNotNone(stored)
+            assert stored is not None
+            self.assertEqual(stored["launcher_unit_id"], "entrance.service")
+            self.assertEqual(stored["launcher_unit_kind"], "interface")
+            self.assertEqual(stored["launcher_unit_class"], "service")
+            self.assertEqual(stored["launcher_instance_policy"], "multi")
+            self.assertIn("conversation and coordination layer", unit["launcher"]["goal_text"])
+            self.assertIn("belongs in this conversation first", unit["launcher"]["initial_prompt"])
             route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
             self.assertIn("development-cycle goal", route["description"])
             self.assertFalse(route["route_when_unhandled"])
+
+    def test_entrance_unit_launch_supports_multiple_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template("entrance.service", default_provider="codex")
+                first = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=unit,
+                    label="Entrance A",
+                )
+                second = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(parent["session_id"]),
+                    app=unit,
+                    label="Entrance B",
+                )
+
+            first_session_id = str(first["session"]["session_id"])
+            second_session_id = str(second["session"]["session_id"])
+            self.assertNotEqual(first_session_id, second_session_id)
+            first_stored = get_session_settings(runtime_root, username="repyt", session_id=first_session_id)
+            second_stored = get_session_settings(runtime_root, username="repyt", session_id=second_session_id)
+            self.assertIsNotNone(first_stored)
+            self.assertIsNotNone(second_stored)
+            assert first_stored is not None
+            assert second_stored is not None
+            self.assertEqual(first_stored["launcher_unit_id"], "entrance.service")
+            self.assertEqual(second_stored["launcher_unit_id"], "entrance.service")
+            self.assertEqual(first_stored["launcher_instance_policy"], "multi")
+            self.assertEqual(second_stored["launcher_instance_policy"], "multi")
+            route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
             self.assertFalse(route["allow_tag_routing"])
+            self.assertEqual(route["route_parent_scope"], "origin_session")
             self.assertIn("separate port or isolated runtime", route["target_goal_text"])
             self.assertIn("final stop-and-migrate coordination", route["spawn_session_skills"][0]["prompt"])
             self.assertIn(
@@ -748,7 +794,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 session_skill_file_path(
                     runtime_root,
                     username="repyt",
-                    session_id=session_id,
+                    session_id=first_session_id,
                     relative_path="entrance_lightweight_response.py",
                 ).read_text(encoding="utf-8"),
             )

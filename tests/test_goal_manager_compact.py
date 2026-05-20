@@ -123,13 +123,14 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     update_session_goal,
     update_session_goal_flags,
     update_session_launcher_profile,
+    update_session_skills,
     update_session_user_response_wait,
     write_json_file,
 )
 from runtime.service_control import build_prompt  # noqa: E402
 from runtime.message_builder import build_aize_input_batch_xml, make_aize_pending_input  # noqa: E402
 from runtime.goal_persist import persist_goal_audit_failure, persist_goal_manager_runtime_reset  # noqa: E402
-from runtime.session_view import persisted_goal_manager_runtime_state  # noqa: E402
+from runtime.session_view import persisted_goal_manager_runtime_state, session_agent_assignment_counts  # noqa: E402
 
 
 TEST_USERNAME = "test-user"
@@ -329,6 +330,15 @@ class GoalManagerCompactTests(unittest.TestCase):
                     "goal_created_at": "2026-03-20T12:00:00Z",
                 }
             ],
+            session_skills=[
+                {
+                    "skill_id": "aize-development-session",
+                    "kind": "development",
+                    "title": "AIze Development Session",
+                    "prompt": "This task session is not resident; close or mark complete after reporting the concrete result or blocker.",
+                    "usage": "This child is finite: once implemented and verified, mark the task complete instead of staying resident.",
+                }
+            ],
         )
 
         self.assertIn("multiple agents mixed together", prompt)
@@ -338,6 +348,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("Verified artifact results", prompt)
         self.assertIn("Emit agent_directive records only for agents that should actively continue now.", prompt)
         self.assertIn("omit agent_directive records", prompt)
+        self.assertIn("Session skills are explicit session-level operating rules", prompt)
+        self.assertIn("finite or non-resident", prompt)
+        self.assertIn('"skill_id": "aize-development-session"', prompt)
         self.assertIn("including a single child goal", prompt)
         self.assertIn("inherits parent-goal lineage/context", prompt)
         self.assertIn("positive requested result", prompt)
@@ -489,6 +502,34 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(contacts[0]["join_role"], "goal_manager")
         self.assertEqual(contacts[0]["join_transport"], "local_dispatch")
         self.assertTrue(contacts[0]["joined_at"])
+
+    def test_session_agent_assignment_counts_split_goal_manager_and_assigned_agents(self) -> None:
+        talk = {
+            "service_id": "service-codex-001",
+            "welcomed_agents": [
+                {
+                    "agent_id": "service-codex-001@@session-1@@worker_agent",
+                    "service_id": "service-codex-001",
+                    "provider": "codex",
+                    "join_role": "worker_agent",
+                },
+                {
+                    "agent_id": "service-codex-002@@session-1@@goal_manager",
+                    "service_id": "service-codex-002",
+                    "provider": "codex",
+                    "join_role": "goal_manager",
+                },
+            ],
+        }
+
+        counts = session_agent_assignment_counts(
+            talk,
+            worker={"service_id": "service-codex-003", "provider": "codex", "slot": 3},
+            goal_manager_worker={"service_id": "service-codex-002", "provider": "codex", "slot": 2},
+            goal_manager_state="running",
+        )
+
+        self.assertEqual(counts, {"goal_manager_reviewers": 1, "assigned_agents": 2})
 
     def test_join_session_agent_keeps_provider_slots_separate(self) -> None:
         join_session_agent(
@@ -2722,6 +2763,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(summary["runtime_in_progress"])
         self.assertEqual(summary["goal_manager_provider"], "codex")
         self.assertEqual(summary["goal_manager_worker"]["slot"], 2)
+        self.assertEqual(summary["agent_counts"], {"goal_manager_reviewers": 1, "assigned_agents": 2})
+        self.assertEqual(summary["goal_manager_reviewer_count"], 1)
+        self.assertEqual(summary["assigned_agent_count"], 2)
 
     def test_runtime_status_changed_event_records_runtime_execution(self) -> None:
         entry = runtime_status_changed_event(
@@ -4370,6 +4414,48 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(audit["progress_state"], "complete")
         self.assertEqual([event["type"] for event in seen], ["item.started"])
         self.assertEqual(seen_schema_ids, [None])
+
+    def test_run_goal_audit_includes_session_skill_rules_in_prompt(self) -> None:
+        update_session_skills(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            session_skills=[
+                {
+                    "skill_id": "aize-development-session",
+                    "kind": "development",
+                    "title": "AIze Development Session",
+                    "prompt": "This task session is not resident; close or mark complete after reporting the concrete result or blocker.",
+                    "usage": "This child is finite: once the requested work is implemented, verified, or blocked with evidence, mark the task complete instead of staying resident.",
+                }
+            ],
+        )
+        seen_prompts: list[str] = []
+
+        def fake_run_codex(prompt: str, *, session_id: str | None, response_schema_id: str | None, on_event=None):
+            seen_prompts.append(prompt)
+            return (
+                goal_audit_jsonl(
+                    {"kind": "goal_state", "progress_state": "complete", "goal_satisfied": True, "summary": "done"}
+                ),
+                [],
+                "audit-session",
+            )
+
+        with patch("runtime.cli_service_adapter.run_codex", side_effect=fake_run_codex):
+            audit = run_goal_audit(
+                runtime_root=self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                goal_text="Ship it",
+                history_entries=[],
+            )
+
+        self.assertEqual(audit["progress_state"], "complete")
+        self.assertEqual(len(seen_prompts), 1)
+        self.assertIn("Session skills to preserve as explicit operating rules:", seen_prompts[0])
+        self.assertIn('"skill_id": "aize-development-session"', seen_prompts[0])
+        self.assertIn("finite or non-resident", seen_prompts[0])
 
     def test_run_goal_audit_prefers_session_provider_over_callsite_provider(self) -> None:
         update_session_goal_flags(

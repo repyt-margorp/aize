@@ -2161,6 +2161,8 @@ def run_agent_service(
                                 "request_id": request_id,
                                 "generated_at": generated_at,
                                 "timeout_seconds": int(request.get("timeout_seconds", 300) or 300),
+                                "effective_timeout_seconds": int((wait_record or {}).get("user_response_wait_effective_timeout_seconds", 300) or 300),
+                                "until_at": str((wait_record or {}).get("user_response_wait_until_at") or ""),
                                 "prompt_text": str(request.get("question") or "").strip(),
                                 "reason": str(request.get("reason") or "").strip(),
                                 "source_service_id": goal_manager_service_id,

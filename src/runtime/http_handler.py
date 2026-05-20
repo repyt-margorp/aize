@@ -138,6 +138,68 @@ HTTP_EVENT_TEXT_LIMIT = 4000
 INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT = 40
 
 
+def session_agent_assignment_counts(
+    talk: dict[str, Any] | None,
+    *,
+    worker: dict[str, Any] | None = None,
+    goal_manager_worker: dict[str, Any] | None = None,
+    goal_manager_state: str | None = None,
+) -> dict[str, int]:
+    # Keep a local compatibility shim so HTTPBridge remains importable across
+    # partial runtime updates where session_view may lag behind.
+    from runtime import session_view as _session_view
+
+    helper = getattr(_session_view, "session_agent_assignment_counts", None)
+    if callable(helper):
+        return helper(
+            talk,
+            worker=worker,
+            goal_manager_worker=goal_manager_worker,
+            goal_manager_state=goal_manager_state,
+        )
+
+    session = talk if isinstance(talk, dict) else {}
+    gm_agents: set[str] = set()
+    assigned_agents: set[str] = set()
+
+    def contact_key(item: dict[str, Any]) -> str:
+        return str(item.get("service_id") or item.get("agent_id") or "").strip()
+
+    welcomed_agents = session.get("welcomed_agents")
+    if isinstance(welcomed_agents, list):
+        for item in welcomed_agents:
+            if not isinstance(item, dict):
+                continue
+            key = contact_key(item)
+            if not key:
+                continue
+            role = str(item.get("join_role") or "agent").strip().lower() or "agent"
+            if role == "goal_manager":
+                gm_agents.add(key)
+            else:
+                assigned_agents.add(key)
+
+    bound_service_id = str(session.get("service_id") or "").strip()
+    if bound_service_id:
+        assigned_agents.add(bound_service_id)
+
+    if isinstance(worker, dict):
+        worker_key = contact_key(worker)
+        if worker_key:
+            assigned_agents.add(worker_key)
+
+    gm_state = str(goal_manager_state or "").strip().lower()
+    if isinstance(goal_manager_worker, dict):
+        gm_key = contact_key(goal_manager_worker)
+        if gm_key and (gm_state == "running" or gm_agents):
+            gm_agents.add(gm_key)
+
+    return {
+        "goal_manager_reviewers": len(gm_agents),
+        "assigned_agents": len(assigned_agents),
+    }
+
+
 def _matching_communication_skill_routes(
     current_session: dict[str, Any] | None,
     *,
@@ -309,20 +371,46 @@ def _sync_canonical_route_parent_session(
             session_id=session_id,
             selected_agents=[str(item) for item in selected_agents if str(item).strip()],
         )
+    unit_id = str(unit_definition.get("unit_id") or unit_definition.get("template_id") or "").strip()
+    if unit_id:
+        update_registered_unit_state(
+            runtime_root,
+            username=username,
+            unit_id=unit_id,
+            updates={
+                "display_name": str(unit_definition.get("display_name") or unit_id).strip() or unit_id,
+                "unit_id": unit_id,
+                "package_id": str(
+                    unit_definition.get("package_id") or unit_definition.get("plugin_id") or ""
+                ).strip(),
+                "plugin_id": str(unit_definition.get("plugin_id") or "").strip(),
+                "last_session_id": session_id,
+                "last_parent_session_id": str(
+                    launcher.get("resident_parent_session_id")
+                    or launcher.get("parent_unit_id")
+                    or current_session_id
+                    or ""
+                ).strip(),
+            },
+        )
     return get_session_settings(runtime_root, username=username, session_id=session_id)
 
 
 def _resolve_communication_route_parent_session_id(
-    sessions: list[dict[str, Any]],
+    runtime_root: Path,
     *,
+    username: str,
+    sessions: list[dict[str, Any]],
     current_session_id: str,
     canonical_session_key: str,
     target_label: str = "",
     target_template_id: str = "",
+    route_parent_scope: str = "",
 ) -> str | None:
     normalized_key = str(canonical_session_key or "").strip()
     if not normalized_key:
         return None
+    normalized_scope = str(route_parent_scope or "").strip().lower()
     candidates = [
         session
         for session in sessions
@@ -336,8 +424,12 @@ def _resolve_communication_route_parent_session_id(
             if isinstance(session.get("session_skills"), list)
         )
     ]
-    if not candidates:
-        return None
+    if normalized_scope == "origin_session":
+        candidates = [
+            session
+            for session in candidates
+            if str(session.get("origin_session_id") or "").strip() == current_session_id
+        ]
     if target_template_id:
         canonical_candidates = [
             session
@@ -347,9 +439,28 @@ def _resolve_communication_route_parent_session_id(
                 target_template_id=target_template_id,
             )
         ]
-        if not canonical_candidates:
-            return None
         candidates = canonical_candidates
+    if not candidates and target_template_id and normalized_scope != "origin_session":
+        registered_state = get_registered_unit_state(
+            runtime_root,
+            username=username,
+            unit_id=target_template_id,
+        )
+        registered_session_id = str((registered_state or {}).get("last_session_id") or "").strip()
+        if registered_session_id and registered_session_id != current_session_id:
+            registered_session = get_session_settings(
+                runtime_root,
+                username=username,
+                session_id=registered_session_id,
+            )
+            if _canonical_route_parent_session(
+                registered_session,
+                target_template_id=target_template_id,
+            ):
+                return registered_session_id
+        return None
+    if not candidates:
+        return None
     scored = [
         (
             _score_communication_route_parent_candidate(
@@ -364,13 +475,25 @@ def _resolve_communication_route_parent_session_id(
     ]
     ranked = sorted(scored, key=lambda item: item[0], reverse=True)
     if len(ranked) > 1 and ranked[0][0][:2] == ranked[1][0][:2]:
+        if target_template_id and normalized_scope != "origin_session":
+            registered_state = get_registered_unit_state(
+                runtime_root,
+                username=username,
+                unit_id=target_template_id,
+            )
+            registered_session_id = str((registered_state or {}).get("last_session_id") or "").strip()
+            ranked_ids = {str(item[1].get("session_id") or "").strip() for item in ranked}
+            if registered_session_id and registered_session_id in ranked_ids:
+                return registered_session_id
         return None
     return str(ranked[0][1].get("session_id") or "").strip() or None
 
 
 def _infer_communication_forward_target_session_id(
+    runtime_root: Path,
     sessions: list[dict[str, Any]],
     *,
+    username: str,
     current_session_id: str,
     prompt_text: str,
     current_session: dict[str, Any] | None = None,
@@ -397,13 +520,16 @@ def _infer_communication_forward_target_session_id(
         if not canonical_session_key:
             continue
         resolved_parent_session_id = _resolve_communication_route_parent_session_id(
-            sessions,
+            runtime_root,
+            username=username,
+            sessions=sessions,
             current_session_id=current_session_id,
             canonical_session_key=canonical_session_key,
             target_label=str(route.get("target_label") or "").strip(),
             target_template_id=str(
                 route.get("target_unit_id") or route.get("target_template_id") or ""
             ).strip(),
+            route_parent_scope=str(route.get("route_parent_scope") or "").strip(),
         )
         if resolved_parent_session_id:
             return resolved_parent_session_id
@@ -450,11 +576,14 @@ def _materialize_communication_routed_child_session(
         ).strip()
         if canonical_session_key and isinstance(sessions, list):
             resolved_parent_session_id = _resolve_communication_route_parent_session_id(
-                sessions,
+                runtime_root,
+                username=username,
+                sessions=sessions,
                 current_session_id=current_session_id,
                 canonical_session_key=canonical_session_key,
                 target_label=target_label,
                 target_template_id=target_template_id,
+                route_parent_scope=str(route.get("route_parent_scope") or "").strip(),
             )
             if resolved_parent_session_id:
                 if direct_route:
@@ -797,6 +926,24 @@ def _communication_immediate_ack_text(
     return ""
 
 
+_LEGACY_OPTIMISTIC_ENTRANCE_ACK = (
+    "Entrance received your request. InteractiveAgent is responding and WorkerAgent is checking in parallel."
+)
+
+
+def _normalize_communication_router_ack_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    text = str(entry.get("text") or "")
+    if text != _LEGACY_OPTIMISTIC_ENTRANCE_ACK:
+        return entry
+    service_id = str(entry.get("service_id") or entry.get("from") or "").strip()
+    provider = str(entry.get("provider") or "").strip().lower()
+    if service_id != "service-entrance-router" and provider != "communication_router":
+        return entry
+    normalized = dict(entry)
+    normalized["text"] = "Entrance received your request."
+    return normalized
+
+
 def _append_communication_immediate_ack(
     append_history: Callable[[str, str, dict[str, Any]], None],
     *,
@@ -926,6 +1073,16 @@ def _normalize_session_preferred_provider(
 ) -> str:
     provider = str((session_settings or {}).get("preferred_provider", default_provider)).strip().lower()
     return provider or default_provider
+
+
+def _payload_prefers_entrance_local_handling(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    target = str(payload.get("communication_target") or "").strip().lower()
+    if target:
+        return target == "entrance"
+    legacy_flag = str(payload.get("entrance_local_only") or "").strip().lower()
+    return legacy_flag in {"1", "true", "yes", "on"}
 
 
 def _running_service_ids(
@@ -1814,6 +1971,7 @@ def _communication_reply_ts(entry: dict[str, Any]) -> datetime | None:
 
 
 def _collapse_communication_duplicate_outputs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    history = [_normalize_communication_router_ack_entry(entry) for entry in history]
     incoming_replies: list[tuple[str, str, datetime | None]] = []
     for entry in history:
         if str(entry.get("direction") or "").strip() != "in":
@@ -2336,6 +2494,54 @@ def _resident_session_ids_for_view(
     return resident_ids
 
 
+def _unit_launched_sessions_for_user(
+    runtime_root: Path,
+    *,
+    viewer_username: str,
+    limit_per_unit: int = 8,
+) -> dict[str, list[dict[str, Any]]]:
+    sessions = list_sessions(runtime_root, username=viewer_username)
+    by_unit: dict[str, list[dict[str, str]]] = {}
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        unit_id = str(session.get("launcher_unit_id") or session.get("launcher_template_id") or "").strip()
+        session_id = str(session.get("session_id") or "").strip()
+        if not unit_id or not session_id:
+            continue
+        by_unit.setdefault(unit_id, []).append(
+            {
+                "session_id": session_id,
+                "label": str(session.get("label") or session_id).strip() or session_id,
+                "goal_text": str(session.get("goal_text") or "").strip(),
+                "goal_active": bool(session.get("goal_active", False)),
+                "goal_completed": bool(session.get("goal_completed", False)),
+                "goal_progress_state": str(
+                    session.get(
+                        "goal_progress_state",
+                        "complete" if bool(session.get("goal_completed", False)) else "in_progress",
+                    )
+                ).strip().lower(),
+                "updated_at": str(session.get("updated_at") or "").strip(),
+                "created_at": str(session.get("created_at") or "").strip(),
+                "session_ui_mode": session_ui_mode(session),
+                "resident_unit_session": bool(
+                    session_registration_metadata(session).get("resident_unit_session", False)
+                ),
+            }
+        )
+    for unit_id, items in by_unit.items():
+        items.sort(
+            key=lambda item: (
+                -_session_updated_at_for_sort_key(item).timestamp(),
+                str(item.get("label") or "").lower(),
+            )
+        )
+        if limit_per_unit > 0:
+            by_unit[unit_id] = items[:limit_per_unit]
+    return by_unit
+
+
 def _filter_display_sessions(
     sessions: list[dict[str, Any]],
     *,
@@ -2365,12 +2571,17 @@ def _filter_display_sessions(
             continue
         updated_at = _session_updated_at_for_sort_key(session)
         include_recent = cutoff is None or updated_at >= cutoff
-        if session_id == current_session_id or session_id in resident_ids or include_recent:
+        session_resident = bool(
+            session_registration_metadata(session, resident_session_ids=resident_ids).get("resident_unit_session", False)
+        )
+        if session_id == current_session_id or session_resident or include_recent:
             filtered.append(session)
     filtered.sort(
         key=lambda session: (
             0 if str(session.get("session_id") or "").strip() == current_session_id else 1,
-            0 if str(session.get("session_id") or "").strip() in resident_ids else 1,
+            0
+            if bool(session_registration_metadata(session, resident_session_ids=resident_ids).get("resident_unit_session", False))
+            else 1,
             -_session_updated_at_for_sort_key(session).timestamp(),
             str(session.get("label") or session.get("session_id") or "").lower(),
         )
@@ -2451,6 +2662,11 @@ def make_handler(
             current_llm_service_topology()
         )
         _summaries: list[dict[str, Any]] = []
+        _resident_session_ids = _resident_session_ids_for_view(
+            runtime_root=runtime_root,
+            viewer_username=viewer_username,
+            include_all=include_all,
+        )
         for _talk in all_sessions:
             _t_user = str(_talk.get("username", ""))
             _t_id = str(_talk.get("session_id", ""))
@@ -2472,6 +2688,12 @@ def make_handler(
                 claude_service_pool=current_claude_service_pool,
                 gemini_service_pool=current_gemini_service_pool,
             ) if _goal_audit else None
+            _agent_counts = session_agent_assignment_counts(
+                _talk,
+                worker=_worker,
+                goal_manager_worker=_gm_worker,
+                goal_manager_state="running" if _goal_audit else "idle",
+            )
             _preferred_provider = str(_talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
             _goal_completed = bool(_talk.get("goal_completed", False))
             _goal_progress_state = str(_talk.get("goal_progress_state", "complete" if _goal_completed else "in_progress")).strip().lower()
@@ -2484,6 +2706,30 @@ def make_handler(
             _wait_started_at = str(_talk.get("user_response_wait_started_at", "") or "").strip()
             _wait_generated_at = str(_talk.get("user_response_wait_generated_at", "") or "").strip()
             _wait_prompt_text = str(_talk.get("user_response_wait_prompt_text", "") or "").strip()
+            _wait_requests_raw = (
+                _talk.get("user_response_wait_requests")
+                if isinstance(_talk.get("user_response_wait_requests"), list)
+                else []
+            )
+            _wait_requests = [
+                {
+                    "request_id": str(item.get("request_id") or "").strip(),
+                    "generated_at": str(item.get("generated_at") or "").strip(),
+                    "started_at": str(item.get("started_at") or "").strip(),
+                    "until_at": str(item.get("until_at") or "").strip(),
+                    "timeout_seconds": int(item.get("timeout_seconds", 300) or 300),
+                    "effective_timeout_seconds": int(item.get("effective_timeout_seconds", 300) or 300),
+                    "question": str(item.get("question") or "").strip(),
+                    "reason": str(item.get("reason") or "").strip(),
+                    "source_service_id": str(item.get("source_service_id") or "").strip(),
+                    "requested_by_role": str(item.get("requested_by_role") or "").strip(),
+                    "status": str(item.get("status") or "").strip(),
+                    "cleared_at": str(item.get("cleared_at") or "").strip(),
+                    "answered_by_user": bool(item.get("answered_by_user", False)),
+                }
+                for item in _wait_requests_raw
+                if isinstance(item, dict)
+            ]
             _wait_status = (
                 "waiting"
                 if bool(_talk.get("user_response_wait_active", False))
@@ -2508,21 +2754,33 @@ def make_handler(
                 "agent_running": _agent_turn is not None,
                 "goal_manager_state": "running" if _goal_audit else "idle",
                 "goal_manager_worker": _gm_worker,
+                "agent_counts": _agent_counts,
+                "goal_manager_reviewer_count": _agent_counts["goal_manager_reviewers"],
+                "assigned_agent_count": _agent_counts["assigned_agents"],
                 "goal_audit_state": _goal_audit_state,
                 "auto_resume_enabled": bool(_talk.get("auto_resume_enabled", False)),
                 "user_response_wait_status": _wait_status,
                 "user_response_wait_active": bool(_talk.get("user_response_wait_active", False)),
+                "user_response_wait_timeout_seconds": int(_talk.get("user_response_wait_timeout_seconds", 300) or 300),
+                "user_response_wait_effective_timeout_seconds": int(
+                    _talk.get("user_response_wait_effective_timeout_seconds", 300) or 300
+                ),
                 "user_response_wait_started_at": _wait_started_at,
                 "user_response_wait_generated_at": _wait_generated_at,
+                "user_response_wait_until_at": str(_talk.get("user_response_wait_until_at", "") or "").strip(),
                 "user_response_wait_request_id": str(_talk.get("user_response_wait_request_id", "") or ""),
                 "user_response_wait_prompt_text": _wait_prompt_text,
                 "user_response_wait_reason": str(_talk.get("user_response_wait_reason", "") or "").strip(),
+                "user_response_wait_requests": _wait_requests,
                 "parent_session_id": str(_talk.get("parent_session_id") or "").strip(),
                 "created_by_username": str(_talk.get("created_by_username") or "").strip(),
                 "created_by_type": str(_talk.get("created_by_type") or "").strip(),
                 "origin_session_id": str(_talk.get("origin_session_id") or "").strip(),
                 "origin_goal_id": str(_talk.get("origin_goal_id") or "").strip(),
-                    **session_registration_metadata(_talk),
+                **session_registration_metadata(
+                    _talk,
+                    resident_session_ids=_resident_session_ids,
+                ),
                     "session_ui_mode": session_ui_mode(_talk),
                     "activity_index": dict(_talk.get("activity_index") or {})
                     if isinstance(_talk.get("activity_index"), dict)
@@ -2572,9 +2830,14 @@ def make_handler(
             for state in list_registered_unit_states(runtime_root)
             if str(state.get("username") or "").strip() == str(viewer_username or "").strip()
         }
+        launched_sessions_by_unit = _unit_launched_sessions_for_user(
+            runtime_root,
+            viewer_username=viewer_username,
+        )
         merged_units: list[dict[str, Any]] = []
         for unit in units:
-            unit_state = registered_states.get(str(unit.get("unit_id") or unit.get("template_id") or "").strip())
+            unit_id = str(unit.get("unit_id") or unit.get("template_id") or "").strip()
+            unit_state = registered_states.get(unit_id)
             state_payload = {
                 "registered": bool(unit_state),
                 "workspace_path": str((unit_state or {}).get("workspace_path") or "").strip(),
@@ -2589,6 +2852,8 @@ def make_handler(
                     **unit,
                     "state": state_payload,
                     "schedule_status": describe_unit_schedule(unit, unit_state=unit_state),
+                    "launched_session_count": len(launched_sessions_by_unit.get(unit_id, [])),
+                    "launched_sessions": launched_sessions_by_unit.get(unit_id, []),
                 }
             )
         return {
@@ -2655,6 +2920,11 @@ def make_handler(
             current_llm_service_topology()
         )
         summaries: list[dict[str, Any]] = []
+        resident_session_ids = _resident_session_ids_for_view(
+            runtime_root=runtime_root,
+            viewer_username=viewer_username,
+            include_all=include_all,
+        )
         for talk in _filter_display_sessions(
             _visible_session_records(viewer_username=viewer_username, include_all=include_all),
             runtime_root=runtime_root,
@@ -2684,6 +2954,12 @@ def make_handler(
                 session_id=session_id,
                 bound_service_id=bound_service_id or None,
             )
+            worker = worker_slot_badge(
+                bound_service_id,
+                codex_service_pool=current_codex_service_pool,
+                claude_service_pool=current_claude_service_pool,
+                gemini_service_pool=current_gemini_service_pool,
+            ) if bound_service_id else None
             audit_summary = load_session_audit_summary(
                 runtime_root,
                 username=username,
@@ -2691,6 +2967,14 @@ def make_handler(
             )
             goal_audit_state = str((audit_summary or {}).get("audit_state") or "all_clear").strip().lower()
             goal_manager_state = str(goal_manager_runtime.get("goal_manager_state") or "idle").strip().lower()
+            agent_counts = session_agent_assignment_counts(
+                talk,
+                worker=worker,
+                goal_manager_worker=goal_manager_runtime.get("goal_manager_worker")
+                if isinstance(goal_manager_runtime.get("goal_manager_worker"), dict)
+                else None,
+                goal_manager_state=goal_manager_state,
+            )
             runtime_execution_state = (
                 "running"
                 if goal_manager_state == "running"
@@ -2712,15 +2996,13 @@ def make_handler(
                     ).strip().lower(),
                     "preferred_provider": str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider,
                     "bound_service_id": bound_service_id,
-                    "worker": worker_slot_badge(
-                        bound_service_id,
-                        codex_service_pool=current_codex_service_pool,
-                        claude_service_pool=current_claude_service_pool,
-                        gemini_service_pool=current_gemini_service_pool,
-                    ) if bound_service_id else None,
+                    "worker": worker,
                     "agent_running": False,
                     "goal_manager_state": goal_manager_state,
                     "goal_manager_worker": goal_manager_runtime.get("goal_manager_worker"),
+                    "agent_counts": agent_counts,
+                    "goal_manager_reviewer_count": agent_counts["goal_manager_reviewers"],
+                    "assigned_agent_count": agent_counts["assigned_agents"],
                     "goal_audit_state": goal_audit_state,
                     "runtime_execution_state": runtime_execution_state,
                     "runtime_in_progress": runtime_execution_state == "running",
@@ -2737,7 +3019,10 @@ def make_handler(
                     "created_by_type": str(talk.get("created_by_type") or "").strip(),
                     "origin_session_id": str(talk.get("origin_session_id") or "").strip(),
                     "origin_goal_id": str(talk.get("origin_goal_id") or "").strip(),
-                    **session_registration_metadata(talk),
+                    **session_registration_metadata(
+                        talk,
+                        resident_session_ids=resident_session_ids,
+                    ),
                     "session_ui_mode": session_ui_mode(talk),
                     "activity_index": dict(talk.get("activity_index") or {})
                     if isinstance(talk.get("activity_index"), dict)
@@ -2871,11 +3156,15 @@ def make_handler(
                 classes.append("is-goal-panic")
             if not goal_active:
                 classes.append("is-goal-inactive")
-            worker = summary.get("worker") if isinstance(summary.get("worker"), dict) else None
-            goal_worker = summary.get("goal_manager_worker") if isinstance(summary.get("goal_manager_worker"), dict) else None
-            worker_provider = str((worker or {}).get("provider") or summary.get("preferred_provider") or "codex")
-            worker_slot = "·" if (worker or {}).get("slot") is None else str((worker or {}).get("slot"))
-            gm_slot = "·" if (goal_worker or {}).get("slot") is None else str((goal_worker or {}).get("slot"))
+            counts = summary.get("agent_counts") if isinstance(summary.get("agent_counts"), dict) else {}
+            assigned_agent_count = int(summary.get("assigned_agent_count") or counts.get("assigned_agents") or 0)
+            gm_reviewer_count = int(summary.get("goal_manager_reviewer_count") or counts.get("goal_manager_reviewers") or 0)
+            count_html = (
+                "<div class='goal-session-agent-counts'>"
+                f"<span class='goal-session-badge' title='Non-GoalManager agents assigned to this session'>Agents {assigned_agent_count}</span>"
+                f"<span class='goal-session-badge{' is-on' if gm_reviewer_count else ''}' title='Agents acting as GoalManager reviewers for this session'>GM Reviewers {gm_reviewer_count}</span>"
+                "</div>"
+            )
             goal_html = html.escape(goal_text) if goal_text else "<span class='goal-session-empty'>No goal</span>"
             parts.append(
                 "".join(
@@ -2884,10 +3173,9 @@ def make_handler(
                         f"{' | registered ' + html.escape(registered_at) if registered_at else ''}"
                         f"{' | goal updated ' + html.escape(goal_updated_at) if goal_updated_at else ''}"
                         f"{' | unit ' + html.escape(unit_id) if unit_id else ''}'>",
-                        f"<span class='goal-marker goal-marker-left{' is-claude' if worker_provider == 'claude' else ''}{'' if worker else ' is-idle'}' title='Bound/selected worker'>{html.escape(worker_slot)}</span>",
-                        f"<span class='goal-marker goal-marker-right{'' if goal_manager_state == 'running' else ' is-hidden'}' title='GoalManager running'>{html.escape(gm_slot)}</span>",
                         "<div class='goal-session-card-head'>",
                         f"<div class='goal-session-title'>{html.escape(label)}</div>",
+                        count_html,
                         "</div>",
                         "<div class='goal-session-state'>",
                         f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Goal Active' if goal_active else 'Goal Inactive'}</span>",
@@ -5121,6 +5409,7 @@ def make_handler(
                 self._json(400, {"error": "to_required"})
                 return
             prompt_text = text.strip()
+            entrance_local_only = _payload_prefers_entrance_local_handling(payload)
             uploaded_files = [dict(item) for item in uploaded_attachments or [] if isinstance(item, dict)]
 
             def process_prompt_submission() -> None:
@@ -5161,6 +5450,8 @@ def make_handler(
                                 "event": {
                                     "type": "service.user_response_wait_cleared",
                                     "reason": "user_reply",
+                                    "request_id": response_request_ids[0] if response_request_ids else str(previous_session_settings.get("user_response_wait_request_id") or ""),
+                                    "cleared_at": utc_ts(),
                                     "response_request_ids": response_request_ids,
                                 },
                             },
@@ -5315,9 +5606,11 @@ def make_handler(
                             if normalized_provider in {"codex", "claude", "gemini"}:
                                 preferred_provider = normalized_provider
                     visible_sessions = list_sessions(runtime_root, username=username)
-                    if communication_agent_enabled:
+                    if communication_agent_enabled and not entrance_local_only:
                         forwarded_session_id = _infer_communication_forward_target_session_id(
+                            runtime_root,
                             visible_sessions,
+                            username=username,
                             current_session_id=session_id,
                             prompt_text=prompt_text,
                             current_session=session_settings,
@@ -5413,43 +5706,6 @@ def make_handler(
                     target_session: dict[str, Any] = {}
                     if forwarded_session_id:
                         target_session = _session_record_by_id(visible_sessions, forwarded_session_id) or {}
-                        target_preferred_provider = _normalize_session_preferred_provider(
-                            target_session,
-                            default_provider=preferred_provider,
-                        )
-                        forwarded_pending_input, forwarded_dispatch_reason = _forwarded_session_pending_input(
-                            target_session,
-                            prompt_text=transport_text,
-                            submitted_by_username=username,
-                            user_response_request_ids=response_request_ids,
-                            message_meta=message_meta,
-                        )
-                        append_pending_input(
-                            runtime_root,
-                            username=username,
-                            session_id=forwarded_session_id,
-                            entry=forwarded_pending_input,
-                        )
-                        forwarded_service_id = _resolve_dispatch_service_for_session(
-                            runtime_root=runtime_root,
-                            username=username,
-                            session_id=forwarded_session_id,
-                            preferred_provider=target_preferred_provider,
-                            default_provider=default_provider,
-                            current_llm_service_topology=current_llm_service_topology,
-                        )
-                        if forwarded_service_id:
-                            join_session_agent(
-                                runtime_root,
-                                username=username,
-                                session_id=forwarded_session_id,
-                                service_id=forwarded_service_id,
-                                provider=str(llm_service_kinds.get(forwarded_service_id) or target_preferred_provider),
-                                role="agent",
-                                transport="http_prompt",
-                            )
-                        else:
-                            dispatch_error = "forward_target_no_available_provider_worker"
                     if communication_agent_enabled:
                         goal_manager_service_id = _resolve_goal_manager_dispatch_service_for_session(
                             runtime_root=runtime_root,
@@ -5518,8 +5774,6 @@ def make_handler(
                     # Determine display target for history entry
                     if ws_only_mode:
                         display_to = "pending:ws_peer"
-                    elif forwarded_session_id:
-                        display_to = f"forward:{forwarded_session_id}"
                     elif interactive_service_id:
                         display_to = interactive_service_id
                     else:
@@ -5610,6 +5864,44 @@ def make_handler(
                             session_id=session_id,
                             entry=prompt_pending_input,
                         )
+                    if forwarded_session_id:
+                        target_preferred_provider = _normalize_session_preferred_provider(
+                            target_session,
+                            default_provider=preferred_provider,
+                        )
+                        forwarded_pending_input, forwarded_dispatch_reason = _forwarded_session_pending_input(
+                            target_session,
+                            prompt_text=transport_text,
+                            submitted_by_username=username,
+                            user_response_request_ids=response_request_ids,
+                            message_meta=message_meta,
+                        )
+                        append_pending_input(
+                            runtime_root,
+                            username=username,
+                            session_id=forwarded_session_id,
+                            entry=forwarded_pending_input,
+                        )
+                        forwarded_service_id = _resolve_dispatch_service_for_session(
+                            runtime_root=runtime_root,
+                            username=username,
+                            session_id=forwarded_session_id,
+                            preferred_provider=target_preferred_provider,
+                            default_provider=default_provider,
+                            current_llm_service_topology=current_llm_service_topology,
+                        )
+                        if forwarded_service_id:
+                            join_session_agent(
+                                runtime_root,
+                                username=username,
+                                session_id=forwarded_session_id,
+                                service_id=forwarded_service_id,
+                                provider=str(llm_service_kinds.get(forwarded_service_id) or target_preferred_provider),
+                                role="agent",
+                                transport="http_prompt",
+                            )
+                        else:
+                            dispatch_error = "forward_target_no_available_provider_worker"
                     maybe_enqueue_mid_turn_progress_inquiry(
                         runtime_root=runtime_root,
                         log_path=log_path,
@@ -5861,6 +6153,8 @@ def make_handler(
                         "text": "User response wait timed out; autonomous work resumed.",
                         "event": {
                             "type": "service.user_response_wait_timed_out",
+                            "request_id": str(due_wait.get("user_response_wait_request_id") or ""),
+                            "cleared_at": str(due_wait.get("user_response_wait_last_timeout_at") or utc_ts()),
                             "dispatch_service_id": target_service_id or "",
                         },
                     },

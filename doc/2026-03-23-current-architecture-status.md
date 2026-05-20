@@ -82,8 +82,9 @@ Current built-in service kinds:
 
 Current built-in pools:
 
-- Codex pool: `service-codex-001` through `service-codex-005` by default
-- Claude pool: `service-claude-001` through `service-claude-005` by default
+- Codex pool: `service-codex-001` through `service-codex-010` by default
+- Claude pool: `service-claude-001` through `service-claude-010` by default
+- Gemini pool: `service-gemini-001` through `service-gemini-010` by default
 
 Current fixed services:
 

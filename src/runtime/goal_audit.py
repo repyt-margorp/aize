@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from runtime.persistent_state_pkg import (
     get_session_settings,
     list_session_agent_contacts,
+    load_session_skills,
     load_goal_manager_pending_inputs,
     load_pending_inputs,
     session_dir,
@@ -378,6 +379,24 @@ def goal_followup_dispatch_targets(
     return targets
 
 
+def _goal_audit_session_skill_lines(session_skills: list[dict[str, Any]] | None) -> list[str]:
+    lines: list[str] = []
+    for skill in session_skills or []:
+        if not isinstance(skill, dict):
+            continue
+        summary = {
+            "skill_id": str(skill.get("skill_id") or "").strip(),
+            "kind": str(skill.get("kind") or "").strip(),
+            "title": str(skill.get("title") or "").strip(),
+            "prompt": str(skill.get("prompt") or "").strip(),
+            "usage": str(skill.get("usage") or "").strip(),
+            "when_to_use": str(skill.get("when_to_use") or "").strip(),
+        }
+        if any(summary.values()):
+            lines.append(json.dumps(summary, ensure_ascii=False))
+    return lines
+
+
 def build_goal_audit_prompt(
     *,
     goal_text: str,
@@ -391,6 +410,7 @@ def build_goal_audit_prompt(
     session_dir_path: Path,
     timeline_path: Path,
     goal_context: list[dict[str, str]],
+    session_skills: list[dict[str, Any]] | None = None,
 ) -> str:
     contacted_agent_lines = [
         json.dumps(
@@ -413,6 +433,7 @@ def build_goal_audit_prompt(
         json.dumps(item, ensure_ascii=False)
         for item in verified_artifacts
     ]
+    session_skill_lines = _goal_audit_session_skill_lines(session_skills)
     return "\n".join(
         [
             "You are GoalManager for an AIze talk.",
@@ -436,6 +457,9 @@ def build_goal_audit_prompt(
             "Before you return progress_state='complete', confirm both the positive requested result and the negative side: check that nearby promised behavior or visible status signals were not regressed by the change.",
             "Do not accept a child session's 'done' claim on positive evidence alone when the touched area also carries neighboring UI/runtime invariants. Look for violated existing behavior and treat any unresolved regression as in_progress.",
             "When relevant, name the exact invariant families you checked: goal state visibility, runtime state visibility, routing/session lineage, permissions, or other behavior directly adjacent to the changed code.",
+            "Session skills are explicit session-level operating rules, not casual suggestions.",
+            "If a session skill says the session is finite or non-resident and should close or mark complete after implementation, verification, and reporting, treat that as an explicit completion rule for this session.",
+            "When the log bundle shows that such a finite child session already implemented the requested change, verified it, and reported the concrete result or blocker, prefer progress_state='complete' unless there is remaining requested work or a regression.",
             "Return JSONL — output one JSON object per line, no markdown fences, no extra text.",
             "Line 1 is always the goal_state record:",
             '  {"kind": "goal_state", "progress_state": "complete" | "in_progress", "goal_satisfied": true | false, "summary": "..."}',
@@ -503,6 +527,13 @@ def build_goal_audit_prompt(
                 [json.dumps(item, ensure_ascii=False) for item in goal_context]
                 if goal_context
                 else ["(no extra goal context)"]
+            ),
+            "",
+            "Session skills to preserve as explicit operating rules:",
+            *(
+                session_skill_lines
+                if session_skill_lines
+                else ["(no session skills recorded)"]
             ),
         ]
     )
@@ -602,6 +633,7 @@ def run_goal_audit(
         )
 
     session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+    session_skills = load_session_skills(runtime_root, username=username, session_id=session_id)
     contacted_agents = list_session_agent_contacts(runtime_root, username=username, session_id=session_id)
     last_reviewed_turn_completed_at = str(
         session_settings.get("goal_manager_last_reviewed_turn_completed_at", "")
@@ -633,6 +665,7 @@ def run_goal_audit(
         session_dir_path=session_dir(runtime_root, username=username, session_id=session_id),
         timeline_path=session_timeline_path(runtime_root, username=username, session_id=session_id),
         goal_context=session_goal_context(runtime_root, username=username, session_id=session_id),
+        session_skills=session_skills,
     )
     requested_provider_kind = str(provider_kind or "").strip().lower()
     preferred_provider = str(session_settings.get("preferred_provider") or "").strip().lower()

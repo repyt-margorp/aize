@@ -182,6 +182,68 @@ from runtime.panic_recovery import (
 from runtime.agent_service import run_agent_service
 from runtime.ws_peer_client import start_ws_peer_clients
 
+
+def session_agent_assignment_counts(
+    talk: dict[str, Any] | None,
+    *,
+    worker: dict[str, Any] | None = None,
+    goal_manager_worker: dict[str, Any] | None = None,
+    goal_manager_state: str | None = None,
+) -> dict[str, int]:
+    # Keep a local compatibility shim so runtime startup still succeeds if an
+    # older or partially updated session_view module is on disk.
+    from runtime import session_view as _session_view
+
+    helper = getattr(_session_view, "session_agent_assignment_counts", None)
+    if callable(helper):
+        return helper(
+            talk,
+            worker=worker,
+            goal_manager_worker=goal_manager_worker,
+            goal_manager_state=goal_manager_state,
+        )
+
+    session = talk if isinstance(talk, dict) else {}
+    gm_agents: set[str] = set()
+    assigned_agents: set[str] = set()
+
+    def contact_key(item: dict[str, Any]) -> str:
+        return str(item.get("service_id") or item.get("agent_id") or "").strip()
+
+    welcomed_agents = session.get("welcomed_agents")
+    if isinstance(welcomed_agents, list):
+        for item in welcomed_agents:
+            if not isinstance(item, dict):
+                continue
+            key = contact_key(item)
+            if not key:
+                continue
+            role = str(item.get("join_role") or "agent").strip().lower() or "agent"
+            if role == "goal_manager":
+                gm_agents.add(key)
+            else:
+                assigned_agents.add(key)
+
+    bound_service_id = str(session.get("service_id") or "").strip()
+    if bound_service_id:
+        assigned_agents.add(bound_service_id)
+
+    if isinstance(worker, dict):
+        worker_key = contact_key(worker)
+        if worker_key:
+            assigned_agents.add(worker_key)
+
+    gm_state = str(goal_manager_state or "").strip().lower()
+    if isinstance(goal_manager_worker, dict):
+        gm_key = contact_key(goal_manager_worker)
+        if gm_key and (gm_state == "running" or gm_agents):
+            gm_agents.add(gm_key)
+
+    return {
+        "goal_manager_reviewers": len(gm_agents),
+        "assigned_agents": len(assigned_agents),
+    }
+
 DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 
@@ -590,6 +652,17 @@ def run_http_service(
                     claude_service_pool=current_claude_service_pool,
                     gemini_service_pool=current_gemini_service_pool,
                 )
+            agent_counts = session_agent_assignment_counts(
+                session,
+                worker=summary.get("worker") if isinstance(summary.get("worker"), dict) else None,
+                goal_manager_worker=summary.get("goal_manager_worker")
+                if isinstance(summary.get("goal_manager_worker"), dict)
+                else None,
+                goal_manager_state=str(summary.get("goal_manager_state") or "idle"),
+            )
+            summary["agent_counts"] = agent_counts
+            summary["goal_manager_reviewer_count"] = agent_counts["goal_manager_reviewers"]
+            summary["assigned_agent_count"] = agent_counts["assigned_agents"]
             summaries.append(summary)
         return {
             "sessions": sessions,

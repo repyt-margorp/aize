@@ -2,7 +2,7 @@
   "kind": "gemini",
   "id_prefix": "service-gemini",
   "pool_size_env": "AIZE_GEMINI_POOL_SIZE",
-  "pool_size_default": 5,
+  "pool_size_default": 10,
   "display_name_template": "Gemini-{index}",
   "persona": "You are Gemini running inside the AIze Unit runtime. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
   "response_schema_id": "service_control_v1",

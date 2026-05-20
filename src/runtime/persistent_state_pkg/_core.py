@@ -219,6 +219,7 @@ def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
             "target_child_label": str(raw_item.get("target_child_label") or "").strip(),
             "target_goal_text": str(raw_item.get("target_goal_text") or "").strip(),
             "preferred_provider": str(raw_item.get("preferred_provider") or "").strip().lower(),
+            "route_parent_scope": str(raw_item.get("route_parent_scope") or "").strip().lower(),
             "session_ui_mode": str(raw_item.get("session_ui_mode") or "").strip().lower(),
             "communication_agent_enabled": bool(raw_item.get("communication_agent_enabled", False)),
             "create_as_child": bool(raw_item.get("create_as_child", True)),

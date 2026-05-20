@@ -45,10 +45,11 @@ class BootstrapManifestTests(unittest.TestCase):
             },
         )
 
-    def test_gemini_descriptor_defaults_to_five_workers(self) -> None:
-        descriptor = json.loads((ROOT / "src" / "services" / "gemini" / "service.json").read_text(encoding="utf-8"))
-        self.assertEqual(descriptor["kind"], "gemini")
-        self.assertEqual(descriptor["pool_size_default"], 5)
+    def test_provider_descriptors_default_to_ten_workers(self) -> None:
+        for kind in ("codex", "claude", "gemini"):
+            descriptor = json.loads((ROOT / "src" / "services" / kind / "service.json").read_text(encoding="utf-8"))
+            self.assertEqual(descriptor["kind"], kind)
+            self.assertEqual(descriptor["pool_size_default"], 10)
 
     def test_provider_descriptors_grant_spawn_service_capability(self) -> None:
         planned_specs = build_service_plan_for_kinds(exclude_kinds={"svcmgr", "http"})

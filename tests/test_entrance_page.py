@@ -26,6 +26,7 @@ from runtime.http_handler import (
     _collapse_communication_duplicate_outputs,
     _communication_dispatch_plan,
     _communication_immediate_ack_text,
+    _filter_display_sessions,
     _matching_communication_skill_routes,
     _forwarded_session_pending_input,
     _infer_communication_forward_target_session_id,
@@ -49,7 +50,11 @@ from runtime.persistent_state_pkg import (
     update_session_goal_flags,
 )
 from runtime.ui_history import build_session_ui_history
-from session_template import get_launchable_session_template, launch_session_template
+from session_template import (
+    get_launchable_session_template,
+    get_registered_unit_state,
+    launch_session_template,
+)
 
 
 class EntrancePageTests(unittest.TestCase):
@@ -81,6 +86,9 @@ class EntrancePageTests(unittest.TestCase):
         self.assertNotIn("if(!realtimeConnected)refreshChat()", page)
         self.assertIn("New Entrance message received.", page)
         self.assertIn("Input sent. Waiting for Entrance updates...", page)
+        self.assertIn("promptText.value='';", page)
+        self.assertIn("entrancePendingFiles=[];", page)
+        self.assertIn("if(entranceFileInput)entranceFileInput.value='';", page)
         self.assertNotIn("Input sent. Waiting for InteractiveAgent...", page)
         self.assertNotIn("InteractiveAgent replied.", page)
         self.assertIn("agent_message.delta", page)
@@ -95,12 +103,96 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("formData.append('file',file,entranceUploadFileName(file,index))", page)
         self.assertIn("pasted-image-${index+1}.${ext}", page)
         self.assertIn("if(!entranceClipboardHasText(clipboardData))ev.preventDefault();", page)
+        self.assertIn("const syncEntranceUrl=(sid)=>{const url=new URL(window.location.href);if(sid)url.searchParams.set('session_id',String(sid));else url.searchParams.delete('session_id');window.history.replaceState({},'',url.toString());};", page)
+        self.assertIn("syncEntranceUrl(entranceSessionId);", page)
+        self.assertIn("const launchEntranceSession=async()=>{const sessions=await jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'});", page)
+        self.assertNotIn("const units=await jsonFetch(`/units?_=${Date.now()}`,{cache:'no-store'});", page)
+        self.assertNotIn("const last=String(entrance?.state?.last_session_id||'').trim();", page)
         self.assertIn(".form{position:fixed", page)
         self.assertIn("left:0;right:0;bottom:0", page)
         self.assertIn("background:#fff", page)
         self.assertIn("border-radius:24px 24px 0 0", page)
         self.assertIn("calc(250px + env(safe-area-inset-bottom))", page)
         self.assertLess(page.index("</div></section><form id='entrance-form'"), page.index("</form></section>"))
+
+    def test_main_page_unit_registry_renders_launched_session_controls(self) -> None:
+        page = render_main_page(
+            display_name="AIze",
+            username="repyt",
+            role_name="superuser",
+            session_id="default",
+            initial_session_scope="owned",
+            initial_session_label="Root",
+            default_target="service-codex-001",
+            default_provider="codex",
+            initial_session_map_open=False,
+            entries_json="[]",
+            initial_runtime_journal_summary_json="{}",
+            context_status_json="{}",
+            initial_auto_compact_threshold=20,
+            initial_goal_text="",
+            initial_active_goal_id="",
+            initial_goal_history_json="[]",
+            initial_goal_active=False,
+            initial_goal_completed=False,
+            initial_goal_progress_state="in_progress",
+            initial_goal_audit_state="all_clear",
+            initial_bound_service_id="service-codex-001",
+            default_httpbridge_recent_messages_limit=100,
+            initial_goal_reset_completed_on_prompt=False,
+            initial_goal_auto_compact_enabled=False,
+            initial_auto_resume_enabled=False,
+            initial_auto_resume_interval_seconds=0,
+            initial_auto_resume_next_at="",
+            initial_auto_resume_reason="",
+            initial_user_response_wait_status="idle",
+            initial_user_response_wait_active=False,
+            initial_user_response_wait_timeout_seconds=300,
+            initial_user_response_wait_effective_timeout_seconds=300,
+            initial_user_response_wait_started_at="",
+            initial_user_response_wait_until_at="",
+            initial_user_response_wait_request_id="",
+            initial_user_response_wait_prompt_text="",
+            initial_user_response_wait_reason="",
+            initial_user_response_wait_last_cleared_at="",
+            initial_user_response_wait_last_timeout_at="",
+            initial_session_group="root",
+            initial_session_ui_mode="map_only",
+            initial_session_permissions_json="{}",
+            initial_child_session_sharing_json="{}",
+            initial_preferred_provider="codex",
+            initial_agent_priority=[],
+            initial_goal_manager_priority=[],
+            initial_session_priority=0,
+            initial_goal_manager_state="idle",
+            initial_agent_welcome_enabled=False,
+            initial_welcomed_agents=[],
+            initial_selected_agents=[],
+            recent_messages_limit_max=5000,
+            initial_session_window_seconds=604800,
+            initial_session_summaries_json="[]",
+            initial_worker_counts_json="{}",
+            initial_latest_user_prompt="",
+            initial_latest_agent_reply="",
+            session_nav_items="",
+            goal_board_items="",
+            sidebar_system_html="",
+            codex_service_pool=[],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+            items="",
+            is_superuser=True,
+        )
+
+        self.assertIn("id='unit-launcher-session-list'", page)
+        self.assertIn("const unitLauncherSessionList = document.getElementById('unit-launcher-session-list');", page)
+        self.assertIn("const unitInterfaceSessionUrl = (unit, sessionId) => {", page)
+        self.assertIn("const openUnitSession = async (unit, sessionId, { preferInterface = true, target = '_self' } = {}) => {", page)
+        self.assertIn("renderLauncherSessionList(unit);", page)
+        self.assertIn("data-unit-session-open-interface", page)
+        self.assertIn("Open Unit Interface", page)
+        self.assertIn("Open Workspace", page)
+        self.assertIn("Open Latest Unit Session", page)
 
     def test_entrance_immediate_ack_does_not_claim_agent_activity_without_state(self) -> None:
         ack = _communication_immediate_ack_text()
@@ -109,6 +201,22 @@ class EntrancePageTests(unittest.TestCase):
         self.assertNotIn("InteractiveAgent", ack)
         self.assertNotIn("WorkerAgent", ack)
         self.assertNotIn("checking in parallel", ack)
+
+    def test_entrance_legacy_optimistic_ack_is_sanitized_for_display(self) -> None:
+        collapsed = _collapse_communication_duplicate_outputs(
+            [
+                {
+                    "direction": "in",
+                    "ts": "2026-05-18T16:41:02Z",
+                    "from": "service-entrance-router",
+                    "service_id": "service-entrance-router",
+                    "text": "Entrance received your request. InteractiveAgent is responding and WorkerAgent is checking in parallel.",
+                    "provider": "communication_router",
+                }
+            ]
+        )
+
+        self.assertEqual(collapsed[0]["text"], "Entrance received your request.")
 
     def test_entrance_delegated_ack_preserves_explicit_route_status(self) -> None:
         ack = _communication_immediate_ack_text(
@@ -135,6 +243,48 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'})", page)
         self.assertIn("/overview?scope=all", page)
         self.assertLess(page.index("renderEntranceEventState(entry);renderChat([entry]);refreshEntranceState();"), page.index("statePollTimer=setInterval(()=>{refreshEntranceState();},10000)"))
+
+    def test_session_map_filter_keeps_multi_entrance_unit_sessions_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            old_ts = "2026-05-18T10:00:00Z"
+            sessions = [
+                {
+                    "session_id": "entrance-a",
+                    "label": "Entrance A",
+                    "username": "repyt",
+                    "created_at": old_ts,
+                    "updated_at": old_ts,
+                    "session_group": "user",
+                    "session_ui_mode": "communication",
+                    "launcher_unit_id": "entrance.service",
+                    "launcher_template_id": "entrance.service",
+                    "launcher_display_name": "Entrance",
+                    "launcher_unit_kind": "interface",
+                    "launcher_unit_class": "service",
+                    "launcher_instance_policy": "multi",
+                },
+                {
+                    "session_id": "old-user",
+                    "label": "Old User",
+                    "username": "repyt",
+                    "created_at": old_ts,
+                    "updated_at": old_ts,
+                    "session_group": "user",
+                    "session_ui_mode": "standard",
+                },
+            ]
+
+            filtered = _filter_display_sessions(
+                sessions,
+                runtime_root=runtime_root,
+                viewer_username="repyt",
+                include_all=False,
+                active_session_id="",
+                recent_window_seconds=60,
+            )
+
+        self.assertEqual([session["session_id"] for session in filtered], ["entrance-a"])
 
     def test_entrance_ui_history_collapses_replayed_interactive_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -418,6 +568,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("composerStatus.textContent = canSendPrompt ? '' : 'Prompt disabled for this session';", page)
         self.assertIn("unit-launcher-open-interface", page)
         self.assertIn("unitLauncherOpenInterface", page)
+        self.assertNotIn("if (lastSessionId && !url.searchParams.get('session_id')) url.searchParams.set('session_id', lastSessionId);", page)
         self.assertIn("Latest Display", page)
         self.assertIn("goal-board-time-window", page)
         self.assertIn("session_window_seconds", page)
@@ -444,6 +595,15 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("patch.user_response_wait_status = 'waiting';", page)
         self.assertIn("userResponseWaitStatus = String(payload?.user_response_wait_status || userResponseWaitStatus || 'idle');", page)
         self.assertIn("userResponseWaitPromptText = String(payload?.user_response_wait_prompt_text || userResponseWaitPromptText || '');", page)
+        self.assertIn("const refreshUserRequests = async () => {", page)
+        self.assertIn("try { await refreshSessionIndex(); } finally { _refreshUserRequestsInFlight = false; renderUserRequests(); }", page)
+        self.assertIn("if (requestsPaneOpen) renderUserRequests();", page)
+        self.assertIn("refreshUserRequests();", page)
+        self.assertIn("const requestHistory = Array.isArray(summary?.user_response_wait_requests)", page)
+        self.assertIn("Question: ${escapeHtml(prompt || 'No request text recorded.')}", page)
+        self.assertIn("Background: ${escapeHtml(reason || 'No background recorded.')}", page)
+        self.assertIn("Timeout policy: ${escapeHtml(requestTimeoutPolicyText({ until_at: request?.until_at || summary?.user_response_wait_until_at || '', effective_timeout_seconds: request?.effective_timeout_seconds || request?.timeout_seconds || summary?.user_response_wait_effective_timeout_seconds || summary?.user_response_wait_timeout_seconds || 0 }))}", page)
+        self.assertIn("the wait times out and GoalManager resumes with the available information and explicit assumptions.", page)
         self.assertIn("sessionWithinMapTimeWindow", page)
         self.assertNotIn("setInterval(() => { if (!document.hidden && sessionMapOpen) refreshWorkspaceBoard(); }, 5000)", page)
         self.assertIn("sessionRuntimeLabel", page)
@@ -453,6 +613,11 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("Executing", page)
         self.assertIn("Runtime Idle", page)
         self.assertIn("All Clear", page)
+        self.assertIn("goal-session-agent-counts", page)
+        self.assertIn("GM Reviewers", page)
+        self.assertIn("Agents ${String(assignedAgentCount)}", page)
+        self.assertNotIn("const workerSlot = worker?.slot == null ? '·' : String(worker.slot);", page)
+        self.assertNotIn("goal-marker-left", page)
         self.assertIn("runtime-journal-panel", page)
         self.assertIn("Runtime Event Log", page)
         self.assertIn("runtimeJournalSummaryText", page)
@@ -689,7 +854,9 @@ class EntrancePageTests(unittest.TestCase):
         ]
         self.assertIsNone(
             _infer_communication_forward_target_session_id(
+                ROOT,
                 sessions,
+                username="repyt",
                 current_session_id="entrance",
                 prompt_text="この修正を行いたくて、AIze開発セッションの下で開発してください",
                 current_session=sessions[0],
@@ -725,7 +892,9 @@ class EntrancePageTests(unittest.TestCase):
         ]
         self.assertIsNone(
             _infer_communication_forward_target_session_id(
+                ROOT,
                 sessions,
+                username="repyt",
                 current_session_id="entrance",
                 prompt_text="development session に送ってください",
                 current_session=sessions[0],
@@ -872,6 +1041,19 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template(
+                    "aize-development.bug-hunting",
+                    default_provider="codex",
+                )
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=unit,
+                    label="AIze Development",
+                )
+            development_parent = launched["session"]
             noncanonical = create_conversation_session(
                 runtime_root,
                 username="repyt",
@@ -912,6 +1094,17 @@ class EntrancePageTests(unittest.TestCase):
             self.assertIsNotNone(parent)
             assert parent is not None
             self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
+            registered_state = get_registered_unit_state(
+                runtime_root,
+                username="repyt",
+                unit_id="aize-development.bug-hunting",
+            )
+            self.assertIsNotNone(registered_state)
+            assert registered_state is not None
+            self.assertEqual(
+                str(registered_state.get("last_session_id") or ""),
+                str(development_parent["session_id"]),
+            )
             self.assertEqual(parent["parent_session_id"], "default")
             self.assertEqual(parent["session_group"], "root")
             self.assertIn("child of the Root session", str(parent.get("goal_text") or ""))
@@ -1126,6 +1319,139 @@ class EntrancePageTests(unittest.TestCase):
             self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
             self.assertEqual(parent["session_ui_mode"], "standard")
             self.assertFalse(bool(parent.get("communication_agent_enabled", False)))
+
+    def test_materialize_communication_routed_child_session_reuses_registered_parent_when_session_snapshot_lacks_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            entrance = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Entrance",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[
+                    {
+                        "skill_id": "canonical-development-routing",
+                        "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
+                        "routing_tags": ["implementation", "fix"],
+                        "canonical_session_key": "aize.development",
+                        "target_template_id": "aize-development.bug-hunting",
+                        "target_label": "AIze Development",
+                        "target_child_label": "AIze Development Task",
+                        "target_goal_text": "Coordinate routed development work.",
+                        "preferred_provider": "codex",
+                        "selected_agents": ["codex_pool"],
+                    }
+                ],
+            )
+
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template(
+                    "aize-development.bug-hunting",
+                    default_provider="codex",
+                )
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=unit,
+                    label="AIze Development",
+                )
+                development_parent = launched["session"]
+                shallow_sessions = []
+                for session in list_sessions(runtime_root, username="repyt"):
+                    copied = dict(session)
+                    copied["session_skills"] = []
+                    shallow_sessions.append(copied)
+
+                routed = _materialize_communication_routed_child_session(
+                    runtime_root,
+                    username="repyt",
+                    current_session=entrance,
+                    prompt_text="Please implement the remaining routing lineage fix.",
+                    sessions=shallow_sessions,
+                )
+
+            self.assertIsNotNone(routed)
+            assert routed is not None
+            self.assertEqual(
+                str(routed.get("parent_session_id") or ""),
+                str(development_parent.get("session_id") or ""),
+            )
+            canonical_parents = [
+                session
+                for session in list_sessions(runtime_root, username="repyt")
+                if str(session.get("launcher_template_id") or "") == "aize-development.bug-hunting"
+            ]
+            self.assertEqual(len(canonical_parents), 1)
+
+    def test_materialize_communication_routed_child_session_keeps_origin_scoped_parent_per_entrance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            route_skill = {
+                "skill_id": "canonical-development-routing",
+                "routing_mode": "create_child_session",
+                "route_when_unhandled": True,
+                "canonical_session_key": "aize.development",
+                "route_parent_scope": "origin_session",
+                "target_template_id": "aize-development.bug-hunting",
+                "target_label": "AIze Development",
+                "target_child_label": "AIze Development Task",
+                "target_goal_text": "Coordinate routed development work.",
+                "preferred_provider": "codex",
+                "selected_agents": ["codex_pool"],
+            }
+            first_entrance = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Entrance A",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[route_skill],
+            )
+            second_entrance = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Entrance B",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[route_skill],
+            )
+
+            first = _materialize_communication_routed_child_session(
+                runtime_root,
+                username="repyt",
+                current_session=first_entrance,
+                prompt_text="First entrance development request.",
+            )
+            second = _materialize_communication_routed_child_session(
+                runtime_root,
+                username="repyt",
+                current_session=second_entrance,
+                prompt_text="Second entrance development request.",
+                sessions=list_sessions(runtime_root, username="repyt"),
+            )
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            assert first is not None and second is not None
+            self.assertNotEqual(first["parent_session_id"], second["parent_session_id"])
+            first_parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=str(first["parent_session_id"]),
+            )
+            second_parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=str(second["parent_session_id"]),
+            )
+            self.assertIsNotNone(first_parent)
+            self.assertIsNotNone(second_parent)
+            assert first_parent is not None and second_parent is not None
+            self.assertEqual(first_parent["origin_session_id"], first_entrance["session_id"])
+            self.assertEqual(second_parent["origin_session_id"], second_entrance["session_id"])
 
     def test_materialize_communication_routed_child_session_prefers_registered_bug_hunting_parent_over_existing_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

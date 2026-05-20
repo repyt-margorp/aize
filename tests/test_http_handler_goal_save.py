@@ -28,6 +28,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     session_goal_manager_state_path,
     update_session_goal,
     update_session_goal_flags,
+    update_session_launcher_profile,
     update_session_user_response_wait,
     update_session_skills,
     write_json_file,
@@ -640,7 +641,8 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
 
         history = get_history(self.runtime_root, username="root", session_id=session_id)
         last_out = next(entry for entry in reversed(history) if entry.get("direction") == "out")
-        self.assertEqual(last_out["to"], f"forward:{child['session_id']}")
+        self.assertEqual(last_out["to"], "service-codex-001")
+        self.assertNotEqual(last_out["to"], f"forward:{child['session_id']}")
         immediate_ack = next(
             entry
             for entry in history
@@ -889,6 +891,10 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertIn(resident_id, session_ids)
         self.assertNotIn(old_id, session_ids)
         self.assertEqual(payload["session_window_seconds"], 86400)
+        resident_summary = next(
+            entry for entry in payload["session_summaries"] if entry["session_id"] == resident_id
+        )
+        self.assertTrue(resident_summary["resident_unit_session"])
 
     def test_cross_user_session_view_lists_session_owner_requests_for_owned_scope(self) -> None:
         repyt_session = create_conversation_session(self.runtime_root, username="repyt", label="Repyt Request")
@@ -931,6 +937,57 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertEqual(summary["user_response_wait_status"], "waiting")
         self.assertEqual(summary["user_response_wait_request_id"], "user-response-repyt")
         self.assertEqual(summary["user_response_wait_prompt_text"], "Which deployment region should I use?")
+
+    def test_get_units_includes_unit_launched_sessions(self) -> None:
+        entrance_session = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance Thread",
+        )
+        entrance_session_id = str(entrance_session["session_id"])
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=entrance_session_id,
+            goal_text="Route follow-up through Entrance",
+        )
+        update_session_launcher_profile(
+            self.runtime_root,
+            username="root",
+            session_id=entrance_session_id,
+            launcher_template_id="entrance.service",
+            launcher_display_name="Entrance",
+            preferred_provider="codex",
+            selected_agents=[],
+            service_targets=[],
+            launcher_unit_kind="interface",
+            launcher_unit_class="service",
+            launcher_instance_policy="multi",
+            workspace_scope="unit",
+            workspace_path="./workspace/entrance",
+        )
+
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {
+            "username": "root",
+            "viewer_username": "root",
+            "session_id": self.session_id,
+        }
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler._do_GET_units("/units", {"_": ["1"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        payload = responses[-1][1]
+        entrance_unit = next(unit for unit in payload["units"] if unit["unit_id"] == "entrance.service")
+        self.assertGreaterEqual(int(entrance_unit["launched_session_count"]), 1)
+        launched = next(item for item in entrance_unit["launched_sessions"] if item["session_id"] == entrance_session_id)
+        self.assertEqual(launched["label"], "Entrance Thread")
+        self.assertEqual(launched["goal_text"], "Route follow-up through Entrance")
+        self.assertTrue(launched["goal_active"])
+        self.assertFalse(launched["goal_completed"])
 
     def test_get_session_runtime_log_returns_summary_and_optional_entries(self) -> None:
         append_history(

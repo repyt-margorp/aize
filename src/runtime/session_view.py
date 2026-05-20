@@ -105,12 +105,66 @@ def worker_slot_badge(
     }
 
 
-def session_registration_metadata(talk: dict[str, Any] | None) -> dict[str, Any]:
+def session_agent_assignment_counts(
+    talk: dict[str, Any] | None,
+    *,
+    worker: dict[str, Any] | None = None,
+    goal_manager_worker: dict[str, Any] | None = None,
+    goal_manager_state: str | None = None,
+) -> dict[str, int]:
     session = talk if isinstance(talk, dict) else {}
+    gm_agents: set[str] = set()
+    assigned_agents: set[str] = set()
+
+    def contact_key(item: dict[str, Any]) -> str:
+        return str(item.get("service_id") or item.get("agent_id") or "").strip()
+
+    for item in session.get("welcomed_agents") if isinstance(session.get("welcomed_agents"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        key = contact_key(item)
+        if not key:
+            continue
+        role = str(item.get("join_role") or "agent").strip().lower() or "agent"
+        if role == "goal_manager":
+            gm_agents.add(key)
+        else:
+            assigned_agents.add(key)
+
+    bound_service_id = str(session.get("service_id") or "").strip()
+    if bound_service_id:
+        assigned_agents.add(bound_service_id)
+
+    if isinstance(worker, dict):
+        worker_key = contact_key(worker)
+        if worker_key:
+            assigned_agents.add(worker_key)
+
+    gm_state = str(goal_manager_state or "").strip().lower()
+    if isinstance(goal_manager_worker, dict):
+        gm_key = contact_key(goal_manager_worker)
+        if gm_key and (gm_state == "running" or gm_agents):
+            gm_agents.add(gm_key)
+
+    return {
+        "goal_manager_reviewers": len(gm_agents),
+        "assigned_agents": len(assigned_agents),
+    }
+
+
+def session_registration_metadata(
+    talk: dict[str, Any] | None,
+    *,
+    resident_session_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    session = talk if isinstance(talk, dict) else {}
+    session_id = str(session.get("session_id") or "").strip()
     session_group = str(session.get("session_group") or "user").strip().lower() or "user"
     ui_mode = session_ui_mode(session)
     launcher_unit_id = str(session.get("launcher_unit_id") or session.get("launcher_template_id") or "").strip()
     launcher_template_id = str(session.get("launcher_template_id") or launcher_unit_id).strip()
+    launcher_unit_kind = str(session.get("launcher_unit_kind") or "").strip().lower()
+    launcher_unit_class = str(session.get("launcher_unit_class") or "").strip().lower()
     registered_at = str(session.get("registered_at") or session.get("created_at") or "").strip()
     goal_updated_at = str(
         session.get("goal_updated_at")
@@ -122,7 +176,14 @@ def session_registration_metadata(talk: dict[str, Any] | None) -> dict[str, Any]
         "session_map",
         "sessionmap",
         "map_only",
-    }
+    } or session_id in (resident_session_ids or set()) or (
+        bool(launcher_unit_id or launcher_template_id)
+        and (
+            launcher_unit_kind == "interface"
+            or launcher_unit_class == "service"
+            or ui_mode == "communication"
+        )
+    )
     return {
         "registered_at": registered_at,
         "goal_updated_at": goal_updated_at,
@@ -229,6 +290,7 @@ def build_session_runtime_summary(
     claude_service_pool: list[str],
     gemini_service_pool: list[str],
     default_provider: str,
+    resident_session_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     session_id = str(talk.get("session_id") or "")
     preferred_provider = str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
@@ -257,9 +319,39 @@ def build_session_runtime_summary(
     goal_manager_provider = str(
         (goal_manager_worker or {}).get("provider") or preferred_provider or default_provider
     ).strip().lower() or default_provider
+    agent_counts = session_agent_assignment_counts(
+        talk,
+        worker=visible_worker,
+        goal_manager_worker=goal_manager_worker,
+        goal_manager_state=str(goal_manager_state.get("state") or "idle"),
+    )
     user_response_wait_active = bool(talk.get("user_response_wait_active", False))
     user_response_wait_started_at = str(talk.get("user_response_wait_started_at", "") or "")
     user_response_wait_generated_at = str(talk.get("user_response_wait_generated_at", "") or "")
+    user_response_wait_requests_raw = (
+        talk.get("user_response_wait_requests")
+        if isinstance(talk.get("user_response_wait_requests"), list)
+        else []
+    )
+    user_response_wait_requests = [
+        {
+            "request_id": str(item.get("request_id") or "").strip(),
+            "generated_at": str(item.get("generated_at") or "").strip(),
+            "started_at": str(item.get("started_at") or "").strip(),
+            "until_at": str(item.get("until_at") or "").strip(),
+            "timeout_seconds": int(item.get("timeout_seconds", 300) or 300),
+            "effective_timeout_seconds": int(item.get("effective_timeout_seconds", 300) or 300),
+            "question": str(item.get("question") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+            "source_service_id": str(item.get("source_service_id") or "").strip(),
+            "requested_by_role": str(item.get("requested_by_role") or "").strip(),
+            "status": str(item.get("status") or "").strip(),
+            "cleared_at": str(item.get("cleared_at") or "").strip(),
+            "answered_by_user": bool(item.get("answered_by_user", False)),
+        }
+        for item in user_response_wait_requests_raw
+        if isinstance(item, dict)
+    ]
     user_response_wait_status = (
         "waiting"
         if user_response_wait_active
@@ -279,7 +371,7 @@ def build_session_runtime_summary(
         "label": str(talk.get("label", session_id)),
         "created_at": str(talk.get("created_at", "") or ""),
         "updated_at": str(talk.get("updated_at", "") or ""),
-        **session_registration_metadata(talk),
+        **session_registration_metadata(talk, resident_session_ids=resident_session_ids),
         "goal_text": goal_text,
         "goal_active": bool(talk.get("goal_active", False)),
         "goal_completed": goal_completed,
@@ -293,15 +385,23 @@ def build_session_runtime_summary(
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
         "goal_manager_provider": goal_manager_provider,
         "goal_manager_worker": goal_manager_worker,
+        "agent_counts": agent_counts,
+        "goal_manager_reviewer_count": agent_counts["goal_manager_reviewers"],
+        "assigned_agent_count": agent_counts["assigned_agents"],
         "auto_resume_enabled": bool(talk.get("auto_resume_enabled", False)),
         "user_response_wait_status": user_response_wait_status,
         "user_response_wait_active": user_response_wait_active,
+        "user_response_wait_timeout_seconds": int(talk.get("user_response_wait_timeout_seconds", 300) or 300),
+        "user_response_wait_effective_timeout_seconds": int(
+            talk.get("user_response_wait_effective_timeout_seconds", 300) or 300
+        ),
         "user_response_wait_started_at": user_response_wait_started_at,
         "user_response_wait_generated_at": user_response_wait_generated_at,
         "user_response_wait_until_at": str(talk.get("user_response_wait_until_at", "") or ""),
         "user_response_wait_request_id": str(talk.get("user_response_wait_request_id", "") or ""),
         "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),
         "user_response_wait_reason": str(talk.get("user_response_wait_reason", "") or "").strip(),
+        "user_response_wait_requests": user_response_wait_requests,
         "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
         "created_by_username": str(talk.get("created_by_username") or "").strip(),
         "created_by_type": str(talk.get("created_by_type") or "").strip(),
