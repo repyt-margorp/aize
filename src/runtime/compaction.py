@@ -566,13 +566,6 @@ def maybe_resume_after_restart(
         if (
             should_standard_goal_route
             and not goal_manager_review_reasons
-            and not history_has_terminal_goal_manager_cycle(history)
-            and (
-                unfinished_turn
-                or has_actionable_pending
-                or isinstance(due_auto_resume, dict)
-                or continue_feedback_enqueued
-            )
         ):
             goal_manager_review_reasons.append("system_restart_active_in_progress")
         if (

@@ -4186,6 +4186,27 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(counts["codex"]["reviewing_turns"], 1)
         self.assertEqual(counts["codex"]["active_turns"], 1)
 
+    def test_build_worker_count_summary_keeps_assigned_slots_when_nothing_is_executing(self) -> None:
+        counts = build_worker_count_summary(
+            service_snapshots=[],
+            session_summaries=[
+                {
+                    "bound_service_id": "service-codex-011",
+                    "welcomed_agents": [
+                        {"service_id": "service-codex-011", "provider": "codex", "join_role": "agent"},
+                        {"service_id": "service-codex-012", "provider": "codex", "join_role": "agent"},
+                    ],
+                    "agent_running": False,
+                    "goal_manager_state": "idle",
+                },
+            ],
+        )
+
+        self.assertEqual(counts["codex"]["assigned_slots"], 2)
+        self.assertEqual(counts["codex"]["active_turns"], 0)
+        self.assertEqual(counts["codex"]["replying_turns"], 0)
+        self.assertEqual(counts["codex"]["reviewing_turns"], 0)
+
     def test_normalize_runtime_execution_state_treats_queued_goal_manager_as_running(self) -> None:
         self.assertEqual(
             normalize_runtime_execution_state(agent_running=False, goal_manager_state="queued"),
@@ -6142,7 +6163,7 @@ printf '%s\\n' '{"type":"turn.completed"}'
         message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
         self.assertEqual(message["payload"]["reason"], "goal_manager_review")
         log_text = (self.runtime_root / "logs" / "service-codex-001.jsonl").read_text(encoding="utf-8")
-        self.assertIn("orphan_in_progress_goal", log_text)
+        self.assertIn("system_restart_active_in_progress", log_text)
 
     def test_maybe_resume_after_restart_routes_unreviewed_turn_to_goal_manager(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
@@ -6374,7 +6395,7 @@ printf '%s\\n' '{"type":"turn.completed"}'
         )
         self.assertEqual(remaining, [])
 
-    def test_maybe_resume_after_restart_treats_goal_audit_completed_as_terminal(self) -> None:
+    def test_maybe_resume_after_restart_routes_active_in_progress_even_after_terminal_goal_audit(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
         save_codex_session(
             self.runtime_root,
@@ -6451,7 +6472,27 @@ printf '%s\\n' '{"type":"turn.completed"}'
             service_kind="codex",
         )
 
-        self.assertEqual(router.writes, [])
+        self.assertEqual(len(router.writes), 1)
+        raw_message = router.writes[0]
+        message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
+        self.assertEqual(message["payload"]["reason"], "goal_manager_review")
+        self.assertEqual(message.get("meta", {}).get("agent_profile"), {"session_slot": "goal_manager"})
+        self.assertEqual(message.get("meta", {}).get("dispatch_priority"), 80)
+        gm_pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=resolve_session_agent_id(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+                role="goal_manager",
+            ),
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual([item["kind"] for item in gm_pending], ["goal_manager_review"])
+        self.assertIn("system_restart_in_progress_goal", gm_pending[0]["text"])
 
     def test_maybe_resume_after_restart_requeues_stale_goal_manager_runtime(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
