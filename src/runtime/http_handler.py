@@ -411,6 +411,10 @@ def _resolve_communication_route_parent_session_id(
     if not normalized_key:
         return None
     normalized_scope = str(route_parent_scope or "").strip().lower()
+    def _matches_origin_scope(session: dict[str, Any] | None) -> bool:
+        if normalized_scope != "origin_session":
+            return True
+        return str((session or {}).get("origin_session_id") or "").strip() == current_session_id
     candidates = [
         session
         for session in sessions
@@ -424,12 +428,7 @@ def _resolve_communication_route_parent_session_id(
             if isinstance(session.get("session_skills"), list)
         )
     ]
-    if normalized_scope == "origin_session":
-        candidates = [
-            session
-            for session in candidates
-            if str(session.get("origin_session_id") or "").strip() == current_session_id
-        ]
+    candidates = [session for session in candidates if _matches_origin_scope(session)]
     if target_template_id:
         canonical_candidates = [
             session
@@ -439,8 +438,19 @@ def _resolve_communication_route_parent_session_id(
                 target_template_id=target_template_id,
             )
         ]
+        if not canonical_candidates:
+            canonical_candidates = [
+                session
+                for session in sessions
+                if isinstance(session, dict)
+                and _matches_origin_scope(session)
+                and _canonical_route_parent_session(
+                    session,
+                    target_template_id=target_template_id,
+                )
+            ]
         candidates = canonical_candidates
-    if not candidates and target_template_id and normalized_scope != "origin_session":
+    if not candidates and target_template_id:
         registered_state = get_registered_unit_state(
             runtime_root,
             username=username,
@@ -456,7 +466,7 @@ def _resolve_communication_route_parent_session_id(
             if _canonical_route_parent_session(
                 registered_session,
                 target_template_id=target_template_id,
-            ):
+            ) and _matches_origin_scope(registered_session):
                 return registered_session_id
         return None
     if not candidates:
@@ -475,7 +485,7 @@ def _resolve_communication_route_parent_session_id(
     ]
     ranked = sorted(scored, key=lambda item: item[0], reverse=True)
     if len(ranked) > 1 and ranked[0][0][:2] == ranked[1][0][:2]:
-        if target_template_id and normalized_scope != "origin_session":
+        if target_template_id:
             registered_state = get_registered_unit_state(
                 runtime_root,
                 username=username,
@@ -483,7 +493,20 @@ def _resolve_communication_route_parent_session_id(
             )
             registered_session_id = str((registered_state or {}).get("last_session_id") or "").strip()
             ranked_ids = {str(item[1].get("session_id") or "").strip() for item in ranked}
-            if registered_session_id and registered_session_id in ranked_ids:
+            registered_session = (
+                get_session_settings(
+                    runtime_root,
+                    username=username,
+                    session_id=registered_session_id,
+                )
+                if registered_session_id
+                else None
+            )
+            if (
+                registered_session_id
+                and registered_session_id in ranked_ids
+                and _matches_origin_scope(registered_session)
+            ):
                 return registered_session_id
         return None
     return str(ranked[0][1].get("session_id") or "").strip() or None
