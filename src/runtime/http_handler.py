@@ -2887,9 +2887,6 @@ def make_handler(
                         "<div class='goal-session-card-head'>",
                         f"<div class='goal-session-title'>{html.escape(label)}</div>",
                         "</div>",
-                        f"<div class='goal-session-meta'>{html.escape(summary.get('username', ''))}{' · ' if summary.get('username') else ''}{html.escape(sid)}{html.escape(origin_meta)}</div>",
-                        f"<div class='goal-session-timing'><span class='goal-session-elapsed' title='Registered at {html.escape(registered_at or 'unknown')}'>Elapsed pending</span><span class='goal-session-updated' title='Goal last updated at {html.escape(goal_updated_at or 'unknown')}'>Goal updated {html.escape(goal_updated_at or 'unknown')}</span></div>",
-                        f"<div class='goal-session-goal'>{goal_html}</div>",
                         "<div class='goal-session-state'>",
                         f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Goal Active' if goal_active else 'Goal Inactive'}</span>",
                         f"<span class='goal-session-badge{' is-done' if goal_progress_complete else ''}'>{'Goal Completed' if goal_progress_complete else 'Goal In Progress'}</span>",
@@ -2905,6 +2902,9 @@ def make_handler(
                             else ""
                         ),
                         "</div>",
+                        f"<div class='goal-session-meta'>{html.escape(summary.get('username', ''))}{' · ' if summary.get('username') else ''}{html.escape(sid)}{html.escape(origin_meta)}</div>",
+                        f"<div class='goal-session-timing'><span class='goal-session-elapsed' title='Registered at {html.escape(registered_at or 'unknown')}'>Elapsed pending</span><span class='goal-session-updated' title='Goal last updated at {html.escape(goal_updated_at or 'unknown')}'>Goal updated {html.escape(goal_updated_at or 'unknown')}</span></div>",
+                        f"<div class='goal-session-goal'>{goal_html}</div>",
                         "</a>",
                     ]
                 )
