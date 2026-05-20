@@ -276,34 +276,11 @@ def maybe_resume_after_restart(
             }
         )
     candidate_entries = session_entries + fallback_entries
-    registry_service_ids = [
-        str(service.get("service_id"))
-        for service in list_service_records(runtime_root)
-        if isinstance(service, dict)
-        and str(service.get("kind") or "").strip().lower() == service_kind
-        and str(service.get("status") or "").strip().lower() == "running"
-        and isinstance(service.get("service_id"), str)
-    ]
-    provider_scopes_for_kind: set[tuple[str, str]] = set()
-    for provider_service_id in sorted({*registry_service_ids, service_id}):
-        if service_kind == "claude":
-            provider_entries = list_claude_sessions(runtime_root, service_id=provider_service_id)
-        elif service_kind == "gemini":
-            provider_entries = list_gemini_sessions(runtime_root, service_id=provider_service_id)
-        else:
-            provider_entries = list_codex_sessions(runtime_root, service_id=provider_service_id)
-        for provider_entry in provider_entries:
-            provider_username = provider_entry.get("username")
-            provider_session_id = provider_entry.get("conversation_session_id") or provider_entry.get("session_id")
-            if isinstance(provider_username, str) and isinstance(provider_session_id, str):
-                provider_scopes_for_kind.add((provider_username, provider_session_id))
-
+    active_scope_entries = set(session_entry_map)
     for talk in list_all_sessions_with_users(runtime_root):
         username = str(talk.get("username") or "").strip()
         session_id = str(talk.get("session_id") or "").strip()
-        if not username or not session_id or (username, session_id) in session_entry_map:
-            continue
-        if (username, session_id) in provider_scopes_for_kind:
+        if not username or not session_id or (username, session_id) in active_scope_entries:
             continue
         preferred_provider = str(talk.get("preferred_provider") or service_kind).strip().lower() or service_kind
         bound_service_id = str(talk.get("service_id") or "").strip()
