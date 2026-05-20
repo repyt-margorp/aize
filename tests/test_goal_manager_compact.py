@@ -6494,6 +6494,127 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertEqual([item["kind"] for item in gm_pending], ["goal_manager_review"])
         self.assertIn("system_restart_in_progress_goal", gm_pending[0]["text"])
 
+    def test_maybe_resume_after_restart_creates_recovery_for_agent_audit_panic(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        parent = create_conversation_session(self.runtime_root, username=TEST_USERNAME, label="Parent Goal")
+        parent_session_id = str(parent["session_id"])
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=parent_session_id,
+            goal_text="Coordinate child recovery.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=parent_session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        join_session_agent(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=parent_session_id,
+            service_id="service-codex-001",
+            agent_id=f"service-codex-001@@{parent_session_id}@@goal_manager",
+            provider="codex",
+            role="goal_manager",
+            transport="local_dispatch",
+        )
+        add_session_child(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id=parent_session_id,
+            child_session_id=self.session_id,
+        )
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Recover this child session.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        children = list_session_children(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        recovery_children = [
+            get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=str(child_id))
+            for child_id in children
+        ]
+        recovery_children = [
+            child
+            for child in recovery_children
+            if isinstance(child, dict)
+            and child.get("recovery_source_session_id") == self.session_id
+            and child.get("recovery_panic_service_id") == "service-codex-001"
+        ]
+        self.assertEqual(len(recovery_children), 1)
+        recovery_session_id = str(recovery_children[0]["session_id"])
+        recovery_pending = load_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=recovery_session_id,
+        )
+        self.assertEqual([item["kind"] for item in recovery_pending], ["panic_recovery"])
+        parent_pending = load_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=parent_session_id,
+        )
+        self.assertEqual([item["kind"] for item in parent_pending], ["child_session_panic"])
+        messages = [
+            json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            for raw in router.writes
+        ]
+        self.assertEqual(
+            [message["payload"]["reason"] for message in messages[:2]],
+            ["restart_recovery", "child_session_panic"],
+        )
+        self.assertEqual(messages[0].get("meta", {}).get("dispatch_priority"), 100)
+        self.assertEqual(messages[1].get("meta", {}).get("dispatch_priority"), 95)
+
     def test_maybe_resume_after_restart_requeues_stale_goal_manager_runtime(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
         save_codex_session(

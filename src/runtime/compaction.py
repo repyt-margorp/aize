@@ -13,14 +13,9 @@ from runtime.message_builder import (
     make_dispatch_pending_message,
 )
 from runtime.dispatch_queue import dispatch_priority
-from runtime.panic_recovery import (
-    ensure_panic_recovery_session,
-    panic_recovery_bootstrap_xml,
-)
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_goal_manager_pending_input,
-    append_pending_input,
     append_service_pending_input,
     claim_session_restart_resume,
     consume_session_due_auto_resume,
@@ -73,6 +68,7 @@ from runtime.restart_recovery import (
     review_cursor_for_session,
     utc_ts_age_seconds,
 )
+from runtime.restart_panic_recovery import enqueue_restart_panic_recovery
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
@@ -598,6 +594,40 @@ def maybe_resume_after_restart(
             not should_resume_unfinished
             and goal_active
             and not goal_completed
+            and goal_progress_state == "in_progress"
+            and goal_audit_state == "panic"
+            and not unfinished_turn
+            and not has_actionable_pending
+            and not isinstance(due_auto_resume, dict)
+        ):
+            panic_event = {
+                "type": "agent_audit_panic_restart",
+                "reason": "agent_audit_state_panic",
+                "service_id": service_id_for_entry,
+                "previous_status": previous_status,
+                "previous_process_id": previous_process_id,
+            }
+            session_label = str(talk.get("label") or scope_session_id)
+            preferred_provider = service_kind if service_kind in {"codex", "claude", "gemini"} else "codex"
+            recovery_session_id = enqueue_restart_panic_recovery(
+                runtime_root,
+                manifest=manifest,
+                process_id=process_id,
+                log_path=log_path,
+                router_conn=router_conn,
+                username=scope_username,
+                source_session_id=scope_session_id,
+                source_label=session_label,
+                panic_service_id=service_id_for_entry,
+                panic_event=panic_event,
+                preferred_provider=preferred_provider,
+            )
+            if recovery_session_id:
+                continue
+        if (
+            not should_resume_unfinished
+            and goal_active
+            and not goal_completed
             and isinstance(gm_failure_entry, dict)
             and not unfinished_turn
             and not has_actionable_pending
@@ -611,85 +641,21 @@ def maybe_resume_after_restart(
                 }
             session_label = str(talk.get("label") or scope_session_id)
             preferred_provider = service_kind if service_kind in {"codex", "claude", "gemini"} else "codex"
-            recovery_session = ensure_panic_recovery_session(
+            recovery_session_id = enqueue_restart_panic_recovery(
                 runtime_root,
+                manifest=manifest,
+                process_id=process_id,
+                log_path=log_path,
+                router_conn=router_conn,
                 username=scope_username,
                 source_session_id=scope_session_id,
                 source_label=session_label,
-                panic_service_id=service_id,
-                event=panic_event,
+                panic_service_id=service_id_for_entry,
+                panic_event=panic_event,
                 preferred_provider=preferred_provider,
             )
-            if isinstance(recovery_session, dict):
-                recovery_session_id = str(recovery_session.get("session_id") or "").strip()
-                if recovery_session_id:
-                    append_pending_input(
-                        runtime_root,
-                        username=scope_username,
-                        session_id=recovery_session_id,
-                        entry=make_aize_pending_input(
-                            kind="panic_recovery",
-                            role="system",
-                            text=panic_recovery_bootstrap_xml(
-                                source_session_id=scope_session_id,
-                                source_label=session_label,
-                                panic_service_id=service_id,
-                                event=panic_event,
-                            ),
-                        ),
-                    )
-                    append_user_history(
-                        runtime_root,
-                        username=scope_username,
-                        session_id=scope_session_id,
-                        entry={
-                            "direction": "event",
-                            "ts": utc_ts(),
-                            "service_id": service_id,
-                            "event_type": "service.panic_recovery_session_created",
-                            "text": f"Panic recovery session created: {recovery_session_id}",
-                            "event": {
-                                "type": "service.panic_recovery_session_created",
-                                "source_session_id": scope_session_id,
-                                "recovery_session_id": recovery_session_id,
-                                "panic_service_id": service_id,
-                                "panic_event": panic_event,
-                            },
-                        },
-                        limit=GOAL_AUDIT_HISTORY_LIMIT,
-                    )
-                    dispatch_message = make_dispatch_pending_message(
-                        manifest=manifest,
-                        from_service_id="service-svcmgr-001",
-                        to_service_id=service_id,
-                        process_id=process_id,
-                        run_id=f"restart-recovery-{int(time.time())}",
-                        username=scope_username,
-                        session_id=recovery_session_id,
-                        auth_context=None,
-                        reason="restart_recovery",
-                        session_agent_id=resolve_session_agent_id(
-                            runtime_root,
-                            username=scope_username,
-                            session_id=recovery_session_id,
-                            service_id=service_id,
-                        ),
-                        dispatch_priority=dispatch_priority("panic_recovery"),
-                    )
-                    router_conn.write(encode_line(dispatch_message))
-                    write_jsonl(
-                        log_path,
-                        {
-                            "type": "service.restart_recovery_enqueued",
-                            "ts": utc_ts(),
-                            "service_id": service_id,
-                            "process_id": process_id,
-                            "scope": {"username": scope_username, "session_id": scope_session_id},
-                            "recovery_session_id": recovery_session_id,
-                            "panic_event_type": str(panic_event.get("type") or ""),
-                        },
-                    )
-                    continue
+            if recovery_session_id:
+                continue
         if not should_resume_unfinished:
             write_jsonl(
                 log_path,
