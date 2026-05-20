@@ -67,6 +67,7 @@ from runtime.persistent_state_pkg import (
     list_session_agent_contacts,
     list_sessions,
     load_agent_audit_state,
+    load_session_audit_summary,
     normalize_auto_compact_threshold_left_percent,
     normalize_child_session_sharing_policy,
     active_agent_profile_priority,
@@ -2675,6 +2676,18 @@ def make_handler(
                 session_id=session_id,
                 bound_service_id=bound_service_id or None,
             )
+            audit_summary = load_session_audit_summary(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+            )
+            goal_audit_state = str((audit_summary or {}).get("audit_state") or "all_clear").strip().lower()
+            goal_manager_state = str(goal_manager_runtime.get("goal_manager_state") or "idle").strip().lower()
+            runtime_execution_state = (
+                "running"
+                if goal_manager_state == "running"
+                else ("failed" if goal_manager_state == "failed" or goal_audit_state == "panic" else "idle")
+            )
             summaries.append(
                 {
                     "username": username,
@@ -2698,8 +2711,11 @@ def make_handler(
                         gemini_service_pool=current_gemini_service_pool,
                     ) if bound_service_id else None,
                     "agent_running": False,
-                    "goal_manager_state": str(goal_manager_runtime.get("goal_manager_state") or "idle"),
+                    "goal_manager_state": goal_manager_state,
                     "goal_manager_worker": goal_manager_runtime.get("goal_manager_worker"),
+                    "goal_audit_state": goal_audit_state,
+                    "runtime_execution_state": runtime_execution_state,
+                    "runtime_in_progress": runtime_execution_state == "running",
                     "auto_resume_enabled": bool(talk.get("auto_resume_enabled", False)),
                     "user_response_wait_status": wait_status,
                     "user_response_wait_active": bool(talk.get("user_response_wait_active", False)),
@@ -2789,7 +2805,39 @@ def make_handler(
             goal_text = str(summary.get("goal_text") or "").strip()
             goal_active = bool(summary.get("goal_active"))
             goal_completed = bool(summary.get("goal_completed"))
-            goal_manager_state = str(summary.get("goal_manager_state") or "idle")
+            goal_progress_state = str(
+                summary.get("goal_progress_state") or ("complete" if goal_completed else "in_progress")
+            ).strip().lower()
+            goal_progress_complete = goal_completed or goal_progress_state == "complete"
+            goal_manager_state = str(summary.get("goal_manager_state") or "idle").strip().lower()
+            runtime_execution_state = str(summary.get("runtime_execution_state") or "").strip().lower()
+            if not runtime_execution_state:
+                runtime_execution_state = (
+                    "running"
+                    if bool(summary.get("runtime_in_progress")) or bool(summary.get("agent_running")) or goal_manager_state == "running"
+                    else "idle"
+                )
+            runtime_label = (
+                "Executing"
+                if runtime_execution_state == "running"
+                else ("Runtime Failed" if runtime_execution_state == "failed" else "Runtime Idle")
+            )
+            runtime_class = (
+                " is-running"
+                if runtime_execution_state == "running"
+                else (" is-audit-panic" if runtime_execution_state == "failed" else "")
+            )
+            audit_state = str(summary.get("goal_audit_state") or "all_clear").strip().lower()
+            audit_label = {
+                "all_clear": "All Clear",
+                "needs_compact": "Needs Compact",
+                "panic": "Panic",
+            }.get(audit_state, audit_state.replace("_", " ").title() if audit_state else "All Clear")
+            audit_class = {
+                "all_clear": " is-audit-ok",
+                "needs_compact": " is-audit-warn",
+                "panic": " is-audit-panic",
+            }.get(audit_state, "")
             wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
             wait_active = bool(summary.get("user_response_wait_active", False))
             registered_at = str(summary.get("registered_at") or summary.get("created_at") or "").strip()
@@ -2810,6 +2858,8 @@ def make_handler(
                 classes.append("is-active-workspace")
             if goal_manager_state == "running":
                 classes.append("is-goal-running")
+            if audit_state == "panic":
+                classes.append("is-goal-panic")
             if not goal_active:
                 classes.append("is-goal-inactive")
             worker = summary.get("worker") if isinstance(summary.get("worker"), dict) else None
@@ -2834,8 +2884,10 @@ def make_handler(
                         f"<div class='goal-session-timing'><span class='goal-session-elapsed' title='Registered at {html.escape(registered_at or 'unknown')}'>Elapsed pending</span><span class='goal-session-updated' title='Goal last updated at {html.escape(goal_updated_at or 'unknown')}'>Goal updated {html.escape(goal_updated_at or 'unknown')}</span></div>",
                         f"<div class='goal-session-goal'>{goal_html}</div>",
                         "<div class='goal-session-state'>",
-                        f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Active' if goal_active else 'Inactive'}</span>",
-                        f"<span class='goal-session-badge{' is-done' if goal_completed else ''}'>{'Completed' if goal_completed else 'In Progress'}</span>",
+                        f"<span class='goal-session-badge{' is-on' if goal_active else ''}'>{'Goal Active' if goal_active else 'Goal Inactive'}</span>",
+                        f"<span class='goal-session-badge{' is-done' if goal_progress_complete else ''}'>{'Goal Completed' if goal_progress_complete else 'Goal In Progress'}</span>",
+                        f"<span class='goal-session-badge{runtime_class}'>{runtime_label}</span>",
+                        f"<span class='goal-session-badge{audit_class}'>{html.escape(audit_label)}</span>",
                         "<span class='goal-session-badge' title='Resident Unit-backed session'>Resident Unit</span>" if resident_unit else "",
                         f"<span class='goal-session-badge' title='Associated unit: {html.escape(unit_id or unit_display)}'>Unit{' · ' + html.escape(unit_display) if unit_display else ''}</span>" if has_unit_file else "",
                         (
