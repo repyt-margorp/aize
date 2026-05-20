@@ -9,12 +9,14 @@
 - Entrance-origin development work now materializes under the canonical `AIze Development` parent rooted at `default`, with the concrete task session created beneath that parent instead of under Entrance.
 - Canonical parent reuse now falls back to the registered `aize-development.bug-hunting` unit state when a shallow session snapshot does not carry enough skill metadata to identify the already-registered development parent.
 - The Entrance composer clears the text, pending files, and file input after the send starts, and restores them if the send fails.
+- Restart resume now resolves the startup-only recovery budget before candidate scanning, so GoalManager/restart-resume bookkeeping cannot hit an unbound local when the resume path evaluates later routing state.
 
 ## Files touched
 
 - `plugins/aize-entrance/units/entrance/unit.json`
 - `src/runtime/html_renderer.py`
 - `src/runtime/http_handler.py`
+- `src/runtime/compaction.py`
 - `tests/test_entrance_page.py`
 - `tests/test_http_handler_goal_save.py`
 - `tests/test_session_template.py`
@@ -24,6 +26,8 @@
 
 - `python3 -m unittest tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_keeps_entrance_request_inside_entrance_before_goal_manager_routing tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_runs_entrance_handler_before_unhandled_development_route tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_with_entrance_target_stays_in_entrance_before_delegation tests.test_entrance_page.EntrancePageTests.test_entrance_page_renders_chat_polling_surface -v`
 - `python3 -m unittest tests.test_entrance_page tests.test_http_handler_goal_save tests.test_session_template -q`
+- `python3 -m unittest tests.test_goal_manager_compact -q`
+- `python3 -m unittest tests.test_entrance_page tests.test_http_handler_goal_save tests.test_goal_manager_compact -q`
 
 ## Residual risk
 

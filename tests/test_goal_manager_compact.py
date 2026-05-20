@@ -51,7 +51,8 @@ from runtime.providers.codex import run_codex, run_codex_compaction  # noqa: E40
 from runtime.providers.gemini import run_gemini  # noqa: E402
 from runtime.providers import provider_supports_context_compaction  # noqa: E402
 from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
-from runtime.compaction import build_restart_resume_claim_run_id, maybe_resume_after_restart  # noqa: E402
+from runtime.compaction import maybe_resume_after_restart  # noqa: E402
+from runtime.restart_recovery import build_restart_resume_claim_run_id  # noqa: E402
 from runtime.agent_service import (  # noqa: E402
     _dispatch_spawn_initial_prompt,
     _ensure_dispatch_allowed_peer,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import json
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +41,6 @@ from runtime.persistent_state_pkg import (
     list_sessions_bound_to_service,
     normalize_auto_compact_threshold_left_percent,
     resolve_session_agent_id,
-    session_goal_manager_reviews_path,
     session_goal_manager_state_path,
     session_service_state_path,
     session_dir,
@@ -59,38 +57,24 @@ from runtime.providers import (
     run_gemini_compaction,
     run_gemini_context_check,
 )
+from runtime.restart_recovery import (
+    GOAL_MANAGER_RUNNING_STALE_SECONDS,
+    build_restart_resume_claim_run_id,
+    has_actionable_pending_inputs,
+    has_live_actionable_pending_inputs,
+    history_has_dangling_goal_audit,
+    history_has_terminal_goal_manager_cycle,
+    history_has_unfinished_turn,
+    latest_agent_turn_completed_at,
+    latest_goal_manager_failure,
+    latest_goal_manager_review,
+    restart_resume_startup_budget as resolve_restart_resume_startup_budget,
+    review_cursor_for_session,
+    utc_ts_age_seconds,
+)
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
-DEFAULT_RESTART_RESUME_STARTUP_BUDGET = 0
-RESTART_RESUME_ONLY_KINDS = {"restart_resume", "scheduled_resume", "turn_completed"}
-GOAL_MANAGER_RUNNING_STALE_SECONDS = 120
-
-
-def _restart_resume_startup_budget(self_service: dict[str, Any]) -> int:
-    config = self_service.get("config")
-    raw_budget: Any = None
-    if isinstance(config, dict):
-        raw_budget = config.get("restart_resume_startup_budget")
-    if raw_budget is None:
-        raw_budget = DEFAULT_RESTART_RESUME_STARTUP_BUDGET
-    try:
-        return max(0, int(raw_budget))
-    except (TypeError, ValueError):
-        return DEFAULT_RESTART_RESUME_STARTUP_BUDGET
-
-
-def _utc_ts_age_seconds(ts: str) -> float | None:
-    text = str(ts or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return max(0.0, datetime.now(UTC).timestamp() - parsed.timestamp())
 
 
 def _fallback_codex_session_id_for_conversation(
@@ -151,41 +135,6 @@ def _fallback_codex_session_id_for_conversation(
             )
             if isinstance(provider_session_id, str) and provider_session_id.strip():
                 return provider_session_id.strip()
-    return None
-
-
-def build_restart_resume_claim_run_id(
-    *,
-    restart_generation_id: str,
-    scope_session_id: str,
-    restart_claim_slot: str,
-    service_id: str,
-) -> str:
-    service_component = "shared" if str(restart_claim_slot or "").strip() == "goal_manager" else service_id
-    return (
-        f"system-restart-{restart_generation_id}-{scope_session_id}-"
-        f"{restart_claim_slot}-{service_component}"
-    )
-
-
-def _latest_goal_manager_review(runtime_root: Path, *, username: str, session_id: str) -> dict[str, Any] | None:
-    path = session_goal_manager_reviews_path(runtime_root, username=username, session_id=session_id)
-    if not path.exists():
-        return None
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-    for raw_line in reversed(lines):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict):
-            return record
     return None
 
 
@@ -284,6 +233,8 @@ def maybe_resume_after_restart(
     restart_resume = dict(self_service.get("config", {})).get("restart_resume")
     if not isinstance(restart_resume, dict):
         return
+    restart_resume_startup_budget = resolve_restart_resume_startup_budget(self_service)
+    restart_resume_startup_count = 0
     previous_status = str(restart_resume.get("previous_status") or "unknown")
     previous_process_id = str(restart_resume.get("previous_process_id") or "unknown")
     if service_kind == "claude":
@@ -418,116 +369,6 @@ def maybe_resume_after_restart(
         candidate_entries.append(session_entry_map[(username, session_id)])
     if not candidate_entries:
         return
-    restart_resume_startup_budget = _restart_resume_startup_budget(self_service)
-    restart_resume_startup_count = 0
-
-    def has_unfinished_turn(username: str, session_id: str) -> bool:
-        history = get_user_history(runtime_root, username=username, session_id=session_id)
-        last_user_out_ts = ""
-        last_turn_completed_ts = ""
-        last_turn_activity_ts = ""
-        for entry in history:
-            ts = str(entry.get("ts") or "")
-            direction = str(entry.get("direction") or "")
-            event_type = str(entry.get("event_type") or "")
-            if direction == "out":
-                last_user_out_ts = ts
-            if event_type in {
-                "thread.started",
-                "turn.started",
-                "item.started",
-            }:
-                if ts >= last_turn_activity_ts:
-                    last_turn_activity_ts = ts
-            if direction == "in":
-                if ts >= last_turn_activity_ts:
-                    last_turn_activity_ts = ts
-            if event_type == "turn.completed":
-                last_turn_completed_ts = ts
-        if last_turn_activity_ts and last_turn_activity_ts > last_turn_completed_ts:
-            return True
-        if not last_user_out_ts:
-            return False
-        if not last_turn_completed_ts:
-            return True
-        return last_user_out_ts > last_turn_completed_ts
-
-    def has_actionable_pending_inputs(pending_inputs: list[dict[str, Any]]) -> bool:
-        return any(
-            str(item.get("kind", "")).strip().lower() not in RESTART_RESUME_ONLY_KINDS
-            for item in pending_inputs
-        )
-
-    def has_live_actionable_pending_inputs(pending_inputs: list[dict[str, Any]]) -> bool:
-        return any(
-            str(item.get("kind", "")).strip().lower() not in RESTART_RESUME_ONLY_KINDS
-            for item in pending_inputs
-        )
-
-    def has_dangling_goal_audit(username: str, session_id: str) -> bool:
-        history = get_user_history(runtime_root, username=username, session_id=session_id)
-        last_started_ts = ""
-        last_terminal_ts = ""
-        for record in history:
-            event_type = str(record.get("event_type") or "")
-            ts = str(record.get("ts") or "")
-            if event_type == "service.goal_manager_compact_started":
-                last_started_ts = ts
-            elif event_type in {
-                "service.goal_manager_compact_completed",
-                "service.goal_manager_compact_failed",
-                "service.goal_audit_completed",
-                "service.goal_audit_failed",
-            }:
-                last_terminal_ts = ts
-        return bool(last_started_ts) and last_started_ts > last_terminal_ts
-
-    def has_terminal_goal_manager_cycle(history: list[dict[str, Any]]) -> bool:
-        last_started_ts = ""
-        last_terminal_ts = ""
-        for record in history:
-            event_type = str(record.get("event_type") or "")
-            ts = str(record.get("ts") or "")
-            if event_type == "service.goal_manager_compact_started":
-                last_started_ts = ts
-            elif event_type in {
-                "service.goal_manager_compact_completed",
-                "service.goal_audit_completed",
-            }:
-                last_terminal_ts = ts
-        return bool(last_terminal_ts) and (not last_started_ts or last_terminal_ts >= last_started_ts)
-
-    def latest_goal_manager_failure(history: list[dict[str, Any]]) -> dict[str, Any] | None:
-        for record in reversed(history):
-            event_type = str(record.get("event_type") or "").strip()
-            if event_type in {"service.goal_manager_compact_failed"}:
-                return record
-            if event_type in {"service.goal_manager_compact_completed", "turn.completed"}:
-                return None
-        return None
-
-    def latest_agent_turn_completed_at(talk: dict[str, Any]) -> str:
-        welcomed_agents = talk.get("welcomed_agents")
-        if not isinstance(welcomed_agents, list):
-            return ""
-        latest = ""
-        for item in welcomed_agents:
-            if not isinstance(item, dict):
-                continue
-            completed_at = str(item.get("last_turn_completed_at") or "").strip()
-            if completed_at and completed_at > latest:
-                latest = completed_at
-        return latest
-
-    def review_cursor_for_session(username: str, session_id: str, talk: dict[str, Any]) -> str:
-        cursor = str(talk.get("goal_manager_last_reviewed_turn_completed_at") or "").strip()
-        goal_manager_state = read_json_file(
-            session_goal_manager_state_path(runtime_root, username=username, session_id=session_id)
-        ) or {}
-        state_cursor = str(goal_manager_state.get("last_reviewed_turn_completed_at") or "").strip()
-        if state_cursor > cursor:
-            cursor = state_cursor
-        return cursor
 
     def reconcile_stale_goal_manager_runtime(
         username: str,
@@ -546,9 +387,14 @@ def maybe_resume_after_restart(
         if runtime_state != "running":
             return False, runtime_state
         latest_turn_completed = latest_agent_turn_completed_at(talk)
-        review_cursor = review_cursor_for_session(username, session_id, talk)
+        review_cursor = review_cursor_for_session(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            talk=talk,
+        )
         updated_at = str(goal_manager_state.get("updated_at") or "").strip()
-        updated_age_seconds = _utc_ts_age_seconds(updated_at)
+        updated_age_seconds = utc_ts_age_seconds(updated_at)
         running_state_is_stale = updated_age_seconds is None or updated_age_seconds >= GOAL_MANAGER_RUNNING_STALE_SECONDS
         pending_work_items = goal_manager_state.get("pending_work_items")
         has_persisted_pending_work = isinstance(pending_work_items, list) and bool(pending_work_items)
@@ -666,7 +512,7 @@ def maybe_resume_after_restart(
         )
         history = get_user_history(runtime_root, username=scope_username, session_id=scope_session_id)
         gm_failure_entry = latest_goal_manager_failure(history)
-        unfinished_turn = has_unfinished_turn(scope_username, scope_session_id)
+        unfinished_turn = history_has_unfinished_turn(history)
         has_actionable_pending = has_actionable_pending_inputs(pending_inputs) or has_actionable_pending_inputs(service_pending_inputs)
         has_live_actionable_pending = has_live_actionable_pending_inputs(pending_inputs) or has_live_actionable_pending_inputs(service_pending_inputs)
         should_standard_goal_route = bool(
@@ -676,7 +522,7 @@ def maybe_resume_after_restart(
             and goal_progress_state == "in_progress"
             and goal_audit_state in {"all_clear", "needs_compact"}
         )
-        latest_review = _latest_goal_manager_review(
+        latest_review = latest_goal_manager_review(
             runtime_root,
             username=scope_username,
             session_id=scope_session_id,
@@ -717,13 +563,18 @@ def maybe_resume_after_restart(
             should_standard_goal_route=should_standard_goal_route,
         )
         latest_turn_completed_at = latest_agent_turn_completed_at(talk)
-        last_reviewed_turn_completed_at = review_cursor_for_session(scope_username, scope_session_id, talk)
+        last_reviewed_turn_completed_at = review_cursor_for_session(
+            runtime_root,
+            username=scope_username,
+            session_id=scope_session_id,
+            talk=talk,
+        )
         has_unreviewed_turn_completed = bool(
             should_standard_goal_route
             and latest_turn_completed_at
             and latest_turn_completed_at > last_reviewed_turn_completed_at
         )
-        dangling_goal_audit = should_standard_goal_route and has_dangling_goal_audit(scope_username, scope_session_id)
+        dangling_goal_audit = should_standard_goal_route and history_has_dangling_goal_audit(history)
         goal_manager_review_reasons: list[str] = []
         if recovery_mode == "goal_manager_review_only":
             goal_manager_review_reasons.append("orphan_in_progress_goal")
@@ -742,7 +593,7 @@ def maybe_resume_after_restart(
             and not isinstance(due_auto_resume, dict)
             and recovery_mode != "reconstruct_without_session"
             and not goal_manager_review_reasons
-            and not has_terminal_goal_manager_cycle(history)
+            and not history_has_terminal_goal_manager_cycle(history)
         ):
             goal_manager_review_reasons.append("orphan_in_progress_goal")
         restart_goal_manager_review_only = bool(
