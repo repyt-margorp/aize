@@ -295,6 +295,57 @@ def render_main_page(
         "waiting": " is-complete",
         "failed": " is-failed",
     }.get(str(initial_goal_manager_state or "idle"), "")
+    initial_progress_state = str(initial_goal_progress_state or "").strip().lower()
+    initial_runtime_state = (
+        "failed"
+        if str(initial_goal_manager_state or "").strip().lower() == "failed"
+        else ("running" if str(initial_goal_manager_state or "").strip().lower() == "running" else "idle")
+    )
+    initial_audit_state = str(initial_goal_audit_state or "all_clear").strip().lower() or "all_clear"
+    initial_audit_label = {
+        "all_clear": "All Clear",
+        "needs_compact": "Needs Compact",
+        "panic": "Panic",
+    }.get(initial_audit_state, initial_audit_state.replace("_", " ").title())
+    initial_audit_class = {
+        "all_clear": " is-audit-ok",
+        "needs_compact": " is-audit-warn",
+        "panic": " is-audit-panic",
+    }.get(initial_audit_state, "")
+    initial_status_chips = [
+        (
+            "Goal Active" if initial_goal_active else "Goal Inactive",
+            " is-active" if initial_goal_active else "",
+        )
+        if has_initial_goal
+        else ("No Goal", ""),
+        (
+            "Goal Completed" if initial_goal_completed or initial_progress_state == "complete" else "Goal In Progress",
+            " is-complete" if initial_goal_completed or initial_progress_state == "complete" else "",
+        ),
+        (
+            "Executing" if initial_runtime_state == "running" else ("Runtime Failed" if initial_runtime_state == "failed" else "Runtime Idle"),
+            " is-running" if initial_runtime_state == "running" else (" is-audit-panic" if initial_runtime_state == "failed" else ""),
+        ),
+        (initial_audit_label, initial_audit_class),
+    ]
+    if initial_user_response_wait_started_at:
+        initial_status_chips.append(
+            (
+                "Waiting for User"
+                if initial_user_response_wait_active
+                else ("Wait Timed Out" if initial_user_response_wait_status == "timed_out" else "Wait Recorded"),
+                " is-waiting",
+            )
+        )
+    initial_session_status_chips_html = "".join(
+        f"<span class='session-status-chip{class_name}'>{html.escape(text)}</span>"
+        for text, class_name in initial_status_chips
+    )
+    initial_composer_status_chips_html = "".join(
+        f"<span class='composer-dock-chip{class_name}'>{html.escape(text)}</span>"
+        for text, class_name in initial_status_chips
+    )
     latest_prompt_summary = initial_latest_user_prompt or "No recent prompt recorded."
     latest_reply_summary = initial_latest_agent_reply or "No recent agent reply recorded."
     account_settings_admin_html = (
@@ -428,7 +479,8 @@ def render_main_page(
     "<header id='main-topbar' class='topbar'>"
     "<div class='session-name-wrap'><div class='session-name-stack'><div class='thread-toolbar-label'>Session</div>"
     f"<textarea id='session-name-textarea' class='session-name-textarea' maxlength='200' rows='1' aria-label='Session name'>{html.escape(initial_session_label)}</textarea>"
-    "<div id='session-name-hint' class='session-name-hint'>Rename this session here. Enter saves, Shift+Enter adds a newline.</div></div></div>"
+    "<div id='session-name-hint' class='session-name-hint'>Rename this session here. Enter saves, Shift+Enter adds a newline.</div>"
+    f"<div id='session-status-strip' class='session-status-strip'>{initial_session_status_chips_html}</div></div></div>"
     "<div class='topbar-tools'>"
     "<div class='view-toolbar-group topbar-panel-group'>"
     "<div class='thread-toolbar-label'>Workspace Views</div>"
@@ -474,7 +526,8 @@ def render_main_page(
     "<div id='workspace-pane' class='pane-view pane-view-workspace'>"
     f"<div id='workspace-view' class='thread'><div id='workspace-goal-panel' class='workspace-goal-panel{' is-hidden' if not has_initial_goal else ''}'><div id='workspace-goal-state-card' class='goal-state-card'><div class='goal-state-main'><div class='workspace-goal-heading'><textarea id='workspace-goal-state-text' class='goal-state-text' readonly aria-label='Current goal text'>{html.escape(initial_goal_summary)}</textarea><button id='workspace-goal-toggle' class='workspace-goal-toggle' type='button' aria-label='Toggle goal details' aria-expanded='true'></button></div><div id='workspace-goal-history-nav' class='goal-history-nav'><div class='goal-history-nav-controls'><button id='workspace-goal-history-prev' class='toolbar-button ghost goal-history-nav-button' type='button' aria-label='Show previous goal revision'>↑</button><div id='workspace-goal-history-position' class='goal-history-position'>1/1</div><button id='workspace-goal-history-next' class='toolbar-button ghost goal-history-nav-button' type='button' aria-label='Show next goal revision'>↓</button></div></div></div><div id='workspace-goal-body' class='workspace-goal-body'><div class='goal-state-separator'></div><div id='workspace-goal-state-meta' class='goal-state-meta'>{html.escape(initial_goal_meta)}</div></div></div></div><details id='runtime-journal-panel' class='runtime-journal-panel'><summary class='runtime-journal-summary'><span>Runtime Event Log</span><span id='runtime-journal-meta'>No runtime events</span></summary><div id='runtime-journal-log' class='runtime-journal-log'><div class='runtime-journal-empty'>Open the log to load runtime events.</div></div></details><div id='messages-loading' class='messages-loading is-hidden'>履歴を読み込み中...</div><ul id='messages' class='messages'>{items}</ul></div>"
     "<form class='composer-dock' method='post' action='/message'>"
-    "<div class='composer-dock-head'><div class='composer-dock-summary'><div class='composer-dock-title'>Composer</div><div id='composer-dock-label' class='composer-dock-label'>Send a message to the selected worker</div></div></div>"
+    "<div class='composer-dock-head'><div class='composer-dock-summary'><div class='composer-dock-title'>Composer</div><div id='composer-dock-label' class='composer-dock-label'>Send a message to the selected worker</div>"
+    f"<div id='composer-dock-meta' class='composer-dock-meta'>{initial_composer_status_chips_html}</div></div></div>"
     "<div class='composer-dock-form'>"
     f"<input type='hidden' name='session_id' value='{html.escape(session_id)}'>"
     "<div class='composer-inputs'><textarea id='composer-text' name='text' placeholder='Send a message to the selected worker, or drop image, audio, video, or document files here'></textarea><input id='composer-file-input' type='file' multiple hidden><div id='composer-upload-list' class='composer-upload-list'></div></div>"

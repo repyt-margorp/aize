@@ -410,8 +410,13 @@ class EntrancePageTests(unittest.TestCase):
         self.assertNotIn("UnitFile", page)
         self.assertNotIn("unit-launcher-open-plugin-ui", page)
         self.assertNotIn("unitLauncherOpenPluginUi", page)
-        self.assertNotIn("id='session-status-strip'", page)
-        self.assertNotIn("id='composer-dock-meta'", page)
+        self.assertIn("id='session-status-strip' class='session-status-strip'", page)
+        self.assertIn("<span class='session-status-chip is-active'>Goal Active</span>", page)
+        self.assertIn("<span class='session-status-chip'>Goal In Progress</span>", page)
+        self.assertIn("<span class='session-status-chip is-running'>Executing</span>", page)
+        self.assertIn("<span class='session-status-chip is-audit-ok'>All Clear</span>", page)
+        self.assertIn("id='composer-dock-meta' class='composer-dock-meta'", page)
+        self.assertIn("<span class='composer-dock-chip is-active'>Goal Active</span>", page)
         self.assertNotIn("Workspace Header", page)
 
     def test_main_page_keeps_workspace_views_and_recent_messages_on_one_desktop_row(self) -> None:
