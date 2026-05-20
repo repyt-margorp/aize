@@ -2761,28 +2761,6 @@ def make_handler(
             active = sid == active_session_id
             goal_active = bool(summary.get("goal_active"))
             goal_completed = bool(summary.get("goal_completed"))
-            goal_progress_state = str(
-                summary.get("goal_progress_state") or ("complete" if goal_completed else "in_progress")
-            ).strip().lower()
-            goal_progress_complete = goal_completed or goal_progress_state == "complete"
-            runtime_execution_state = str(summary.get("runtime_execution_state") or "").strip().lower()
-            if not runtime_execution_state:
-                runtime_execution_state = (
-                    "running"
-                    if bool(summary.get("runtime_in_progress")) or bool(summary.get("agent_running")) or str(summary.get("goal_manager_state") or "").strip().lower() == "running"
-                    else "idle"
-                )
-            runtime_label = (
-                "Executing"
-                if runtime_execution_state == "running"
-                else ("Runtime Failed" if runtime_execution_state == "failed" else "Runtime Idle")
-            )
-            audit_state = str(summary.get("goal_audit_state") or "all_clear").strip().lower()
-            audit_label = {
-                "all_clear": "All Clear",
-                "needs_compact": "Needs Compact",
-                "panic": "Panic",
-            }.get(audit_state, audit_state.replace("_", " ").title() if audit_state else "All Clear")
             wait_status = str(summary.get("user_response_wait_status") or "idle").strip()
             wait_active = bool(summary.get("user_response_wait_active", False))
             registered_at = str(summary.get("registered_at") or summary.get("created_at") or "").strip()
@@ -2812,12 +2790,6 @@ def make_handler(
                         "</span>",
                         f"<span class='workspace-nav-meta'>{html.escape(sid)}</span>",
                         f"<span class='workspace-nav-origin'>{html.escape(origin_meta)}</span>",
-                        "<span class='workspace-nav-status'>",
-                        f"<span class='workspace-nav-chip{' is-active' if goal_active else ''}'>{'Goal Active' if goal_active else 'Goal Inactive'}</span>",
-                        f"<span class='workspace-nav-chip{' is-complete' if goal_progress_complete else ''}'>{'Goal Completed' if goal_progress_complete else 'Goal In Progress'}</span>",
-                        f"<span class='workspace-nav-chip'>{html.escape(runtime_label)}</span>",
-                        f"<span class='workspace-nav-chip'>{html.escape(audit_label)}</span>",
-                        "</span>",
                         "</a>",
                     ]
                 )
@@ -3210,16 +3182,21 @@ def make_handler(
                 session_settings.get("goal_progress_state", "complete" if initial_goal_completed else "in_progress")
             )
             _bound_service_for_ui = get_session_service(runtime_root, username=username, session_id=session_id)
-            initial_goal_audit_state = (
-                load_agent_audit_state(
+            initial_audit_summary = load_session_audit_summary(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+            )
+            initial_goal_audit_state = str((initial_audit_summary or {}).get("audit_state") or "").strip()
+            if not initial_goal_audit_state and _bound_service_for_ui:
+                initial_goal_audit_state = load_agent_audit_state(
                     runtime_root,
                     service_id=_bound_service_for_ui,
                     username=username,
                     session_id=session_id,
                 )
-                if _bound_service_for_ui
-                else "all_clear"
-            )
+            if not initial_goal_audit_state:
+                initial_goal_audit_state = "all_clear"
             initial_goal_reset_completed_on_prompt = bool(
                 session_settings.get("goal_reset_completed_on_prompt", True)
             )

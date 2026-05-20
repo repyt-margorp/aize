@@ -23,6 +23,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     load_pending_inputs,
     load_service_pending_inputs,
     list_sessions,
+    save_agent_audit_state,
     session_message_dir,
     session_goal_manager_state_path,
     update_session_goal,
@@ -180,11 +181,10 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertIn("session-map-pane", responses[0][1])
         self.assertIn("goal-board-grid", responses[0][1])
         self.assertIn(self.session_id, responses[0][1])
-        self.assertIn("workspace-nav-status", responses[0][1])
-        self.assertIn("<span class='workspace-nav-chip is-active'>Goal Active</span>", responses[0][1])
-        self.assertIn("<span class='workspace-nav-chip'>Goal In Progress</span>", responses[0][1])
-        self.assertIn("<span class='workspace-nav-chip'>Runtime Idle</span>", responses[0][1])
-        self.assertIn("<span class='workspace-nav-chip'>All Clear</span>", responses[0][1])
+        self.assertNotIn("workspace-nav-status", responses[0][1])
+        self.assertIn("workspace-signal-active is-on", responses[0][1])
+        self.assertIn("workspace-signal-completed", responses[0][1])
+        self.assertIn("workspace-signal-audit", responses[0][1])
         self.assertIn("<span class='goal-session-badge is-on'>Goal Active</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge'>Goal In Progress</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge'>Runtime Idle</span>", responses[0][1])
@@ -202,6 +202,50 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         )
         self.assertEqual(summary["goal_audit_state"], "all_clear")
         self.assertEqual(summary["runtime_execution_state"], "idle")
+
+    def test_root_page_status_strip_uses_strongest_session_audit_state(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_text="Recover the session.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_active=True,
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-other",
+            username="root",
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+
+        Handler = self._make_handler(
+            lambda **kwargs: ("", ""),
+            current_context=lambda *args, **kwargs: {
+                "username": "root",
+                "viewer_username": "root",
+                "session_id": self.session_id,
+                "roles": ["root", "superuser"],
+                "role": "root",
+                "is_superuser": True,
+            },
+            requested_session_id=lambda *args, **kwargs: None,
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, str]] = []
+        handler._trace_auth_request = lambda *args, **kwargs: None
+        handler._html = lambda status, body: responses.append((status, body))
+
+        handler._do_GET_root("/", {})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertIn("id='session-status-strip' class='session-status-strip'", responses[0][1])
+        self.assertIn("<span class='session-status-chip is-audit-panic'>Panic</span>", responses[0][1])
 
     def test_message_goal_mode_resets_goal_manager_runtime_state(self) -> None:
         state_path = session_goal_manager_state_path(
