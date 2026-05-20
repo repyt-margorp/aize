@@ -180,10 +180,28 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertIn("session-map-pane", responses[0][1])
         self.assertIn("goal-board-grid", responses[0][1])
         self.assertIn(self.session_id, responses[0][1])
+        self.assertIn("workspace-nav-status", responses[0][1])
+        self.assertIn("<span class='workspace-nav-chip is-active'>Goal Active</span>", responses[0][1])
+        self.assertIn("<span class='workspace-nav-chip'>Goal In Progress</span>", responses[0][1])
+        self.assertIn("<span class='workspace-nav-chip'>Runtime Idle</span>", responses[0][1])
+        self.assertIn("<span class='workspace-nav-chip'>All Clear</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge is-on'>Goal Active</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge'>Goal In Progress</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge'>Runtime Idle</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge is-audit-ok'>All Clear</span>", responses[0][1])
+
+        json_responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: json_responses.append((status, payload))
+        handler._do_GET_sessions("/sessions", {"_": ["1"]})
+
+        self.assertEqual(json_responses[-1][0], 200)
+        summary = next(
+            item
+            for item in json_responses[-1][1]["session_summaries"]
+            if item["session_id"] == self.session_id
+        )
+        self.assertEqual(summary["goal_audit_state"], "all_clear")
+        self.assertEqual(summary["runtime_execution_state"], "idle")
 
     def test_message_goal_mode_resets_goal_manager_runtime_state(self) -> None:
         state_path = session_goal_manager_state_path(
