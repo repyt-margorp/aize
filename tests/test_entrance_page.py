@@ -103,6 +103,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("for(const key of ['goal_active','goal_completed','goal_progress_state','goal_completion_policy'])", page)
         self.assertIn("eventType==='runtime.status_changed'", page)
         self.assertIn("for(const key of ['runtime_execution_state','runtime_in_progress','agent_running','goal_manager_state','worker','goal_manager_worker'])", page)
+        self.assertIn("const goalManagerState=String(s.goal_manager_state||'').trim().toLowerCase();", page)
+        self.assertIn("goalManagerState==='running'?'running':'idle'", page)
         self.assertIn("statePollTimer=setInterval(()=>{refreshEntranceState();},10000)", page)
         self.assertIn("jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'})", page)
         self.assertIn("/overview?scope=all", page)
@@ -274,6 +276,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("_communication_dispatch_plan(", source)
         self.assertIn("append_goal_manager_pending_input(", source)
         self.assertIn('"reason": "goal_manager_review"', source)
+        self.assertNotIn("and not forwarded_session_id", source)
 
     def test_main_page_renders_latest_first_workspace_header_and_fixed_composer(self) -> None:
         page = render_main_page(
@@ -287,6 +290,7 @@ class EntrancePageTests(unittest.TestCase):
             default_provider="codex",
             initial_session_map_open=False,
             entries_json="[]",
+            initial_runtime_journal_summary_json="{}",
             context_status_json="{}",
             initial_auto_compact_threshold=20,
             initial_session_label="WorkspaceView",
@@ -373,6 +377,31 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("patchWorkspaceSummaryFromEvent(entry);", page)
         self.assertIn("sessionWithinMapTimeWindow", page)
         self.assertNotIn("setInterval(() => { if (!document.hidden && sessionMapOpen) refreshWorkspaceBoard(); }, 5000)", page)
+        self.assertIn("sessionRuntimeLabel", page)
+        self.assertIn("sessionRuntimeBadgeClass", page)
+        self.assertIn("Goal Active", page)
+        self.assertIn("Goal In Progress", page)
+        self.assertIn("Executing", page)
+        self.assertIn("Runtime Idle", page)
+        self.assertIn("All Clear", page)
+        self.assertIn("runtime-journal-panel", page)
+        self.assertIn("Runtime Event Log", page)
+        self.assertIn("runtimeJournalSummaryText", page)
+        self.assertIn("/session/runtime-log?session_id=", page)
+        self.assertIn("renderRuntimeJournalMeta();", page)
+        self.assertIn("eventsTitle.textContent = 'Event Log';", page)
+        self.assertIn("rawHead.textContent = 'Raw JSON';", page)
+        self.assertIn("raw.textContent = JSON.stringify(eventEntry.event, null, 2);", page)
+        self.assertIn("raw.textContent = JSON.stringify(item, null, 2);", page)
+        self.assertIn(".workspace-goal-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex:1 1 auto;min-width:0}", page)
+        self.assertIn(".workspace-goal-heading textarea.goal-state-text", page)
+        self.assertIn("<textarea id='workspace-goal-state-text' class='goal-state-text' readonly aria-label='Current goal text'>Ship the WorkspaceView refresh</textarea>", page)
+        self.assertIn("workspaceGoalStateText instanceof HTMLTextAreaElement", page)
+        self.assertNotIn("<button id='workspace-goal-toggle' class='workspace-goal-toggle' type='button'><div id='workspace-goal-state-text'", page)
+        self.assertIn("workspaceGoalToggle.setAttribute('aria-expanded', workspaceGoalCollapsed ? 'false' : 'true');", page)
+        self.assertIn("workspaceGoalToggle.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');", page)
+        self.assertIn("Goal Active' : 'Goal Inactive", page)
+        self.assertIn("Goal Active' : 'Goal Inactive'} | ${goalProgressState === 'complete' ? 'Goal Completed' : 'Goal In Progress'", page)
         self.assertIn("allowed_source_unit_ids", page)
         self.assertIn("Only the listed sessions or units may create child sessions here.", page)
         self.assertIn("Allowed unit IDs", page)
@@ -397,6 +426,7 @@ class EntrancePageTests(unittest.TestCase):
             default_provider="codex",
             initial_session_map_open=False,
             entries_json="[]",
+            initial_runtime_journal_summary_json="{}",
             context_status_json="{}",
             initial_auto_compact_threshold=20,
             initial_session_label="WorkspaceView",
@@ -456,8 +486,12 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn(".topbar-tools{position:relative;z-index:2;display:flex;flex-direction:row;", page)
         self.assertIn("justify-content:flex-end;gap:12px;flex-wrap:nowrap;", page)
         self.assertIn(".view-toolbar-group{flex:1 1 auto;min-width:0}", page)
-        self.assertIn(".recent-messages-control{display:flex;flex:0 0 260px;", page)
-        self.assertIn("min-width:240px;max-width:260px;", page)
+        self.assertIn(".topbar-panel-group{flex-direction:row;align-items:center;gap:10px;padding:10px 12px}", page)
+        self.assertIn(".topbar-panel-group .session-toolbar-actions{flex:1 1 auto;min-width:0;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}", page)
+        self.assertIn(".toolbar-button{white-space:nowrap}", page)
+        self.assertIn(".recent-messages-control{display:flex;flex:0 0 auto;", page)
+        self.assertIn(".recent-messages-form{display:flex;gap:8px;align-items:center;min-width:0;flex-wrap:nowrap;white-space:nowrap}", page)
+        self.assertIn(".recent-messages-input{width:68px;min-width:68px;", page)
         self.assertIn(
             "<div class='view-toolbar-group topbar-panel-group'>",
             page,
@@ -466,12 +500,17 @@ class EntrancePageTests(unittest.TestCase):
             "<section class='recent-messages-control'>",
             page,
         )
+        self.assertIn(
+            "<form id='recent-messages-limit-form' class='recent-messages-form'><label class='recent-messages-inline-label' for='recent-messages-limit-input'><span class='thread-toolbar-label'>RecentMessages</span><span class='recent-messages-copy'>up to</span></label>",
+            page,
+        )
+        self.assertNotIn("recent-messages-head", page)
         self.assertLess(
             page.index("<div class='view-toolbar-group topbar-panel-group'>"),
             page.index("<section class='recent-messages-control'>"),
         )
         self.assertIn(".topbar-tools{flex-direction:column;gap:8px;flex:none;width:100%;max-width:100%}", page)
-        self.assertIn(".recent-messages-control{flex:none;min-width:0;max-width:100%;width:100%}", page)
+        self.assertIn(".recent-messages-control{flex:none;min-width:0;max-width:100%;width:100%;align-self:stretch}", page)
 
     def test_communication_session_settings_detect_interactive_sessions(self) -> None:
         self.assertTrue(_is_communication_session_settings({"session_interactive": True}))
@@ -489,13 +528,13 @@ class EntrancePageTests(unittest.TestCase):
         self.assertFalse(_is_communication_chat_noise({"direction": "in", "text": "actual reply"}))
         self.assertFalse(_is_communication_chat_noise({"direction": "out", "text": "user prompt"}))
 
-    def test_matching_communication_skill_routes_detects_development_request(self) -> None:
+    def test_matching_communication_skill_routes_prefers_explicit_default_route(self) -> None:
         current_session = {
             "session_skills": [
                 {
                     "skill_id": "canonical-development-routing",
                     "routing_mode": "direct_session_template",
-                    "routing_tags": ["development", "dev", "開発"],
+                    "route_when_unhandled": True,
                     "canonical_session_key": "aize.development",
                 }
             ]
@@ -510,22 +549,40 @@ class EntrancePageTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            _matching_communication_skill_routes(current_session, prompt_text="こんにちは"),
-            [],
+            len(_matching_communication_skill_routes(current_session, prompt_text="こんにちは")),
+            1,
         )
 
-    def test_matching_communication_skill_routes_falls_back_to_launcher_template_skills(self) -> None:
+    def test_matching_communication_skill_routes_launcher_template_does_not_auto_route_by_default(self) -> None:
         current_session = {
             "launcher_template_id": "entrance.service",
             "session_skills": [],
         }
 
-        matches = _matching_communication_skill_routes(
-            current_session,
-            prompt_text="Please fix the implementation routing.",
+        self.assertEqual(
+            _matching_communication_skill_routes(
+                current_session,
+                prompt_text="Please fix the implementation routing.",
+            ),
+            [],
         )
 
-        self.assertTrue(any(match.get("skill_id") == "canonical-development-routing" for match in matches))
+    def test_matching_communication_skill_routes_ignores_tags_without_opt_in(self) -> None:
+        current_session = {
+            "session_skills": [
+                {
+                    "skill_id": "canonical-development-routing",
+                    "routing_mode": "direct_session_template",
+                    "routing_tags": ["development"],
+                    "canonical_session_key": "aize.development",
+                }
+            ]
+        }
+
+        self.assertEqual(
+            _matching_communication_skill_routes(current_session, prompt_text="development work"),
+            [],
+        )
 
     def test_infer_communication_forward_target_session_id_skips_direct_development_route(self) -> None:
         sessions = [
@@ -538,6 +595,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "direct_session_template",
+                        "route_when_unhandled": True,
                         "routing_tags": ["development", "dev", "開発"],
                         "canonical_session_key": "aize.development",
                     }
@@ -575,6 +633,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "direct_session_template",
+                        "route_when_unhandled": True,
                         "routing_tags": ["development"],
                         "canonical_session_key": "aize.development",
                     }
@@ -613,8 +672,10 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["development", "dev", "開発"],
                         "canonical_session_key": "aize.development",
+                        "target_template_id": "aize-development.bug-hunting",
                         "target_label": "AIze Development",
                         "target_goal_text": "Implement the requested changes here.",
                         "preferred_provider": "codex",
@@ -670,6 +731,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "direct_session_template",
+                        "route_when_unhandled": True,
                         "routing_tags": ["implementation", "fix"],
                         "canonical_session_key": "aize.development",
                         "target_template_id": "aize-development.bug-hunting",
@@ -707,7 +769,7 @@ class EntrancePageTests(unittest.TestCase):
             self.assertEqual(stored["session_group"], "root")
             self.assertEqual(list_session_children(runtime_root, username="repyt", session_id=str(stored["session_id"])), [])
 
-    def test_materialize_communication_routed_child_session_uses_existing_development_parent(self) -> None:
+    def test_materialize_communication_routed_child_session_ignores_noncanonical_development_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             entrance = create_conversation_session(
@@ -720,8 +782,10 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["development", "dev", "開発"],
                         "canonical_session_key": "aize.development",
+                        "target_template_id": "aize-development.bug-hunting",
                         "target_label": "AIze Development",
                         "target_goal_text": "Implement the requested changes here.",
                         "preferred_provider": "codex",
@@ -735,7 +799,7 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            development = create_conversation_session(
+            noncanonical = create_conversation_session(
                 runtime_root,
                 username="repyt",
                 label="AIze Development",
@@ -746,27 +810,38 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            development = update_session_goal(
+            noncanonical = update_session_goal(
                 runtime_root,
                 username="repyt",
-                session_id=str(development["session_id"]),
+                session_id=str(noncanonical["session_id"]),
                 goal_text="No backward compatibility; implement directly in AIze Development.",
             )
-            assert development is not None
+            assert noncanonical is not None
 
             routed = _materialize_communication_routed_child_session(
                 runtime_root,
                 username="repyt",
                 current_session=entrance,
                 prompt_text="開発してください。legacy compatibility は切ってください。",
-                sessions=[entrance, development],
+                sessions=[entrance, noncanonical],
             )
 
             self.assertIsNotNone(routed)
             assert routed is not None
-            self.assertEqual(routed["parent_session_id"], development["session_id"])
+            self.assertNotEqual(routed["parent_session_id"], noncanonical["session_id"])
             self.assertEqual(str(routed.get("label") or ""), "Development Task")
             self.assertEqual(routed["goal_text"], "開発してください。legacy compatibility は切ってください。")
+            parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=str(routed["parent_session_id"]),
+            )
+            self.assertIsNotNone(parent)
+            assert parent is not None
+            self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
+            self.assertEqual(parent["parent_session_id"], "default")
+            self.assertEqual(parent["session_group"], "root")
+            self.assertIn("child of the Root session", str(parent.get("goal_text") or ""))
 
     def test_materialize_communication_routed_child_session_prefers_top_level_canonical_parent_when_multiple_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -781,6 +856,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["development", "dev", "開発"],
                         "canonical_session_key": "aize.development",
                         "target_label": "AIze Development",
@@ -790,23 +866,19 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            development_root = create_conversation_session(
-                runtime_root,
-                username="repyt",
-                label="AIze Development",
-                session_skills=[
-                    {
-                        "skill_id": "aize-development-session",
-                        "canonical_session_key": "aize.development",
-                    }
-                ],
-            )
-            update_session_goal(
-                runtime_root,
-                username="repyt",
-                session_id=str(development_root["session_id"]),
-                goal_text="Canonical development parent goal.",
-            )
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template(
+                    "aize-development.bug-hunting",
+                    default_provider="codex",
+                )
+                launched = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=unit,
+                    label="AIze Development",
+                )
+            development_root = launched["session"]
             older_child = create_child_conversation_session(
                 runtime_root,
                 username="repyt",
@@ -850,6 +922,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["development", "dev", "開発"],
                         "canonical_session_key": "aize.development",
                         "target_template_id": "aize-development.bug-hunting",
@@ -886,6 +959,7 @@ class EntrancePageTests(unittest.TestCase):
             self.assertIsNotNone(parent)
             assert parent is not None
             self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
+            self.assertIn("child of the Root session", str(parent.get("goal_text") or ""))
             self.assertEqual(parent["parent_session_id"], "default")
             self.assertEqual(parent["session_group"], "root")
             self.assertEqual(parent["session_ui_mode"], "standard")
@@ -899,7 +973,7 @@ class EntrancePageTests(unittest.TestCase):
             )
             self.assertEqual(skills[0]["canonical_session_key"], "aize.development")
 
-    def test_materialize_launcher_route_preserves_development_skill_usage_guidance(self) -> None:
+    def test_materialize_launcher_route_does_not_auto_delegate_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             entrance = create_conversation_session(
@@ -920,25 +994,7 @@ class EntrancePageTests(unittest.TestCase):
                 sessions=list_sessions(runtime_root, username="repyt"),
             )
 
-            self.assertIsNotNone(routed)
-            assert routed is not None
-            self.assertEqual(str(routed.get("label") or ""), "AIze Development Task")
-            parent = get_session_settings(
-                runtime_root,
-                username="repyt",
-                session_id=str(routed.get("parent_session_id") or ""),
-            )
-            self.assertIsNotNone(parent)
-            assert parent is not None
-            self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
-            skills = load_session_skills(
-                runtime_root,
-                username="repyt",
-                session_id=str(routed["session_id"]),
-            )
-            self.assertEqual(skills[0]["canonical_session_key"], "aize.development")
-            self.assertIn("AIzeDevelopment parent coordinator", skills[0]["when_to_use"])
-            self.assertIn("separate port or isolated runtime", skills[0]["usage"])
+            self.assertIsNone(routed)
 
     def test_materialize_communication_routed_child_session_reuses_registered_parent_for_parallel_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -953,6 +1009,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["implementation", "fix"],
                         "canonical_session_key": "aize.development",
                         "target_template_id": "aize-development.bug-hunting",
@@ -1009,6 +1066,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["implementation", "fix"],
                         "canonical_session_key": "aize.development",
                         "target_template_id": "aize-development.bug-hunting",
@@ -1084,6 +1142,7 @@ class EntrancePageTests(unittest.TestCase):
                     {
                         "skill_id": "canonical-development-routing",
                         "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                         "routing_tags": ["implementation", "fix"],
                         "canonical_session_key": "aize.development",
                         "target_template_id": "aize-development.bug-hunting",

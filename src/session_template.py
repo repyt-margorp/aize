@@ -9,6 +9,7 @@ from unit_catalog import list_unit_file_descriptors
 from runtime.persistent_state_pkg import (
     DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
     SESSION_GROUP_DEFAULT_PERMISSIONS,
+    add_session_child,
     session_template_metadata_path,
     session_templates_dir,
     unit_metadata_path,
@@ -18,6 +19,7 @@ from runtime.persistent_state_pkg import (
     ensure_session_storage_unlocked,
     ensure_session_template_workspace,
     get_session_settings,
+    list_session_parents,
     list_sessions,
     normalize_child_session_sharing_policy,
     normalize_session_skills,
@@ -89,6 +91,88 @@ def _read_unit_metadata(runtime_root: Path, *, username: str, template_id: str) 
     legacy_path = legacy_metadata_path.with_name("app.json")
     legacy = read_json_file(legacy_path)
     return legacy if isinstance(legacy, dict) else None
+
+
+def _ensure_session_parent_link(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    parent_session_id: str,
+) -> None:
+    normalized_username = normalize_username(username)
+    normalized_session_id = str(session_id or "").strip()
+    normalized_parent_session_id = str(parent_session_id or "").strip()
+    if (
+        not normalized_session_id
+        or not normalized_parent_session_id
+        or normalized_session_id == normalized_parent_session_id
+    ):
+        return
+    session = get_session_settings(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_session_id,
+    )
+    if not isinstance(session, dict):
+        return
+    _ensure_resident_parent_session(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_parent_session_id,
+    )
+    parents = list_session_parents(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_session_id,
+    )
+    metadata_parent_session_id = str(session.get("parent_session_id") or "").strip()
+    if (
+        normalized_parent_session_id in parents
+        and metadata_parent_session_id == normalized_parent_session_id
+    ):
+        return
+    add_session_child(
+        runtime_root,
+        username=normalized_username,
+        parent_session_id=normalized_parent_session_id,
+        child_session_id=normalized_session_id,
+    )
+
+
+def _repair_registered_template_lineage(
+    runtime_root: Path,
+    *,
+    username: str,
+    template_state: dict[str, Any] | None = None,
+    session_template: dict[str, Any] | None = None,
+) -> None:
+    if not isinstance(template_state, dict):
+        return
+    normalized_username = normalize_username(username)
+    normalized_template_id = str(
+        template_state.get("template_id") or template_state.get("unit_id") or ""
+    ).strip()
+    last_session_id = str(template_state.get("last_session_id") or "").strip()
+    if not normalized_template_id or not last_session_id:
+        return
+    launcher = dict((session_template or {}).get("launcher") or {})
+    resident_parent_session_id = str(launcher.get("resident_parent_session_id") or "").strip()
+    if not resident_parent_session_id:
+        return
+    _ensure_session_parent_link(
+        runtime_root,
+        username=normalized_username,
+        session_id=last_session_id,
+        parent_session_id=resident_parent_session_id,
+    )
+    if str(template_state.get("last_parent_session_id") or "").strip() != resident_parent_session_id:
+        update_registered_session_template_state(
+            runtime_root,
+            username=normalized_username,
+            template_id=normalized_template_id,
+            updates={"last_parent_session_id": resident_parent_session_id},
+        )
 
 
 def _normalize_provider(value: Any, *, default_provider: str) -> str:
@@ -452,6 +536,12 @@ def resolve_session_template_launch_parent_session_id(
     session_template: dict[str, Any] | None = None,
 ) -> str | None:
     normalized_username = normalize_username(username)
+    _repair_registered_template_lineage(
+        runtime_root,
+        username=normalized_username,
+        template_state=template_state,
+        session_template=session_template,
+    )
     candidates: list[str] = []
     launcher = dict((session_template or {}).get("launcher") or {})
     resident_parent_session_id = str(launcher.get("resident_parent_session_id") or "").strip()

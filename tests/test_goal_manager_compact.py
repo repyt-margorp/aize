@@ -45,7 +45,7 @@ from runtime.cli_service_adapter import (  # noqa: E402
 )
 from kernel.lifecycle import init_lifecycle_state, register_process  # noqa: E402
 from kernel.auth import bootstrap_root_user, has_users as auth_has_users, resolve_user_record, verify_user_password  # noqa: E402
-from kernel.registry import init_registry, update_service_process  # noqa: E402
+from kernel.registry import get_service_record, init_registry, update_service_process  # noqa: E402
 from runtime.providers.claude import normalize_claude_stream_event, run_claude  # noqa: E402
 from runtime.providers.codex import run_codex  # noqa: E402
 from runtime.providers.gemini import run_gemini  # noqa: E402
@@ -54,6 +54,7 @@ from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
 from runtime.compaction import build_restart_resume_claim_run_id, maybe_resume_after_restart  # noqa: E402
 from runtime.agent_service import (  # noqa: E402
     _dispatch_spawn_initial_prompt,
+    _ensure_dispatch_allowed_peer,
     _resolve_audit_state_after_goal_manager_compact,
     _materialize_goal_child_sessions,
     _extract_user_response_wait_control,
@@ -338,6 +339,9 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("omit agent_directive records", prompt)
         self.assertIn("including a single child goal", prompt)
         self.assertIn("inherits parent-goal lineage/context", prompt)
+        self.assertIn("positive requested result", prompt)
+        self.assertIn("negative side", prompt)
+        self.assertIn("goal state visibility", prompt)
         self.assertIn("Session files:", prompt)
         self.assertIn("Do NOT load the entire JSONL bundle in one read call", prompt)
         self.assertIn("Use targeted inspection first", prompt)
@@ -614,6 +618,56 @@ class GoalManagerCompactTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )["children"],
             [],
+        )
+
+    def test_add_session_child_repairs_existing_rootless_parent_under_root(self) -> None:
+        rootless_parent = create_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            label="AIze Development",
+        )
+        rootless_parent_id = str(rootless_parent["session_id"])
+
+        self.assertEqual(
+            list_session_parents(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=rootless_parent_id,
+            ),
+            [],
+        )
+
+        repaired = add_session_child(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            parent_session_id="default",
+            child_session_id=rootless_parent_id,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertIn(
+            rootless_parent_id,
+            list_session_children(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id="default",
+            ),
+        )
+        self.assertEqual(
+            list_session_parents(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=rootless_parent_id,
+            ),
+            ["default"],
+        )
+        self.assertEqual(
+            get_session_settings(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=rootless_parent_id,
+            )["parent_session_id"],
+            "default",
         )
 
     def test_provider_session_binding_is_written_under_session_services_directory(self) -> None:
@@ -1649,6 +1703,53 @@ class GoalManagerCompactTests(unittest.TestCase):
         journal = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(journal[-1]["journal_type"], "runtime.event")
         self.assertEqual(journal[-1]["event_type"], "runtime.status_changed")
+
+        session = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert session is not None
+        self.assertEqual(
+            session["runtime_journal_summary"],
+            {
+                "entry_count": 1,
+                "first_ts": "2026-05-06T00:00:00Z",
+                "last_ts": "2026-05-06T00:00:00Z",
+                "service_ids": [],
+                "event_types": ["runtime.status_changed"],
+            },
+        )
+        self.assertEqual(session["activity_index"]["last_event_ts"], "2026-05-06T00:00:00Z")
+
+    def test_append_history_skips_duplicate_runtime_journal_entries(self) -> None:
+        entry = {
+            "direction": "event",
+            "ts": "2026-05-06T00:00:00Z",
+            "event_type": "runtime.status_changed",
+            "text": "Runtime executing",
+            "event": {"type": "runtime.status_changed", "runtime_execution_state": "running"},
+        }
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=entry,
+            limit=20,
+        )
+        append_history(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=entry,
+            limit=20,
+        )
+        journal_path = (
+            Path(self.runtime_root)
+            / ".aize-state"
+            / "sessions"
+            / TEST_USERNAME
+            / self.session_id
+            / "runtime_journal.jsonl"
+        )
+        journal = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(journal), 1)
 
     def test_sync_communication_goal_progress_ignores_standard_session(self) -> None:
         update_session_goal(
@@ -3047,6 +3148,41 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(created[0].get("dispatch_service_id"), "service-codex-001")
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertTrue(any(entry.get("event_type") == "service.goal_child_sessions_created" for entry in history))
+
+    def test_ensure_dispatch_allowed_peer_grants_selected_cross_service_target(self) -> None:
+        init_registry(
+            self.runtime_root,
+            {
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [
+                    {
+                        "service_id": "service-aize-development-parent",
+                        "kind": "codex",
+                        "display_name": "AIze Development Parent",
+                        "persona": "test",
+                        "max_turns": 100,
+                    },
+                    {
+                        "service_id": "service-codex-004",
+                        "kind": "codex",
+                        "display_name": "Codex 004",
+                        "persona": "test",
+                        "max_turns": 100,
+                    },
+                ],
+                "routes": [],
+            },
+        )
+
+        _ensure_dispatch_allowed_peer(
+            self.runtime_root,
+            from_service_id="service-aize-development-parent",
+            to_service_id="service-codex-004",
+        )
+
+        sender = get_service_record(self.runtime_root, "service-aize-development-parent")
+        self.assertIn("service-codex-004", sender.get("allowed_peers", []))
 
     def test_materialize_goal_child_sessions_keeps_single_valid_child_goal(self) -> None:
         update_session_goal(

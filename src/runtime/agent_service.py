@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from kernel.auth import GOAL_MANAGER_USERNAME, auth_context_allows
 from kernel.lifecycle import get_process_record, register_process, update_process_fields
-from kernel.registry import list_service_records, update_service_process
+from kernel.registry import add_allowed_peer, list_service_records, update_service_process
 from runtime.compaction import (
     GOAL_AUDIT_HISTORY_LIMIT,
     maybe_auto_compact_claude_session,
@@ -128,6 +128,26 @@ from wire.protocol import (
     utc_ts,
     write_jsonl,
 )
+
+
+def _ensure_dispatch_allowed_peer(
+    runtime_root: Path,
+    *,
+    from_service_id: str,
+    to_service_id: str,
+) -> None:
+    sender = str(from_service_id or "").strip()
+    recipient = str(to_service_id or "").strip()
+    if not sender or not recipient or sender == recipient:
+        return
+    if sender in {"user.local", "kernel.local"}:
+        return
+    if recipient in {"kernel.spawn", "kernel.control"}:
+        return
+    try:
+        add_allowed_peer(runtime_root, service_id=sender, peer_service_id=recipient)
+    except Exception:
+        return
 
 
 def _worker_session_skills_block(
@@ -516,6 +536,11 @@ def _dispatch_spawn_initial_prompt(
             text=normalized_prompt,
         ),
     )
+    _ensure_dispatch_allowed_peer(
+        runtime_root,
+        from_service_id=service_id,
+        to_service_id=child_service_id,
+    )
     send_tx(
         make_dispatch_pending_message(
             manifest=manifest,
@@ -846,6 +871,11 @@ def maybe_dispatch_panic_recovery_parent_resume(
             service_id=dispatch_service_id,
         ),
     )
+    _ensure_dispatch_allowed_peer(
+        runtime_root,
+        from_service_id=service_id,
+        to_service_id=dispatch_service_id,
+    )
     send_tx(dispatch_message)
     write_jsonl(
         log_path,
@@ -1163,6 +1193,11 @@ def run_agent_service(
                 service_id=dispatch_service_id,
             ),
         )
+        _ensure_dispatch_allowed_peer(
+            runtime_root,
+            from_service_id=service_id,
+            to_service_id=dispatch_service_id,
+        )
         send_tx(dispatch_message)
         return recovery_session
 
@@ -1357,6 +1392,11 @@ def run_agent_service(
                 ),
             ),
         )
+        _ensure_dispatch_allowed_peer(
+            runtime_root,
+            from_service_id=goal_manager_service_id,
+            to_service_id=dispatch_service_id,
+        )
         send_tx(
             make_dispatch_pending_message(
                 manifest=manifest,
@@ -1490,6 +1530,11 @@ def run_agent_service(
                     session_id=session_id,
                     auth_context=None,
                     reason="provider_fallback",
+                )
+                _ensure_dispatch_allowed_peer(
+                    runtime_root,
+                    from_service_id=service_id,
+                    to_service_id=next_svc,
                 )
                 send_tx(fallback_dispatch)
                 append_user_history(
@@ -1695,6 +1740,11 @@ def run_agent_service(
             if dispatch_service_id and dispatch_service_id not in dispatch_targets:
                 dispatch_targets.append(dispatch_service_id)
             for target_service_id in dispatch_targets:
+                _ensure_dispatch_allowed_peer(
+                    runtime_root,
+                    from_service_id=completion_service_id,
+                    to_service_id=target_service_id,
+                )
                 send_tx(
                     make_dispatch_pending_message(
                         manifest=manifest,
@@ -2351,6 +2401,11 @@ def run_agent_service(
                         },
                     )
                     continue
+                _ensure_dispatch_allowed_peer(
+                    runtime_root,
+                    from_service_id=goal_manager_service_id,
+                    to_service_id=dispatch_service_id,
+                )
                 send_tx(
                     make_dispatch_pending_message(
                         manifest=manifest,
@@ -3185,6 +3240,11 @@ def run_agent_service(
                     "ephemeral": True,
                 }
                 interactive_profile["session_slot"] = "interactive_agent"
+                _ensure_dispatch_allowed_peer(
+                    runtime_root,
+                    from_service_id=service_id,
+                    to_service_id=target_interactive_service_id,
+                )
                 send_tx(
                     make_dispatch_pending_message(
                         manifest=manifest,
@@ -3734,6 +3794,11 @@ def run_agent_service(
                                         }
                                     )
                                     write_json_file(goal_manager_state_path, goal_manager_state)
+                                    _ensure_dispatch_allowed_peer(
+                                        runtime_root,
+                                        from_service_id=service_id,
+                                        to_service_id=goal_manager_service_id,
+                                    )
                                     send_tx(
                                         make_dispatch_pending_message(
                                             manifest=manifest,

@@ -200,6 +200,10 @@ def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
                 or ""
             ).strip(),
             "routing_tags": _normalize_text_list(raw_item.get("routing_tags")),
+            "allow_tag_routing": bool(raw_item.get("allow_tag_routing", False)),
+            "route_when_unhandled": bool(
+                raw_item.get("route_when_unhandled", raw_item.get("default_route", False))
+            ),
             "canonical_session_key": str(raw_item.get("canonical_session_key") or "").strip(),
             "routing_mode": str(raw_item.get("routing_mode") or "").strip().lower(),
             "handler_file": str(
@@ -1183,6 +1187,28 @@ def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
     session.setdefault("goal_updated_at", session.get("updated_at", utc_ts()))
     session.setdefault("last_context_status", None)
     session.setdefault("last_context_status_updated_at", session.get("updated_at", utc_ts()))
+    activity_index = session.get("activity_index")
+    session["activity_index"] = dict(activity_index) if isinstance(activity_index, dict) else {
+        "history_entry_count": 0,
+        "last_ts": "",
+        "last_user_ts": "",
+        "last_agent_ts": "",
+        "last_event_ts": "",
+        "service_ids": [],
+        "event_types": [],
+    }
+    runtime_journal_summary = session.get("runtime_journal_summary")
+    session["runtime_journal_summary"] = (
+        dict(runtime_journal_summary)
+        if isinstance(runtime_journal_summary, dict)
+        else {
+            "entry_count": 0,
+            "first_ts": "",
+            "last_ts": "",
+            "service_ids": [],
+            "event_types": [],
+        }
+    )
     session.setdefault("created_by_username", "")
     session.setdefault("created_by_type", "user")
     session.setdefault("origin_session_id", str(session.get("parent_session_id") or "").strip())

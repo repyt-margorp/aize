@@ -10,9 +10,11 @@ from typing import Any
 from ._core import (
     DEFAULT_PENDING_INPUT_LIMIT,
     normalize_username,
+    read_json_file,
     read_jsonl,
     remove_file_if_exists,
     append_jsonl,
+    session_metadata_path,
     session_goal_manager_pending_path,
     session_pending_path,
     session_runtime_journal_path,
@@ -20,6 +22,7 @@ from ._core import (
     session_service_pending_path,
     session_timeline_path,
     state_lock,
+    write_json_file,
     write_jsonl,
 )
 
@@ -27,6 +30,82 @@ _history_subscribers: dict[str, set[queue.Queue[dict[str, Any]]]] = defaultdict(
 _history_subscribers_lock = threading.Lock()
 MAX_HISTORY_STRING_LENGTH = 4000
 EXTERNALIZED_TEXT_THRESHOLD_BYTES = 4096
+
+
+def _merge_unique_sorted(existing: Any, value: str) -> list[str]:
+    items = [str(item).strip() for item in existing] if isinstance(existing, list) else []
+    normalized = [item for item in items if item]
+    if value and value not in normalized:
+        normalized.append(value)
+    return sorted(set(normalized))
+
+
+def _update_session_activity_index(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    entry: dict[str, Any],
+) -> None:
+    session_path = session_metadata_path(runtime_root, username=username, session_id=session_id)
+    session = read_json_file(session_path)
+    if not isinstance(session, dict):
+        return
+
+    ts = str(entry.get("ts") or "").strip()
+    direction = str(entry.get("direction") or "").strip().lower()
+    service_id = str(entry.get("service_id") or entry.get("from") or "").strip()
+    event_type = str(entry.get("event_type") or "").strip()
+    activity_index = session.get("activity_index")
+    activity = {
+        "history_entry_count": 0,
+        "last_ts": "",
+        "last_user_ts": "",
+        "last_agent_ts": "",
+        "last_event_ts": "",
+        "service_ids": [],
+        "event_types": [],
+        **(dict(activity_index) if isinstance(activity_index, dict) else {}),
+    }
+    if ts:
+        if ts >= str(activity.get("last_ts") or ""):
+            activity["last_ts"] = ts
+            session["updated_at"] = ts
+        if direction == "out" and ts >= str(activity.get("last_user_ts") or ""):
+            activity["last_user_ts"] = ts
+        elif direction == "in" and ts >= str(activity.get("last_agent_ts") or ""):
+            activity["last_agent_ts"] = ts
+        elif direction == "event" and ts >= str(activity.get("last_event_ts") or ""):
+            activity["last_event_ts"] = ts
+    if service_id:
+        activity["service_ids"] = _merge_unique_sorted(activity.get("service_ids"), service_id)
+    if event_type:
+        activity["event_types"] = _merge_unique_sorted(activity.get("event_types"), event_type)
+    activity["history_entry_count"] = max(0, int(activity.get("history_entry_count", 0) or 0)) + 1
+    session["activity_index"] = activity
+
+    if direction == "event":
+        journal_summary = session.get("runtime_journal_summary")
+        summary = {
+            "entry_count": 0,
+            "first_ts": "",
+            "last_ts": "",
+            "service_ids": [],
+            "event_types": [],
+            **(dict(journal_summary) if isinstance(journal_summary, dict) else {}),
+        }
+        summary["entry_count"] = max(0, int(summary.get("entry_count", 0) or 0)) + 1
+        if ts and not str(summary.get("first_ts") or "").strip():
+            summary["first_ts"] = ts
+        if ts and ts >= str(summary.get("last_ts") or ""):
+            summary["last_ts"] = ts
+        if service_id:
+            summary["service_ids"] = _merge_unique_sorted(summary.get("service_ids"), service_id)
+        if event_type:
+            summary["event_types"] = _merge_unique_sorted(summary.get("event_types"), event_type)
+        session["runtime_journal_summary"] = summary
+
+    write_json_file(session_path, session)
 
 
 def _sanitize_history_value(value: Any) -> Any:
@@ -176,15 +255,15 @@ def append_history(
     sanitized_entry = sanitize_history_entry(stored_entry)
     with state_lock(runtime_root):
         timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
-        append_jsonl(
-            session_runtime_journal_path(runtime_root, username=normalized, session_id=session_id),
-            runtime_journal_entry(entry),
-        )
         history = [sanitize_history_entry(item) for item in read_jsonl(timeline_path)]
         # Skip exact replay of the most recent entry. This avoids local append +
         # HttpBridge event echo writing the same timeline record twice.
         if history and history[-1] == sanitized_entry:
             return history
+        append_jsonl(
+            session_runtime_journal_path(runtime_root, username=normalized, session_id=session_id),
+            runtime_journal_entry(entry),
+        )
         history.append(sanitized_entry)
         if len(history) > limit:
             # Protect user-visible reply/message entries from being evicted by event flooding.
@@ -197,6 +276,12 @@ def append_history(
             else:
                 history = history[-limit:]
         write_jsonl(timeline_path, history)
+        _update_session_activity_index(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+            entry=sanitized_entry,
+        )
     _notify_history_subscribers(username=normalized, session_id=session_id, entry=sanitized_entry)
     return history
 

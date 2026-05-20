@@ -6,7 +6,7 @@
 - Normal restart calls self-detach into a supervisor so restart can continue after the old Unit runtime is terminated.
 - Restart diagnostics logs live under `.temp/restart-debug/` (runtime state — not tracked in source).
 - Run `python3 scripts/diagnostics/probe_restart.py` from the repo root to capture a restart report.
-- The report records launcher/router/adapter PID transitions, `https://127.0.0.1:4123/health`, restart script stdout/stderr, and the tail of `.temp/restart-debug/launcher.log`.
+- The report records launcher/router/adapter PID transitions, the active HttpBridge health URL resolved from runtime state (default `https://127.0.0.1:4123/health`), restart script stdout/stderr, and the tail of `.temp/restart-debug/launcher.log`.
 - Reports are written to `.temp/restart-debug/logs/`.
 
 ## Scripts
@@ -44,7 +44,7 @@ The script will prompt for:
 
 Passwords are never passed as command-line arguments and do not appear in process listings. The script authenticates the admin first, then registers the new user using that session — so both the admin credential and new-user credential are verified before any account is created.
 
-**Prerequisites:** the Unit runtime must be running (`https://127.0.0.1:4123/health` should be reachable) and the admin account must have the `superuser` role.
+**Prerequisites:** the Unit runtime must be running (the active HttpBridge health URL should be reachable; the default is `https://127.0.0.1:4123/health`) and the admin account must have the `superuser` role.
 
 ## HTTPS / TLS Setup
 
@@ -122,9 +122,15 @@ Import `.aize-runtime/tls/server.crt` into your browser's trust store
 
 ### Scripts / health checks
 
-`restart_aize_unit.sh` uses `curl -k` to skip cert verification when polling
-`https://127.0.0.1:4123/health`.  `scripts/diagnostics/probe_restart.py` does the same
+`restart_aize_unit.sh` uses `curl -k` to skip cert verification when polling the
+active HttpBridge health URL (default `https://127.0.0.1:4123/health`). `scripts/diagnostics/probe_restart.py` does the same
 via a custom `ssl.SSLContext` with `CERT_NONE`.
+
+## HTTPBridge Responsiveness
+- Treat HttpBridge list views and session-detail views as latency-sensitive surfaces.
+- Shape persistent state so top-level views can answer from session metadata or other immediately adjacent state first, then descend into timeline or runtime-log files only when the user opens a detail view.
+- When adding filtering for "last N hours" or "last N days", prefer queryable timestamps and shallow indexes over pre-rendered summary blobs or full-file scans on every request.
+- Refactors that affect HttpBridge must preserve quick initial render for SessionMap, WorkspaceView, and SessionLog before adding richer UI detail.
 
 ## Temporary Workspace
 - Store temporary code, ad hoc scripts, scratch files, and throwaway test code under `./.temp/`.
@@ -132,6 +138,12 @@ via a custom `ssl.SSLContext` with `CERT_NONE`.
 
 ## Documentation Notes
 - When implementation notes or design records are needed, write them under `./doc/` using the filename format `yyyy-mm-dd-topic.md`.
+- After code changes, add or update a concise implementation log under `./doc/` describing the user-visible behavior changed, files touched, verification run, and any remaining risk.
+
+## Skill Positioning
+- Session skills describe durable session conventions: routing expectations, workflow boundaries, verification requirements, and recurring operating norms for a SessionUnit.
+- AdaptiveSkill content should hold reusable task code or short procedural helpers that may be invoked as needed for repeated work inside a session. Keep one-off implementation decisions in the session/doc log instead of baking them into broad session behavior.
+- Do not use skills to silently reduce functionality. If a skill-guided refactor changes behavior, preserve visible capabilities unless the task explicitly asks to remove them, and record the behavioral change in `./doc/`.
 
 ## Environment-Independent Writing Policy
 - **Never hard-code environment-specific data** in source files, scripts, or docs. This includes:

@@ -401,6 +401,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
                 {
                     "skill_id": "canonical-development-routing",
                     "routing_mode": "create_child_session",
+                        "route_when_unhandled": True,
                     "routing_tags": ["development", "implement", "fix"],
                     "canonical_session_key": "aize.development",
                     "target_template_id": "aize-development.bug-hunting",
@@ -559,7 +560,10 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             session_id=session_id,
         )
         self.assertEqual([item["kind"] for item in interactive_pending], ["user_dialogue"])
-        self.assertEqual(worker_pending, [])
+        self.assertEqual([item["kind"] for item in worker_pending], ["interactive_worker_request"])
+        self.assertEqual(worker_pending[0]["delegated_session_id"], child["session_id"])
+        self.assertIn("delegated_session", worker_pending[0]["text"])
+        self.assertIn(str(child["session_id"]), worker_pending[0]["text"])
 
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
         self.assertEqual(
@@ -599,6 +603,137 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         assert reopened is not None
         self.assertFalse(bool(reopened.get("goal_completed", False)))
         self.assertEqual(reopened["goal_progress_state"], "in_progress")
+
+    def test_message_prompt_runs_entrance_handler_before_unhandled_development_route(self) -> None:
+        talk = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+        )
+        session_id = str(talk["session_id"])
+        update_session_skills(
+            self.runtime_root,
+            username="root",
+            session_id=session_id,
+            session_skills=[
+                {
+                    "skill_id": "entrance-lightweight-response",
+                    "kind": "interactive",
+                    "routing_mode": "handle_user_message",
+                    "handler_file": "entrance.py",
+                    "files": [
+                        {
+                            "path": "entrance.py",
+                            "content": (
+                                "def handle(context):\n"
+                                "    if context['prompt_text'].strip().lower() == 'status':\n"
+                                "        return {'handled': True, 'assistant_text': 'status handled'}\n"
+                                "    return {'handled': False}\n"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "skill_id": "canonical-development-routing",
+                    "kind": "routing",
+                    "routing_mode": "create_child_session",
+                    "route_when_unhandled": True,
+                    "canonical_session_key": "aize.development",
+                    "target_template_id": "aize-development.bug-hunting",
+                    "target_label": "AIze Development",
+                    "target_goal_text": "Coordinate routed development work.",
+                },
+            ],
+        )
+
+        router_calls: list[dict[str, object]] = []
+        Handler = make_handler(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test"},
+            self_service={"service_id": "service-http-001"},
+            process_id="proc-http-001",
+            log_path=self.runtime_root / "logs" / "http.jsonl",
+            default_target="service-codex-001",
+            default_provider="codex",
+            history_limit=100,
+            tls_enabled=True,
+            codex_service_pool=["service-codex-001", "service-codex-002"],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+            llm_service_kinds={"service-codex-001": "codex", "service-codex-002": "codex"},
+            pending=[],
+            awaiting_replies={},
+            subscribers={},
+            subscribers_lock=threading.Lock(),
+            stopped=threading.Event(),
+            _active_goal_audits={},
+            _active_goal_audits_lock=threading.Lock(),
+            _active_agent_turns={},
+            _active_agent_turns_lock=threading.Lock(),
+            release_stale_session_bindings=lambda: None,
+            subscriber_key=lambda *args, **kwargs: "",
+            append_history=lambda username, sid, entry: append_history(
+                self.runtime_root,
+                username=username,
+                session_id=sid,
+                entry=entry,
+                limit=100,
+            ),
+            send_router_control=lambda message: router_calls.append(message) or True,
+            enqueue_service_control=lambda *args, **kwargs: None,
+            service_snapshots=lambda: {},
+            session_runtime_payload=lambda *args, **kwargs: {},
+            peer_descriptor=lambda *args, **kwargs: {},
+            resolve_session_service_for_dispatch=lambda *args, **kwargs: "",
+            codex_service_candidates_for_session=lambda *args, **kwargs: [],
+            current_llm_service_topology=lambda: (
+                ["service-codex-001", "service-codex-002"],
+                [],
+                [],
+                {"service-codex-001": "codex", "service-codex-002": "codex"},
+            ),
+            resolve_bound_codex_session=lambda *args, **kwargs: "",
+            enqueue_goal_dispatch=lambda **kwargs: ("", ""),
+            session_auto_compact_threshold=lambda *args, **kwargs: 20,
+            context_status_from_entry=lambda *args, **kwargs: {},
+            latest_context_status=lambda *args, **kwargs: {},
+            stored_context_status=lambda *args, **kwargs: {},
+            refresh_context_status=lambda *args, **kwargs: {},
+            ensure_context_status=lambda *args, **kwargs: {},
+            manual_compact_current_session=lambda *args, **kwargs: None,
+            render_entry_html=lambda *args, **kwargs: "",
+            cookie_value=lambda *args, **kwargs: "",
+            request_parts=lambda *args, **kwargs: ("", {}),
+            requested_session_id=lambda *args, **kwargs: "",
+            request_positive_int=lambda *args, **kwargs: 0,
+            current_context=lambda *args, **kwargs: {},
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, dict]] = []
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with (
+            patch("runtime.http_handler.issue_auth_context", return_value={"username": "root"}),
+            patch("runtime.http_handler.threading.Thread", _ImmediateThread),
+        ):
+            handler._do_POST_message(
+                {"mode": "prompt", "text": "status", "session_id": session_id},
+                "application/json",
+            )
+
+        self.assertEqual(responses[0][0], 202)
+        history = get_history(self.runtime_root, username="root", session_id=session_id)
+        self.assertTrue(any(entry.get("text") == "status handled" for entry in history))
+        created_sessions = [
+            item
+            for item in list_sessions(self.runtime_root, username="root")
+            if str(item.get("origin_session_id") or "") == session_id
+        ]
+        self.assertEqual(created_sessions, [])
+        self.assertEqual(router_calls, [])
 
     def test_get_overview_bypasses_ttl_cache_for_cache_busted_requests(self) -> None:
         Handler = self._make_handler(lambda **kwargs: ("", ""))
@@ -687,6 +822,122 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertIn(resident_id, session_ids)
         self.assertNotIn(old_id, session_ids)
         self.assertEqual(payload["session_window_seconds"], 86400)
+
+    def test_get_session_runtime_log_returns_summary_and_optional_entries(self) -> None:
+        append_history(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            entry={
+                "direction": "event",
+                "ts": "2026-05-20T13:36:00Z",
+                "event_type": "runtime.status_changed",
+                "text": "Runtime executing",
+                "service_id": "service-codex-verify",
+                "event": {"type": "runtime.status_changed", "runtime_execution_state": "running"},
+            },
+            limit=20,
+        )
+
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {"username": "root", "session_id": self.session_id}
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler._do_GET_session_runtime_log("/session/runtime-log", {"entries": ["0"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        self.assertEqual(responses[-1][1]["entries"], [])
+        self.assertEqual(
+            responses[-1][1]["summary"],
+            {
+                "entry_count": 1,
+                "first_ts": "2026-05-20T13:36:00Z",
+                "last_ts": "2026-05-20T13:36:00Z",
+                "service_ids": ["service-codex-verify"],
+                "event_types": ["runtime.status_changed"],
+            },
+        )
+
+        handler._do_GET_session_runtime_log("/session/runtime-log", {"limit": ["5"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        self.assertEqual(len(responses[-1][1]["entries"]), 1)
+        self.assertEqual(responses[-1][1]["entries"][0]["event_type"], "runtime.status_changed")
+        self.assertEqual(responses[-1][1]["entries"][0]["entry"]["text"], "Runtime executing")
+
+    def test_get_session_runtime_log_filters_by_recent_window(self) -> None:
+        append_history(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            entry={
+                "direction": "event",
+                "ts": "2026-05-01T00:00:00Z",
+                "event_type": "runtime.status_changed",
+                "text": "Old runtime event",
+                "service_id": "service-codex-old",
+                "event": {"type": "runtime.status_changed"},
+            },
+            limit=20,
+        )
+        append_history(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            entry={
+                "direction": "event",
+                "ts": "2099-05-20T13:36:00Z",
+                "event_type": "runtime.status_changed",
+                "text": "Recent runtime event",
+                "service_id": "service-codex-new",
+                "event": {"type": "runtime.status_changed"},
+            },
+            limit=20,
+        )
+
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {"username": "root", "session_id": self.session_id}
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler._do_GET_session_runtime_log("/session/runtime-log", {"session_window_seconds": ["86400"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        self.assertEqual(responses[-1][1]["summary"]["entry_count"], 1)
+        self.assertEqual(responses[-1][1]["entries"][0]["entry"]["text"], "Recent runtime event")
+
+    def test_get_messages_filters_by_recent_window(self) -> None:
+        append_history(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            entry={"direction": "out", "ts": "2026-05-01T00:00:00Z", "text": "old user prompt"},
+            limit=20,
+        )
+        append_history(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            entry={"direction": "out", "ts": "2099-05-20T13:36:00Z", "text": "recent user prompt"},
+            limit=20,
+        )
+
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {"username": "root", "session_id": self.session_id}
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler._do_GET_messages("/messages", {"session_window_seconds": ["86400"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        self.assertEqual(
+            [entry["text"] for entry in responses[-1][1]["messages"]],
+            ["recent user prompt"],
+        )
 
     def test_get_overview_cache_key_includes_session_window_seconds(self) -> None:
         old = create_conversation_session(self.runtime_root, username="root", label="Old Session")

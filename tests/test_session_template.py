@@ -31,6 +31,8 @@ from runtime.persistent_state_pkg import (
     create_conversation_session,
     ensure_state,
     get_session_settings,
+    list_session_children,
+    list_session_parents,
     load_session_skills,
     session_skill_file_path,
     update_session_goal_flags,
@@ -281,12 +283,19 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(unit["launcher"]["session_group"], "root")
             self.assertEqual(unit["launcher"]["selected_agents"], ["codex_pool"])
             self.assertIn("canonical non-UI AIzeDevelopment parent session", unit["launcher"]["goal_text"])
+            self.assertIn("child of the Root session", unit["launcher"]["goal_text"])
+            self.assertIn("constitutional objective", unit["launcher"]["goal_text"])
             self.assertIn("separate port or isolated runtime", unit["launcher"]["goal_text"])
             self.assertIn("stop-and-migrate", unit["launcher"]["goal_text"])
+            self.assertIn("not parallel to Root", unit["launcher"]["initial_prompt"])
+            self.assertIn("project-developer instruction", unit["launcher"]["initial_prompt"])
             self.assertIn("Treat Entrance as IO/management only", unit["launcher"]["initial_prompt"])
             self.assertEqual(unit["launcher"]["skills"][0]["canonical_session_key"], "aize.development")
             self.assertIn("persistent AIzeDevelopment parent workflow", unit["launcher"]["skills"][0]["description"])
+            self.assertIn("Root-goal lineage", unit["launcher"]["skills"][0]["description"])
             self.assertIn("parent coordinator", unit["launcher"]["skills"][0]["when_to_use"])
+            self.assertIn("subordinate subgoal", unit["launcher"]["skills"][0]["usage"])
+            self.assertIn("Root session's overall goal", unit["launcher"]["skills"][0]["prompt"])
             self.assertIn("separate port or isolated runtime", unit["launcher"]["skills"][0]["usage"])
             self.assertIn("delegated child task", unit["launcher"]["skills"][0]["prompt"])
             self.assertEqual(unit["launcher"]["skills"][0]["files"][0]["path"], "README.md")
@@ -316,7 +325,25 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 ).read_text(encoding="utf-8"),
             )
             self.assertIn(
+                "Root session's goal is the overall constitutional objective",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="README.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
                 "Stop the currently running AIze runtime",
+                session_skill_file_path(
+                    runtime_root,
+                    username="repyt",
+                    session_id=session_id,
+                    relative_path="development-cycle.md",
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "subordinate subgoal",
                 session_skill_file_path(
                     runtime_root,
                     username="repyt",
@@ -333,6 +360,79 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                     relative_path="migration-audit.md",
                 ).read_text(encoding="utf-8"),
             )
+
+    def test_resolve_bug_hunting_parent_repairs_existing_root_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            orphan_parent = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="AIze Development",
+            )
+            orphan_parent_session_id = str(orphan_parent["session_id"])
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template(
+                    "aize-development.bug-hunting",
+                    default_provider="codex",
+                )
+            update_registered_session_template_state(
+                runtime_root,
+                username="repyt",
+                template_id="aize-development.bug-hunting",
+                updates={
+                    "display_name": "AIze Bug Hunting",
+                    "plugin_id": "aize-development",
+                    "package_id": "aize-development",
+                    "last_session_id": orphan_parent_session_id,
+                    "last_parent_session_id": "",
+                },
+            )
+
+            resolved_parent_session_id = resolve_session_template_launch_parent_session_id(
+                runtime_root,
+                username="repyt",
+                template_state=get_registered_unit_state(
+                    runtime_root,
+                    username="repyt",
+                    unit_id="aize-development.bug-hunting",
+                ),
+                session_template=unit,
+            )
+
+            self.assertEqual(resolved_parent_session_id, "default")
+            repaired_parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=orphan_parent_session_id,
+            )
+            self.assertIsNotNone(repaired_parent)
+            assert repaired_parent is not None
+            self.assertEqual(repaired_parent["parent_session_id"], "default")
+            self.assertEqual(
+                list_session_parents(
+                    runtime_root,
+                    username="repyt",
+                    session_id=orphan_parent_session_id,
+                ),
+                ["default"],
+            )
+            self.assertIn(
+                orphan_parent_session_id,
+                list_session_children(
+                    runtime_root,
+                    username="repyt",
+                    session_id="default",
+                ),
+            )
+            refreshed_state = get_registered_unit_state(
+                runtime_root,
+                username="repyt",
+                unit_id="aize-development.bug-hunting",
+            )
+            self.assertIsNotNone(refreshed_state)
+            assert refreshed_state is not None
+            self.assertEqual(refreshed_state["last_parent_session_id"], "default")
 
     def test_minix_refactor_unit_is_scheduled_development_child(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -639,6 +739,8 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertIn("delegated sessions created or selected by session skills", unit["launcher"]["initial_prompt"])
             route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
             self.assertIn("development-cycle goal", route["description"])
+            self.assertFalse(route["route_when_unhandled"])
+            self.assertFalse(route["allow_tag_routing"])
             self.assertIn("separate port or isolated runtime", route["target_goal_text"])
             self.assertIn("final stop-and-migrate coordination", route["spawn_session_skills"][0]["prompt"])
             self.assertIn(

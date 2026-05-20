@@ -44,6 +44,30 @@ class HttpBindResolutionTests(unittest.TestCase):
         self.assertIn('if [[ "$HTTP_PORT" != "$DEFAULT_HTTP_PORT" ]]; then', script)
         self.assertIn('log "port $port owners terminated"', script)
 
+    def test_register_user_script_resolves_runtime_port_and_https(self) -> None:
+        script = (ROOT / "scripts" / "register_user.sh").read_text(encoding="utf-8")
+        self.assertIn('RUNTIME_ROOT="${AIZE_RUNTIME_ROOT:-$ROOT/.aize-runtime}"', script)
+        self.assertIn('runtime_root / "state" / "services.json"', script)
+        self.assertIn('BASE_URL="${SCHEME}://${HOST}:${PORT}"', script)
+        self.assertIn('if [[ "$SCHEME" == "https" ]]; then', script)
+        self.assertIn('curl -sf "${CURL_TLS_ARGS[@]}" -X POST "${BASE_URL}/login"', script)
+        self.assertIn('curl -sf "${CURL_TLS_ARGS[@]}" -X POST "${BASE_URL}/register"', script)
+
+    def test_agents_notes_describe_active_httpbridge_health_url(self) -> None:
+        notes = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "the active HttpBridge health URL resolved from runtime state (default `https://127.0.0.1:4123/health`)",
+            notes,
+        )
+        self.assertIn(
+            "the active HttpBridge health URL should be reachable; the default is `https://127.0.0.1:4123/health`",
+            notes,
+        )
+        self.assertIn(
+            "active HttpBridge health URL (default `https://127.0.0.1:4123/health`)",
+            notes,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
