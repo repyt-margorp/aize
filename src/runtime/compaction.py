@@ -12,6 +12,7 @@ from runtime.message_builder import (
     make_aize_pending_input,
     make_dispatch_pending_message,
 )
+from runtime.dispatch_queue import dispatch_priority
 from runtime.panic_recovery import (
     ensure_panic_recovery_session,
     panic_recovery_bootstrap_xml,
@@ -527,35 +528,11 @@ def maybe_resume_after_restart(
             username=scope_username,
             session_id=scope_session_id,
         )
-        if (
-            should_standard_goal_route
-            and not has_actionable_pending
-            and not unfinished_turn
-            and isinstance(latest_review, dict)
-            and str(latest_review.get("progress_state") or "").strip().lower() == "in_progress"
-            and str(latest_review.get("audit_state") or "").strip().lower() == "all_clear"
-        ):
-            continue_feedback_enqueued = False
-            continue_xml = str(latest_review.get("continue_xml") or "").strip()
-            if continue_xml:
-                append_pending_input(
-                    runtime_root,
-                    username=scope_username,
-                    session_id=scope_session_id,
-                    entry=make_aize_pending_input(
-                        kind="goal_feedback",
-                        role="system",
-                        text=continue_xml,
-                    ),
-                )
-                continue_feedback_enqueued = True
-                pending_inputs = load_pending_inputs(
-                    runtime_root,
-                    username=scope_username,
-                    session_id=scope_session_id,
-                )
-        else:
-            continue_feedback_enqueued = False
+        # Restart dispatch enters through GoalManager. The latest review may
+        # include worker continuation XML, but after a process restart the GM
+        # should decide whether to close the goal, resume a worker, or spawn
+        # follow-up child sessions.
+        continue_feedback_enqueued = False
         stale_goal_manager_reset, _goal_manager_runtime_state = reconcile_stale_goal_manager_runtime(
             scope_username,
             scope_session_id,
@@ -588,6 +565,18 @@ def maybe_resume_after_restart(
             goal_manager_review_reasons.append("goal_manager_pending")
         if (
             should_standard_goal_route
+            and not goal_manager_review_reasons
+            and not history_has_terminal_goal_manager_cycle(history)
+            and (
+                unfinished_turn
+                or has_actionable_pending
+                or isinstance(due_auto_resume, dict)
+                or continue_feedback_enqueued
+            )
+        ):
+            goal_manager_review_reasons.append("system_restart_active_in_progress")
+        if (
+            should_standard_goal_route
             and not unfinished_turn
             and not has_actionable_pending
             and not isinstance(due_auto_resume, dict)
@@ -599,9 +588,6 @@ def maybe_resume_after_restart(
         restart_goal_manager_review_only = bool(
             should_standard_goal_route
             and not goal_completed
-            and not unfinished_turn
-            and not has_actionable_pending
-            and not isinstance(due_auto_resume, dict)
             and recovery_mode != "reconstruct_without_session"
             and goal_manager_review_reasons
         )
@@ -695,6 +681,7 @@ def maybe_resume_after_restart(
                             session_id=recovery_session_id,
                             service_id=service_id,
                         ),
+                        dispatch_priority=dispatch_priority("panic_recovery"),
                     )
                     router_conn.write(encode_line(dispatch_message))
                     write_jsonl(
@@ -925,6 +912,9 @@ def maybe_resume_after_restart(
                 {"session_slot": "goal_manager"}
                 if restart_goal_manager_review_only
                 else ({"session_slot": session_slot} if session_slot else None)
+            ),
+            dispatch_priority=dispatch_priority(
+                "goal_manager_review" if restart_goal_manager_review_only else "restart_resume"
             ),
         )
         router_conn.write(encode_line(dispatch_message))

@@ -620,7 +620,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
         self.assertEqual(
             dispatch_reasons,
-            ["http_user_dialogue", "interactive_worker_request", "goal_manager_review"],
+            ["goal_manager_review", "http_user_dialogue", "interactive_worker_request"],
         )
 
         history = get_history(self.runtime_root, username="root", session_id=session_id)
@@ -910,7 +910,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertFalse(any(str(entry.get("to") or "").startswith("forward:") for entry in history))
 
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
-        self.assertEqual(dispatch_reasons, ["http_user_dialogue", "interactive_worker_request", "goal_manager_review"])
+        self.assertEqual(dispatch_reasons, ["goal_manager_review", "http_user_dialogue", "interactive_worker_request"])
 
     def test_get_overview_bypasses_ttl_cache_for_cache_busted_requests(self) -> None:
         Handler = self._make_handler(lambda **kwargs: ("", ""))
@@ -1119,6 +1119,37 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertEqual(launched["goal_text"], "Route follow-up through Entrance")
         self.assertTrue(launched["goal_active"])
         self.assertFalse(launched["goal_completed"])
+
+    def test_units_launch_dispatches_active_in_progress_session_on_registration(self) -> None:
+        dispatch_calls: list[dict[str, str]] = []
+
+        def enqueue_goal_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return "service-codex-001", None
+
+        Handler = self._make_handler(enqueue_goal_dispatch)
+        handler = object.__new__(Handler)
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": self.session_id}
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            handler._do_POST_units_launch(
+                {
+                    "unit_id": "aize-development.bug-hunting",
+                    "parent_session_id": self.session_id,
+                    "goal_text": "Implement the queued launch work.",
+                }
+            )
+
+        self.assertEqual(responses[-1][0], 201)
+        self.assertEqual(responses[-1][1]["dispatched_to"], "service-codex-001")
+        self.assertEqual(len(dispatch_calls), 1)
+        self.assertEqual(dispatch_calls[0]["reason"], "session_created")
+        launched_session = responses[-1][1]["session"]
+        self.assertTrue(launched_session["goal_active"])
+        self.assertFalse(launched_session["goal_completed"])
+        self.assertEqual(launched_session["goal_progress_state"], "in_progress")
 
     def test_get_session_runtime_log_returns_summary_and_optional_entries(self) -> None:
         append_history(

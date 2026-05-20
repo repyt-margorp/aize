@@ -138,6 +138,7 @@ from runtime.event_log import (
     make_history_event_entry,
     emit_turn_completed_event,
 )
+from runtime.dispatch_queue import dispatch_priority, order_dispatch_messages
 from runtime.session_view import (
     active_agent_turn_state,
     worker_slot_badge,
@@ -145,6 +146,7 @@ from runtime.session_view import (
     persisted_goal_manager_runtime_state,
     build_session_runtime_summary,
     build_worker_count_summary,
+    session_assignment_contacts,
     pending_progress_inquiry_exists,
     build_progress_inquiry_xml,
     maybe_enqueue_mid_turn_progress_inquiry,
@@ -629,6 +631,11 @@ def run_http_service(
                 bound_service_id=bound_service_id,
             )
             summary["goal_manager_state"] = str(persisted_goal_manager.get("state") or summary.get("goal_manager_state") or "idle")
+            summary["goal_manager_pending_work_items"] = (
+                list(persisted_goal_manager.get("pending_work_items", []))
+                if isinstance(persisted_goal_manager.get("pending_work_items"), list)
+                else []
+            )
             summary["goal_manager_worker"] = worker_slot_badge(
                 str(persisted_goal_manager.get("service_id") or bound_service_id),
                 codex_service_pool=current_codex_service_pool,
@@ -663,6 +670,17 @@ def run_http_service(
             summary["agent_counts"] = agent_counts
             summary["goal_manager_reviewer_count"] = agent_counts["goal_manager_reviewers"]
             summary["assigned_agent_count"] = agent_counts["assigned_agents"]
+            summary["agent_contacts"] = session_assignment_contacts(session)
+            summary.update(
+                build_runtime_status(
+                    agent_running=bool(summary.get("agent_running", False)),
+                    goal_manager_state=str(summary.get("goal_manager_state") or "idle"),
+                    worker=summary.get("worker") if isinstance(summary.get("worker"), dict) else None,
+                    goal_manager_worker=summary.get("goal_manager_worker")
+                    if isinstance(summary.get("goal_manager_worker"), dict)
+                    else None,
+                )
+            )
             summaries.append(summary)
         return {
             "sessions": sessions,
@@ -947,6 +965,7 @@ def run_http_service(
             session_id=session_id,
             auth_context=auth_context,
             reason=reason,
+            dispatch_priority=dispatch_priority(reason),
         )
         if not send_router_control(goal_dispatch_message):
             return None, "router_dispatch_failed"
@@ -1556,6 +1575,7 @@ def run_http_service(
                 except queue.Empty:
                     break
             if drained:
+                drained = order_dispatch_messages(drained)
                 grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
                 ordered_keys: list[tuple[str, str, str]] = []
                 for outbound in drained:

@@ -47,6 +47,10 @@ from runtime.message_builder import (
     make_dispatch_pending_message,
     make_aize_pending_input,
 )
+from runtime.http_dispatch import (
+    communication_dispatch_plan as _communication_dispatch_plan,
+    send_http_dispatch_plan,
+)
 from runtime.persistent_state_pkg import (
     append_pending_input,
     append_goal_manager_pending_input,
@@ -112,6 +116,7 @@ from runtime.session_view import (
     latest_goal_manager_runtime_state,
     persisted_goal_manager_runtime_state,
     maybe_enqueue_mid_turn_progress_inquiry,
+    session_assignment_contacts,
     session_registration_metadata,
     worker_slot_badge,
 )
@@ -1026,63 +1031,6 @@ def _append_communication_immediate_ack(
             },
         },
     )
-
-
-def _communication_dispatch_plan(
-    *,
-    session_id: str,
-    interactive_service_id: str | None,
-    worker_service_id: str | None,
-    goal_manager_service_id: str | None,
-    forwarded_session_id: str | None,
-    forwarded_service_id: str | None,
-    forwarded_dispatch_reason: str | None,
-) -> list[dict[str, str]]:
-    plan: list[dict[str, str]] = []
-    normalized_session_id = str(session_id or "").strip()
-    normalized_interactive_service_id = str(interactive_service_id or "").strip()
-    normalized_worker_service_id = str(worker_service_id or "").strip()
-    normalized_goal_manager_service_id = str(goal_manager_service_id or "").strip()
-    normalized_forwarded_session_id = str(forwarded_session_id or "").strip()
-    normalized_forwarded_service_id = str(forwarded_service_id or "").strip()
-    normalized_forwarded_reason = str(forwarded_dispatch_reason or "http_prompt").strip() or "http_prompt"
-    if normalized_interactive_service_id and normalized_session_id:
-        plan.append(
-            {
-                "channel": "interactive",
-                "service_id": normalized_interactive_service_id,
-                "session_id": normalized_session_id,
-                "reason": "http_user_dialogue",
-            }
-        )
-    if normalized_worker_service_id and normalized_session_id:
-        plan.append(
-            {
-                "channel": "worker",
-                "service_id": normalized_worker_service_id,
-                "session_id": normalized_session_id,
-                "reason": "interactive_worker_request",
-            }
-        )
-    if normalized_goal_manager_service_id and normalized_session_id:
-        plan.append(
-            {
-                "channel": "goal_manager",
-                "service_id": normalized_goal_manager_service_id,
-                "session_id": normalized_session_id,
-                "reason": "goal_manager_review",
-            }
-        )
-    if normalized_forwarded_session_id and normalized_forwarded_service_id:
-        plan.append(
-            {
-                "channel": "forwarded",
-                "service_id": normalized_forwarded_service_id,
-                "session_id": normalized_forwarded_session_id,
-                "reason": normalized_forwarded_reason,
-            }
-        )
-    return plan
 
 
 def _slot_agent_id(service_id: str, session_id: str, slot: str) -> str:
@@ -2698,7 +2646,19 @@ def make_handler(
             _agent_turn = _active_turns_snap.get(_ov_key)
             _goal_audit = _active_audits_snap.get(_ov_key)
             _active_svc = str((_agent_turn or {}).get("service_id") or "").strip()
-            _gm_svc = str((_goal_audit or {}).get("service_id") or _bound_svc).strip()
+            _persisted_goal_manager = persisted_goal_manager_runtime_state(
+                runtime_root,
+                username=_t_user,
+                session_id=_t_id,
+                bound_service_id=_bound_svc,
+            )
+            _goal_manager_state = "running" if _goal_audit else str(_persisted_goal_manager.get("state") or "idle")
+            _goal_manager_pending_work_items = (
+                list(_persisted_goal_manager.get("pending_work_items", []))
+                if isinstance(_persisted_goal_manager.get("pending_work_items"), list)
+                else []
+            )
+            _gm_svc = str((_goal_audit or {}).get("service_id") or _persisted_goal_manager.get("service_id") or _bound_svc).strip()
             _worker = worker_slot_badge(
                 _active_svc or _bound_svc,
                 codex_service_pool=current_codex_service_pool,
@@ -2710,12 +2670,12 @@ def make_handler(
                 codex_service_pool=current_codex_service_pool,
                 claude_service_pool=current_claude_service_pool,
                 gemini_service_pool=current_gemini_service_pool,
-            ) if _goal_audit else None
+            ) if _goal_manager_state in {"running", "queued"} and _gm_svc else None
             _agent_counts = session_agent_assignment_counts(
                 _talk,
                 worker=_worker,
                 goal_manager_worker=_gm_worker,
-                goal_manager_state="running" if _goal_audit else "idle",
+                goal_manager_state=_goal_manager_state,
             )
             _preferred_provider = str(_talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
             _goal_completed = bool(_talk.get("goal_completed", False))
@@ -2775,8 +2735,10 @@ def make_handler(
                 "bound_service_id": _bound_svc,
                 "worker": _worker,
                 "agent_running": _agent_turn is not None,
-                "goal_manager_state": "running" if _goal_audit else "idle",
+                "goal_manager_state": _goal_manager_state,
                 "goal_manager_worker": _gm_worker,
+                "goal_manager_pending_work_items": _goal_manager_pending_work_items,
+                "agent_contacts": session_assignment_contacts(_talk),
                 "agent_counts": _agent_counts,
                 "goal_manager_reviewer_count": _agent_counts["goal_manager_reviewers"],
                 "assigned_agent_count": _agent_counts["assigned_agents"],
@@ -2904,6 +2866,7 @@ def make_handler(
             return {
                 "goal_manager_state": "running",
                 "goal_manager_service_id": service_id,
+                "goal_manager_pending_work_items": [],
                 "goal_manager_worker": worker_slot_badge(
                     service_id,
                     codex_service_pool=codex_service_pool,
@@ -2924,6 +2887,9 @@ def make_handler(
         return {
             "goal_manager_state": str(runtime_state.get("state") or "idle"),
             "goal_manager_service_id": service_id,
+            "goal_manager_pending_work_items": list(runtime_state.get("pending_work_items", []))
+            if isinstance(runtime_state.get("pending_work_items"), list)
+            else [],
             "goal_manager_worker": worker_slot_badge(
                 service_id,
                 codex_service_pool=codex_service_pool,
@@ -3000,7 +2966,7 @@ def make_handler(
             )
             runtime_execution_state = (
                 "running"
-                if goal_manager_state == "running"
+                if goal_manager_state in {"running", "queued"}
                 else ("failed" if goal_manager_state == "failed" or goal_audit_state == "panic" else "idle")
             )
             summaries.append(
@@ -3023,6 +2989,10 @@ def make_handler(
                     "agent_running": False,
                     "goal_manager_state": goal_manager_state,
                     "goal_manager_worker": goal_manager_runtime.get("goal_manager_worker"),
+                    "goal_manager_pending_work_items": goal_manager_runtime.get("goal_manager_pending_work_items")
+                    if isinstance(goal_manager_runtime.get("goal_manager_pending_work_items"), list)
+                    else [],
+                    "agent_contacts": session_assignment_contacts(talk),
                     "agent_counts": agent_counts,
                     "goal_manager_reviewer_count": agent_counts["goal_manager_reviewers"],
                     "assigned_agent_count": agent_counts["assigned_agents"],
@@ -3131,7 +3101,7 @@ def make_handler(
             if not runtime_execution_state:
                 runtime_execution_state = (
                     "running"
-                    if bool(summary.get("runtime_in_progress")) or bool(summary.get("agent_running")) or goal_manager_state == "running"
+                    if bool(summary.get("runtime_in_progress")) or bool(summary.get("agent_running")) or goal_manager_state in {"running", "queued"}
                     else "idle"
                 )
             runtime_label = (
@@ -3173,7 +3143,7 @@ def make_handler(
             classes = ["goal-session-card"]
             if sid == active_session_id:
                 classes.append("is-active-workspace")
-            if goal_manager_state == "running":
+            if goal_manager_state in {"running", "queued"}:
                 classes.append("is-goal-running")
             if audit_state == "panic":
                 classes.append("is-goal-panic")
@@ -4388,6 +4358,26 @@ def make_handler(
                 return
             session = launched.get("session") if isinstance(launched, dict) else {}
             session_id = str((session or {}).get("session_id") or "").strip()
+            dispatched_to = None
+            dispatch_error = None
+            if session_id:
+                progress_state = str(
+                    (session or {}).get(
+                        "goal_progress_state",
+                        "complete" if bool((session or {}).get("goal_completed", False)) else "in_progress",
+                    )
+                ).strip().lower()
+                if (
+                    bool((session or {}).get("goal_active", False))
+                    and not bool((session or {}).get("goal_completed", False))
+                    and progress_state == "in_progress"
+                ):
+                    dispatched_to, dispatch_error = enqueue_goal_dispatch(
+                        username=context["username"],
+                        session_id=session_id,
+                        auth_context=issue_auth_context(runtime_root, username=context["username"]),
+                        reason="session_created",
+                    )
             with _ov_cache_lock:
                 _ov_cache_state[0] = None
             self._json(
@@ -4400,6 +4390,8 @@ def make_handler(
                     "session_id": session_id,
                     "active_session_id": session_id,
                     "launch_plan": launched.get("launch_plan"),
+                    "dispatched_to": dispatched_to,
+                    "dispatch_error": dispatch_error,
                 },
             )
             return
@@ -5940,41 +5932,27 @@ def make_handler(
                                 "reason": dispatch_reason,
                             }
                         )
-                    for dispatch_step in dispatch_plan:
-                        channel = str(dispatch_step.get("channel") or "")
-                        target_service_id = str(dispatch_step.get("service_id") or "")
-                        target_session_id = str(dispatch_step.get("session_id") or "")
-                        reason = str(dispatch_step.get("reason") or "")
-                        session_agent_id = None
-                        agent_profile = None
-                        if channel in {"interactive", "agent"}:
-                            agent_profile = selected_agent_profile
-                        elif channel == "worker":
-                            session_agent_id = _slot_agent_id(target_service_id, target_session_id, "worker_agent")
-                            worker_dispatch_queued = True
-                        elif channel == "goal_manager":
-                            session_agent_id = resolve_session_agent_id(
-                                runtime_root,
-                                username=username,
-                                session_id=target_session_id,
-                                service_id=target_service_id,
-                            )
-                        if not send_router_control(
-                            make_dispatch_pending_message(
-                                manifest=manifest,
-                                from_service_id=self_service["service_id"],
-                                to_service_id=target_service_id,
-                                process_id=process_id,
-                                run_id=(worker_request_id or manifest["run_id"]) if channel == "worker" else manifest["run_id"],
-                                username=username,
-                                session_id=target_session_id,
-                                auth_context=auth_context,
-                                reason=reason,
-                                session_agent_id=session_agent_id,
-                                agent_profile=agent_profile,
-                            )
-                        ):
-                            dispatch_error = dispatch_error or f"router_control_injection_failed:{channel}"
+                    queued_worker_dispatch, dispatch_plan_error = send_http_dispatch_plan(
+                        dispatch_plan=dispatch_plan,
+                        manifest=manifest,
+                        from_service_id=self_service["service_id"],
+                        process_id=process_id,
+                        run_id=manifest["run_id"],
+                        worker_request_id=worker_request_id,
+                        username=username,
+                        auth_context=auth_context,
+                        selected_agent_profile=selected_agent_profile,
+                        slot_agent_id=_slot_agent_id,
+                        resolve_goal_manager_agent_id=lambda target_service_id, target_session_id: resolve_session_agent_id(
+                            runtime_root,
+                            username=username,
+                            session_id=target_session_id,
+                            service_id=target_service_id,
+                        ),
+                        send_router_control=send_router_control,
+                    )
+                    worker_dispatch_queued = worker_dispatch_queued or queued_worker_dispatch
+                    dispatch_error = dispatch_error or dispatch_plan_error
                     write_jsonl(
                         log_path,
                         {

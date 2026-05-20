@@ -32,6 +32,7 @@ from runtime.dispatch_policy import (
     normalize_provider_session_slot as _normalize_provider_session_slot,
     slot_agent_id as _slot_agent_id,
 )
+from runtime.dispatch_queue import dispatch_priority
 from runtime.dispatch_state import (
     dispatch_target_agent_id as _dispatch_target_agent_id,
     post_turn_followup_pending_state as _post_turn_followup_pending_state,
@@ -92,6 +93,7 @@ from runtime.persistent_state_pkg import (
     load_pending_inputs,
     load_service_pending_inputs,
     list_session_agent_contacts,
+    list_session_parents,
     list_session_children,
     release_session_service,
     resolve_session_agent_id,
@@ -1219,6 +1221,7 @@ def run_agent_service(
                 session_id=recovery_session_id,
                 service_id=dispatch_service_id,
             ),
+            dispatch_priority=dispatch_priority("panic_recovery"),
         )
         _ensure_dispatch_allowed_peer(
             runtime_root,
@@ -1226,6 +1229,23 @@ def run_agent_service(
             to_service_id=dispatch_service_id,
         )
         send_tx(dispatch_message)
+        queue_parent_child_state_change(
+            username=username,
+            child_session_id=session_id,
+            event_kind="child_session_panic",
+            summary=(
+                f"Child session '{session_label}' entered panic recovery. "
+                f"Recovery session created: {recovery_session_id}"
+            ),
+            source_service_id=service_id,
+            source_event={
+                "type": "child_session_panic",
+                "source_session_id": session_id,
+                "recovery_session_id": recovery_session_id,
+                "panic_service_id": panic_service_id,
+                "panic_event": dict(panic_event or {}),
+            },
+        )
         return recovery_session
 
     def _pool_for_kind_from_manifest(kind: str) -> list[str]:
@@ -1374,6 +1394,119 @@ def run_agent_service(
                 )
                 return leased_service_id
         return None
+
+    def queue_parent_child_state_change(
+        *,
+        username: str,
+        child_session_id: str,
+        event_kind: str,
+        summary: str,
+        source_service_id: str,
+        source_event: dict[str, Any] | None = None,
+    ) -> list[str]:
+        queued_parent_ids: list[str] = []
+        child_session_settings = get_session_settings(
+            runtime_root,
+            username=username,
+            session_id=child_session_id,
+        ) or {}
+        child_label = str(child_session_settings.get("label") or child_session_id).strip() or child_session_id
+        child_goal_text = str(child_session_settings.get("goal_text") or "").strip()
+        for parent_session_id in list_session_parents(
+            runtime_root,
+            username=username,
+            session_id=child_session_id,
+        ):
+            parent_session_settings = get_session_settings(
+                runtime_root,
+                username=username,
+                session_id=parent_session_id,
+            ) or {}
+            parent_progress_state = str(
+                parent_session_settings.get(
+                    "goal_progress_state",
+                    "complete" if bool(parent_session_settings.get("goal_completed", False)) else "in_progress",
+                )
+            ).strip().lower()
+            if (
+                not bool(parent_session_settings.get("goal_active", False))
+                or bool(parent_session_settings.get("goal_completed", False))
+                or parent_progress_state != "in_progress"
+            ):
+                continue
+            payload = {
+                "event_type": event_kind,
+                "parent_session_id": parent_session_id,
+                "child_session_id": child_session_id,
+                "child_label": child_label,
+                "child_goal_text": child_goal_text,
+                "summary": summary,
+            }
+            if isinstance(source_event, dict):
+                payload["event"] = dict(source_event)
+            append_pending_input(
+                runtime_root,
+                username=username,
+                session_id=parent_session_id,
+                entry=make_aize_pending_input(
+                    kind=event_kind,
+                    role="system",
+                    text=json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            append_user_history(
+                runtime_root,
+                username=username,
+                session_id=parent_session_id,
+                entry={
+                    "direction": "session_input",
+                    "kind": event_kind,
+                    "ts": utc_ts(),
+                    "service_id": source_service_id,
+                    "text": summary,
+                },
+                limit=GOAL_AUDIT_HISTORY_LIMIT,
+            )
+            dispatch_targets: list[str] = []
+            for contact in list_session_agent_contacts(runtime_root, username=username, session_id=parent_session_id):
+                contact_service_id = str(contact.get("service_id") or "").strip()
+                if contact_service_id and contact_service_id not in dispatch_targets:
+                    dispatch_targets.append(contact_service_id)
+            dispatch_service_id = resolve_session_dispatch_service(
+                username=username,
+                session_id=parent_session_id,
+                default_service_id=str(parent_session_settings.get("service_id") or "").strip() or None,
+            )
+            if dispatch_service_id and dispatch_service_id not in dispatch_targets:
+                dispatch_targets.append(dispatch_service_id)
+            for target_service_id in dispatch_targets:
+                _ensure_dispatch_allowed_peer(
+                    runtime_root,
+                    from_service_id=source_service_id,
+                    to_service_id=target_service_id,
+                )
+                send_tx(
+                    make_dispatch_pending_message(
+                        manifest=manifest,
+                        from_service_id=source_service_id,
+                        to_service_id=target_service_id,
+                        process_id=process_id,
+                        run_id=f"{event_kind}-{uuid.uuid4().hex[:8]}",
+                        username=username,
+                        session_id=parent_session_id,
+                        auth_context=None,
+                        reason=event_kind,
+                        session_agent_id=resolve_session_agent_id(
+                            runtime_root,
+                            username=username,
+                            session_id=parent_session_id,
+                            service_id=target_service_id,
+                        ),
+                        dispatch_priority=dispatch_priority(event_kind),
+                    )
+                )
+            queued_parent_ids.append(parent_session_id)
+        return queued_parent_ids
 
     def kickoff_goal_child_session_for_dispatch(
         *,
@@ -1789,6 +1922,7 @@ def run_agent_service(
                             session_id=report_session_id,
                             service_id=target_service_id,
                         ),
+                        dispatch_priority=dispatch_priority("child_session_completed"),
                     )
                 )
         return progress
@@ -3190,6 +3324,7 @@ def run_agent_service(
                                 "prompt_text": visible_text,
                                 "request_id": str(user_response_wait.get("request_id") or "").strip(),
                                 "source_service_id": service_id,
+                                "requested_by_role": provider_session_slot or "agent",
                                 "reason": "agent_not_authorized",
                             },
                         },

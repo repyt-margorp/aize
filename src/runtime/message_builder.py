@@ -333,6 +333,7 @@ def make_dispatch_pending_message(
     reply_to_service_id: str = "service-http-001",
     session_agent_id: str | None = None,
     agent_profile: dict[str, Any] | None = None,
+    dispatch_priority: int | None = None,
 ) -> dict[str, Any]:
     message = make_message(
         from_node_id=manifest["node_id"],
@@ -346,6 +347,8 @@ def make_dispatch_pending_message(
     message_set_meta(message, "process_id", process_id)
     message_set_meta(message, "conversation", {"username": username, "session_id": session_id})
     message_set_meta(message, "reply_to_service_id", reply_to_service_id)
+    if isinstance(dispatch_priority, int):
+        message_set_meta(message, "dispatch_priority", dispatch_priority)
     if isinstance(session_agent_id, str) and session_agent_id.strip():
         message_set_meta(message, "session_agent_id", session_agent_id.strip())
     if isinstance(agent_profile, dict):
@@ -418,5 +421,6 @@ def dispatch_pending_opens_visible_turn(message: dict[str, Any], incoming_text: 
         "scheduled_resume",
         "turn_completed",
         "child_session_created",
+        "child_session_panic",
         "child_session_completed",
     }

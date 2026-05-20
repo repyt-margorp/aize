@@ -264,7 +264,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("eventType==='runtime.status_changed'", page)
         self.assertIn("for(const key of ['runtime_execution_state','runtime_in_progress','agent_running','goal_manager_state','worker','goal_manager_worker'])", page)
         self.assertIn("const goalManagerState=String(s.goal_manager_state||'').trim().toLowerCase();", page)
-        self.assertIn("goalManagerState==='running'?'running':'idle'", page)
+        self.assertIn("goalManagerState==='running'||goalManagerState==='queued'?'running':'idle'", page)
         self.assertIn("statePollTimer=setInterval(()=>{refreshEntranceState();},10000)", page)
         self.assertIn("jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'})", page)
         self.assertIn("/overview?scope=all", page)
@@ -508,7 +508,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertNotIn("_interactive_prompt_needs_worker(prompt_text)", source)
         self.assertIn("_communication_dispatch_plan(", source)
         self.assertIn("append_goal_manager_pending_input(", source)
-        self.assertIn('"reason": "goal_manager_review"', source)
+        self.assertIn('kind="goal_manager_review"', source)
         self.assertNotIn("and not forwarded_session_id", source)
 
     def test_main_page_renders_latest_first_workspace_header_and_fixed_composer(self) -> None:
@@ -617,7 +617,10 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("patchWorkspaceSummaryFromEvent(entry);", page)
         self.assertIn("eventType.startsWith('service.user_response_wait_')", page)
         self.assertIn("eventType === 'service.user_response_wait_started'", page)
+        self.assertIn("eventType === 'service.user_response_wait_ignored'", page)
         self.assertIn("patch.user_response_wait_status = 'waiting';", page)
+        self.assertIn("patch.user_response_wait_status = 'recorded';", page)
+        self.assertIn("request.status = 'recorded';", page)
         self.assertIn("userResponseWaitStatus = String(payload?.user_response_wait_status || userResponseWaitStatus || 'idle');", page)
         self.assertIn("userResponseWaitPromptText = String(payload?.user_response_wait_prompt_text || userResponseWaitPromptText || '');", page)
         self.assertIn("const refreshUserRequests = async () => {", page)

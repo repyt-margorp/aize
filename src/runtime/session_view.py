@@ -152,6 +152,28 @@ def session_agent_assignment_counts(
     }
 
 
+def session_assignment_contacts(talk: dict[str, Any] | None) -> list[dict[str, str]]:
+    session = talk if isinstance(talk, dict) else {}
+    contacts: list[dict[str, str]] = []
+    welcomed_agents = session.get("welcomed_agents")
+    if not isinstance(welcomed_agents, list):
+        return contacts
+    for item in welcomed_agents:
+        if not isinstance(item, dict):
+            continue
+        service_id = str(item.get("service_id") or "").strip()
+        if not service_id:
+            continue
+        provider = str(item.get("provider") or "").strip().lower()
+        join_role = str(item.get("join_role") or "agent").strip().lower() or "agent"
+        contacts.append({
+            "service_id": service_id,
+            "provider": provider,
+            "join_role": join_role,
+        })
+    return contacts
+
+
 def session_registration_metadata(
     talk: dict[str, Any] | None,
     *,
@@ -238,6 +260,11 @@ def persisted_goal_manager_runtime_state(
     service_id = str(state.get("service_id") or bound_service_id or "").strip()
     runtime_state = str(state.get("state") or "idle").strip().lower()
     progress_state = str(state.get("progress_state") or "").strip().lower()
+    pending_work_items = (
+        list(state.get("pending_work_items", []))
+        if isinstance(state.get("pending_work_items"), list)
+        else []
+    )
     if service_id and progress_state in {"complete", "in_progress"}:
         service_state_path = session_service_state_path(
             runtime_root,
@@ -265,14 +292,14 @@ def persisted_goal_manager_runtime_state(
                 "audit_state": str(state.get("audit_state") or "").strip(),
                 "goal_satisfied": bool(state.get("goal_satisfied", False)),
                 "summary": str(state.get("summary") or "").strip(),
-                "pending_work_items": list(state.get("pending_work_items", []))
-                if isinstance(state.get("pending_work_items"), list)
-                else [],
+                "pending_work_items": pending_work_items,
                 "updated_at": str(state.get("updated_at") or utc_ts()),
             }
             write_json_file(service_state_path, service_state)
     if runtime_state == "running":
-        return {"state": "running", "service_id": service_id}
+        return {"state": "running", "service_id": service_id, "pending_work_items": pending_work_items}
+    if runtime_state == "queued" and pending_work_items:
+        return {"state": "queued", "service_id": service_id, "pending_work_items": pending_work_items}
     if runtime_state == "failed":
         return {"state": "failed", "service_id": service_id}
     if progress_state == "complete":
@@ -385,6 +412,7 @@ def build_session_runtime_summary(
         "goal_manager_state": str(goal_manager_state.get("state") or "idle"),
         "goal_manager_provider": goal_manager_provider,
         "goal_manager_worker": goal_manager_worker,
+        "agent_contacts": session_assignment_contacts(talk),
         "agent_counts": agent_counts,
         "goal_manager_reviewer_count": agent_counts["goal_manager_reviewers"],
         "assigned_agent_count": agent_counts["assigned_agents"],
@@ -455,6 +483,14 @@ def build_worker_count_summary(
         def resolve_provider(candidate: dict[str, Any] | None) -> str:
             worker = candidate if isinstance(candidate, dict) else {}
             provider = str(worker.get("provider") or "").strip().lower()
+            service_id = str(worker.get("service_id") or "").strip().lower()
+            if provider not in counts and service_id:
+                if "claude" in service_id:
+                    provider = "claude"
+                elif "codex" in service_id:
+                    provider = "codex"
+                elif "gemini" in service_id:
+                    provider = "gemini"
             if provider not in counts:
                 provider = str(talk.get("preferred_provider") or "").strip().lower()
             if provider not in counts:
@@ -492,8 +528,10 @@ def build_worker_count_summary(
             else:
                 assigned_slots[provider].add(service_id)
 
-        welcomed_agents = talk.get("welcomed_agents") if isinstance(talk.get("welcomed_agents"), list) else []
-        for item in welcomed_agents:
+        assignment_contacts = talk.get("agent_contacts") if isinstance(talk.get("agent_contacts"), list) else []
+        if not assignment_contacts:
+            assignment_contacts = talk.get("welcomed_agents") if isinstance(talk.get("welcomed_agents"), list) else []
+        for item in assignment_contacts:
             if isinstance(item, dict):
                 track_welcomed_assignment(item)
 
@@ -518,6 +556,29 @@ def build_worker_count_summary(
                 talk.get("goal_manager_worker") if isinstance(talk.get("goal_manager_worker"), dict) else None
             )
             if provider in counts:
+                counts[provider]["active_turns"] += 1
+                counts[provider]["reviewing_turns"] += 1
+        elif str(talk.get("goal_manager_state") or "").strip().lower() == "queued":
+            pending_work_items = (
+                talk.get("goal_manager_pending_work_items")
+                if isinstance(talk.get("goal_manager_pending_work_items"), list)
+                else []
+            )
+            pending_reviewers: set[tuple[str, str]] = set()
+            for item in pending_work_items:
+                if not isinstance(item, dict):
+                    continue
+                service_id = str(item.get("service_id") or goal_manager_service_id).strip().lower()
+                provider = resolve_provider({"service_id": service_id, "provider": item.get("provider", "")})
+                if provider in counts and service_id:
+                    pending_reviewers.add((provider, service_id))
+            if not pending_reviewers:
+                provider = resolve_provider(goal_manager_worker)
+                if provider in counts and goal_manager_service_id:
+                    pending_reviewers.add((provider, goal_manager_service_id))
+            for provider, service_id in pending_reviewers:
+                assigned_slots[provider].add(service_id)
+                goal_manager_reviewers[provider].add(service_id)
                 counts[provider]["active_turns"] += 1
                 counts[provider]["reviewing_turns"] += 1
     for provider, service_ids in assigned_slots.items():

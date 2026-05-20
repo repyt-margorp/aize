@@ -14,7 +14,7 @@ def normalize_runtime_execution_state(
     goal_manager_state: str = "idle",
 ) -> str:
     gm_state = str(goal_manager_state or "idle").strip().lower()
-    if bool(agent_running) or gm_state == "running":
+    if bool(agent_running) or gm_state in {"running", "queued"}:
         return "running"
     if gm_state == "failed":
         return "failed"
