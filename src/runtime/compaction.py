@@ -281,17 +281,11 @@ def maybe_resume_after_restart(
         for service in list_service_records(runtime_root)
         if isinstance(service, dict)
         and str(service.get("kind") or "").strip().lower() == service_kind
-        and isinstance(service.get("service_id"), str)
-    ]
-    manifest_service_ids = [
-        str(service.get("service_id"))
-        for service in manifest.get("services", [])
-        if isinstance(service, dict)
-        and str(service.get("kind") or "").strip().lower() == service_kind
+        and str(service.get("status") or "").strip().lower() == "running"
         and isinstance(service.get("service_id"), str)
     ]
     provider_scopes_for_kind: set[tuple[str, str]] = set()
-    for provider_service_id in sorted({*registry_service_ids, *manifest_service_ids, service_id}):
+    for provider_service_id in sorted({*registry_service_ids, service_id}):
         if service_kind == "claude":
             provider_entries = list_claude_sessions(runtime_root, service_id=provider_service_id)
         elif service_kind == "gemini":

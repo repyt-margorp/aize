@@ -6615,6 +6615,71 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertEqual(messages[0].get("meta", {}).get("dispatch_priority"), 100)
         self.assertEqual(messages[1].get("meta", {}).get("dispatch_priority"), 95)
 
+    def test_maybe_resume_after_restart_requeues_session_bound_to_missing_service(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-002",
+            provider_session_id="old-provider-session",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Resume this active goal after its old service disappeared.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [
+                    {"service_id": "service-codex-001", "kind": "codex"},
+                    {"service_id": "service-codex-002", "kind": "codex"},
+                ],
+            },
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        self.assertEqual(len(router.writes), 1)
+        raw_message = router.writes[0]
+        message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
+        self.assertEqual(message["payload"]["reason"], "goal_manager_review")
+        self.assertEqual(message["meta"]["conversation"]["session_id"], self.session_id)
+        self.assertEqual(message.get("meta", {}).get("agent_profile"), {"session_slot": "goal_manager"})
+
     def test_maybe_resume_after_restart_requeues_stale_goal_manager_runtime(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
         save_codex_session(
