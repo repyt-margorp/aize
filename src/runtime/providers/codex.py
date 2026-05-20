@@ -27,6 +27,11 @@ def _is_thread_not_found_error(text: str, *, session_id: str | None) -> bool:
     )
 
 
+def _is_internal_tool_process_error(text: str) -> bool:
+    lowered = text.lower()
+    return "write_stdin failed: unknown process id" in lowered
+
+
 def _sanitize_config_overrides(config_overrides: dict[str, Any] | None) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for key, value in (config_overrides or {}).items():
@@ -106,6 +111,7 @@ def run_codex(
         attempt_cmd = build_cmd(attempt_model, attempt_session_id)
         proc = subprocess.Popen(
             attempt_cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -141,6 +147,8 @@ def run_codex(
         if attempt_model is not None and _is_usage_limit_error(error_text):
             continue
         if attempt_session_id and _is_thread_not_found_error(error_text, session_id=attempt_session_id):
+            continue
+        if attempt_session_id and _is_internal_tool_process_error(error_text):
             continue
         if _is_minimal_reasoning_tools_error(error_text):
             continue
@@ -181,6 +189,7 @@ def _run_codex_helper(
     try:
         proc = subprocess.run(
             cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

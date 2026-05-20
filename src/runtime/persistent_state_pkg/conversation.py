@@ -1189,6 +1189,80 @@ def update_session_user_response_wait(
         return None
 
 
+def record_session_user_response_request(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    status: Any,
+    timeout_seconds: Any | None = None,
+    prompt_text: Any | None = None,
+    request_id: Any | None = None,
+    request_reason: Any | None = None,
+    source_service_id: Any | None = None,
+    requested_by_role: Any | None = None,
+) -> dict[str, Any] | None:
+    normalized = normalize_username(username)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if not isinstance(talk, dict) or str(talk.get("session_id")) != session_id:
+                continue
+            _ensure_session_defaults_unlocked(talk)
+            try:
+                requested_timeout_seconds = int(timeout_seconds or DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS)
+            except (TypeError, ValueError):
+                requested_timeout_seconds = DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS
+            effective_timeout_seconds = max(
+                60,
+                min(DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS, requested_timeout_seconds),
+            )
+            recorded_at = utc_ts()
+            normalized_request_id = str(request_id or "").strip() or f"user-response-{uuid.uuid4().hex[:12]}"
+            prompt = str(prompt_text or "").strip()
+            reason = str(request_reason or "").strip()
+            source = str(source_service_id or "").strip()
+            role = str(requested_by_role or "").strip() or "agent"
+            normalized_status = str(status or "recorded").strip() or "recorded"
+            talk["user_response_wait_request_id"] = normalized_request_id
+            talk["user_response_wait_timeout_seconds"] = requested_timeout_seconds
+            talk["user_response_wait_effective_timeout_seconds"] = effective_timeout_seconds
+            talk["user_response_wait_generated_at"] = recorded_at
+            talk["user_response_wait_started_at"] = ""
+            talk["user_response_wait_until_at"] = _utc_ts_after_seconds(effective_timeout_seconds)
+            talk["user_response_wait_prompt_text"] = prompt
+            talk["user_response_wait_reason"] = reason
+            talk["user_response_wait_source_service_id"] = source
+            talk["user_response_wait_requested_by_role"] = role
+            talk["user_response_wait_active"] = False
+            talk.pop("user_response_wait_last_timeout_at", None)
+            requests = talk.get("user_response_wait_requests")
+            if not isinstance(requests, list):
+                requests = []
+            requests.append(
+                {
+                    "request_id": normalized_request_id,
+                    "generated_at": recorded_at,
+                    "started_at": recorded_at,
+                    "until_at": _utc_ts_after_seconds(effective_timeout_seconds),
+                    "timeout_seconds": requested_timeout_seconds,
+                    "effective_timeout_seconds": effective_timeout_seconds,
+                    "question": prompt,
+                    "reason": reason,
+                    "source_service_id": source,
+                    "requested_by_role": role,
+                    "status": normalized_status,
+                }
+            )
+            talk["user_response_wait_requests"] = requests[-50:]
+            talk["updated_at"] = utc_ts()
+            ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+            return dict(talk)
+        return None
+
+
 def consume_session_due_user_response_wait(
     runtime_root: Path,
     *,

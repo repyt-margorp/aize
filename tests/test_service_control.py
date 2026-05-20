@@ -15,6 +15,8 @@ from runtime.agent_service import (
     _finalize_superseded_panic_recovery_siblings,
     _handoff_spawn_request_to_child_session,
     _interactive_recent_context,
+    _is_usage_limit_error_text,
+    _retry_after_seconds_from_error_text,
     _service_can_spawn_children,
     _worker_session_skills_block,
     maybe_dispatch_panic_recovery_parent_resume,
@@ -91,6 +93,11 @@ class ServiceControlParserTests(unittest.TestCase):
         self.assertIn("do not inspect files, run shell commands, browse, or use tools", prompt)
         self.assertIn("WorkerAgent is already running in parallel", prompt)
         self.assertIn("Do not frame your reply as a future proposal", prompt)
+
+    def test_usage_limit_helpers_treat_capacity_as_transient(self) -> None:
+        error_text = "Selected model is at capacity. Please try a different model."
+        self.assertTrue(_is_usage_limit_error_text(error_text))
+        self.assertEqual(_retry_after_seconds_from_error_text(error_text), 15 * 60)
 
     def test_interactive_recent_context_keeps_worker_and_goal_manager_results(self) -> None:
         context = _interactive_recent_context(

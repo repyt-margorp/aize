@@ -28,6 +28,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     session_goal_manager_state_path,
     update_session_goal,
     update_session_goal_flags,
+    update_session_user_response_wait,
     update_session_skills,
     write_json_file,
 )
@@ -888,6 +889,48 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertIn(resident_id, session_ids)
         self.assertNotIn(old_id, session_ids)
         self.assertEqual(payload["session_window_seconds"], 86400)
+
+    def test_cross_user_session_view_lists_session_owner_requests_for_owned_scope(self) -> None:
+        repyt_session = create_conversation_session(self.runtime_root, username="repyt", label="Repyt Request")
+        repyt_session_id = str(repyt_session["session_id"])
+        update_session_user_response_wait(
+            self.runtime_root,
+            username="repyt",
+            session_id=repyt_session_id,
+            active=True,
+            request_id="user-response-repyt",
+            prompt_text="Which deployment region should I use?",
+            request_reason="Need a human deployment choice.",
+            source_service_id="service-codex-001",
+            requested_by_role="goal_manager",
+        )
+
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {
+            "username": "repyt",
+            "viewer_username": "root",
+            "session_id": repyt_session_id,
+            "roles": ["root", "superuser"],
+            "role": "root",
+            "is_superuser": True,
+        }
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler._do_GET_sessions("/sessions", {"session_window_seconds": ["0"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        payload = responses[-1][1]
+        self.assertEqual(payload["viewer_username"], "root")
+        session_ids = {entry["session_id"] for entry in payload["session_summaries"]}
+        self.assertIn(repyt_session_id, session_ids)
+        self.assertNotIn(self.session_id, session_ids)
+        summary = next(entry for entry in payload["session_summaries"] if entry["session_id"] == repyt_session_id)
+        self.assertEqual(summary["username"], "repyt")
+        self.assertEqual(summary["user_response_wait_status"], "waiting")
+        self.assertEqual(summary["user_response_wait_request_id"], "user-response-repyt")
+        self.assertEqual(summary["user_response_wait_prompt_text"], "Which deployment region should I use?")
 
     def test_get_session_runtime_log_returns_summary_and_optional_entries(self) -> None:
         append_history(

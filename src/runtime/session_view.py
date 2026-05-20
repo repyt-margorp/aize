@@ -259,13 +259,14 @@ def build_session_runtime_summary(
     ).strip().lower() or default_provider
     user_response_wait_active = bool(talk.get("user_response_wait_active", False))
     user_response_wait_started_at = str(talk.get("user_response_wait_started_at", "") or "")
+    user_response_wait_generated_at = str(talk.get("user_response_wait_generated_at", "") or "")
     user_response_wait_status = (
         "waiting"
         if user_response_wait_active
         else (
             "timed_out"
             if str(talk.get("user_response_wait_last_timeout_at", "") or "").strip()
-            else ("recorded" if user_response_wait_started_at else "idle")
+            else ("recorded" if user_response_wait_started_at or user_response_wait_generated_at else "idle")
         )
     )
     goal_text = str(talk.get("goal_text", "")).strip()
@@ -296,6 +297,7 @@ def build_session_runtime_summary(
         "user_response_wait_status": user_response_wait_status,
         "user_response_wait_active": user_response_wait_active,
         "user_response_wait_started_at": user_response_wait_started_at,
+        "user_response_wait_generated_at": user_response_wait_generated_at,
         "user_response_wait_until_at": str(talk.get("user_response_wait_until_at", "") or ""),
         "user_response_wait_request_id": str(talk.get("user_response_wait_request_id", "") or ""),
         "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),

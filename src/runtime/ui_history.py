@@ -91,6 +91,9 @@ def _record_has_user_visible_provider_text(record: dict[str, Any]) -> bool:
 
 def _timeline_entry_is_ui_relevant(entry: dict[str, Any]) -> bool:
     direction = str(entry.get("direction") or "").strip().lower()
+    event_type = str(entry.get("event_type") or "").strip()
+    if event_type.startswith("service.user_response_wait_"):
+        return True
     if direction in {"out", "user"}:
         return True
     if direction == "in":
@@ -103,7 +106,6 @@ def _timeline_entry_is_ui_relevant(entry: dict[str, Any]) -> bool:
         event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
         return str(event.get("provider") or "").strip().lower() == "communication_router"
     if direction == "event":
-        event_type = str(entry.get("event_type") or "").strip()
         event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         if event_type == "item.completed" and str(item.get("type") or "") == "agent_message":
@@ -525,6 +527,7 @@ def build_session_ui_history(
                 "service.post_turn_followup_started",
                 "service.post_turn_followup_failed",
                 "service.panic_cleared_after_successful_turn",
+                "service.user_response_wait_started",
                 "service.user_response_wait_cleared",
                 "service.user_response_wait_timed_out",
             }:

@@ -25,6 +25,7 @@ from runtime.agent_service import (
 from runtime.http_handler import (
     _collapse_communication_duplicate_outputs,
     _communication_dispatch_plan,
+    _communication_immediate_ack_text,
     _matching_communication_skill_routes,
     _forwarded_session_pending_input,
     _infer_communication_forward_target_session_id,
@@ -68,6 +69,9 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("mergeMessages", page)
         self.assertIn("kind==='agent'?[role,kind,value,turnBucket].join('|')", page)
         self.assertIn("renderChat([entry])", page)
+        self.assertIn("renderEntranceUploadList();refreshChat();refreshEntranceState();", page)
+        self.assertNotIn("entranceOptimisticText", page)
+        self.assertNotIn("renderChat([{direction:'out'", page)
         self.assertIn("/messages?session_id=", page)
         self.assertIn("pollTimer=setInterval(()=>{refreshChat();},2500)", page)
         self.assertIn("let statePollTimer=0;", page)
@@ -75,7 +79,10 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("statePollTimer=setInterval(()=>{refreshEntranceState();},10000)", page)
         self.assertIn("refreshChat();refreshEntranceState();startRealtime();", page)
         self.assertNotIn("if(!realtimeConnected)refreshChat()", page)
-        self.assertIn("InteractiveAgent", page)
+        self.assertIn("New Entrance message received.", page)
+        self.assertIn("Input sent. Waiting for Entrance updates...", page)
+        self.assertNotIn("Input sent. Waiting for InteractiveAgent...", page)
+        self.assertNotIn("InteractiveAgent replied.", page)
         self.assertIn("agent_message.delta", page)
         self.assertIn("user", page)
         self.assertIn("normalizedText==='response started'", page)
@@ -94,6 +101,25 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("border-radius:24px 24px 0 0", page)
         self.assertIn("calc(250px + env(safe-area-inset-bottom))", page)
         self.assertLess(page.index("</div></section><form id='entrance-form'"), page.index("</form></section>"))
+
+    def test_entrance_immediate_ack_does_not_claim_agent_activity_without_state(self) -> None:
+        ack = _communication_immediate_ack_text()
+
+        self.assertEqual(ack, "")
+        self.assertNotIn("InteractiveAgent", ack)
+        self.assertNotIn("WorkerAgent", ack)
+        self.assertNotIn("checking in parallel", ack)
+
+    def test_entrance_delegated_ack_preserves_explicit_route_status(self) -> None:
+        ack = _communication_immediate_ack_text(
+            forwarded_session={"session_id": "child-001", "label": "Child Unit"},
+            forwarded_label="Development Unit",
+        )
+
+        self.assertEqual(
+            ack,
+            "Routed to Development Unit. Entrance will keep this session updated while that work runs.",
+        )
 
     def test_entrance_status_events_refresh_immediately_and_state_poll_converges(self) -> None:
         page = render_entrance_unit_page(display_name="AIze", username="repyt")
@@ -181,6 +207,38 @@ class EntrancePageTests(unittest.TestCase):
             if entry.get("direction") == "in" and entry.get("text") == "The status is ready."
         ]
         self.assertEqual(len(replies), 1)
+
+    def test_ui_history_includes_user_response_wait_started_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            runtime_root = Path(tempdir) / "runtime"
+            ensure_state(runtime_root)
+            session = create_conversation_session(runtime_root, username="repyt", label="Goal Session")
+            session_id = str(session["session_id"])
+            append_history(
+                runtime_root,
+                username="repyt",
+                session_id=session_id,
+                entry={
+                    "direction": "agent",
+                    "ts": "2026-05-20T16:00:00Z",
+                    "from": "service-codex-002",
+                    "session_id": session_id,
+                    "event_type": "service.user_response_wait_started",
+                    "text": "Which deployment region should I use?",
+                    "event": {
+                        "type": "service.user_response_wait_started",
+                        "request_id": "user-response-test",
+                        "prompt_text": "Which deployment region should I use?",
+                    },
+                },
+                limit=500,
+            )
+
+            history = build_session_ui_history(runtime_root, username="repyt", session_id=session_id, limit=20)
+
+        self.assertTrue(
+            any(entry.get("event_type") == "service.user_response_wait_started" for entry in history)
+        )
 
     def test_entrance_ui_history_collapses_provider_replay_without_agent_role_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -350,8 +408,14 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("renderSessionStatusStrip", page)
         self.assertIn("composer-dock", page)
         self.assertIn("composer-dock-form", page)
+        self.assertIn("id='composer-submit-button' class='toolbar-button' type='submit'>Send Prompt</button>", page)
+        self.assertNotIn("id='composer-dock-meta'", page)
+        self.assertNotIn("id='goal-audit-indicator'", page)
+        self.assertNotIn("composer-dock-title", page)
+        self.assertNotIn("composer-dock-label", page)
+        self.assertNotIn("Send to the active ${providerLabel()} service", page)
         self.assertIn("list.replaceChildren(...timeline.map", page)
-        self.assertIn("Send to the active ${providerLabel()} service", page)
+        self.assertIn("composerStatus.textContent = canSendPrompt ? '' : 'Prompt disabled for this session';", page)
         self.assertIn("unit-launcher-open-interface", page)
         self.assertIn("unitLauncherOpenInterface", page)
         self.assertIn("Latest Display", page)
@@ -375,6 +439,11 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("sessionMapWindowSeconds", page)
         self.assertIn("const patchWorkspaceSummaryFromEvent = (entry) => {", page)
         self.assertIn("patchWorkspaceSummaryFromEvent(entry);", page)
+        self.assertIn("eventType.startsWith('service.user_response_wait_')", page)
+        self.assertIn("eventType === 'service.user_response_wait_started'", page)
+        self.assertIn("patch.user_response_wait_status = 'waiting';", page)
+        self.assertIn("userResponseWaitStatus = String(payload?.user_response_wait_status || userResponseWaitStatus || 'idle');", page)
+        self.assertIn("userResponseWaitPromptText = String(payload?.user_response_wait_prompt_text || userResponseWaitPromptText || '');", page)
         self.assertIn("sessionWithinMapTimeWindow", page)
         self.assertNotIn("setInterval(() => { if (!document.hidden && sessionMapOpen) refreshWorkspaceBoard(); }, 5000)", page)
         self.assertIn("sessionRuntimeLabel", page)
@@ -415,8 +484,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("<span class='session-status-chip'>Goal In Progress</span>", page)
         self.assertIn("<span class='session-status-chip is-running'>Executing</span>", page)
         self.assertIn("<span class='session-status-chip is-audit-ok'>All Clear</span>", page)
-        self.assertIn("id='composer-dock-meta' class='composer-dock-meta'", page)
-        self.assertIn("<span class='composer-dock-chip is-active'>Goal Active</span>", page)
+        self.assertNotIn("id='composer-dock-meta' class='composer-dock-meta'", page)
+        self.assertNotIn("<span class='composer-dock-chip is-active'>Goal Active</span>", page)
         self.assertNotIn("Workspace Header", page)
 
     def test_main_page_keeps_workspace_views_and_recent_messages_on_one_desktop_row(self) -> None:
@@ -558,19 +627,21 @@ class EntrancePageTests(unittest.TestCase):
             1,
         )
 
-    def test_matching_communication_skill_routes_launcher_template_does_not_auto_route_by_default(self) -> None:
+    def test_matching_communication_skill_routes_launcher_template_uses_default_route(self) -> None:
         current_session = {
             "launcher_template_id": "entrance.service",
             "session_skills": [],
         }
 
-        self.assertEqual(
-            _matching_communication_skill_routes(
+        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            routes = _matching_communication_skill_routes(
                 current_session,
                 prompt_text="Please fix the implementation routing.",
-            ),
-            [],
-        )
+            )
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["skill_id"], "canonical-development-routing")
+        self.assertTrue(routes[0]["route_when_unhandled"])
 
     def test_matching_communication_skill_routes_ignores_tags_without_opt_in(self) -> None:
         current_session = {
@@ -978,7 +1049,7 @@ class EntrancePageTests(unittest.TestCase):
             )
             self.assertEqual(skills[0]["canonical_session_key"], "aize.development")
 
-    def test_materialize_launcher_route_does_not_auto_delegate_by_default(self) -> None:
+    def test_materialize_launcher_route_delegates_to_default_development_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             entrance = create_conversation_session(
@@ -991,15 +1062,28 @@ class EntrancePageTests(unittest.TestCase):
             )
             entrance["launcher_template_id"] = "entrance.service"
 
-            routed = _materialize_communication_routed_child_session(
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                routed = _materialize_communication_routed_child_session(
+                    runtime_root,
+                    username="repyt",
+                    current_session=entrance,
+                    prompt_text="Please implement this development routing fix.",
+                    sessions=list_sessions(runtime_root, username="repyt"),
+                )
+
+            self.assertIsNotNone(routed)
+            assert routed is not None
+            self.assertEqual(routed["label"], "AIze Development Task")
+            parent = get_session_settings(
                 runtime_root,
                 username="repyt",
-                current_session=entrance,
-                prompt_text="Please implement this development routing fix.",
-                sessions=list_sessions(runtime_root, username="repyt"),
+                session_id=str(routed["parent_session_id"]),
             )
-
-            self.assertIsNone(routed)
+            self.assertIsNotNone(parent)
+            assert parent is not None
+            self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
+            self.assertEqual(parent["parent_session_id"], "default")
 
     def test_materialize_communication_routed_child_session_reuses_registered_parent_for_parallel_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -101,6 +101,7 @@ from runtime.persistent_state_pkg import (
     save_claude_session,
     save_codex_session,
     save_gemini_session,
+    record_session_user_response_request,
     session_goal_manager_state_path,
     session_dir,
     session_skill_file_path,
@@ -612,10 +613,17 @@ def _enqueue_goal_child_session_requests(
 
 def _is_usage_limit_error_text(text: str) -> bool:
     normalized = str(text or "").lower()
-    return "usage limit" in normalized or "rate limit" in normalized or "too many requests" in normalized
+    return (
+        "usage limit" in normalized
+        or "rate limit" in normalized
+        or "too many requests" in normalized
+        or "at capacity" in normalized
+    )
 
 
 def _retry_after_seconds_from_error_text(text: str) -> int | None:
+    if "at capacity" in str(text or "").lower():
+        return 15 * 60
     match = _USAGE_LIMIT_RETRY_RE.search(str(text or ""))
     if not match:
         return None
@@ -738,8 +746,27 @@ def _extract_user_response_wait_control(text: str) -> tuple[str, dict[str, Any] 
             timeout_seconds = max(60, int(timeout_match.group(1)))
         except (TypeError, ValueError):
             timeout_seconds = 300
+    request_id_match = re.search(
+        r"<request_id>\s*([^<]{1,200})\s*</request_id>",
+        body,
+        flags=re.IGNORECASE,
+    )
+    reason_match = re.search(
+        r"<reason>\s*(.*?)\s*</reason>",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     visible_text = (raw_text[: match.start()] + raw_text[match.end() :]).strip()
-    return visible_text, {"timeout_seconds": timeout_seconds}
+    control: dict[str, Any] = {"timeout_seconds": timeout_seconds}
+    if request_id_match:
+        request_id = str(request_id_match.group(1) or "").strip()
+        if request_id:
+            control["request_id"] = request_id
+    if reason_match:
+        request_reason = str(reason_match.group(1) or "").strip()
+        if request_reason:
+            control["request_reason"] = request_reason
+    return visible_text, control
 
 
 def _should_defer_dispatch_for_completed_goal(
@@ -3133,6 +3160,18 @@ def run_agent_service(
                 visible_text = _interactive_worker_result_fallback_text(incoming_text)
             if scope_username and scope_session_id:
                 if isinstance(user_response_wait, dict):
+                    record_session_user_response_request(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        status="recorded",
+                        timeout_seconds=int(user_response_wait.get("timeout_seconds", 300) or 300),
+                        prompt_text=visible_text,
+                        request_id=user_response_wait.get("request_id"),
+                        request_reason=user_response_wait.get("request_reason") or "agent_not_authorized",
+                        source_service_id=service_id,
+                        requested_by_role=provider_session_slot or "agent",
+                    )
                     append_user_history(
                         runtime_root,
                         username=scope_username,
@@ -3147,6 +3186,7 @@ def run_agent_service(
                                 "type": "service.user_response_wait_ignored",
                                 "timeout_seconds": int(user_response_wait.get("timeout_seconds", 300) or 300),
                                 "prompt_text": visible_text,
+                                "request_id": str(user_response_wait.get("request_id") or "").strip(),
                                 "source_service_id": service_id,
                                 "reason": "agent_not_authorized",
                             },

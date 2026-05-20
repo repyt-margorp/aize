@@ -21,7 +21,7 @@ set +e
 (
   cd "$WORKDIR"
   codex exec resume --dangerously-bypass-approvals-and-sandbox --json "$SESSION_ID" "/compact"
-) >"$TMP_STDOUT" 2>"$TMP_STDERR"
+) < /dev/null >"$TMP_STDOUT" 2>"$TMP_STDERR"
 RC=$?
 set -e
 

@@ -35,7 +35,10 @@ def _user_response_wait_status(talk: dict[str, Any]) -> str:
         return "timed_out"
     if str(talk.get("user_response_wait_last_cleared_at", "") or "").strip():
         return "answered"
-    if str(talk.get("user_response_wait_started_at", "") or "").strip():
+    if (
+        str(talk.get("user_response_wait_started_at", "") or "").strip()
+        or str(talk.get("user_response_wait_generated_at", "") or "").strip()
+    ):
         return "recorded"
     return "idle"
 

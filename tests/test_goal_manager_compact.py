@@ -47,7 +47,7 @@ from kernel.lifecycle import init_lifecycle_state, register_process  # noqa: E40
 from kernel.auth import bootstrap_root_user, has_users as auth_has_users, resolve_user_record, verify_user_password  # noqa: E402
 from kernel.registry import get_service_record, init_registry, update_service_process  # noqa: E402
 from runtime.providers.claude import normalize_claude_stream_event, run_claude  # noqa: E402
-from runtime.providers.codex import run_codex  # noqa: E402
+from runtime.providers.codex import run_codex, run_codex_compaction  # noqa: E402
 from runtime.providers.gemini import run_gemini  # noqa: E402
 from runtime.providers import provider_supports_context_compaction  # noqa: E402
 from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
@@ -101,6 +101,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     record_session_agent_contact,
     release_nonrunnable_session_services,
     reconcile_session_waiting_on_children,
+    record_session_user_response_request,
     resolve_session_agent_id,
     resolve_session_context,
     save_codex_session,
@@ -846,6 +847,49 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         self.assertEqual(visible_text, "Need the deployment region.")
         self.assertEqual(control, {"timeout_seconds": 600})
+
+    def test_extract_user_response_wait_control_parses_optional_fields(self) -> None:
+        visible_text, control = _extract_user_response_wait_control(
+            "Need the deployment region.\n"
+            "<aize_user_response_wait>"
+            "<timeout_seconds>600</timeout_seconds>"
+            "<request_id>req-123</request_id>"
+            "<reason>Deployment cannot proceed without a region.</reason>"
+            "</aize_user_response_wait>"
+        )
+
+        self.assertEqual(visible_text, "Need the deployment region.")
+        self.assertEqual(
+            control,
+            {
+                "timeout_seconds": 600,
+                "request_id": "req-123",
+                "request_reason": "Deployment cannot proceed without a region.",
+            },
+        )
+
+    def test_record_session_user_response_request_sets_visible_summary_fields(self) -> None:
+        talk = record_session_user_response_request(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            status="recorded",
+            timeout_seconds=600,
+            prompt_text="Need the deployment region.",
+            request_id="req-123",
+            request_reason="Goal blocked on user input.",
+            source_service_id="service-codex-002",
+            requested_by_role="interactive_agent",
+        )
+
+        assert talk is not None
+        self.assertFalse(talk["user_response_wait_active"])
+        self.assertEqual(talk["user_response_wait_request_id"], "req-123")
+        self.assertEqual(talk["user_response_wait_prompt_text"], "Need the deployment region.")
+        self.assertEqual(talk["user_response_wait_reason"], "Goal blocked on user input.")
+        self.assertEqual(talk["user_response_wait_requested_by_role"], "interactive_agent")
+        self.assertTrue(talk["user_response_wait_generated_at"])
+        self.assertEqual(talk["user_response_wait_requests"][-1]["status"], "recorded")
 
     def test_completed_goal_dispatch_is_deferred_for_non_user_fifo_inputs(self) -> None:
         self.assertTrue(
@@ -2777,6 +2821,33 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(summary["user_response_wait_status"], "timed_out")
         self.assertEqual(summary["user_response_wait_started_at"], "2026-03-23T20:00:00Z")
 
+    def test_build_session_runtime_summary_derives_recorded_status_from_generated_at(self) -> None:
+        talk = {
+            "session_id": self.session_id,
+            "label": "Goal Talk",
+            "goal_text": "Ship it",
+            "goal_active": True,
+            "goal_completed": False,
+            "goal_progress_state": "in_progress",
+            "preferred_provider": "codex",
+            "user_response_wait_active": False,
+            "user_response_wait_generated_at": "2026-03-23T20:00:00Z",
+            "user_response_wait_request_id": "req-123",
+            "user_response_wait_prompt_text": "Need the deployment region.",
+        }
+
+        summary = build_session_runtime_summary(
+            talk,
+            history_entries=[],
+            codex_service_pool=["service-codex-001"],
+            claude_service_pool=["service-claude-001"],
+            gemini_service_pool=[],
+            default_provider="codex",
+        )
+
+        self.assertEqual(summary["user_response_wait_status"], "recorded")
+        self.assertEqual(summary["user_response_wait_generated_at"], "2026-03-23T20:00:00Z")
+
     def test_build_session_runtime_summary_carries_wait_prompt_text(self) -> None:
         talk = {
             "session_id": self.session_id,
@@ -4698,6 +4769,7 @@ class GoalManagerCompactTests(unittest.TestCase):
 
     def test_run_codex_retries_without_session_when_resumed_thread_is_missing(self) -> None:
         seen_cmds: list[list[str]] = []
+        seen_stdin: list[Any] = []
 
         class FakeProc:
             def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
@@ -4713,6 +4785,109 @@ class GoalManagerCompactTests(unittest.TestCase):
             {
                 "stdout_text": "",
                 "stderr_text": "ERROR codex_core::session: failed to record rollout items: thread stale-session not found",
+                "returncode": 1,
+            },
+            {
+                "stdout_text": "\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "fresh-session"}),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": '{"assistant_text":"recovered","spawn_requests":[]}',
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                "stderr_text": "",
+                "returncode": 0,
+            },
+        ]
+
+        def fake_popen(cmd: list[str], **kwargs: Any) -> FakeProc:
+            seen_stdin.append(kwargs.get("stdin"))
+            attempt = attempts.pop(0)
+            return FakeProc(cmd, **attempt)
+
+        with patch("runtime.providers.codex.subprocess.Popen", side_effect=fake_popen):
+            final_text, _events, next_session_id = run_codex(
+                "prompt",
+                session_id="stale-session",
+                response_schema_id="service_control_v1",
+            )
+
+        self.assertEqual(final_text, '{"assistant_text":"recovered","spawn_requests":[]}')
+        self.assertEqual(next_session_id, "fresh-session")
+        self.assertEqual(len(seen_cmds), 2)
+        self.assertEqual(seen_stdin, [subprocess.DEVNULL, subprocess.DEVNULL])
+        self.assertIn("resume", seen_cmds[0])
+        self.assertNotIn("resume", seen_cmds[1])
+        self.assertNotIn("stale-session", seen_cmds[1])
+
+    def test_run_codex_disconnects_stdin_for_noninteractive_exec(self) -> None:
+        seen_stdin: list[Any] = []
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = StringIO(
+                    "\n".join(
+                        [
+                            json.dumps({"type": "thread.started", "thread_id": "codex-session-1"}),
+                            json.dumps(
+                                {
+                                    "type": "item.completed",
+                                    "item": {
+                                        "type": "agent_message",
+                                        "text": '{"assistant_text":"ok","spawn_requests":[]}',
+                                    },
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n"
+                )
+                self.stderr = StringIO("")
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(cmd: list[str], **kwargs: Any) -> FakeProc:
+            del cmd
+            seen_stdin.append(kwargs.get("stdin"))
+            return FakeProc()
+
+        with patch("runtime.providers.codex.subprocess.Popen", side_effect=fake_popen):
+            final_text, _events, next_session_id = run_codex(
+                "prompt",
+                session_id="codex-session-1",
+                response_schema_id="service_control_v1",
+            )
+
+        self.assertEqual(final_text, '{"assistant_text":"ok","spawn_requests":[]}')
+        self.assertEqual(next_session_id, "codex-session-1")
+        self.assertEqual(seen_stdin, [subprocess.DEVNULL])
+
+    def test_run_codex_retries_without_session_when_resume_has_no_rollout(self) -> None:
+        seen_cmds: list[list[str]] = []
+
+        class FakeProc:
+            def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
+                seen_cmds.append(list(cmd))
+                self.stdout = StringIO(stdout_text)
+                self.stderr = StringIO(stderr_text)
+                self._returncode = returncode
+
+            def wait(self) -> int:
+                return self._returncode
+
+        attempts = [
+            {
+                "stdout_text": "",
+                "stderr_text": "Error: thread/resume: thread/resume failed: no rollout found for thread id stale-session",
                 "returncode": 1,
             },
             {
@@ -4754,7 +4929,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertNotIn("resume", seen_cmds[1])
         self.assertNotIn("stale-session", seen_cmds[1])
 
-    def test_run_codex_retries_without_session_when_resume_has_no_rollout(self) -> None:
+    def test_run_codex_retries_without_session_when_resume_hits_internal_tool_process_error(self) -> None:
         seen_cmds: list[list[str]] = []
 
         class FakeProc:
@@ -4770,7 +4945,10 @@ class GoalManagerCompactTests(unittest.TestCase):
         attempts = [
             {
                 "stdout_text": "",
-                "stderr_text": "Error: thread/resume: thread/resume failed: no rollout found for thread id stale-session",
+                "stderr_text": (
+                    "2026-05-20T16:33:59.893986Z ERROR codex_core::tools::router: "
+                    "error=write_stdin failed: Unknown process id 14065"
+                ),
                 "returncode": 1,
             },
             {
@@ -5053,6 +5231,39 @@ printf '%s\\n' '{"type":"turn.completed"}'
             args_file.read_text(encoding="utf-8").strip(),
             "exec resume --dangerously-bypass-approvals-and-sandbox --json session-1 /compact",
         )
+
+    def test_run_codex_compaction_disconnects_stdin(self) -> None:
+        seen_stdin: list[Any] = []
+
+        class FakeCompletedProcess:
+            def __init__(self) -> None:
+                self.stdout = "\n".join(
+                    [
+                        "command_status: accepted",
+                        "compaction: triggered",
+                        "wait_status: turn_completed",
+                    ]
+                )
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> FakeCompletedProcess:
+            self.assertTrue(cmd[0].endswith("compact_codex_session.sh"))
+            seen_stdin.append(kwargs.get("stdin"))
+            return FakeCompletedProcess()
+
+        with patch("runtime.providers.codex.subprocess.run", side_effect=fake_run):
+            event, returncode = run_codex_compaction(
+                repo_root=ROOT,
+                session_id="session-1",
+                threshold_left_percent=101,
+                mode="goal_manager",
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(event["type"], "service.goal_manager_compact_checked")
+        self.assertEqual(event["command_status"], "accepted")
+        self.assertEqual(seen_stdin, [subprocess.DEVNULL])
 
     def test_goal_audit_history_text_labels_provider_session_explicitly(self) -> None:
         text = goal_audit_history_text(

@@ -794,9 +794,7 @@ def _communication_immediate_ack_text(
         return (
             f"Routed to {target_label}. Entrance will keep this session updated while that work runs."
         )
-    return (
-        "Entrance received your request. InteractiveAgent is responding and WorkerAgent is checking in parallel."
-    )
+    return ""
 
 
 def _append_communication_immediate_ack(
@@ -2484,6 +2482,7 @@ def make_handler(
             )
             _goal_audit_state = str((_audit_summary or {}).get("audit_state") or "all_clear").strip().lower()
             _wait_started_at = str(_talk.get("user_response_wait_started_at", "") or "").strip()
+            _wait_generated_at = str(_talk.get("user_response_wait_generated_at", "") or "").strip()
             _wait_prompt_text = str(_talk.get("user_response_wait_prompt_text", "") or "").strip()
             _wait_status = (
                 "waiting"
@@ -2491,7 +2490,7 @@ def make_handler(
                 else (
                     "timed_out"
                     if str(_talk.get("user_response_wait_last_timeout_at", "") or "").strip()
-                    else ("recorded" if _wait_started_at else "idle")
+                    else ("recorded" if _wait_started_at or _wait_generated_at else "idle")
                 )
             )
             _journal_summary = _runtime_journal_summary_from_session(_talk)
@@ -2514,6 +2513,7 @@ def make_handler(
                 "user_response_wait_status": _wait_status,
                 "user_response_wait_active": bool(_talk.get("user_response_wait_active", False)),
                 "user_response_wait_started_at": _wait_started_at,
+                "user_response_wait_generated_at": _wait_generated_at,
                 "user_response_wait_request_id": str(_talk.get("user_response_wait_request_id", "") or ""),
                 "user_response_wait_prompt_text": _wait_prompt_text,
                 "user_response_wait_reason": str(_talk.get("user_response_wait_reason", "") or "").strip(),
@@ -2669,13 +2669,14 @@ def make_handler(
                 continue
             bound_service_id = str(talk.get("service_id") or "").strip()
             wait_started_at = str(talk.get("user_response_wait_started_at", "") or "").strip()
+            wait_generated_at = str(talk.get("user_response_wait_generated_at", "") or "").strip()
             wait_status = (
                 "waiting"
                 if bool(talk.get("user_response_wait_active", False))
                 else (
                     "timed_out"
                     if str(talk.get("user_response_wait_last_timeout_at", "") or "").strip()
-                    else ("recorded" if wait_started_at else "idle")
+                    else ("recorded" if wait_started_at or wait_generated_at else "idle")
                 )
             )
             goal_manager_runtime = _goal_manager_runtime_payload(
@@ -2727,6 +2728,7 @@ def make_handler(
                     "user_response_wait_status": wait_status,
                     "user_response_wait_active": bool(talk.get("user_response_wait_active", False)),
                     "user_response_wait_started_at": wait_started_at,
+                    "user_response_wait_generated_at": wait_generated_at,
                     "user_response_wait_request_id": str(talk.get("user_response_wait_request_id", "") or ""),
                     "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),
                     "user_response_wait_reason": str(talk.get("user_response_wait_reason", "") or "").strip(),
@@ -3139,6 +3141,7 @@ def make_handler(
                 return
             username = context["username"]
             viewer_username = str(context.get("viewer_username") or username)
+            session_list_username = username
             session_id = context["session_id"]
             role_name = context.get("role", "user")
             is_superuser = bool(context.get("is_superuser"))
@@ -3218,7 +3221,10 @@ def make_handler(
                         if str(session_settings.get("user_response_wait_last_cleared_at", "") or "").strip()
                         else (
                             "recorded"
-                            if str(session_settings.get("user_response_wait_started_at", "") or "").strip()
+                            if (
+                                str(session_settings.get("user_response_wait_started_at", "") or "").strip()
+                                or str(session_settings.get("user_response_wait_generated_at", "") or "").strip()
+                            )
                             else "idle"
                         )
                     )
@@ -3269,7 +3275,7 @@ def make_handler(
             # When a specific session is requested, skip the expensive all-sessions
             # computation entirely — the client will fetch /overview lazily when needed.
             initial_session_summaries = _initial_session_summaries_for_view(
-                viewer_username=viewer_username,
+                viewer_username=session_list_username,
                 include_all=(initial_session_scope == "all"),
                 active_session_id=session_id,
                 recent_window_seconds=initial_session_window_seconds,
@@ -3277,7 +3283,7 @@ def make_handler(
             if initial_session_map_open:
                 try:
                     _paged_ov = _get_overview_cached(
-                        viewer_username=viewer_username,
+                        viewer_username=session_list_username,
                         include_all=(initial_session_scope == "all"),
                         active_session_id=session_id,
                         recent_window_seconds=initial_session_window_seconds,
@@ -3597,7 +3603,7 @@ def make_handler(
             include_all = _scope_include_all(context=context, query=query)
             recent_window_seconds = _parse_recent_window_seconds(query)
             talks_payload = _compute_overview_payload(
-                viewer_username=str(context.get("viewer_username") or context["username"]),
+                viewer_username=str(context["username"]),
                 include_all=include_all,
                 active_session_id=str(context.get("session_id") or ""),
                 recent_window_seconds=recent_window_seconds,
@@ -3659,14 +3665,14 @@ def make_handler(
             recent_window_seconds = _parse_recent_window_seconds(query)
             payload = (
                 _compute_overview_payload(
-                    viewer_username=str(context.get("viewer_username") or context["username"]),
+                    viewer_username=str(context["username"]),
                     include_all=include_all,
                     active_session_id=str(context.get("session_id") or ""),
                     recent_window_seconds=recent_window_seconds,
                 )
                 if _query_requests_live_overview(query)
                 else _get_overview_cached(
-                    viewer_username=str(context.get("viewer_username") or context["username"]),
+                    viewer_username=str(context["username"]),
                     include_all=include_all,
                     active_session_id=str(context.get("session_id") or ""),
                     recent_window_seconds=recent_window_seconds,
