@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,20 @@ from runtime.persistent_state_pkg import (
 from wire.protocol import utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
+CANONICAL_LLM_SERVICE_RE = re.compile(r"^service-(codex|claude|gemini)-\d{3}$")
+
+
+def is_canonical_llm_service_id(service_id: str) -> bool:
+    return bool(CANONICAL_LLM_SERVICE_RE.match(str(service_id or "").strip()))
+
+
+def session_has_active_in_progress_goal(talk: dict[str, Any] | None) -> bool:
+    session = talk if isinstance(talk, dict) else {}
+    goal_active = bool(session.get("goal_active", True))
+    progress = str(
+        session.get("goal_progress_state") or ("complete" if bool(session.get("goal_completed", False)) else "in_progress")
+    ).strip().lower()
+    return goal_active and not bool(session.get("goal_completed", False)) and progress != "complete"
 
 
 def active_agent_turn_state(history_entries: list[dict[str, Any]]) -> dict[str, str] | None:
@@ -109,6 +124,7 @@ def session_agent_assignment_counts(
     talk: dict[str, Any] | None,
     *,
     worker: dict[str, Any] | None = None,
+    agent_running: bool | None = None,
     goal_manager_worker: dict[str, Any] | None = None,
     goal_manager_state: str | None = None,
 ) -> dict[str, int]:
@@ -119,31 +135,27 @@ def session_agent_assignment_counts(
     def contact_key(item: dict[str, Any]) -> str:
         return str(item.get("service_id") or item.get("agent_id") or "").strip()
 
-    for item in session.get("welcomed_agents") if isinstance(session.get("welcomed_agents"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        key = contact_key(item)
-        if not key:
-            continue
-        role = str(item.get("join_role") or "agent").strip().lower() or "agent"
-        if role == "goal_manager":
-            gm_agents.add(key)
-        else:
-            assigned_agents.add(key)
+    if not session_has_active_in_progress_goal(session):
+        return {
+            "goal_manager_reviewers": 0,
+            "assigned_agents": 0,
+        }
 
-    bound_service_id = str(session.get("service_id") or "").strip()
-    if bound_service_id:
-        assigned_agents.add(bound_service_id)
+    replying = bool(session.get("agent_running", False)) if agent_running is None else bool(agent_running)
+    if replying:
+        bound_service_id = str(session.get("service_id") or "").strip()
+        if bound_service_id:
+            assigned_agents.add(bound_service_id)
 
-    if isinstance(worker, dict):
-        worker_key = contact_key(worker)
-        if worker_key:
-            assigned_agents.add(worker_key)
+        if isinstance(worker, dict):
+            worker_key = contact_key(worker)
+            if worker_key:
+                assigned_agents.add(worker_key)
 
     gm_state = str(goal_manager_state or "").strip().lower()
     if isinstance(goal_manager_worker, dict):
         gm_key = contact_key(goal_manager_worker)
-        if gm_key and (gm_state == "running" or gm_agents):
+        if gm_key and gm_state in {"running", "queued"}:
             gm_agents.add(gm_key)
 
     return {
@@ -349,6 +361,7 @@ def build_session_runtime_summary(
     agent_counts = session_agent_assignment_counts(
         talk,
         worker=visible_worker,
+        agent_running=agent_running,
         goal_manager_worker=goal_manager_worker,
         goal_manager_state=str(goal_manager_state.get("state") or "idle"),
     )
@@ -474,11 +487,16 @@ def build_worker_count_summary(
         kind = str(service.get("kind") or "").strip().lower()
         if kind not in counts:
             continue
+        service_id = str(service.get("service_id") or "").strip()
+        if not is_canonical_llm_service_id(service_id):
+            continue
         status = str((process or {}).get("status") or service.get("status") or "").strip().lower()
         if status and status != "stopped":
             counts[kind]["running"] += 1
     for talk in session_summaries:
         if not isinstance(talk, dict):
+            continue
+        if not session_has_active_in_progress_goal(talk):
             continue
         def resolve_provider(candidate: dict[str, Any] | None) -> str:
             worker = candidate if isinstance(candidate, dict) else {}
@@ -535,15 +553,13 @@ def build_worker_count_summary(
             if isinstance(item, dict):
                 track_welcomed_assignment(item)
 
-        track_assignment(
-            talk.get("worker") if isinstance(talk.get("worker"), dict) else None,
-            fallback_service_id=str(talk.get("bound_service_id") or ""),
-        )
+        if talk.get("agent_running"):
+            track_assignment(
+                talk.get("worker") if isinstance(talk.get("worker"), dict) else None,
+                fallback_service_id=str(talk.get("bound_service_id") or ""),
+            )
         goal_manager_worker = talk.get("goal_manager_worker") if isinstance(talk.get("goal_manager_worker"), dict) else None
         goal_manager_service_id = str((goal_manager_worker or {}).get("service_id") or "").strip().lower()
-        goal_manager_provider = resolve_provider(goal_manager_worker)
-        if goal_manager_provider in goal_manager_reviewers and goal_manager_service_id:
-            goal_manager_reviewers[goal_manager_provider].add(goal_manager_service_id)
 
         if talk.get("agent_running"):
             provider = resolve_provider(talk.get("worker") if isinstance(talk.get("worker"), dict) else None)
@@ -556,7 +572,10 @@ def build_worker_count_summary(
                 talk.get("goal_manager_worker") if isinstance(talk.get("goal_manager_worker"), dict) else None
             )
             if provider in counts:
-                counts[provider]["active_turns"] += 1
+                reviewer_service_id = goal_manager_service_id or str(talk.get("bound_service_id") or "").strip().lower()
+                if reviewer_service_id:
+                    assigned_slots[provider].add(reviewer_service_id)
+                    goal_manager_reviewers[provider].add(reviewer_service_id)
                 counts[provider]["reviewing_turns"] += 1
         elif str(talk.get("goal_manager_state") or "").strip().lower() == "queued":
             pending_work_items = (
@@ -579,11 +598,11 @@ def build_worker_count_summary(
             for provider, service_id in pending_reviewers:
                 assigned_slots[provider].add(service_id)
                 goal_manager_reviewers[provider].add(service_id)
-                counts[provider]["active_turns"] += 1
                 counts[provider]["reviewing_turns"] += 1
     for provider, service_ids in assigned_slots.items():
         counts[provider]["assigned_slots"] = len(service_ids)
         counts[provider]["goal_manager_reviewers"] = len(goal_manager_reviewers[provider])
+        counts[provider]["active_turns"] = counts[provider]["replying_turns"] + counts[provider]["reviewing_turns"]
     return counts
 
 

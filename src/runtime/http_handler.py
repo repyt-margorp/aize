@@ -117,6 +117,7 @@ from runtime.session_view import (
     persisted_goal_manager_runtime_state,
     maybe_enqueue_mid_turn_progress_inquiry,
     session_assignment_contacts,
+    session_has_active_in_progress_goal,
     session_registration_metadata,
     worker_slot_badge,
 )
@@ -147,6 +148,7 @@ def session_agent_assignment_counts(
     talk: dict[str, Any] | None,
     *,
     worker: dict[str, Any] | None = None,
+    agent_running: bool | None = None,
     goal_manager_worker: dict[str, Any] | None = None,
     goal_manager_state: str | None = None,
 ) -> dict[str, int]:
@@ -159,6 +161,7 @@ def session_agent_assignment_counts(
         return helper(
             talk,
             worker=worker,
+            agent_running=agent_running,
             goal_manager_worker=goal_manager_worker,
             goal_manager_state=goal_manager_state,
         )
@@ -188,15 +191,17 @@ def session_agent_assignment_counts(
     if bound_service_id:
         assigned_agents.add(bound_service_id)
 
-    if isinstance(worker, dict):
-        worker_key = contact_key(worker)
-        if worker_key:
-            assigned_agents.add(worker_key)
+    replying = bool(session.get("agent_running", False)) if agent_running is None else bool(agent_running)
+    if replying:
+        if isinstance(worker, dict):
+            worker_key = contact_key(worker)
+            if worker_key:
+                assigned_agents.add(worker_key)
 
     gm_state = str(goal_manager_state or "").strip().lower()
     if isinstance(goal_manager_worker, dict):
         gm_key = contact_key(goal_manager_worker)
-        if gm_key and (gm_state == "running" or gm_agents):
+        if gm_key and gm_state in {"running", "queued"}:
             gm_agents.add(gm_key)
 
     return {
@@ -955,7 +960,9 @@ def _communication_immediate_ack_text(
 
 
 _LEGACY_OPTIMISTIC_ENTRANCE_ACK = (
-    "Entrance received your request. InteractiveAgent is responding and WorkerAgent is checking in parallel."
+    "Entrance received your request. "
+    "InteractiveAgent is responding and "
+    "WorkerAgent is checking in parallel."
 )
 
 
@@ -2589,6 +2596,8 @@ def make_handler(
     # Both GET / (SessionMap initial state) and GET /overview share this cache.
     _ov_cache_state: list = [None, 0.0, ""]  # [payload | None, monotonic timestamp, cache_key]
     _ov_cache_lock = threading.Lock()
+    _idle_goal_reconcile_seen: dict[str, float] = {}
+    _idle_goal_reconcile_lock = threading.Lock()
     _OV_CACHE_TTL = 3.5  # seconds
 
     def _scope_include_all(*, context: dict[str, Any] | None, query: dict[str, list[str]] | None = None) -> bool:
@@ -2671,9 +2680,53 @@ def make_handler(
                 claude_service_pool=current_claude_service_pool,
                 gemini_service_pool=current_gemini_service_pool,
             ) if _goal_manager_state in {"running", "queued"} and _gm_svc else None
+            if (
+                _agent_turn is None
+                and _goal_audit is None
+                and session_has_active_in_progress_goal(_talk)
+                and _goal_manager_state not in {"running", "queued"}
+            ):
+                _reconcile_key = f"{_t_user}::{_t_id}"
+                _should_reconcile = False
+                _now = time.monotonic()
+                with _idle_goal_reconcile_lock:
+                    _last_seen = _idle_goal_reconcile_seen.get(_reconcile_key, 0.0)
+                    if (_now - _last_seen) >= 30.0:
+                        _idle_goal_reconcile_seen[_reconcile_key] = _now
+                        _should_reconcile = True
+                if _should_reconcile:
+                    _dispatched_to, _dispatch_error = enqueue_goal_dispatch(
+                        username=_t_user,
+                        session_id=_t_id,
+                        auth_context=None,
+                        reason="active_in_progress_idle_reconcile",
+                    )
+                    write_jsonl(
+                        log_path,
+                        {
+                            "type": "runtime.active_goal_idle_reconcile",
+                            "ts": utc_ts(),
+                            "service_id": self_service["service_id"],
+                            "process_id": process_id,
+                            "username": _t_user,
+                            "session_id": _t_id,
+                            "to": _dispatched_to,
+                            "dispatch_error": _dispatch_error,
+                        },
+                    )
+                    if _dispatched_to and not _dispatch_error:
+                        _goal_manager_state = "queued"
+                        _gm_svc = str(_dispatched_to)
+                        _gm_worker = worker_slot_badge(
+                            _gm_svc,
+                            codex_service_pool=current_codex_service_pool,
+                            claude_service_pool=current_claude_service_pool,
+                            gemini_service_pool=current_gemini_service_pool,
+                        )
             _agent_counts = session_agent_assignment_counts(
                 _talk,
                 worker=_worker,
+                agent_running=_agent_turn is not None,
                 goal_manager_worker=_gm_worker,
                 goal_manager_state=_goal_manager_state,
             )
@@ -2959,6 +3012,7 @@ def make_handler(
             agent_counts = session_agent_assignment_counts(
                 talk,
                 worker=worker,
+                agent_running=False,
                 goal_manager_worker=goal_manager_runtime.get("goal_manager_worker")
                 if isinstance(goal_manager_runtime.get("goal_manager_worker"), dict)
                 else None,
@@ -3098,15 +3152,26 @@ def make_handler(
             goal_progress_complete = goal_completed or goal_progress_state == "complete"
             goal_manager_state = str(summary.get("goal_manager_state") or "idle").strip().lower()
             runtime_execution_state = str(summary.get("runtime_execution_state") or "").strip().lower()
+            counts = summary.get("agent_counts") if isinstance(summary.get("agent_counts"), dict) else {}
+            assigned_agent_count = int(summary.get("assigned_agent_count") or counts.get("assigned_agents") or 0)
+            gm_reviewer_count = int(summary.get("goal_manager_reviewer_count") or counts.get("goal_manager_reviewers") or 0)
             if not runtime_execution_state:
                 runtime_execution_state = (
                     "running"
-                    if bool(summary.get("runtime_in_progress")) or bool(summary.get("agent_running")) or goal_manager_state in {"running", "queued"}
+                    if (
+                        bool(summary.get("runtime_in_progress"))
+                        or bool(summary.get("agent_running"))
+                        or assigned_agent_count > 0
+                        or gm_reviewer_count > 0
+                        or goal_manager_state in {"running", "queued"}
+                    )
                     else "idle"
                 )
+            elif runtime_execution_state == "idle" and (assigned_agent_count > 0 or gm_reviewer_count > 0):
+                runtime_execution_state = "running"
             runtime_label = (
                 "Executing"
-                if runtime_execution_state == "running"
+                if runtime_execution_state in {"executing", "running", "reviewing"}
                 else ("Runtime Failed" if runtime_execution_state == "failed" else "Runtime Idle")
             )
             runtime_class = (
@@ -3149,13 +3214,10 @@ def make_handler(
                 classes.append("is-goal-panic")
             if not goal_active:
                 classes.append("is-goal-inactive")
-            counts = summary.get("agent_counts") if isinstance(summary.get("agent_counts"), dict) else {}
-            assigned_agent_count = int(summary.get("assigned_agent_count") or counts.get("assigned_agents") or 0)
-            gm_reviewer_count = int(summary.get("goal_manager_reviewer_count") or counts.get("goal_manager_reviewers") or 0)
             count_html = (
                 "<div class='goal-session-agent-counts'>"
-                f"<span class='goal-session-badge' title='Non-GoalManager agents assigned to this session'>Agents {assigned_agent_count}</span>"
-                f"<span class='goal-session-badge{' is-on' if gm_reviewer_count else ''}' title='Agents acting as GoalManager reviewers for this session'>GM Reviewers {gm_reviewer_count}</span>"
+                f"<span class='goal-session-badge{' is-on' if assigned_agent_count else ''}' title='Replying agents currently assigned to this session'>Replying {assigned_agent_count}</span>"
+                f"<span class='goal-session-badge{' is-on' if gm_reviewer_count else ''}' title='Reviewing agents currently assigned to this session'>Reviewing {gm_reviewer_count}</span>"
                 "</div>"
             )
             goal_html = html.escape(goal_text) if goal_text else "<span class='goal-session-empty'>No goal</span>"

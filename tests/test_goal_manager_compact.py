@@ -511,6 +511,10 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_session_agent_assignment_counts_split_goal_manager_and_assigned_agents(self) -> None:
         talk = {
             "service_id": "service-codex-001",
+            "goal_active": True,
+            "goal_progress_state": "in_progress",
+            "goal_completed": False,
+            "agent_running": True,
             "welcomed_agents": [
                 {
                     "agent_id": "service-codex-001@@session-1@@worker_agent",
@@ -4082,13 +4086,16 @@ class GoalManagerCompactTests(unittest.TestCase):
     def test_build_worker_count_summary_counts_running_replying_and_reviewing(self) -> None:
         counts = build_worker_count_summary(
             service_snapshots=[
-                {"service": {"kind": "codex", "status": "running"}, "process": {"status": "running"}},
-                {"service": {"kind": "claude", "status": "running"}, "process": {"status": "running"}},
-                {"service": {"kind": "codex", "status": "stopped"}, "process": {"status": "stopped"}},
+                {"service": {"kind": "codex", "service_id": "service-codex-001", "status": "running"}, "process": {"status": "running"}},
+                {"service": {"kind": "claude", "service_id": "service-claude-001", "status": "running"}, "process": {"status": "running"}},
+                {"service": {"kind": "codex", "service_id": "service-codex-002", "status": "stopped"}, "process": {"status": "stopped"}},
+                {"service": {"kind": "codex", "service_id": "service-codex-extra-001", "status": "running"}, "process": {"status": "running"}},
             ],
             session_summaries=[
-                {"agent_running": True, "worker": {"provider": "codex", "service_id": "service-codex-001"}},
+                {"goal_active": True, "goal_progress_state": "in_progress", "agent_running": True, "worker": {"provider": "codex", "service_id": "service-codex-001"}},
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "agent_running": True,
                     "worker": {"provider": "claude", "service_id": "service-claude-001"},
                     "goal_manager_state": "running",
@@ -4098,11 +4105,13 @@ class GoalManagerCompactTests(unittest.TestCase):
                         {"service_id": "service-claude-002", "provider": "claude", "join_role": "goal_manager"},
                     ],
                 },
-                {"agent_running": False, "worker": {"provider": "codex", "service_id": "service-codex-002"}},
-                {"agent_running": True, "preferred_provider": "codex", "bound_service_id": "service-codex-003"},
-                {"agent_running": True, "worker": {"provider": "unknown", "service_id": "service-codex-004"}, "preferred_provider": "codex"},
-                {"agent_running": True, "bound_service_id": "service-claude-001"},
+                {"goal_active": True, "goal_progress_state": "in_progress", "agent_running": False, "worker": {"provider": "codex", "service_id": "service-codex-002"}},
+                {"goal_active": True, "goal_progress_state": "in_progress", "agent_running": True, "preferred_provider": "codex", "bound_service_id": "service-codex-003"},
+                {"goal_active": True, "goal_progress_state": "in_progress", "agent_running": True, "worker": {"provider": "unknown", "service_id": "service-codex-004"}, "preferred_provider": "codex"},
+                {"goal_active": True, "goal_progress_state": "in_progress", "agent_running": True, "bound_service_id": "service-claude-001"},
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "goal_manager_state": "running",
                     "goal_manager_worker": {"provider": "codex", "service_id": "service-codex-005"},
                     "agent_contacts": [
@@ -4110,6 +4119,8 @@ class GoalManagerCompactTests(unittest.TestCase):
                     ],
                 },
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "goal_manager_state": "queued",
                     "goal_manager_worker": {"provider": "codex", "service_id": "service-codex-006"},
                     "goal_manager_pending_work_items": [
@@ -4127,7 +4138,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(counts["claude"]["running"], 1)
         self.assertEqual(counts["codex"]["assigned_slots"], 5)
         self.assertEqual(counts["codex"]["goal_manager_reviewers"], 2)
-        self.assertEqual(counts["claude"]["assigned_slots"], 1)
+        self.assertEqual(counts["claude"]["assigned_slots"], 2)
         self.assertEqual(counts["claude"]["goal_manager_reviewers"], 1)
         self.assertEqual(counts["codex"]["replying_turns"], 3)
         self.assertEqual(counts["codex"]["reviewing_turns"], 2)
@@ -4150,11 +4161,15 @@ class GoalManagerCompactTests(unittest.TestCase):
             ],
             session_summaries=[
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "agent_running": True,
                     "preferred_provider": "codex",
                     "bound_service_id": "service-codex-001",
                 },
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "goal_manager_state": "running",
                     "preferred_provider": "codex",
                     "bound_service_id": "service-codex-002",
@@ -4172,6 +4187,8 @@ class GoalManagerCompactTests(unittest.TestCase):
             service_snapshots=[],
             session_summaries=[
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "goal_manager_state": "queued",
                     "goal_manager_pending_work_items": [
                         {"service_id": "service-codex-007", "provider": "codex"},
@@ -4191,6 +4208,8 @@ class GoalManagerCompactTests(unittest.TestCase):
             service_snapshots=[],
             session_summaries=[
                 {
+                    "goal_active": True,
+                    "goal_progress_state": "in_progress",
                     "bound_service_id": "service-codex-011",
                     "welcomed_agents": [
                         {"service_id": "service-codex-011", "provider": "codex", "join_role": "agent"},

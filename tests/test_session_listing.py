@@ -209,6 +209,10 @@ class SessionListingTests(unittest.TestCase):
         counts = session_agent_assignment_counts(
             {
                 "service_id": "service-codex-001",
+                "goal_active": True,
+                "goal_progress_state": "in_progress",
+                "goal_completed": False,
+                "agent_running": True,
                 "welcomed_agents": [
                     {"agent_id": "service-codex-001@@session-1@@interactive_agent", "join_role": "interactive_agent"},
                     {"agent_id": "service-codex-001@@session-1@@goal_manager", "join_role": "goal_manager"},
@@ -219,8 +223,8 @@ class SessionListingTests(unittest.TestCase):
             goal_manager_state="running",
         )
 
-        self.assertEqual(counts["assigned_agents"], 3)
-        self.assertEqual(counts["goal_manager_reviewers"], 2)
+        self.assertEqual(counts["assigned_agents"], 2)
+        self.assertEqual(counts["goal_manager_reviewers"], 1)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,9 @@ def normalize_runtime_execution_state(
     goal_manager_state: str = "idle",
 ) -> str:
     gm_state = str(goal_manager_state or "idle").strip().lower()
-    if bool(agent_running) or gm_state in {"running", "queued"}:
+    if gm_state in {"running", "queued"}:
+        return "running"
+    if bool(agent_running):
         return "running"
     if gm_state == "failed":
         return "failed"
@@ -82,7 +84,11 @@ def runtime_status_changed_event(
             previous_status.get("runtime_execution_state") or "idle"
         )
     state = str(event["runtime_execution_state"])
-    text = "Runtime executing" if state == "running" else ("Runtime failed" if state == "failed" else "Runtime idle")
+    text = (
+        "Runtime executing"
+        if state in {"executing", "running", "reviewing"}
+        else ("Runtime failed" if state == "failed" else "Runtime idle")
+    )
     return {
         "direction": "event",
         "ts": utc_ts(),

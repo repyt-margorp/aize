@@ -236,7 +236,11 @@ class EntrancePageTests(unittest.TestCase):
                     "ts": "2026-05-18T16:41:02Z",
                     "from": "service-entrance-router",
                     "service_id": "service-entrance-router",
-                    "text": "Entrance received your request. InteractiveAgent is responding and WorkerAgent is checking in parallel.",
+                    "text": (
+                        "Entrance received your request. "
+                        "InteractiveAgent is responding and "
+                        "WorkerAgent is checking in parallel."
+                    ),
                     "provider": "communication_router",
                 }
             ]
@@ -264,7 +268,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("eventType==='runtime.status_changed'", page)
         self.assertIn("for(const key of ['runtime_execution_state','runtime_in_progress','agent_running','goal_manager_state','worker','goal_manager_worker'])", page)
         self.assertIn("const goalManagerState=String(s.goal_manager_state||'').trim().toLowerCase();", page)
-        self.assertIn("goalManagerState==='running'||goalManagerState==='queued'?'running':'idle'", page)
+        self.assertIn("goalManagerState==='running'||goalManagerState==='queued'||rawRuntime==='reviewing'?'running':'idle'", page)
         self.assertIn("statePollTimer=setInterval(()=>{refreshEntranceState();},10000)", page)
         self.assertIn("jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'})", page)
         self.assertIn("/overview?scope=all", page)
@@ -641,11 +645,15 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("Goal Active", page)
         self.assertIn("Goal In Progress", page)
         self.assertIn("Executing", page)
-        self.assertIn("Runtime Idle", page)
+        self.assertIn("Idle", page)
         self.assertIn("All Clear", page)
+        self.assertIn("Codex ${String(codex.running || 0)} lots / ${String(codex.replying_turns || 0)} replying / ${String(codex.reviewing_turns || 0)} reviewing", page)
+        self.assertIn("<span>lots</span><span>${String(item.replying_turns || 0)} replying</span><span>${String(item.reviewing_turns || 0)} reviewing</span>", page)
+        self.assertNotIn("assigned / ${String(codex.active_turns || 0)} executing", page)
+        self.assertNotIn("${String(item.assigned_slots || 0)} assigned</span><span>${String(item.active_turns || 0)} executing", page)
         self.assertIn("goal-session-agent-counts", page)
-        self.assertIn("GM Reviewers", page)
-        self.assertIn("Agents ${String(assignedAgentCount)}", page)
+        self.assertIn("Reviewing ${String(gmReviewerCount)}", page)
+        self.assertIn("Replying ${String(assignedAgentCount)}", page)
         self.assertNotIn("const workerSlot = worker?.slot == null ? '·' : String(worker.slot);", page)
         self.assertNotIn("goal-marker-left", page)
         self.assertIn("runtime-journal-panel", page)
@@ -658,8 +666,15 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("raw.textContent = JSON.stringify(eventEntry.event, null, 2);", page)
         self.assertIn("raw.textContent = JSON.stringify(item, null, 2);", page)
         self.assertIn(".workspace-goal-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex:1 1 auto;min-width:0}", page)
+        self.assertIn(".workspace-goal-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}", page)
         self.assertIn(".workspace-goal-heading textarea.goal-state-text", page)
         self.assertIn("<textarea id='workspace-goal-state-text' class='goal-state-text' readonly aria-label='Current goal text'>Ship the WorkspaceView refresh</textarea>", page)
+        self.assertIn("id='workspace-goal-edit-button' class='toolbar-button' type='button'>Update Goal</button>", page)
+        self.assertIn("id='workspace-goal-active-toggle-button' class='toolbar-button ghost' type='button'>Deactivate</button>", page)
+        self.assertIn("id='workspace-settings-open-button' class='toolbar-button ghost' type='button'>Settings</button>", page)
+        self.assertIn("if (workspaceGoalEditButton) workspaceGoalEditButton.onclick = (event) => { event.preventDefault(); setGoalPopoverOpen(true); renderViewMode(); };", page)
+        self.assertIn("if (workspaceSettingsOpenButton) workspaceSettingsOpenButton.onclick = (event) => { event.preventDefault(); setSettingsPopoverOpen(true); };", page)
+        self.assertIn("workspaceGoalPanel.classList.remove('is-hidden');", page)
         self.assertIn("workspaceGoalStateText instanceof HTMLTextAreaElement", page)
         self.assertNotIn("<button id='workspace-goal-toggle' class='workspace-goal-toggle' type='button'><div id='workspace-goal-state-text'", page)
         self.assertIn("workspaceGoalToggle.setAttribute('aria-expanded', workspaceGoalCollapsed ? 'false' : 'true');", page)

@@ -146,6 +146,8 @@ from runtime.session_view import (
     persisted_goal_manager_runtime_state,
     build_session_runtime_summary,
     build_worker_count_summary,
+    is_canonical_llm_service_id,
+    session_has_active_in_progress_goal,
     session_assignment_contacts,
     pending_progress_inquiry_exists,
     build_progress_inquiry_xml,
@@ -189,6 +191,7 @@ def session_agent_assignment_counts(
     talk: dict[str, Any] | None,
     *,
     worker: dict[str, Any] | None = None,
+    agent_running: bool | None = None,
     goal_manager_worker: dict[str, Any] | None = None,
     goal_manager_state: str | None = None,
 ) -> dict[str, int]:
@@ -201,6 +204,7 @@ def session_agent_assignment_counts(
         return helper(
             talk,
             worker=worker,
+            agent_running=agent_running,
             goal_manager_worker=goal_manager_worker,
             goal_manager_state=goal_manager_state,
         )
@@ -230,15 +234,17 @@ def session_agent_assignment_counts(
     if bound_service_id:
         assigned_agents.add(bound_service_id)
 
-    if isinstance(worker, dict):
-        worker_key = contact_key(worker)
-        if worker_key:
-            assigned_agents.add(worker_key)
+    replying = bool(session.get("agent_running", False)) if agent_running is None else bool(agent_running)
+    if replying:
+        if isinstance(worker, dict):
+            worker_key = contact_key(worker)
+            if worker_key:
+                assigned_agents.add(worker_key)
 
     gm_state = str(goal_manager_state or "").strip().lower()
     if isinstance(goal_manager_worker, dict):
         gm_key = contact_key(goal_manager_worker)
-        if gm_key and (gm_state == "running" or gm_agents):
+        if gm_key and gm_state in {"running", "queued"}:
             gm_agents.add(gm_key)
 
     return {
@@ -586,6 +592,8 @@ def run_http_service(
             kind = str(record.get("kind") or manifest_kinds.get(service_id) or "").strip().lower()
             if not service_id or kind not in {"codex", "claude", "gemini"}:
                 continue
+            if not is_canonical_llm_service_id(service_id):
+                continue
             live_kinds[service_id] = kind
         if not live_kinds:
             live_kinds = dict(manifest_kinds)
@@ -608,6 +616,7 @@ def run_http_service(
             active_turns_snap = dict(_active_agent_turns)
         with _active_goal_audits_lock:
             active_audits_snap = dict(_active_goal_audits)
+        idle_goal_reconciled_sessions: set[str] = set()
         summaries: list[dict[str, Any]] = []
         for session in sessions:
             session_id = str(session.get("session_id") or "")
@@ -659,9 +668,38 @@ def run_http_service(
                     claude_service_pool=current_claude_service_pool,
                     gemini_service_pool=current_gemini_service_pool,
                 )
+            if (
+                active_turn is None
+                and active_goal_audit is None
+                and session_has_active_in_progress_goal(session)
+                and str(summary.get("goal_manager_state") or "").strip().lower() not in {"running", "queued"}
+            ):
+                reconcile_key = f"{username}::{session_id}"
+                if reconcile_key not in idle_goal_reconciled_sessions:
+                    idle_goal_reconciled_sessions.add(reconcile_key)
+                    dispatched_to, dispatch_error = enqueue_goal_dispatch(
+                        username=username,
+                        session_id=session_id,
+                        auth_context=None,
+                        reason="active_in_progress_idle_reconcile",
+                    )
+                    write_jsonl(
+                        log_path,
+                        {
+                            "type": "runtime.active_goal_idle_reconcile",
+                            "ts": utc_ts(),
+                            "service_id": self_service["service_id"],
+                            "process_id": process_id,
+                            "username": username,
+                            "session_id": session_id,
+                            "to": dispatched_to,
+                            "dispatch_error": dispatch_error,
+                        },
+                    )
             agent_counts = session_agent_assignment_counts(
                 session,
                 worker=summary.get("worker") if isinstance(summary.get("worker"), dict) else None,
+                agent_running=bool(summary.get("agent_running", False)),
                 goal_manager_worker=summary.get("goal_manager_worker")
                 if isinstance(summary.get("goal_manager_worker"), dict)
                 else None,
