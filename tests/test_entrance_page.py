@@ -627,21 +627,18 @@ class EntrancePageTests(unittest.TestCase):
             1,
         )
 
-    def test_matching_communication_skill_routes_launcher_template_uses_default_route(self) -> None:
+    def test_matching_communication_skill_routes_launcher_template_does_not_auto_route_by_default(self) -> None:
         current_session = {
             "launcher_template_id": "entrance.service",
             "session_skills": [],
         }
 
         with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
             routes = _matching_communication_skill_routes(
                 current_session,
                 prompt_text="Please fix the implementation routing.",
             )
-        self.assertEqual(len(routes), 1)
-        self.assertEqual(routes[0]["skill_id"], "canonical-development-routing")
-        self.assertTrue(routes[0]["route_when_unhandled"])
+        self.assertEqual(routes, [])
 
     def test_matching_communication_skill_routes_ignores_tags_without_opt_in(self) -> None:
         current_session = {
@@ -1049,7 +1046,7 @@ class EntrancePageTests(unittest.TestCase):
             )
             self.assertEqual(skills[0]["canonical_session_key"], "aize.development")
 
-    def test_materialize_launcher_route_delegates_to_default_development_route(self) -> None:
+    def test_materialize_launcher_route_does_not_auto_delegate_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             entrance = create_conversation_session(
@@ -1063,7 +1060,6 @@ class EntrancePageTests(unittest.TestCase):
             entrance["launcher_template_id"] = "entrance.service"
 
             with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
                 routed = _materialize_communication_routed_child_session(
                     runtime_root,
                     username="repyt",
@@ -1072,18 +1068,7 @@ class EntrancePageTests(unittest.TestCase):
                     sessions=list_sessions(runtime_root, username="repyt"),
                 )
 
-            self.assertIsNotNone(routed)
-            assert routed is not None
-            self.assertEqual(routed["label"], "AIze Development Task")
-            parent = get_session_settings(
-                runtime_root,
-                username="repyt",
-                session_id=str(routed["parent_session_id"]),
-            )
-            self.assertIsNotNone(parent)
-            assert parent is not None
-            self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
-            self.assertEqual(parent["parent_session_id"], "default")
+            self.assertIsNone(routed)
 
     def test_materialize_communication_routed_child_session_reuses_registered_parent_for_parallel_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
