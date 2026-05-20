@@ -161,9 +161,10 @@ def build_restart_resume_claim_run_id(
     restart_claim_slot: str,
     service_id: str,
 ) -> str:
+    service_component = "shared" if str(restart_claim_slot or "").strip() == "goal_manager" else service_id
     return (
         f"system-restart-{restart_generation_id}-{scope_session_id}-"
-        f"{restart_claim_slot}-{service_id}"
+        f"{restart_claim_slot}-{service_component}"
     )
 
 
@@ -481,6 +482,21 @@ def maybe_resume_after_restart(
                 last_terminal_ts = ts
         return bool(last_started_ts) and last_started_ts > last_terminal_ts
 
+    def has_terminal_goal_manager_cycle(history: list[dict[str, Any]]) -> bool:
+        last_started_ts = ""
+        last_terminal_ts = ""
+        for record in history:
+            event_type = str(record.get("event_type") or "")
+            ts = str(record.get("ts") or "")
+            if event_type == "service.goal_manager_compact_started":
+                last_started_ts = ts
+            elif event_type in {
+                "service.goal_manager_compact_completed",
+                "service.goal_audit_completed",
+            }:
+                last_terminal_ts = ts
+        return bool(last_terminal_ts) and (not last_started_ts or last_terminal_ts >= last_started_ts)
+
     def latest_goal_manager_failure(history: list[dict[str, Any]]) -> dict[str, Any] | None:
         for record in reversed(history):
             event_type = str(record.get("event_type") or "").strip()
@@ -719,6 +735,16 @@ def maybe_resume_after_restart(
             goal_manager_review_reasons.append("stale_goal_manager_runtime")
         if goal_manager_pending_inputs:
             goal_manager_review_reasons.append("goal_manager_pending")
+        if (
+            should_standard_goal_route
+            and not unfinished_turn
+            and not has_actionable_pending
+            and not isinstance(due_auto_resume, dict)
+            and recovery_mode != "reconstruct_without_session"
+            and not goal_manager_review_reasons
+            and not has_terminal_goal_manager_cycle(history)
+        ):
+            goal_manager_review_reasons.append("orphan_in_progress_goal")
         restart_goal_manager_review_only = bool(
             should_standard_goal_route
             and not goal_completed

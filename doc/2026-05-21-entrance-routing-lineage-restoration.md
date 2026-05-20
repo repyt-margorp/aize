@@ -4,20 +4,25 @@
 
 - The shipped Entrance launcher template keeps the canonical development routing skill available, but it no longer routes every unhandled prompt by default.
 - That route still does not use prompt-tag heuristics: `allow_tag_routing` remains disabled, and new launcher sessions require an explicit Entrance decision or an explicitly persisted session-level default route before work is delegated.
+- `Send to Entrance` submits `communication_target=entrance` in both JSON and multipart requests, so HttpBridge keeps that prompt in the Entrance session for InteractiveAgent, WorkerAgent, and GoalManager review before any later delegation.
+- Entrance prompt history now records the local Entrance target instead of rewriting the outbound row to `forward:<child-session-id>`.
 - Entrance-origin development work now materializes under the canonical `AIze Development` parent rooted at `default`, with the concrete task session created beneath that parent instead of under Entrance.
 - Canonical parent reuse now falls back to the registered `aize-development.bug-hunting` unit state when a shallow session snapshot does not carry enough skill metadata to identify the already-registered development parent.
+- The Entrance composer clears the text, pending files, and file input after the send starts, and restores them if the send fails.
 
 ## Files touched
 
 - `plugins/aize-entrance/units/entrance/unit.json`
+- `src/runtime/html_renderer.py`
 - `src/runtime/http_handler.py`
 - `tests/test_entrance_page.py`
+- `tests/test_http_handler_goal_save.py`
 - `tests/test_session_template.py`
 - `doc/2026-05-21-entrance-routing-lineage-restoration.md`
 
 ## Verification
 
-- `python3 -m unittest tests.test_entrance_page.EntrancePageTests.test_matching_communication_skill_routes_launcher_template_does_not_auto_route_by_default tests.test_entrance_page.EntrancePageTests.test_materialize_launcher_route_does_not_auto_delegate_by_default tests.test_entrance_page.EntrancePageTests.test_materialize_communication_routed_child_session_prefers_registered_bug_hunting_parent_over_existing_child tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_routes_entrance_request_through_development_child_proxy_path tests.test_session_template.SessionTemplateLauncherTests.test_entrance_unit_provisions_code_based_interactive_skill -v`
+- `python3 -m unittest tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_keeps_entrance_request_inside_entrance_before_goal_manager_routing tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_runs_entrance_handler_before_unhandled_development_route tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_message_prompt_with_entrance_target_stays_in_entrance_before_delegation tests.test_entrance_page.EntrancePageTests.test_entrance_page_renders_chat_polling_surface -v`
 - `python3 -m unittest tests.test_entrance_page tests.test_http_handler_goal_save tests.test_session_template -q`
 
 ## Residual risk

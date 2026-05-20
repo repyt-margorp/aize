@@ -5629,28 +5629,11 @@ def make_handler(
                             if normalized_provider in {"codex", "claude", "gemini"}:
                                 preferred_provider = normalized_provider
                     visible_sessions = list_sessions(runtime_root, username=username)
-                    if communication_agent_enabled and not entrance_local_only:
-                        forwarded_session_id = _infer_communication_forward_target_session_id(
-                            runtime_root,
-                            visible_sessions,
-                            username=username,
-                            current_session_id=session_id,
-                            prompt_text=prompt_text,
-                            current_session=session_settings,
-                        )
-                        if not forwarded_session_id:
-                            routed_child_session = _materialize_communication_routed_child_session(
-                                runtime_root,
-                                username=username,
-                                current_session=session_settings,
-                                prompt_text=prompt_text,
-                                sessions=visible_sessions,
-                            )
-                            if isinstance(routed_child_session, dict):
-                                visible_sessions = list_sessions(runtime_root, username=username)
-                                forwarded_session_id = str(
-                                    routed_child_session.get("session_id") or ""
-                                ).strip() or None
+                    if communication_agent_enabled:
+                        # Entrance must keep user input inside the communication session first.
+                        # GoalManager and explicit session skills decide later whether any
+                        # delegated implementation session should be created.
+                        forwarded_session_id = None
                     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
@@ -5726,9 +5709,6 @@ def make_handler(
                             interactive_service_id,
                             provider_pool,
                         )
-                    target_session: dict[str, Any] = {}
-                    if forwarded_session_id:
-                        target_session = _session_record_by_id(visible_sessions, forwarded_session_id) or {}
                     if communication_agent_enabled:
                         goal_manager_service_id = _resolve_goal_manager_dispatch_service_for_session(
                             runtime_root=runtime_root,
@@ -5821,22 +5801,6 @@ def make_handler(
                             "attachments": list(message_meta.get("attachments") or []),
                         },
                     )
-                    if communication_agent_enabled:
-                        immediate_ack_label = ""
-                        if forwarded_session_id:
-                            parent_session_id = str(target_session.get("parent_session_id") or "").strip()
-                            if parent_session_id and parent_session_id != session_id:
-                                parent_session = _session_record_by_id(visible_sessions, parent_session_id) or {}
-                                immediate_ack_label = str(parent_session.get("label") or "").strip()
-                        _append_communication_immediate_ack(
-                            append_history,
-                            username=username,
-                            session_id=session_id,
-                            text=_communication_immediate_ack_text(
-                                forwarded_session=target_session if forwarded_session_id else None,
-                                forwarded_label=immediate_ack_label,
-                            ),
-                        )
                     # When WS-only, write a degraded-state event if no WS peer is
                     # actively subscribed (no live connection joined the session).
                     if ws_only_mode:
@@ -5887,44 +5851,6 @@ def make_handler(
                             session_id=session_id,
                             entry=prompt_pending_input,
                         )
-                    if forwarded_session_id:
-                        target_preferred_provider = _normalize_session_preferred_provider(
-                            target_session,
-                            default_provider=preferred_provider,
-                        )
-                        forwarded_pending_input, forwarded_dispatch_reason = _forwarded_session_pending_input(
-                            target_session,
-                            prompt_text=transport_text,
-                            submitted_by_username=username,
-                            user_response_request_ids=response_request_ids,
-                            message_meta=message_meta,
-                        )
-                        append_pending_input(
-                            runtime_root,
-                            username=username,
-                            session_id=forwarded_session_id,
-                            entry=forwarded_pending_input,
-                        )
-                        forwarded_service_id = _resolve_dispatch_service_for_session(
-                            runtime_root=runtime_root,
-                            username=username,
-                            session_id=forwarded_session_id,
-                            preferred_provider=target_preferred_provider,
-                            default_provider=default_provider,
-                            current_llm_service_topology=current_llm_service_topology,
-                        )
-                        if forwarded_service_id:
-                            join_session_agent(
-                                runtime_root,
-                                username=username,
-                                session_id=forwarded_session_id,
-                                service_id=forwarded_service_id,
-                                provider=str(llm_service_kinds.get(forwarded_service_id) or target_preferred_provider),
-                                role="agent",
-                                transport="http_prompt",
-                            )
-                        else:
-                            dispatch_error = "forward_target_no_available_provider_worker"
                     maybe_enqueue_mid_turn_progress_inquiry(
                         runtime_root=runtime_root,
                         log_path=log_path,
@@ -5968,7 +5894,6 @@ def make_handler(
                             request_id=worker_request_id,
                             transport_text=transport_text,
                             session_settings=session_settings,
-                            forwarded_session=target_session if forwarded_session_id else None,
                         )
                         worker_pending = make_aize_pending_input(
                             kind="interactive_worker_request",
@@ -5982,9 +5907,6 @@ def make_handler(
                         )
                         worker_pending["request_id"] = worker_request_id
                         worker_pending["source_user_text"] = transport_text
-                        if forwarded_session_id:
-                            worker_pending["delegated_session_id"] = forwarded_session_id
-                            worker_pending["delegated_goal_text"] = str(target_session.get("goal_text") or "")
                         if isinstance(interactive_service_id, str) and interactive_service_id:
                             worker_pending["interactive_service_id"] = interactive_service_id
                             worker_pending["interactive_agent_id"] = _slot_agent_id(

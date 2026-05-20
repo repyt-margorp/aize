@@ -424,9 +424,19 @@ def build_worker_count_summary(
     session_summaries: list[dict[str, Any]],
 ) -> dict[str, dict[str, int]]:
     counts = {
-        "codex": {"running": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
-        "claude": {"running": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
-        "gemini": {"running": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
+        "codex": {"running": 0, "assigned_slots": 0, "goal_manager_reviewers": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
+        "claude": {"running": 0, "assigned_slots": 0, "goal_manager_reviewers": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
+        "gemini": {"running": 0, "assigned_slots": 0, "goal_manager_reviewers": 0, "active_turns": 0, "replying_turns": 0, "reviewing_turns": 0},
+    }
+    assigned_slots: dict[str, set[str]] = {
+        "codex": set(),
+        "claude": set(),
+        "gemini": set(),
+    }
+    goal_manager_reviewers: dict[str, set[str]] = {
+        "codex": set(),
+        "claude": set(),
+        "gemini": set(),
     }
     for snapshot in service_snapshots:
         service = snapshot.get("service") if isinstance(snapshot, dict) else None
@@ -457,6 +467,46 @@ def build_worker_count_summary(
                     provider = "gemini"
             return provider
 
+        def track_assignment(candidate: dict[str, Any] | None = None, *, fallback_service_id: str = "") -> None:
+            provider = resolve_provider(candidate)
+            service_id = ""
+            if isinstance(candidate, dict):
+                service_id = str(candidate.get("service_id") or "").strip().lower()
+            if not service_id:
+                service_id = str(fallback_service_id or "").strip().lower()
+            if provider in assigned_slots and service_id:
+                assigned_slots[provider].add(service_id)
+
+        def track_welcomed_assignment(item: dict[str, Any]) -> None:
+            service_id = str(item.get("service_id") or "").strip().lower()
+            if not service_id:
+                return
+            role = str(item.get("join_role") or "agent").strip().lower() or "agent"
+            provider = str(item.get("provider") or "").strip().lower()
+            if provider not in counts:
+                provider = resolve_provider({"service_id": service_id})
+            if provider not in counts:
+                return
+            if role == "goal_manager":
+                goal_manager_reviewers[provider].add(service_id)
+            else:
+                assigned_slots[provider].add(service_id)
+
+        welcomed_agents = talk.get("welcomed_agents") if isinstance(talk.get("welcomed_agents"), list) else []
+        for item in welcomed_agents:
+            if isinstance(item, dict):
+                track_welcomed_assignment(item)
+
+        track_assignment(
+            talk.get("worker") if isinstance(talk.get("worker"), dict) else None,
+            fallback_service_id=str(talk.get("bound_service_id") or ""),
+        )
+        goal_manager_worker = talk.get("goal_manager_worker") if isinstance(talk.get("goal_manager_worker"), dict) else None
+        goal_manager_service_id = str((goal_manager_worker or {}).get("service_id") or "").strip().lower()
+        goal_manager_provider = resolve_provider(goal_manager_worker)
+        if goal_manager_provider in goal_manager_reviewers and goal_manager_service_id:
+            goal_manager_reviewers[goal_manager_provider].add(goal_manager_service_id)
+
         if talk.get("agent_running"):
             provider = resolve_provider(talk.get("worker") if isinstance(talk.get("worker"), dict) else None)
             if provider in counts:
@@ -470,6 +520,9 @@ def build_worker_count_summary(
             if provider in counts:
                 counts[provider]["active_turns"] += 1
                 counts[provider]["reviewing_turns"] += 1
+    for provider, service_ids in assigned_slots.items():
+        counts[provider]["assigned_slots"] = len(service_ids)
+        counts[provider]["goal_manager_reviewers"] = len(goal_manager_reviewers[provider])
     return counts
 
 

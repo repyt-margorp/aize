@@ -74,7 +74,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("mergeMessages", page)
         self.assertIn("kind==='agent'?[role,kind,value,turnBucket].join('|')", page)
         self.assertIn("renderChat([entry])", page)
-        self.assertIn("renderEntranceUploadList();refreshChat();refreshEntranceState();", page)
+        self.assertIn("renderEntranceUploadList();setStatus('Sending input to Entrance...')", page)
+        self.assertIn("refreshChat();refreshEntranceState();setStatus('Input sent. Waiting for Entrance updates...')", page)
         self.assertNotIn("entranceOptimisticText", page)
         self.assertNotIn("renderChat([{direction:'out'", page)
         self.assertIn("/messages?session_id=", page)
@@ -86,9 +87,27 @@ class EntrancePageTests(unittest.TestCase):
         self.assertNotIn("if(!realtimeConnected)refreshChat()", page)
         self.assertIn("New Entrance message received.", page)
         self.assertIn("Input sent. Waiting for Entrance updates...", page)
+        self.assertIn("let entranceSubmitInFlight=false;", page)
+        self.assertIn("let entranceIsComposing=false;", page)
+        self.assertIn("if(entranceSubmitInFlight)return;", page)
+        self.assertIn("formData.set('communication_target','entrance')", page)
+        self.assertIn("communication_target:'entrance'", page)
         self.assertIn("promptText.value='';", page)
         self.assertIn("entrancePendingFiles=[];", page)
+        self.assertIn("const pendingFilesSnapshot=[...entrancePendingFiles];", page)
+        self.assertIn(
+            "entranceSubmitInFlight=true;sendButton.disabled=true;if(promptText)promptText.disabled=true;if(entranceFileInput)entranceFileInput.disabled=true;promptText.value='';entrancePendingFiles=[];",
+            page,
+        )
+        self.assertIn("for(const [index,file] of pendingFilesSnapshot.entries())", page)
+        self.assertIn("promptText.value=text;entrancePendingFiles=pendingFilesSnapshot;", page)
+        self.assertIn(
+            "entranceSubmitInFlight=false;if(promptText)promptText.disabled=false;if(entranceFileInput)entranceFileInput.disabled=false;sendButton.disabled=!entranceSessionId;if(promptText)promptText.focus();",
+            page,
+        )
         self.assertIn("if(entranceFileInput)entranceFileInput.value='';", page)
+        self.assertIn("formData.set('communication_target','entrance');", page)
+        self.assertIn("communication_target:'entrance'", page)
         self.assertNotIn("Input sent. Waiting for InteractiveAgent...", page)
         self.assertNotIn("InteractiveAgent replied.", page)
         self.assertIn("agent_message.delta", page)
@@ -98,13 +117,19 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("entranceClipboardImageFiles", page)
         self.assertIn("entranceClipboardHasText", page)
         self.assertIn("entranceUploadFileName", page)
+        self.assertIn("promptText.addEventListener('compositionstart'", page)
+        self.assertIn("promptText.addEventListener('compositionend'", page)
+        self.assertIn("if(entranceSubmitInFlight){ev.preventDefault();return;}", page)
+        self.assertIn("if(entranceIsComposing||ev.isComposing||ev.keyCode===229)return;", page)
         self.assertIn("promptText.addEventListener('paste'", page)
         self.assertIn("queueEntranceFiles(imageFiles)", page)
         self.assertIn("formData.append('file',file,entranceUploadFileName(file,index))", page)
+        self.assertIn("if(!messageRequestAccepted(response,payload))throw new Error(String(payload.error||`HTTP ${response.status}`));", page)
         self.assertIn("pasted-image-${index+1}.${ext}", page)
         self.assertIn("if(!entranceClipboardHasText(clipboardData))ev.preventDefault();", page)
         self.assertIn("const syncEntranceUrl=(sid)=>{const url=new URL(window.location.href);if(sid)url.searchParams.set('session_id',String(sid));else url.searchParams.delete('session_id');window.history.replaceState({},'',url.toString());};", page)
         self.assertIn("syncEntranceUrl(entranceSessionId);", page)
+        self.assertIn("const messageRequestAccepted=(response,payload)=>{if(!response?.ok)return false;", page)
         self.assertIn("const launchEntranceSession=async()=>{const sessions=await jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'});", page)
         self.assertNotIn("const units=await jsonFetch(`/units?_=${Date.now()}`,{cache:'no-store'});", page)
         self.assertNotIn("const last=String(entrance?.state?.last_session_id||'').trim();", page)
@@ -186,6 +211,7 @@ class EntrancePageTests(unittest.TestCase):
 
         self.assertIn("id='unit-launcher-session-list'", page)
         self.assertIn("const unitLauncherSessionList = document.getElementById('unit-launcher-session-list');", page)
+        self.assertIn("if (!messageRequestAccepted(response, payload)) {", page)
         self.assertIn("const unitInterfaceSessionUrl = (unit, sessionId) => {", page)
         self.assertIn("const openUnitSession = async (unit, sessionId, { preferInterface = true, target = '_self' } = {}) => {", page)
         self.assertIn("renderLauncherSessionList(unit);", page)
@@ -480,7 +506,6 @@ class EntrancePageTests(unittest.TestCase):
         )
 
         self.assertNotIn("_interactive_prompt_needs_worker(prompt_text)", source)
-        self.assertIn("_forwarded_session_pending_input(", source)
         self.assertIn("_communication_dispatch_plan(", source)
         self.assertIn("append_goal_manager_pending_input(", source)
         self.assertIn('"reason": "goal_manager_review"', source)
@@ -596,7 +621,9 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("userResponseWaitStatus = String(payload?.user_response_wait_status || userResponseWaitStatus || 'idle');", page)
         self.assertIn("userResponseWaitPromptText = String(payload?.user_response_wait_prompt_text || userResponseWaitPromptText || '');", page)
         self.assertIn("const refreshUserRequests = async () => {", page)
-        self.assertIn("try { await refreshSessionIndex(); } finally { _refreshUserRequestsInFlight = false; renderUserRequests(); }", page)
+        self.assertIn("const requestDisplayQuery = () => { const bits = []; if (isSuperuser) bits.push('scope=all');", page)
+        self.assertIn("const response = await fetch(`/sessions?${displayQuery}${displayQuery ? '&' : ''}_=${Date.now()}`", page)
+        self.assertIn("requestWorkspaceSummaries = payload.session_summaries;", page)
         self.assertIn("if (requestsPaneOpen) renderUserRequests();", page)
         self.assertIn("refreshUserRequests();", page)
         self.assertIn("const requestHistory = Array.isArray(summary?.user_response_wait_requests)", page)
@@ -1452,6 +1479,104 @@ class EntrancePageTests(unittest.TestCase):
             assert first_parent is not None and second_parent is not None
             self.assertEqual(first_parent["origin_session_id"], first_entrance["session_id"])
             self.assertEqual(second_parent["origin_session_id"], second_entrance["session_id"])
+
+    def test_materialize_explicit_route_reuses_origin_scoped_registered_parent_from_shallow_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            route_skill = {
+                "skill_id": "canonical-development-routing",
+                "routing_mode": "create_child_session",
+                "route_when_unhandled": True,
+                "canonical_session_key": "aize.development",
+                "route_parent_scope": "origin_session",
+                "target_template_id": "aize-development.bug-hunting",
+                "target_label": "AIze Development",
+                "target_child_label": "AIze Development Task",
+                "target_goal_text": "Coordinate routed development work.",
+                "preferred_provider": "codex",
+                "selected_agents": ["codex_pool"],
+            }
+            first_entrance = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Entrance A",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[route_skill],
+            )
+            second_entrance = create_conversation_session(
+                runtime_root,
+                username="repyt",
+                label="Entrance B",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[route_skill],
+            )
+            first_entrance["launcher_template_id"] = "entrance.service"
+            second_entrance["launcher_template_id"] = "entrance.service"
+
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                first = _materialize_communication_routed_child_session(
+                    runtime_root,
+                    username="repyt",
+                    current_session=first_entrance,
+                    prompt_text="First entrance development request.",
+                    sessions=list_sessions(runtime_root, username="repyt"),
+                )
+                second = _materialize_communication_routed_child_session(
+                    runtime_root,
+                    username="repyt",
+                    current_session=second_entrance,
+                    prompt_text="Second entrance development request.",
+                    sessions=list_sessions(runtime_root, username="repyt"),
+                )
+                shallow_sessions = []
+                for session in list_sessions(runtime_root, username="repyt"):
+                    copied = dict(session)
+                    copied["session_skills"] = []
+                    shallow_sessions.append(copied)
+                repeated = _materialize_communication_routed_child_session(
+                    runtime_root,
+                    username="repyt",
+                    current_session=first_entrance,
+                    prompt_text="Please implement the remaining routing lineage fix.",
+                    sessions=shallow_sessions,
+                )
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertIsNotNone(repeated)
+            assert first is not None and second is not None and repeated is not None
+            self.assertEqual(repeated["parent_session_id"], first["parent_session_id"])
+            self.assertNotEqual(repeated["parent_session_id"], second["parent_session_id"])
+            first_parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=str(first["parent_session_id"]),
+            )
+            second_parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=str(second["parent_session_id"]),
+            )
+            repeated_parent = get_session_settings(
+                runtime_root,
+                username="repyt",
+                session_id=str(repeated["parent_session_id"]),
+            )
+            self.assertIsNotNone(first_parent)
+            self.assertIsNotNone(second_parent)
+            self.assertIsNotNone(repeated_parent)
+            assert first_parent is not None and second_parent is not None and repeated_parent is not None
+            self.assertEqual(first_parent["origin_session_id"], first_entrance["session_id"])
+            self.assertEqual(second_parent["origin_session_id"], second_entrance["session_id"])
+            self.assertEqual(repeated_parent["origin_session_id"], first_entrance["session_id"])
+            canonical_parents = [
+                session
+                for session in list_sessions(runtime_root, username="repyt")
+                if str(session.get("launcher_template_id") or "") == "aize-development.bug-hunting"
+            ]
+            self.assertEqual(len(canonical_parents), 2)
 
     def test_materialize_communication_routed_child_session_prefers_registered_bug_hunting_parent_over_existing_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

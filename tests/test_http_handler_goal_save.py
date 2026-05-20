@@ -458,7 +458,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertTrue(any(entry.get("direction") == "in" and entry.get("text") == "http skill: echo through http skill" for entry in ui_history))
         self.assertEqual(router_calls, [])
 
-    def test_message_prompt_routes_entrance_request_through_development_child_proxy_path(self) -> None:
+    def test_message_prompt_keeps_entrance_request_inside_entrance_before_goal_manager_routing(self) -> None:
         talk = create_conversation_session(
             self.runtime_root,
             username="root",
@@ -596,22 +596,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
 
         sessions = list_sessions(self.runtime_root, username="root")
         created_sessions = [item for item in sessions if str(item.get("origin_session_id") or "") == session_id]
-        parent = next(item for item in created_sessions if str(item.get("label") or "") == "AIze Development")
-        child = next(item for item in created_sessions if str(item.get("parent_session_id") or "") == str(parent["session_id"]))
-
-        self.assertEqual(parent["launcher_template_id"], "aize-development.bug-hunting")
-        self.assertEqual(parent["parent_session_id"], "default")
-        self.assertEqual(parent["session_group"], "root")
-        self.assertEqual(child["goal_text"], "Please implement the development routing fix.")
-
-        child_pending = load_pending_inputs(
-            self.runtime_root,
-            username="root",
-            session_id=str(child["session_id"]),
-        )
-        self.assertEqual(len(child_pending), 1)
-        self.assertEqual(child_pending[0]["kind"], "goal_feedback")
-        self.assertIn("Please implement the development routing fix.", child_pending[0]["text"])
+        self.assertEqual(created_sessions, [])
 
         interactive_pending = load_service_pending_inputs(
             self.runtime_root,
@@ -629,29 +614,24 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         )
         self.assertEqual([item["kind"] for item in interactive_pending], ["user_dialogue"])
         self.assertEqual([item["kind"] for item in worker_pending], ["interactive_worker_request"])
-        self.assertEqual(worker_pending[0]["delegated_session_id"], child["session_id"])
-        self.assertIn("delegated_session", worker_pending[0]["text"])
-        self.assertIn(str(child["session_id"]), worker_pending[0]["text"])
+        self.assertNotIn("delegated_session_id", worker_pending[0])
+        self.assertNotIn("delegated_session", worker_pending[0]["text"])
 
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
         self.assertEqual(
             dispatch_reasons,
-            ["http_user_dialogue", "interactive_worker_request", "goal_manager_review", "goal_feedback"],
+            ["http_user_dialogue", "interactive_worker_request", "goal_manager_review"],
         )
 
         history = get_history(self.runtime_root, username="root", session_id=session_id)
         last_out = next(entry for entry in reversed(history) if entry.get("direction") == "out")
         self.assertEqual(last_out["to"], "service-codex-001")
-        self.assertNotEqual(last_out["to"], f"forward:{child['session_id']}")
-        immediate_ack = next(
-            entry
-            for entry in history
-            if entry.get("direction") == "in" and entry.get("service_id") == "service-entrance-router"
+        self.assertFalse(
+            any(
+                entry.get("direction") == "in" and entry.get("service_id") == "service-entrance-router"
+                for entry in history
+            )
         )
-        expected_ack = (
-            f"Routed to {parent['label']}. Entrance will keep this session updated while that work runs."
-        )
-        self.assertEqual(immediate_ack["text"], expected_ack)
 
         ui_history = build_session_ui_history(
             self.runtime_root,
@@ -659,10 +639,10 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             session_id=session_id,
             limit=20,
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 entry.get("direction") == "in"
-                and entry.get("text") == expected_ack
+                and "Entrance will keep this session updated while that work runs." in str(entry.get("text") or "")
                 for entry in ui_history
             )
         )
@@ -804,6 +784,134 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertEqual(created_sessions, [])
         self.assertEqual(router_calls, [])
 
+    def test_message_prompt_with_entrance_target_stays_in_entrance_before_delegation(self) -> None:
+        talk = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+            session_skills=[
+                {
+                    "skill_id": "canonical-development-routing",
+                    "routing_mode": "create_child_session",
+                    "route_when_unhandled": True,
+                    "canonical_session_key": "aize.development",
+                    "target_template_id": "aize-development.bug-hunting",
+                    "target_label": "AIze Development",
+                    "target_goal_text": "Coordinate routed development work.",
+                    "preferred_provider": "codex",
+                    "selected_agents": ["codex_pool"],
+                }
+            ],
+        )
+        session_id = str(talk["session_id"])
+        router_calls: list[dict[str, object]] = []
+        service_kinds = {
+            "service-codex-001": "codex",
+            "service-codex-002": "codex",
+            "service-codex-003": "codex",
+        }
+        Handler = make_handler(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test"},
+            self_service={"service_id": "service-http-001"},
+            process_id="proc-http-001",
+            log_path=self.runtime_root / "logs" / "http.jsonl",
+            default_target="service-codex-001",
+            default_provider="codex",
+            history_limit=100,
+            tls_enabled=True,
+            codex_service_pool=["service-codex-001", "service-codex-002"],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+            llm_service_kinds=service_kinds,
+            pending=[],
+            awaiting_replies={},
+            subscribers={},
+            subscribers_lock=threading.Lock(),
+            stopped=threading.Event(),
+            _active_goal_audits={},
+            _active_goal_audits_lock=threading.Lock(),
+            _active_agent_turns={},
+            _active_agent_turns_lock=threading.Lock(),
+            release_stale_session_bindings=lambda: None,
+            subscriber_key=lambda *args, **kwargs: "",
+            append_history=lambda username, sid, entry: append_history(
+                self.runtime_root,
+                username=username,
+                session_id=sid,
+                entry=entry,
+                limit=100,
+            ),
+            send_router_control=lambda message: router_calls.append(message) or True,
+            enqueue_service_control=lambda *args, **kwargs: None,
+            service_snapshots=lambda: {},
+            session_runtime_payload=lambda *args, **kwargs: {},
+            peer_descriptor=lambda *args, **kwargs: {},
+            resolve_session_service_for_dispatch=lambda *args, **kwargs: "",
+            codex_service_candidates_for_session=lambda *args, **kwargs: [],
+            current_llm_service_topology=lambda: (
+                ["service-codex-001", "service-codex-002"],
+                [],
+                [],
+                service_kinds,
+            ),
+            resolve_bound_codex_session=lambda *args, **kwargs: "",
+            enqueue_goal_dispatch=lambda **kwargs: ("", ""),
+            session_auto_compact_threshold=lambda *args, **kwargs: 20,
+            context_status_from_entry=lambda *args, **kwargs: {},
+            latest_context_status=lambda *args, **kwargs: {},
+            stored_context_status=lambda *args, **kwargs: {},
+            refresh_context_status=lambda *args, **kwargs: {},
+            ensure_context_status=lambda *args, **kwargs: {},
+            manual_compact_current_session=lambda *args, **kwargs: None,
+            render_entry_html=lambda *args, **kwargs: "",
+            cookie_value=lambda *args, **kwargs: "",
+            request_parts=lambda *args, **kwargs: ("", {}),
+            requested_session_id=lambda *args, **kwargs: "",
+            request_positive_int=lambda *args, **kwargs: 0,
+            current_context=lambda *args, **kwargs: {},
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, dict]] = []
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with (
+            patch("runtime.http_handler.issue_auth_context", return_value={"username": "root"}),
+            patch("runtime.http_handler.threading.Thread", _ImmediateThread),
+            patch(
+                "runtime.http_handler._resolve_goal_manager_dispatch_service_for_session",
+                return_value="service-codex-003",
+            ),
+        ):
+            handler._do_POST_message(
+                {
+                    "mode": "prompt",
+                    "text": "今きているRequestを日本語で教えてください。",
+                    "session_id": session_id,
+                    "communication_target": "entrance",
+                },
+                "application/json",
+            )
+
+        self.assertEqual(responses[0][0], 202)
+        created_sessions = [
+            item
+            for item in list_sessions(self.runtime_root, username="root")
+            if str(item.get("origin_session_id") or "") == session_id
+        ]
+        self.assertEqual(created_sessions, [])
+
+        history = get_history(self.runtime_root, username="root", session_id=session_id)
+        last_out = next(entry for entry in reversed(history) if entry.get("direction") == "out")
+        self.assertEqual(last_out["to"], "service-codex-001")
+        self.assertFalse(any(str(entry.get("to") or "").startswith("forward:") for entry in history))
+
+        dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
+        self.assertEqual(dispatch_reasons, ["http_user_dialogue", "interactive_worker_request", "goal_manager_review"])
+
     def test_get_overview_bypasses_ttl_cache_for_cache_busted_requests(self) -> None:
         Handler = self._make_handler(lambda **kwargs: ("", ""))
         handler = object.__new__(Handler)
@@ -937,6 +1045,29 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertEqual(summary["user_response_wait_status"], "waiting")
         self.assertEqual(summary["user_response_wait_request_id"], "user-response-repyt")
         self.assertEqual(summary["user_response_wait_prompt_text"], "Which deployment region should I use?")
+
+        handler._require_user = lambda query=None: {
+            "username": "root",
+            "viewer_username": "root",
+            "session_id": self.session_id,
+            "roles": ["root", "superuser"],
+            "role": "root",
+            "is_superuser": True,
+        }
+        responses.clear()
+
+        handler._do_GET_sessions("/sessions", {"session_window_seconds": ["0"]})
+        owned_ids = {entry["session_id"] for entry in responses[-1][1]["session_summaries"]}
+        self.assertIn(self.session_id, owned_ids)
+        self.assertNotIn(repyt_session_id, owned_ids)
+
+        handler._do_GET_sessions("/sessions", {"scope": ["all"], "session_window_seconds": ["0"]})
+        all_ids = {entry["session_id"] for entry in responses[-1][1]["session_summaries"]}
+        self.assertIn(self.session_id, all_ids)
+        self.assertIn(repyt_session_id, all_ids)
+        all_summary = next(entry for entry in responses[-1][1]["session_summaries"] if entry["session_id"] == repyt_session_id)
+        self.assertEqual(all_summary["username"], "repyt")
+        self.assertEqual(all_summary["user_response_wait_status"], "waiting")
 
     def test_get_units_includes_unit_launched_sessions(self) -> None:
         entrance_session = create_conversation_session(

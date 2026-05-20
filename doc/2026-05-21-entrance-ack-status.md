@@ -21,6 +21,7 @@
 - Restarted with `./restart_aize_unit.sh`.
 - Verified HttpBridge health on the active local HTTPS port with certificate verification disabled.
 - Ran a headless Chrome DevTools Protocol browser check against `/units/entrance?session_id=8149fee8e6aeac43`; after submitting through the Entrance form, the page status was `Input sent. Waiting for Entrance updates...`, the form remained usable, and the misleading parallel-agent claim was absent from the rendered body, including older Entrance history.
+- Re-ran browser verification after restart against the same Entrance session. The page rendered `Entrance session ready.`, status badges remained coherent as `Goal Active`, `Goal In Progress`, `Runtime Idle`, and `All Clear`, the Entrance form was enabled, and zero non-user chat rows contained the old parallel-agent claim. One user-authored message still quoted the old text as part of the original bug report, so whole-page text searches can still find the phrase in user history; agent/status rows do not show it.
 
 ## Remaining risk
 

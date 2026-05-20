@@ -2632,6 +2632,47 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         self.assertEqual(stored["restart_resume_claim_service_id"], "service-codex-002")
 
+    def test_goal_manager_restart_claim_is_shared_across_services(self) -> None:
+        first = claim_session_restart_resume(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            run_id=build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="goal_manager",
+                service_id="service-codex-001",
+            ),
+            service_id="service-codex-001",
+        )
+        second_distinct_service = claim_session_restart_resume(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            run_id=build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="goal_manager",
+                service_id="service-codex-002",
+            ),
+            service_id="service-codex-002",
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second_distinct_service)
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        self.assertEqual(
+            stored["restart_resume_claim_run_id"],
+            build_restart_resume_claim_run_id(
+                restart_generation_id="gen-1",
+                scope_session_id=self.session_id,
+                restart_claim_slot="goal_manager",
+                service_id="service-codex-001",
+            ),
+        )
+        self.assertEqual(stored["restart_resume_claim_service_id"], "service-codex-001")
+
     def test_old_goal_completion_does_not_overwrite_new_active_goal(self) -> None:
         from runtime.persistent_state_pkg import update_session_goal
 
@@ -3989,23 +4030,37 @@ class GoalManagerCompactTests(unittest.TestCase):
                 {"service": {"kind": "codex", "status": "stopped"}, "process": {"status": "stopped"}},
             ],
             session_summaries=[
-                {"agent_running": True, "worker": {"provider": "codex"}},
+                {"agent_running": True, "worker": {"provider": "codex", "service_id": "service-codex-001"}},
                 {
                     "agent_running": True,
-                    "worker": {"provider": "claude"},
+                    "worker": {"provider": "claude", "service_id": "service-claude-001"},
                     "goal_manager_state": "running",
-                    "goal_manager_worker": {"provider": "claude"},
+                    "goal_manager_worker": {"provider": "claude", "service_id": "service-claude-002"},
+                    "welcomed_agents": [
+                        {"service_id": "service-claude-001", "provider": "claude", "join_role": "agent"},
+                        {"service_id": "service-claude-002", "provider": "claude", "join_role": "goal_manager"},
+                    ],
                 },
-                {"agent_running": False, "worker": {"provider": "codex"}},
-                {"agent_running": True, "preferred_provider": "codex"},
-                {"agent_running": True, "worker": {"provider": "unknown"}, "preferred_provider": "codex"},
+                {"agent_running": False, "worker": {"provider": "codex", "service_id": "service-codex-002"}},
+                {"agent_running": True, "preferred_provider": "codex", "bound_service_id": "service-codex-003"},
+                {"agent_running": True, "worker": {"provider": "unknown", "service_id": "service-codex-004"}, "preferred_provider": "codex"},
                 {"agent_running": True, "bound_service_id": "service-claude-001"},
-                {"goal_manager_state": "running", "goal_manager_worker": {"provider": "codex"}},
+                {
+                    "goal_manager_state": "running",
+                    "goal_manager_worker": {"provider": "codex", "service_id": "service-codex-005"},
+                    "welcomed_agents": [
+                        {"service_id": "service-codex-005", "provider": "codex", "join_role": "goal_manager"},
+                    ],
+                },
             ],
         )
 
         self.assertEqual(counts["codex"]["running"], 1)
         self.assertEqual(counts["claude"]["running"], 1)
+        self.assertEqual(counts["codex"]["assigned_slots"], 4)
+        self.assertEqual(counts["codex"]["goal_manager_reviewers"], 1)
+        self.assertEqual(counts["claude"]["assigned_slots"], 1)
+        self.assertEqual(counts["claude"]["goal_manager_reviewers"], 1)
         self.assertEqual(counts["codex"]["replying_turns"], 3)
         self.assertEqual(counts["codex"]["reviewing_turns"], 1)
         self.assertEqual(counts["codex"]["active_turns"], 4)
@@ -5871,6 +5926,68 @@ printf '%s\\n' '{"type":"turn.completed"}'
         raw_message = router.writes[0]
         message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
         self.assertEqual(message["payload"]["reason"], "goal_manager_review")
+
+    def test_maybe_resume_after_restart_routes_provider_scoped_idle_in_progress_to_goal_manager(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep working until this goal is closed.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        agent_id = f"service-codex-001@@{self.session_id}@@goal_manager"
+        pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual([item["kind"] for item in pending], ["goal_manager_review"])
+        self.assertIn("restart_goal_review", pending[0]["text"])
+        self.assertEqual(len(router.writes), 1)
+        raw_message = router.writes[0]
+        message = json.loads(raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message)
+        self.assertEqual(message["payload"]["reason"], "goal_manager_review")
+        log_text = (self.runtime_root / "logs" / "service-codex-001.jsonl").read_text(encoding="utf-8")
+        self.assertIn("orphan_in_progress_goal", log_text)
 
     def test_maybe_resume_after_restart_routes_unreviewed_turn_to_goal_manager(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")
