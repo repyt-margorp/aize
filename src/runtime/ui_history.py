@@ -450,6 +450,7 @@ def build_session_ui_history(
                 continue
             if str(message.get("type") or "").strip() != "prompt":
                 continue
+            message_meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
             add(
                 {
                     "direction": "in",
@@ -457,6 +458,7 @@ def build_session_ui_history(
                     "from": str(message.get("from") or record.get("service_id") or ""),
                     "session_id": session_id,
                     "text": resolve_payload_text(runtime_root, message),
+                    "message_id": str(message_meta.get("message_id") or ""),
                 }
             )
 

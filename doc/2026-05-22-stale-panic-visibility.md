@@ -1,0 +1,6 @@
+# Stale Panic Visibility
+
+- Session audit summaries now use one merge rule everywhere: an authoritative GoalManager audit state only overrides per-service audit state when the GoalManager record is at least as fresh as the strongest per-service record. That preserves newer per-service `panic` visibility while still letting a newer GoalManager `all_clear` clear an older stale panic marker.
+- Touched `src/runtime/persistent_state_pkg/agent_audit.py`, `src/runtime/session_view.py`, `src/runtime/http_handler.py`, `tests/test_http_handler_goal_save.py`, and `tests/test_goal_manager_compact.py`.
+- Verification: `python3 -m unittest tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_root_page_status_strip_uses_strongest_session_audit_state tests.test_http_handler_goal_save.HttpHandlerGoalSaveTests.test_root_page_status_strip_prefers_newer_goal_manager_audit_state tests.test_goal_manager_compact.GoalManagerCompactTests.test_load_session_audit_summary_keeps_newer_service_audit_over_stale_goal_manager tests.test_goal_manager_compact.GoalManagerCompactTests.test_load_session_audit_summary_prefers_newer_goal_manager_all_clear`
+- Residual risk: any future path that bypasses session-aware summary loading and reads raw per-service audit files directly can still diverge until it uses the same freshness comparison.

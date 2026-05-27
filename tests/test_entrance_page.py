@@ -65,15 +65,40 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("id='chat-log'", page)
         self.assertIn("entrance-status-badges", page)
         self.assertIn("renderEntranceState", page)
+        self.assertIn("String(eventType||'').startsWith('service.user_response_wait_')", page)
+        self.assertIn("eventType==='service.user_response_wait_started'", page)
+        self.assertIn("update.user_response_wait_status='waiting';", page)
+        self.assertIn("Waiting for User${prompt?`: ${prompt}`:''}", page)
         self.assertIn("enter-send", page)
         self.assertIn("Enter sends message", page)
         self.assertIn("submitEntrancePrompt", page)
         self.assertIn("/overview?scope=all", page)
         self.assertIn("visibleAssistantText", page)
         self.assertIn("assistanttext", page)
+        self.assertIn("entryMessageId", page)
+        self.assertIn("if(messageId&&(direction==='out'||direction==='user'||direction==='session_input'||direction==='in'))return `message:${messageId}`;", page)
         self.assertIn("mergeMessages", page)
         self.assertIn("kind==='agent'?[role,kind,value,turnBucket].join('|')", page)
+        self.assertIn("duplicateVisibleItem(role,kind,value,ts)", page)
+        self.assertIn("Math.abs(current-previous)<=5000", page)
         self.assertIn("renderChat([entry])", page)
+        self.assertIn("if(direction==='out'||direction==='user'||direction==='session_input'){refreshChat();return;}", page)
+        self.assertIn("runtimeWorkerState(entry)", page)
+        self.assertIn("misleadingWorkerClaim(entry,direction,text)", page)
+        self.assertIn("worker?.service_id||event?.worker_service_id", page)
+        self.assertIn("runtime==='running'||runtime==='executing'||runtime==='reviewing'", page)
+        self.assertIn("rawRuntime==='executing'||rawRuntime==='running'||rawRuntime==='reviewing'", page)
+        self.assertNotIn("goalManagerState==='queued'||rawRuntime==='reviewing'?'running'", page)
+        self.assertIn("GoalManager ${goalManagerState.replace(/_/g,' ')}", page)
+        self.assertIn("Runtime Executing", page)
+        self.assertIn("normalized.includes(['workeragent','is','checking'].join(' '))", page)
+        self.assertNotIn("workeragent is checking", page.lower())
+        self.assertIn("String(eventType||'').startsWith('service.user_response_wait_')", page)
+        self.assertIn("eventType==='service.user_response_wait_ignored'", page)
+        self.assertIn("User response request recorded", page)
+        self.assertIn("update.user_response_wait_status='recorded';", page)
+        self.assertIn("update.user_response_wait_generated_at=String(event.generated_at||entry?.ts||'');", page)
+        self.assertIn("update.user_response_wait_until_at=String(event.until_at||'');", page)
         self.assertIn("renderEntranceUploadList();setStatus('Sending input to Entrance...')", page)
         self.assertIn("refreshChat();refreshEntranceState();setStatus('Input sent. Waiting for Entrance updates...')", page)
         self.assertNotIn("entranceOptimisticText", page)
@@ -179,6 +204,8 @@ class EntrancePageTests(unittest.TestCase):
             initial_user_response_wait_request_id="",
             initial_user_response_wait_prompt_text="",
             initial_user_response_wait_reason="",
+            initial_user_response_wait_source_service_id="",
+            initial_user_response_wait_requested_by_role="",
             initial_user_response_wait_last_cleared_at="",
             initial_user_response_wait_last_timeout_at="",
             initial_session_group="root",
@@ -268,7 +295,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("eventType==='runtime.status_changed'", page)
         self.assertIn("for(const key of ['runtime_execution_state','runtime_in_progress','agent_running','goal_manager_state','worker','goal_manager_worker'])", page)
         self.assertIn("const goalManagerState=String(s.goal_manager_state||'').trim().toLowerCase();", page)
-        self.assertIn("goalManagerState==='running'||goalManagerState==='queued'||rawRuntime==='reviewing'?'running':'idle'", page)
+        self.assertIn("rawRuntime==='executing'||rawRuntime==='running'||rawRuntime==='reviewing'?'running':'idle'", page)
+        self.assertIn("if(goalManagerState&&goalManagerState!=='idle')parts.push(badge(`GoalManager ${goalManagerState.replace(/_/g,' ')}`", page)
         self.assertIn("statePollTimer=setInterval(()=>{refreshEntranceState();},10000)", page)
         self.assertIn("jsonFetch(`/sessions?_=${Date.now()}`,{cache:'no-store'})", page)
         self.assertIn("/overview?scope=all", page)
@@ -356,6 +384,7 @@ class EntrancePageTests(unittest.TestCase):
                     "from": service_id,
                     "session_id": session_id,
                     "text": "The status is ready.",
+                    "message_id": "sendto-reply-1",
                 },
                 limit=500,
             )
@@ -369,7 +398,10 @@ class EntrancePageTests(unittest.TestCase):
                             "from": service_id,
                             "to": "service-http-001",
                             "type": "prompt",
-                            "meta": {"conversation": {"username": "repyt", "session_id": session_id}},
+                            "meta": {
+                                "message_id": "sendto-reply-1",
+                                "conversation": {"username": "repyt", "session_id": session_id},
+                            },
                             "payload": {"text": "The status is ready."},
                         },
                     },
@@ -387,6 +419,7 @@ class EntrancePageTests(unittest.TestCase):
             if entry.get("direction") == "in" and entry.get("text") == "The status is ready."
         ]
         self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0].get("message_id"), "sendto-reply-1")
 
     def test_ui_history_includes_user_response_wait_started_event(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -555,6 +588,8 @@ class EntrancePageTests(unittest.TestCase):
             initial_user_response_wait_request_id="",
             initial_user_response_wait_prompt_text="",
             initial_user_response_wait_reason="",
+            initial_user_response_wait_source_service_id="",
+            initial_user_response_wait_requested_by_role="",
             initial_user_response_wait_last_cleared_at="",
             initial_user_response_wait_last_timeout_at="",
             initial_session_group="",
@@ -620,20 +655,29 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("const patchWorkspaceSummaryFromEvent = (entry) => {", page)
         self.assertIn("patchWorkspaceSummaryFromEvent(entry);", page)
         self.assertIn("eventType.startsWith('service.user_response_wait_')", page)
+        self.assertIn("if (Array.isArray(requestWorkspaceSummaries)) requestWorkspaceSummaries = requestWorkspaceSummaries.map((summary) => String(summary?.session_id || '').trim() === sessionId ? { ...summary, ...patch } : summary);", page)
         self.assertIn("eventType === 'service.user_response_wait_started'", page)
         self.assertIn("eventType === 'service.user_response_wait_ignored'", page)
+        self.assertIn("'service.user_response_wait_ignored'", page)
         self.assertIn("patch.user_response_wait_status = 'waiting';", page)
         self.assertIn("patch.user_response_wait_status = 'recorded';", page)
+        self.assertIn("patch.user_response_wait_until_at = String(event.until_at || currentSummary?.user_response_wait_until_at || '');", page)
+        self.assertIn("request.until_at = String(event.until_at || request.until_at || currentSummary?.user_response_wait_until_at || '');", page)
+        self.assertIn("userResponseWaitStatus = 'recorded';", page)
+        self.assertIn("userResponseWaitStartedAt = String(event.generated_at || entry.ts || userResponseWaitStartedAt || '');", page)
+        self.assertIn("userResponseWaitUntilAt = String(event.until_at || userResponseWaitUntilAt || '');", page)
         self.assertIn("request.status = 'recorded';", page)
         self.assertIn("userResponseWaitStatus = String(payload?.user_response_wait_status || userResponseWaitStatus || 'idle');", page)
         self.assertIn("userResponseWaitPromptText = String(payload?.user_response_wait_prompt_text || userResponseWaitPromptText || '');", page)
         self.assertIn("const refreshUserRequests = async () => {", page)
-        self.assertIn("const requestDisplayQuery = () => { const bits = []; if (isSuperuser) bits.push('scope=all');", page)
+        self.assertIn("const requestDisplayQuery = () => { const bits = []; if (activeSessionId) bits.push(`session_id=${encodeURIComponent(activeSessionId)}`); const windowQuery = sessionWindowQuery(); if (windowQuery) bits.push(windowQuery); return bits.join('&'); };", page)
         self.assertIn("const response = await fetch(`/sessions?${displayQuery}${displayQuery ? '&' : ''}_=${Date.now()}`", page)
         self.assertIn("requestWorkspaceSummaries = payload.session_summaries;", page)
         self.assertIn("if (requestsPaneOpen) renderUserRequests();", page)
         self.assertIn("refreshUserRequests();", page)
         self.assertIn("const requestHistory = Array.isArray(summary?.user_response_wait_requests)", page)
+        self.assertIn("if (!requestItems.length && String(userResponseWaitStatus || 'idle').trim().toLowerCase() !== 'idle')", page)
+        self.assertIn("question: String(userResponseWaitPromptText || '').trim()", page)
         self.assertIn("Question: ${escapeHtml(prompt || 'No request text recorded.')}", page)
         self.assertIn("Background: ${escapeHtml(reason || 'No background recorded.')}", page)
         self.assertIn("Timeout policy: ${escapeHtml(requestTimeoutPolicyText({ until_at: request?.until_at || summary?.user_response_wait_until_at || '', effective_timeout_seconds: request?.effective_timeout_seconds || request?.timeout_seconds || summary?.user_response_wait_effective_timeout_seconds || summary?.user_response_wait_timeout_seconds || 0 }))}", page)
@@ -647,13 +691,13 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("Executing", page)
         self.assertIn("Idle", page)
         self.assertIn("All Clear", page)
-        self.assertIn("Codex ${String(codex.running || 0)} lots / ${String(codex.replying_turns || 0)} replying / ${String(codex.reviewing_turns || 0)} reviewing", page)
-        self.assertIn("<span>lots</span><span>${String(item.replying_turns || 0)} replying</span><span>${String(item.reviewing_turns || 0)} reviewing</span>", page)
+        self.assertIn("Codex ${String(codex.running || 0)} processes / ${String(codex.replying_turns || 0)} replying / ${String(codex.reviewing_turns || 0)} reviewing", page)
+        self.assertIn("<span>processes</span><span>${String(item.replying_turns || 0)} replying</span><span>${String(item.reviewing_turns || 0)} reviewing</span>", page)
         self.assertNotIn("assigned / ${String(codex.active_turns || 0)} executing", page)
         self.assertNotIn("${String(item.assigned_slots || 0)} assigned</span><span>${String(item.active_turns || 0)} executing", page)
         self.assertIn("goal-session-agent-counts", page)
-        self.assertIn("Reviewing ${String(gmReviewerCount)}", page)
-        self.assertIn("Replying ${String(assignedAgentCount)}", page)
+        self.assertIn("GM Reviewers ${String(gmReviewerCount)}", page)
+        self.assertIn("Agents ${String(assignedAgentCount)}", page)
         self.assertNotIn("const workerSlot = worker?.slot == null ? '·' : String(worker.slot);", page)
         self.assertNotIn("goal-marker-left", page)
         self.assertIn("runtime-journal-panel", page)
@@ -738,6 +782,8 @@ class EntrancePageTests(unittest.TestCase):
             initial_user_response_wait_request_id="",
             initial_user_response_wait_prompt_text="",
             initial_user_response_wait_reason="",
+            initial_user_response_wait_source_service_id="",
+            initial_user_response_wait_requested_by_role="",
             initial_user_response_wait_last_cleared_at="",
             initial_user_response_wait_last_timeout_at="",
             initial_session_group="",
@@ -809,8 +855,24 @@ class EntrancePageTests(unittest.TestCase):
         self.assertTrue(_is_communication_chat_noise({"event_type": "turn.started"}))
         self.assertTrue(_is_communication_chat_noise({"text": "response started"}))
         self.assertTrue(_is_communication_chat_noise({"text": " Response Started "}))
+        self.assertTrue(_is_communication_chat_noise({"direction": "in", "text": "WorkerAgent is checking the UI browser verification now."}))
+        self.assertTrue(_is_communication_chat_noise({"direction": "in", "text": "WorkerAgent is checking in parallel."}))
+        self.assertFalse(
+            _is_communication_chat_noise(
+                {
+                    "direction": "in",
+                    "text": "WorkerAgent is checking runtime state now.",
+                    "event": {
+                        "runtime_execution_state": "running",
+                        "runtime_in_progress": True,
+                        "worker": {"service_id": "service-codex-worker-001"},
+                    },
+                }
+            )
+        )
         self.assertFalse(_is_communication_chat_noise({"direction": "in", "text": "actual reply"}))
         self.assertFalse(_is_communication_chat_noise({"direction": "out", "text": "user prompt"}))
+        self.assertFalse(_is_communication_chat_noise({"direction": "out", "text": "User asked why WorkerAgent is checking."}))
 
     def test_matching_communication_skill_routes_prefers_explicit_default_route(self) -> None:
         current_session = {
@@ -837,7 +899,7 @@ class EntrancePageTests(unittest.TestCase):
             1,
         )
 
-    def test_matching_communication_skill_routes_launcher_template_does_not_auto_route_by_default(self) -> None:
+    def test_matching_communication_skill_routes_launcher_template_keeps_unhandled_prompts_in_entrance(self) -> None:
         current_session = {
             "launcher_template_id": "entrance.service",
             "session_skills": [],
@@ -1307,6 +1369,10 @@ class EntrancePageTests(unittest.TestCase):
                 )
 
             self.assertIsNone(routed)
+            self.assertEqual(
+                [str(item.get("session_id") or "") for item in list_sessions(runtime_root, username="repyt")],
+                [str(entrance["session_id"])],
+            )
 
     def test_materialize_communication_routed_child_session_reuses_registered_parent_for_parallel_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

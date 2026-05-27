@@ -212,6 +212,7 @@ from .conversation import (
 from .agent_audit import (
     load_agent_audit_state,
     load_session_audit_summary,
+    reconcile_stale_session_service_states,
     save_agent_audit_state,
     reset_agent_audit_states_for_session,
 )
@@ -407,6 +408,7 @@ __all__ = [
     # Agent audit
     "load_agent_audit_state",
     "load_session_audit_summary",
+    "reconcile_stale_session_service_states",
     "save_agent_audit_state",
     "reset_agent_audit_states_for_session",
 ]

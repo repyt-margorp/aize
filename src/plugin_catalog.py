@@ -91,6 +91,11 @@ def _descriptor_with_defaults(descriptor_path: Path, *, descriptor_type: str) ->
     data = json.loads(descriptor_path.read_text(encoding="utf-8"))
     data["_descriptor_path"] = str(descriptor_path)
     data["_descriptor_dir"] = str(descriptor_path.parent)
+    if descriptor_type == "app":
+        unit_id = str(data.get("unit_id") or data.get("template_id") or data.get("app_id") or "").strip()
+        if unit_id:
+            data.setdefault("unit_id", unit_id)
+            data.setdefault("template_id", unit_id)
     if descriptor_type == "service":
         data.setdefault("module", _module_name_for_path(descriptor_path.parent))
     return data

@@ -9,9 +9,11 @@ from runtime.event_log import make_history_event_entry
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_jsonl,
+    get_session_service,
     normalize_agent_priority,
     normalize_goal_manager_priority,
     get_session_settings,
+    load_agent_audit_state,
     read_json_file,
     save_agent_audit_state,
     session_group_permissions,
@@ -26,6 +28,35 @@ from runtime.persistent_state_pkg import (
 from wire.protocol import utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
+
+
+def _goal_manager_compact_health_payload(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    service_id: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    if str(event.get("type") or "").strip() != "service.goal_manager_compact_checked":
+        return {}
+    compaction = str(event.get("compaction") or "").strip().lower()
+    if compaction not in {"triggered", "not_needed"}:
+        return {}
+    audit_state = load_agent_audit_state(
+        runtime_root,
+        service_id=service_id,
+        username=username,
+        session_id=session_id,
+    )
+    if audit_state != "all_clear":
+        return {}
+    return {
+        "audit_state": "all_clear",
+        "progress_state": "in_progress",
+        "goal_satisfied": False,
+        "summary": "No user work is pending to proxy, track, or report. GoalManager compaction completed and the session is idle.",
+    }
 
 
 def _user_response_wait_status(talk: dict[str, Any]) -> str:
@@ -60,6 +91,17 @@ def _normalize_goal_manager_compact_event(event: dict[str, Any]) -> dict[str, An
     return normalized
 
 
+def _goal_manager_audit_state_after_compact_event(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type") or "").strip().lower()
+    if event_type == "service.goal_manager_compact_failed":
+        return "panic"
+    if event_type != "service.goal_manager_compact_checked":
+        return ""
+    if str(event.get("compaction") or "").strip().lower() == "suppressed_by_session_setting":
+        return "needs_compact"
+    return "all_clear"
+
+
 def _persist_goal_manager_runtime_state(
     *,
     runtime_root: Path,
@@ -73,18 +115,28 @@ def _persist_goal_manager_runtime_state(
     normalized_payload = dict(payload)
     normalized_payload.pop("_service_snapshot_id", None)
     state.update(normalized_payload)
+    pending_work_items = state.get("pending_work_items")
+    runtime_state = str(state.get("state") or "").strip().lower()
+    if isinstance(pending_work_items, list) and not pending_work_items and runtime_state in {
+        "",
+        "idle",
+        "failed",
+        "complete",
+    }:
+        state.pop("stale_reason", None)
+        state["last_queued_turn_completed_at"] = ""
     state["updated_at"] = utc_ts()
     write_json_file(state_path, state)
-    service_id = snapshot_service_id or str(state.get("service_id") or "").strip()
-    if not service_id:
+    target_service_ids: list[str] = []
+    for candidate in (
+        snapshot_service_id,
+        str(state.get("service_id") or "").strip(),
+        str(get_session_service(runtime_root, username=username, session_id=session_id) or "").strip(),
+    ):
+        if candidate and candidate not in target_service_ids:
+            target_service_ids.append(candidate)
+    if not target_service_ids:
         return
-    service_state_path = session_service_state_path(
-        runtime_root,
-        username=username,
-        session_id=session_id,
-        service_id=service_id,
-    )
-    service_state = read_json_file(service_state_path) or {"service_id": service_id}
     progress_state = str(
         state.get("progress_state", "complete" if bool(state.get("goal_satisfied")) else "in_progress")
     ).strip().lower()
@@ -95,20 +147,28 @@ def _persist_goal_manager_runtime_state(
         status = runtime_status
     else:
         status = "in_progress"
-    service_state["status"] = status
-    service_state["updated_at"] = str(state["updated_at"])
-    service_state["goal_manager"] = {
-        "state": runtime_status or "idle",
-        "progress_state": progress_state,
-        "audit_state": str(state.get("audit_state") or "").strip(),
-        "goal_satisfied": bool(state.get("goal_satisfied", False)),
-        "summary": str(state.get("summary") or "").strip(),
-        "pending_work_items": list(state.get("pending_work_items", []))
-        if isinstance(state.get("pending_work_items"), list)
-        else [],
-        "updated_at": str(state["updated_at"]),
-    }
-    write_json_file(service_state_path, service_state)
+    for service_id in target_service_ids:
+        service_state_path = session_service_state_path(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            service_id=service_id,
+        )
+        service_state = read_json_file(service_state_path) or {"service_id": service_id}
+        service_state["status"] = status
+        service_state["updated_at"] = str(state["updated_at"])
+        service_state["goal_manager"] = {
+            "state": runtime_status or "idle",
+            "progress_state": progress_state,
+            "audit_state": str(state.get("audit_state") or "").strip(),
+            "goal_satisfied": bool(state.get("goal_satisfied", False)),
+            "summary": str(state.get("summary") or "").strip(),
+            "pending_work_items": list(state.get("pending_work_items", []))
+            if isinstance(state.get("pending_work_items"), list)
+            else [],
+            "updated_at": str(state["updated_at"]),
+        }
+        write_json_file(service_state_path, service_state)
 
 
 def goal_state_response_payload(
@@ -120,6 +180,7 @@ def goal_state_response_payload(
     goal_manager_state: str | None = None,
     goal_manager_service_id: str | None = None,
     goal_manager_worker: dict[str, Any] | None = None,
+    goal_manager_pending_work_items: list[dict[str, Any]] | None = None,
     welcomed_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     # audit_state is agent-side; use provided value or default to all_clear (session no longer stores it)
@@ -186,6 +247,15 @@ def goal_state_response_payload(
             or default_provider
         ),
         "goal_manager_worker": goal_manager_worker if isinstance(goal_manager_worker, dict) else None,
+        "goal_manager_pending_work_items": (
+            goal_manager_pending_work_items
+            if isinstance(goal_manager_pending_work_items, list)
+            else (
+                list(talk.get("goal_manager_pending_work_items", []))
+                if isinstance(talk.get("goal_manager_pending_work_items"), list)
+                else []
+            )
+        ),
         "welcomed_agents": welcomed_agents if welcomed_agents is not None else list(talk.get("welcomed_agents", [])) if isinstance(talk.get("welcomed_agents"), list) else [],
         "selected_agents": list(talk.get("selected_agents", [])) if isinstance(talk.get("selected_agents"), list) else [],
     }
@@ -425,16 +495,28 @@ def persist_goal_manager_compact_event(
     event: dict[str, Any],
     history_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
+    audit_state = _goal_manager_audit_state_after_compact_event(event)
+    health_payload = _goal_manager_compact_health_payload(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=service_id,
+        event=event,
+    )
+    payload = {
+        "state": "idle" if str(event.get("type") or "").endswith("_checked") else "failed",
+        "service_id": service_id,
+        "pending_work_items": [],
+        "compact_event": dict(event),
+        **health_payload,
+    }
+    if audit_state:
+        payload["audit_state"] = audit_state
     _persist_goal_manager_runtime_state(
         runtime_root=runtime_root,
         username=username,
         session_id=session_id,
-        payload={
-            "state": "idle" if str(event.get("type") or "").endswith("_checked") else "failed",
-            "service_id": service_id,
-            "pending_work_items": [],
-            "compact_event": dict(event),
-        },
+        payload=payload,
     )
     write_jsonl(
         log_path,

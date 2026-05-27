@@ -130,29 +130,29 @@ def panic_recovery_goal_text(
     wait_status = str(event.get("wait_status") or "").strip()
     left_percent = str(event.get("left_percent") or event.get("post_left_percent") or "").strip()
     lines = [
-        "ユーザー指示: Panic に陥った親セッションを復旧させよ。",
-        f"対象セッションID: {source_session_id}",
-        f"対象セッション名: {source_label or source_session_id}",
-        f"Panic を起こしたエージェント: {panic_service_id or 'unknown'}",
-        f"失敗イベント: {event_type}",
+        "User instruction: Recover the parent session that entered panic.",
+        f"Source session ID: {source_session_id}",
+        f"Source session label: {source_label or source_session_id}",
+        f"Panicking agent: {panic_service_id or 'unknown'}",
+        f"Failure event: {event_type}",
     ]
     if reason:
-        lines.append(f"失敗理由: {reason}")
+        lines.append(f"Failure reason: {reason}")
     if compact:
-        lines.append(f"compact 状態: {compact}")
+        lines.append(f"Compaction state: {compact}")
     if wait_status:
-        lines.append(f"wait 状態: {wait_status}")
+        lines.append(f"Wait status: {wait_status}")
     if left_percent:
-        lines.append(f"context left_percent: {left_percent}")
+        lines.append(f"Context left_percent: {left_percent}")
     lines.extend(
         [
-            "要件:",
-            "1. 親セッションが Panic になった直接原因を特定すること。",
-            "2. 最小限の修正で、親セッションが再開できる状態に戻すことを最優先にすること。",
-            "3. 無関係な全面リファクタや広範囲修正は行わず、親セッションの続行を妨げる箇所だけ直すこと。",
-            "4. 親セッションへ戻すために必要な具体的手順または自動処理まで実装すること。",
-            "5. 修正後、親セッションが実際に再開して新しい turn / 応答を出すところまで確認すること。",
-            "6. 進捗と結果はこの recovery セッションに報告すること。",
+            "Requirements:",
+            "1. Identify the direct cause of the parent session panic.",
+            "2. Prioritize the smallest viable fix that returns the parent session to a resumable state.",
+            "3. Do not broaden scope into unrelated refactors or wide changes; fix only what blocks the parent session from continuing.",
+            "4. Implement the concrete steps or automation needed to hand control back to the parent session.",
+            "5. After the fix, verify that the parent session actually resumes and produces a new turn or reply.",
+            "6. Report progress and results in this recovery session.",
         ]
     )
     return "\n".join(lines)

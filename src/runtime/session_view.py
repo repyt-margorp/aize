@@ -11,9 +11,12 @@ from runtime.status_gateway import merge_runtime_status
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_pending_input,
+    get_session_service,
     get_history as get_user_history,
+    load_session_audit_summary,
     load_pending_inputs,
     read_json_file,
+    reconcile_stale_session_service_states,
     session_goal_manager_state_path,
     session_service_state_path,
     session_ui_mode,
@@ -99,24 +102,20 @@ def worker_slot_badge(
         return {
             "service_id": normalized_service_id,
             "provider": "codex",
-            "slot": codex_service_pool.index(normalized_service_id) + 1,
         }
     if normalized_service_id in claude_service_pool:
         return {
             "service_id": normalized_service_id,
             "provider": "claude",
-            "slot": claude_service_pool.index(normalized_service_id) + 1,
         }
     if normalized_service_id in gemini_service_pool:
         return {
             "service_id": normalized_service_id,
             "provider": "gemini",
-            "slot": gemini_service_pool.index(normalized_service_id) + 1,
         }
     return {
         "service_id": normalized_service_id,
         "provider": "unknown",
-        "slot": None,
     }
 
 
@@ -133,13 +132,30 @@ def session_agent_assignment_counts(
     assigned_agents: set[str] = set()
 
     def contact_key(item: dict[str, Any]) -> str:
-        return str(item.get("service_id") or item.get("agent_id") or "").strip()
+        raw = str(item.get("service_id") or item.get("agent_id") or "").strip()
+        if "@@" in raw:
+            return raw.split("@@", 1)[0].strip()
+        return raw
 
     if not session_has_active_in_progress_goal(session):
         return {
             "goal_manager_reviewers": 0,
             "assigned_agents": 0,
         }
+
+    welcomed_agents = session.get("welcomed_agents")
+    if isinstance(welcomed_agents, list):
+        for item in welcomed_agents:
+            if not isinstance(item, dict):
+                continue
+            key = contact_key(item)
+            if not key:
+                continue
+            role = str(item.get("join_role") or "agent").strip().lower() or "agent"
+            if role == "goal_manager":
+                gm_agents.add(key)
+            else:
+                assigned_agents.add(key)
 
     replying = bool(session.get("agent_running", False)) if agent_running is None else bool(agent_running)
     if replying:
@@ -265,7 +281,15 @@ def persisted_goal_manager_runtime_state(
     username: str,
     session_id: str,
     bound_service_id: str = "",
+    allow_reconcile: bool = True,
 ) -> dict[str, Any]:
+    if allow_reconcile:
+        reconcile_stale_session_service_states(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            preferred_service_id=bound_service_id,
+        )
     state = read_json_file(
         session_goal_manager_state_path(runtime_root, username=username, session_id=session_id)
     ) or {}
@@ -277,36 +301,50 @@ def persisted_goal_manager_runtime_state(
         if isinstance(state.get("pending_work_items"), list)
         else []
     )
-    if service_id and progress_state in {"complete", "in_progress"}:
-        service_state_path = session_service_state_path(
-            runtime_root,
-            username=username,
-            session_id=session_id,
-            service_id=service_id,
-        )
-        service_state = read_json_file(service_state_path) or {"service_id": service_id}
-        goal_manager_state = service_state.get("goal_manager")
-        if not isinstance(goal_manager_state, dict):
-            goal_manager_state = {}
-        current_progress_state = str(goal_manager_state.get("progress_state") or "").strip().lower()
-        if current_progress_state != progress_state:
-            if progress_state == "complete":
-                service_status = "complete"
-            elif runtime_state in {"running", "failed", "idle", "queued"}:
-                service_status = runtime_state
-            else:
-                service_status = "in_progress"
+    if allow_reconcile and service_id and progress_state in {"complete", "in_progress"}:
+        target_service_ids: list[str] = []
+        for candidate in (
+            service_id,
+            str(bound_service_id or "").strip(),
+            str(get_session_service(runtime_root, username=username, session_id=session_id) or "").strip(),
+        ):
+            if candidate and candidate not in target_service_ids:
+                target_service_ids.append(candidate)
+        if progress_state == "complete":
+            service_status = "complete"
+        elif runtime_state in {"running", "failed", "idle", "queued"}:
+            service_status = runtime_state
+        else:
+            service_status = "in_progress"
+        goal_manager_payload = {
+            "state": runtime_state or "idle",
+            "progress_state": progress_state,
+            "audit_state": str(state.get("audit_state") or "").strip(),
+            "goal_satisfied": bool(state.get("goal_satisfied", False)),
+            "summary": str(state.get("summary") or "").strip(),
+            "pending_work_items": pending_work_items,
+            "updated_at": str(state.get("updated_at") or utc_ts()),
+        }
+        for target_service_id in target_service_ids:
+            service_state_path = session_service_state_path(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=target_service_id,
+            )
+            service_state = read_json_file(service_state_path) or {"service_id": target_service_id}
+            goal_manager_state = service_state.get("goal_manager")
+            if not isinstance(goal_manager_state, dict):
+                goal_manager_state = {}
+            if (
+                str(service_state.get("status") or "").strip().lower() == service_status
+                and goal_manager_state == goal_manager_payload
+                and str(service_state.get("updated_at") or "") == goal_manager_payload["updated_at"]
+            ):
+                continue
             service_state["status"] = service_status
-            service_state["updated_at"] = str(state.get("updated_at") or utc_ts())
-            service_state["goal_manager"] = {
-                "state": runtime_state or "idle",
-                "progress_state": progress_state,
-                "audit_state": str(state.get("audit_state") or "").strip(),
-                "goal_satisfied": bool(state.get("goal_satisfied", False)),
-                "summary": str(state.get("summary") or "").strip(),
-                "pending_work_items": pending_work_items,
-                "updated_at": str(state.get("updated_at") or utc_ts()),
-            }
+            service_state["updated_at"] = goal_manager_payload["updated_at"]
+            service_state["goal_manager"] = dict(goal_manager_payload)
             write_json_file(service_state_path, service_state)
     if runtime_state == "running":
         return {"state": "running", "service_id": service_id, "pending_work_items": pending_work_items}
@@ -330,8 +368,23 @@ def build_session_runtime_summary(
     gemini_service_pool: list[str],
     default_provider: str,
     resident_session_ids: set[str] | None = None,
+    runtime_root: Path | None = None,
+    username: str | None = None,
+    allow_reconcile: bool = True,
 ) -> dict[str, Any]:
     session_id = str(talk.get("session_id") or "")
+    goal_audit_state = str(talk.get("goal_audit_state", "all_clear") or "all_clear")
+    if runtime_root is not None and username and session_id:
+        prefer_authoritative_goal_manager = session_has_active_in_progress_goal(talk)
+        audit_summary = load_session_audit_summary(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            preferred_service_id=str(talk.get("service_id") or "").strip() or None,
+            prefer_authoritative_goal_manager=prefer_authoritative_goal_manager,
+            allow_reconcile=allow_reconcile,
+        )
+        goal_audit_state = str((audit_summary or {}).get("audit_state") or goal_audit_state or "all_clear")
     preferred_provider = str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
     bound_service_id = str(talk.get("service_id") or "").strip()
     active_turn = active_agent_turn_state(history_entries)
@@ -349,6 +402,20 @@ def build_session_runtime_summary(
         gemini_service_pool=gemini_service_pool,
     )
     goal_manager_state = latest_goal_manager_runtime_state(history_entries)
+    if runtime_root is not None and username and session_id:
+        persisted_goal_manager = persisted_goal_manager_runtime_state(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            bound_service_id=bound_service_id,
+            allow_reconcile=allow_reconcile,
+        )
+        persisted_state = str(persisted_goal_manager.get("state") or "").strip().lower()
+        live_state = str(goal_manager_state.get("state") or "").strip().lower()
+        if persisted_state in {"running", "queued", "failed"} or (
+            live_state == "idle" and persisted_state in {"waiting", "complete"}
+        ):
+            goal_manager_state = dict(persisted_goal_manager)
     goal_manager_worker = worker_slot_badge(
         str(goal_manager_state.get("service_id") or bound_service_id),
         codex_service_pool=codex_service_pool,
@@ -416,7 +483,7 @@ def build_session_runtime_summary(
         "goal_active": bool(talk.get("goal_active", False)),
         "goal_completed": goal_completed,
         "goal_progress_state": goal_progress_state,
-        "goal_audit_state": str(talk.get("goal_audit_state", "all_clear") or "all_clear"),
+        "goal_audit_state": goal_audit_state,
         "agent_welcome_enabled": bool(talk.get("agent_welcome_enabled", False)),
         "preferred_provider": preferred_provider,
         "bound_service_id": bound_service_id,
@@ -442,6 +509,8 @@ def build_session_runtime_summary(
         "user_response_wait_request_id": str(talk.get("user_response_wait_request_id", "") or ""),
         "user_response_wait_prompt_text": str(talk.get("user_response_wait_prompt_text", "") or "").strip(),
         "user_response_wait_reason": str(talk.get("user_response_wait_reason", "") or "").strip(),
+        "user_response_wait_source_service_id": str(talk.get("user_response_wait_source_service_id", "") or "").strip(),
+        "user_response_wait_requested_by_role": str(talk.get("user_response_wait_requested_by_role", "") or "").strip(),
         "user_response_wait_requests": user_response_wait_requests,
         "parent_session_id": str(talk.get("parent_session_id") or "").strip(),
         "created_by_username": str(talk.get("created_by_username") or "").strip(),

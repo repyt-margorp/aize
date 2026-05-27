@@ -96,6 +96,57 @@ class SessionSkillsTests(unittest.TestCase):
             "Implement routed changes here.",
         )
 
+    def test_update_session_skills_preserves_existing_durable_files(self) -> None:
+        session = create_conversation_session(self.runtime_root, username=self.username, label="Root")
+        session_id = str(session["session_id"])
+        skill = {
+            "skill_id": "monitor",
+            "files": [
+                {
+                    "path": "monitor-record.md",
+                    "content": "Append one entry per scheduled run\n",
+                    "description": "Durable record of monitoring runs.",
+                }
+            ],
+        }
+
+        self.assertIsNotNone(
+            update_session_skills(
+                self.runtime_root,
+                username=self.username,
+                session_id=session_id,
+                session_skills=[skill],
+            )
+        )
+        record_path = session_skill_file_path(
+            self.runtime_root,
+            username=self.username,
+            session_id=session_id,
+            relative_path="monitor-record.md",
+        )
+        record_path.write_text("Append one entry per scheduled run\n\n- durable finding\n", encoding="utf-8")
+
+        self.assertIsNotNone(
+            update_session_skills(
+                self.runtime_root,
+                username=self.username,
+                session_id=session_id,
+                session_skills=[skill],
+            )
+        )
+
+        self.assertEqual(
+            record_path.read_text(encoding="utf-8"),
+            "Append one entry per scheduled run\n\n- durable finding\n",
+        )
+        self.assertTrue(
+            load_session_skills(
+                self.runtime_root,
+                username=self.username,
+                session_id=session_id,
+            )[0]["files"][0]["preserve_existing"]
+        )
+
     def test_child_session_creation_preserves_session_skills(self) -> None:
         parent = create_conversation_session(self.runtime_root, username=self.username, label="Parent")
         child = create_child_conversation_session(

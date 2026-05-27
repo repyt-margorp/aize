@@ -41,6 +41,7 @@
           {
             "path": "monitor-record.md",
             "description": "Durable record of monitoring runs and recurring findings.",
+            "preserve_existing": true,
             "content": "# AIze System Monitor\n\nAppend one entry per scheduled run:\n\n- Date/time:\n- Scanner summary:\n- Sessions with unresolved user input:\n- Unfinished goals:\n- Stalled sessions:\n- System problems:\n- Follow-up recommended:\n"
           }
         ]

@@ -13,6 +13,7 @@ from runtime.message_builder import (
     make_dispatch_pending_message,
 )
 from runtime.dispatch_queue import dispatch_priority
+from runtime.communication_goal import session_goal_completion_policy
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
     append_goal_manager_pending_input,
@@ -69,6 +70,9 @@ from runtime.restart_recovery import (
     utc_ts_age_seconds,
 )
 from runtime.restart_panic_recovery import enqueue_restart_panic_recovery
+from runtime.session_lifecycle import (
+    purge_continuous_communication_restart_owner_lost_state,
+)
 from wire.protocol import encode_line, make_message, message_set_meta, utc_ts, write_jsonl
 
 GOAL_AUDIT_HISTORY_LIMIT = 500
@@ -354,7 +358,12 @@ def maybe_resume_after_restart(
         runtime_state = str(goal_manager_state.get("state") or "").strip().lower()
         if runtime_state != "running":
             return False, runtime_state
-        latest_turn_completed = latest_agent_turn_completed_at(talk)
+        queued_turn_completed = str(
+            goal_manager_state.get("last_queued_turn_completed_at") or ""
+        ).strip()
+        latest_turn_completed = queued_turn_completed
+        if not latest_turn_completed and not bool(talk.get("communication_agent_enabled", False)):
+            latest_turn_completed = latest_agent_turn_completed_at(talk)
         review_cursor = review_cursor_for_session(
             runtime_root,
             username=username,
@@ -401,6 +410,7 @@ def maybe_resume_after_restart(
                 )
             goal_manager_state["state"] = "queued"
             goal_manager_state["pending_work_items"] = pending_work_items
+            goal_manager_state["last_queued_turn_completed_at"] = str(latest_turn_completed or "").strip()
             goal_manager_state["stale_reason"] = (
                 "persisted_pending_work_after_stale_running_state"
                 if has_persisted_pending_work
@@ -483,6 +493,21 @@ def maybe_resume_after_restart(
         unfinished_turn = history_has_unfinished_turn(history)
         has_actionable_pending = has_actionable_pending_inputs(pending_inputs) or has_actionable_pending_inputs(service_pending_inputs)
         has_live_actionable_pending = has_live_actionable_pending_inputs(pending_inputs) or has_live_actionable_pending_inputs(service_pending_inputs)
+        is_continuous_communication_goal = bool(
+            talk.get("communication_agent_enabled", False)
+            and session_goal_completion_policy(talk) == "continuous"
+        )
+        if is_continuous_communication_goal:
+            purge_continuous_communication_restart_owner_lost_state(
+                runtime_root,
+                username=scope_username,
+                session_id=scope_session_id,
+            )
+            goal_manager_pending_inputs = load_goal_manager_pending_inputs(
+                runtime_root,
+                username=scope_username,
+                session_id=scope_session_id,
+            )
         should_standard_goal_route = bool(
             goal_text
             and goal_active
@@ -533,6 +558,7 @@ def maybe_resume_after_restart(
         if (
             should_standard_goal_route
             and not goal_manager_review_reasons
+            and not is_continuous_communication_goal
         ):
             goal_manager_review_reasons.append("system_restart_active_in_progress")
         if (
@@ -543,6 +569,7 @@ def maybe_resume_after_restart(
             and recovery_mode != "reconstruct_without_session"
             and not goal_manager_review_reasons
             and not history_has_terminal_goal_manager_cycle(history)
+            and not is_continuous_communication_goal
         ):
             goal_manager_review_reasons.append("orphan_in_progress_goal")
         restart_goal_manager_review_only = bool(

@@ -39,6 +39,7 @@ from ._core import (
     read_json_file,
     read_jsonl,
     sessions_dir,
+    session_agent_state_path,
     session_dag_children_path,
     session_dag_parents_path,
     session_dir,
@@ -47,6 +48,7 @@ from ._core import (
     session_agent_acl_path,
     session_metadata_path,
     session_goal_manager_state_path,
+    session_service_state_path,
     session_timeline_path,
     session_user_dir,
     state_lock,
@@ -70,6 +72,38 @@ def _parse_utc_ts(value: Any) -> datetime | None:
 
 def _utc_ts_after_seconds(seconds: int) -> str:
     return (datetime.now(UTC) + timedelta(seconds=max(0, int(seconds)))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _user_response_wait_is_due(session: dict[str, Any], *, now: datetime | None = None) -> bool:
+    record = dict(session or {})
+    if not bool(record.get("user_response_wait_active", False)):
+        return False
+    due_at = _parse_utc_ts(record.get("user_response_wait_until_at"))
+    if due_at is None:
+        return False
+    return due_at <= (now or datetime.now(UTC))
+
+
+def _clear_due_user_response_wait_unlocked(talk: dict[str, Any], *, now: datetime | None = None) -> bool:
+    if not _user_response_wait_is_due(talk, now=now):
+        return False
+    talk["user_response_wait_active"] = False
+    cleared_at = utc_ts()
+    talk["user_response_wait_last_cleared_at"] = cleared_at
+    talk["user_response_wait_last_timeout_at"] = cleared_at
+    active_request_id = str(talk.get("user_response_wait_request_id") or "").strip()
+    requests = talk.get("user_response_wait_requests")
+    if isinstance(requests, list) and active_request_id:
+        for item in reversed(requests):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("request_id") or "").strip() != active_request_id:
+                continue
+            item["status"] = "timed_out"
+            item["cleared_at"] = cleared_at
+            break
+    talk["updated_at"] = utc_ts()
+    return True
 
 
 def session_group_permissions(session: dict[str, Any] | None) -> dict[str, bool]:
@@ -178,6 +212,14 @@ def _list_session_records(runtime_root: Path, *, username: str) -> list[dict[str
         if not isinstance(stored, dict):
             continue
         _ensure_session_defaults_unlocked(stored)
+        if _user_response_wait_is_due(stored):
+            expired = consume_session_due_user_response_wait(
+                runtime_root,
+                username=username,
+                session_id=talk_dir.name,
+            )
+            if isinstance(expired, dict):
+                stored = expired
         sessions.append(dict(stored))
     return sessions
 
@@ -187,8 +229,7 @@ def list_sessions(runtime_root: Path, *, username: str) -> list[dict[str, Any]]:
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         _ensure_default_session_unlocked(state, normalized)
-    with state_read_lock(runtime_root):
-        return _list_session_records(runtime_root, username=normalized)
+    return _list_session_records(runtime_root, username=normalized)
 
 
 def list_sessions_with_histories(
@@ -198,28 +239,26 @@ def list_sessions_with_histories(
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         _ensure_default_session_unlocked(state, normalized)
-    with state_read_lock(runtime_root):
-        sessions = _list_session_records(runtime_root, username=normalized)
-        histories: dict[str, list[dict[str, Any]]] = {}
-        for session in sessions:
-            session_id = str(session.get("session_id") or "")
-            timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
-            histories[session_id] = read_jsonl(timeline_path)
+    sessions = _list_session_records(runtime_root, username=normalized)
+    histories: dict[str, list[dict[str, Any]]] = {}
+    for session in sessions:
+        session_id = str(session.get("session_id") or "")
+        timeline_path = session_timeline_path(runtime_root, username=normalized, session_id=session_id)
+        histories[session_id] = read_jsonl(timeline_path)
     return sessions, histories
 
 
 def list_all_sessions_with_users(runtime_root: Path) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     sessions_root = sessions_dir(runtime_root)
-    with state_read_lock(runtime_root):
-        if not sessions_root.exists():
-            return result
-        for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir()):
-            username = normalize_username(user_dir.name)
-            for session in _list_session_records(runtime_root, username=username):
-                entry = dict(session)
-                entry["username"] = username
-                result.append(entry)
+    if not sessions_root.exists():
+        return result
+    for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir()):
+        username = normalize_username(user_dir.name)
+        for session in _list_session_records(runtime_root, username=username):
+            entry = dict(session)
+            entry["username"] = username
+            result.append(entry)
     return result
 
 
@@ -491,6 +530,7 @@ def create_conversation_session(
     session_permissions: dict[str, Any] | None = None,
     created_by_username: str | None = None,
     created_by_type: str | None = None,
+    parent_session_id: str | None = None,
     origin_session_id: str | None = None,
     origin_goal_id: str | None = None,
     origin_goal_text: str | None = None,
@@ -502,6 +542,8 @@ def create_conversation_session(
     session_skills: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_username(username)
+    normalized_parent_session_id = str(parent_session_id or "").strip()
+    created_session_id = ""
     with state_lock(runtime_root):
         state = _load_state_unlocked(runtime_root)
         sessions = _conversation_sessions(state).setdefault(normalized, [])
@@ -542,14 +584,26 @@ def create_conversation_session(
             "updated_at": utc_ts(),
             "created_by_username": str(created_by_username or normalized).strip(),
             "created_by_type": str(created_by_type or "user").strip().lower() or "user",
-            "origin_session_id": str(origin_session_id or "").strip(),
+            "parent_session_id": normalized_parent_session_id,
+            "origin_session_id": str(origin_session_id or normalized_parent_session_id).strip(),
             "origin_goal_id": str(origin_goal_id or "").strip(),
             "origin_goal_text": str(origin_goal_text or ""),
         }
         sessions.append(session)
+        created_session_id = str(session["session_id"])
         ensure_session_storage_unlocked(runtime_root, username=normalized, session=session)
         write_state(runtime_root, state)
-        return dict(session)
+    if normalized_parent_session_id and created_session_id:
+        add_session_child(
+            runtime_root,
+            username=normalized,
+            parent_session_id=normalized_parent_session_id,
+            child_session_id=created_session_id,
+        )
+        linked_session = get_session_settings(runtime_root, username=normalized, session_id=created_session_id)
+        if isinstance(linked_session, dict):
+            return linked_session
+    return dict(session)
 
 
 def get_session_service(runtime_root: Path, *, username: str, session_id: str) -> str | None:
@@ -560,6 +614,47 @@ def get_session_service(runtime_root: Path, *, username: str, session_id: str) -
             service_id = session.get("service_id")
             return str(service_id) if isinstance(service_id, str) and service_id else None
         return None
+
+
+def _clear_superseded_service_session_state(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+) -> None:
+    normalized_service_id = str(service_id or "").strip()
+    if not normalized_service_id:
+        return
+    audit_path = session_agent_state_path(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=normalized_service_id,
+    )
+    audit_record = read_json_file(audit_path)
+    if isinstance(audit_record, dict):
+        audit_record["audit_state"] = "all_clear"
+        audit_record["updated_at"] = utc_ts()
+        write_json_file(audit_path, audit_record)
+
+    service_state_path = session_service_state_path(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=normalized_service_id,
+    )
+    service_state = read_json_file(service_state_path)
+    if isinstance(service_state, dict):
+        service_state["status"] = "idle"
+        service_state["updated_at"] = utc_ts()
+        goal_manager = service_state.get("goal_manager")
+        if isinstance(goal_manager, dict):
+            goal_manager["state"] = "idle"
+            goal_manager["audit_state"] = "all_clear"
+            goal_manager["updated_at"] = service_state["updated_at"]
+            service_state["goal_manager"] = goal_manager
+        write_json_file(service_state_path, service_state)
 
 
 def lease_session_service(
@@ -599,6 +694,14 @@ def lease_session_service(
                         leased[svc_id] = (user_dir.name, talk_dir.name, prio)
         available = next((service_id for service_id in pool if service_id not in leased), None)
         if available is not None:
+            previous_service_id = str(existing_service_id or "").strip()
+            if previous_service_id and previous_service_id != available:
+                _clear_superseded_service_session_state(
+                    runtime_root,
+                    username=normalized,
+                    session_id=session_id,
+                    service_id=previous_service_id,
+                )
             target_session["service_id"] = available
             target_session["updated_at"] = utc_ts()
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=target_session)
@@ -618,6 +721,14 @@ def lease_session_service(
                     victim_session.pop("service_id", None)
                     victim_session["updated_at"] = utc_ts()
                     ensure_session_storage_unlocked(runtime_root, username=victim_user, session=victim_session)
+                previous_service_id = str(existing_service_id or "").strip()
+                if previous_service_id and previous_service_id != victim_svc:
+                    _clear_superseded_service_session_state(
+                        runtime_root,
+                        username=normalized,
+                        session_id=session_id,
+                        service_id=previous_service_id,
+                    )
                 target_session["service_id"] = victim_svc
                 target_session["updated_at"] = utc_ts()
                 ensure_session_storage_unlocked(runtime_root, username=normalized, session=target_session)
@@ -769,6 +880,9 @@ def get_session_settings(runtime_root: Path, *, username: str, session_id: str) 
         stored = read_json_file(session_metadata_path(runtime_root, username=normalized, session_id=session_id))
         if isinstance(stored, dict):
             _ensure_session_defaults_unlocked(stored)
+            if _clear_due_user_response_wait_unlocked(stored):
+                ensure_session_storage_unlocked(runtime_root, username=normalized, session=stored)
+                return dict(stored)
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=stored)
             return dict(stored)
         return None
@@ -1281,25 +1395,8 @@ def consume_session_due_user_response_wait(
             _ensure_session_defaults_unlocked(talk)
             if not bool(talk.get("user_response_wait_active", False)):
                 return None
-            due_at = _parse_utc_ts(talk.get("user_response_wait_until_at"))
-            if due_at is None or due_at > now:
+            if not _clear_due_user_response_wait_unlocked(talk, now=now):
                 return None
-            talk["user_response_wait_active"] = False
-            cleared_at = utc_ts()
-            talk["user_response_wait_last_cleared_at"] = cleared_at
-            talk["user_response_wait_last_timeout_at"] = cleared_at
-            active_request_id = str(talk.get("user_response_wait_request_id") or "").strip()
-            requests = talk.get("user_response_wait_requests")
-            if isinstance(requests, list) and active_request_id:
-                for item in reversed(requests):
-                    if not isinstance(item, dict):
-                        continue
-                    if str(item.get("request_id") or "").strip() != active_request_id:
-                        continue
-                    item["status"] = "timed_out"
-                    item["cleared_at"] = cleared_at
-                    break
-            talk["updated_at"] = utc_ts()
             ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
             return dict(talk)
         return None
@@ -1642,7 +1739,31 @@ def update_goal_manager_review_cursor(
                     session_id=session_id,
                 )
                 goal_manager_state = read_json_file(goal_manager_state_path) or {}
-                goal_manager_state["last_reviewed_turn_completed_at"] = talk["goal_manager_last_reviewed_turn_completed_at"]
+                review_cursor = talk["goal_manager_last_reviewed_turn_completed_at"]
+                goal_manager_state["last_reviewed_turn_completed_at"] = review_cursor
+                pending_work_items = goal_manager_state.get("pending_work_items")
+                if isinstance(pending_work_items, list):
+                    remaining_pending_work_items = []
+                    for item in pending_work_items:
+                        if not isinstance(item, dict):
+                            remaining_pending_work_items.append(item)
+                            continue
+                        item_kind = str(item.get("kind") or "").strip().lower()
+                        item_ts = str(item.get("ts") or "").strip()
+                        if item_kind == "turn_completed" and item_ts and item_ts <= review_cursor:
+                            continue
+                        remaining_pending_work_items.append(item)
+                    goal_manager_state["pending_work_items"] = remaining_pending_work_items
+                    if not remaining_pending_work_items:
+                        runtime_state = str(goal_manager_state.get("state") or "").strip().lower()
+                        if runtime_state in {"queued", "running"}:
+                            goal_manager_state["state"] = "idle"
+                        goal_manager_state.pop("stale_reason", None)
+                queued_turn_completed_at = str(
+                    goal_manager_state.get("last_queued_turn_completed_at") or ""
+                ).strip()
+                if queued_turn_completed_at and queued_turn_completed_at <= review_cursor:
+                    goal_manager_state["last_queued_turn_completed_at"] = ""
                 goal_manager_state["updated_at"] = talk["updated_at"]
                 write_json_file(goal_manager_state_path, goal_manager_state)
                 return dict(talk)

@@ -13,6 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import runtime.http_handler as http_handler  # noqa: E402
 from runtime.http_handler import make_handler  # noqa: E402
 from runtime.persistent_state_pkg import (  # noqa: E402
     append_history,
@@ -159,6 +160,18 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             session_id=self.session_id,
             goal_active=True,
         )
+        update_session_user_response_wait(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            active=True,
+            request_id="user-response-root-render",
+            timeout_seconds=7200,
+            prompt_text="Which deployment region should I use?",
+            request_reason="Deployment needs a region.",
+            source_service_id="service-codex-001",
+            requested_by_role="goal_manager",
+        )
 
         Handler = self._make_handler(
             lambda **kwargs: ("", ""),
@@ -191,6 +204,8 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertIn("<span class='goal-session-badge'>Goal In Progress</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge'>Runtime Idle</span>", responses[0][1])
         self.assertIn("<span class='goal-session-badge is-audit-ok'>All Clear</span>", responses[0][1])
+        self.assertIn("user-response-root-render", responses[0][1])
+        self.assertIn("Which deployment region should I use?", responses[0][1])
 
         json_responses: list[tuple[int, dict]] = []
         handler._json = lambda status, payload: json_responses.append((status, payload))
@@ -204,6 +219,50 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         )
         self.assertEqual(summary["goal_audit_state"], "all_clear")
         self.assertEqual(summary["runtime_execution_state"], "idle")
+        self.assertEqual(summary["user_response_wait_status"], "waiting")
+        self.assertEqual(summary["user_response_wait_requests"][0]["request_id"], "user-response-root-render")
+
+    def test_root_page_with_selected_session_skips_all_session_audit_prefetch(self) -> None:
+        extra_session = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Sibling Session",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username="root",
+            session_id=str(extra_session["session_id"]),
+            audit_state="panic",
+        )
+
+        Handler = self._make_handler(
+            lambda **kwargs: ("", ""),
+            current_context=lambda *args, **kwargs: {
+                "username": "root",
+                "viewer_username": "root",
+                "session_id": self.session_id,
+                "roles": ["root", "superuser"],
+                "role": "root",
+                "is_superuser": True,
+            },
+            requested_session_id=lambda *args, **kwargs: self.session_id,
+        )
+        handler = object.__new__(Handler)
+        handler._trace_auth_request = lambda *args, **kwargs: None
+        handler._html = lambda status, body: None
+
+        original = http_handler.load_session_audit_summary
+        calls: list[tuple[str | None, str | None]] = []
+
+        def wrapped(*args, **kwargs):
+            calls.append((kwargs.get("username"), kwargs.get("session_id")))
+            return original(*args, **kwargs)
+
+        with patch.object(http_handler, "load_session_audit_summary", side_effect=wrapped):
+            handler._do_GET_root("/", {})
+
+        self.assertEqual(calls, [("root", self.session_id)])
 
     def test_root_page_status_strip_uses_strongest_session_audit_state(self) -> None:
         update_session_goal(
@@ -224,6 +283,22 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             username="root",
             session_id=self.session_id,
             audit_state="panic",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username="root",
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-007",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "goal_satisfied": False,
+                "summary": "Stale review before the newer agent panic.",
+                "updated_at": "2026-05-20T00:00:00Z",
+            },
         )
 
         Handler = self._make_handler(
@@ -248,6 +323,197 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertEqual(responses[0][0], 200)
         self.assertIn("id='session-status-strip' class='session-status-strip'", responses[0][1])
         self.assertIn("<span class='session-status-chip is-audit-panic'>Panic</span>", responses[0][1])
+
+    def test_root_page_status_strip_prefers_newer_goal_manager_audit_state(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_text="Keep the resident session in progress.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username="root",
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username="root",
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-007",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "goal_satisfied": False,
+                "summary": "Resident session remains intentionally in progress.",
+                "updated_at": "2026-05-22T23:59:59Z",
+            },
+        )
+
+        Handler = self._make_handler(
+            lambda **kwargs: ("", ""),
+            current_context=lambda *args, **kwargs: {
+                "username": "root",
+                "viewer_username": "root",
+                "session_id": self.session_id,
+                "roles": ["root", "superuser"],
+                "role": "root",
+                "is_superuser": True,
+            },
+            requested_session_id=lambda *args, **kwargs: None,
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, str]] = []
+        handler._trace_auth_request = lambda *args, **kwargs: None
+        handler._html = lambda status, body: responses.append((status, body))
+
+        handler._do_GET_root("/", {})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertIn("id='session-status-strip' class='session-status-strip'", responses[0][1])
+        self.assertIn("<span class='session-status-chip is-audit-ok'>All Clear</span>", responses[0][1])
+        self.assertNotIn("<span class='session-status-chip is-audit-panic'>Panic</span>", responses[0][1])
+
+        json_responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: json_responses.append((status, payload))
+        handler._do_GET_sessions("/sessions", {"_": ["1"]})
+
+        summary = next(
+            item
+            for item in json_responses[-1][1]["session_summaries"]
+            if item["session_id"] == self.session_id
+        )
+        self.assertEqual(summary["goal_audit_state"], "all_clear")
+        self.assertEqual(summary["runtime_execution_state"], "idle")
+
+    def test_root_page_idle_reconcile_skips_empty_communication_sessions(self) -> None:
+        communication = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance Session",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+        )
+        communication_session_id = str(communication["session_id"])
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=communication_session_id,
+            goal_text="Continue the communication session goal.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=communication_session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+
+        dispatch_calls: list[dict[str, str | None]] = []
+
+        def enqueue_goal_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return "service-codex-001", None
+
+        Handler = self._make_handler(
+            enqueue_goal_dispatch,
+            current_context=lambda *args, **kwargs: {
+                "username": "root",
+                "viewer_username": "root",
+                "session_id": self.session_id,
+                "roles": ["root", "superuser"],
+                "role": "root",
+                "is_superuser": True,
+            },
+            requested_session_id=lambda *args, **kwargs: None,
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, str]] = []
+        handler._trace_auth_request = lambda *args, **kwargs: None
+        handler._html = lambda status, body: responses.append((status, body))
+
+        handler._do_GET_root("/", {})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(dispatch_calls, [])
+
+    def test_root_page_idle_reconcile_skips_sessions_with_goal_manager_already_queued(self) -> None:
+        communication = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance Session",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+        )
+        communication_session_id = str(communication["session_id"])
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=communication_session_id,
+            goal_text="Continue the communication session goal.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=communication_session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username="root",
+                session_id=communication_session_id,
+            ),
+            {
+                "state": "queued",
+                "service_id": "service-codex-queued",
+                "pending_work_items": [{"kind": "goal_manager_review"}],
+            },
+        )
+
+        dispatch_calls: list[dict[str, str | None]] = []
+
+        def enqueue_goal_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return "service-codex-001", None
+
+        Handler = self._make_handler(
+            enqueue_goal_dispatch,
+            current_context=lambda *args, **kwargs: {
+                "username": "root",
+                "viewer_username": "root",
+                "session_id": self.session_id,
+                "roles": ["root", "superuser"],
+                "role": "root",
+                "is_superuser": True,
+            },
+            requested_session_id=lambda *args, **kwargs: None,
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, str]] = []
+        handler._trace_auth_request = lambda *args, **kwargs: None
+        handler._html = lambda status, body: responses.append((status, body))
+
+        handler._do_GET_root("/", {})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(dispatch_calls, [])
 
     def test_message_goal_mode_resets_goal_manager_runtime_state(self) -> None:
         state_path = session_goal_manager_state_path(
@@ -303,6 +569,174 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         history = get_history(self.runtime_root, username="root", session_id=self.session_id)
         self.assertEqual(history[-1]["event_type"], "service.goal_manager_reset")
         self.assertEqual(history[-1]["event"]["reason"], "goal_updated")
+
+    def test_session_goal_save_resets_goal_manager_runtime_state_and_dispatches_review(self) -> None:
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+        )
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_text="Previous goal",
+        )
+        write_json_file(
+            state_path,
+            {
+                "state": "running",
+                "goal_audit_job_id": "goal-audit-stale",
+                "service_id": "service-claude-001",
+                "pending_work_items": [{"kind": "goal_manager_review"}],
+            },
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username="root",
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+
+        dispatch_calls: list[dict[str, object]] = []
+
+        def enqueue_goal_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return "service-codex-002", ""
+
+        Handler = self._make_handler(enqueue_goal_dispatch)
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, dict]] = []
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": self.session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with patch("runtime.http_handler.issue_auth_context", return_value={"username": "root"}):
+            handler._do_POST_session_goal({"goal_text": "Updated goal"})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(responses[0][1]["goal_text"], "Updated goal")
+        self.assertEqual(responses[0][1]["dispatched_to"], "service-codex-002")
+        self.assertEqual(responses[0][1]["dispatch_error"], "")
+
+        talk = get_session_settings(self.runtime_root, username="root", session_id=self.session_id)
+        assert talk is not None
+        self.assertEqual(talk["goal_text"], "Updated goal")
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "idle")
+        self.assertEqual(state["goal_audit_job_id"], "")
+        self.assertEqual(state["service_id"], "")
+        self.assertEqual(state["pending_work_items"], [])
+
+        self.assertEqual(len(dispatch_calls), 1)
+        self.assertEqual(dispatch_calls[0]["reason"], "goal_saved")
+        self.assertEqual(dispatch_calls[0]["previous_goal_text"], "Previous goal")
+        self.assertTrue(dispatch_calls[0]["previous_goal_id"])
+
+        history = get_history(self.runtime_root, username="root", session_id=self.session_id)
+        self.assertEqual(history[-1]["event_type"], "service.goal_manager_reset")
+        self.assertEqual(history[-1]["event"]["reason"], "goal_updated")
+
+    def test_session_goal_save_honors_explicit_target_session_id(self) -> None:
+        child = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Child Goal Target",
+        )
+        child_session_id = str(child["session_id"])
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=child_session_id,
+            goal_text="Child previous goal",
+        )
+
+        dispatch_calls: list[dict[str, object]] = []
+
+        def enqueue_goal_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return "service-codex-002", ""
+
+        Handler = self._make_handler(enqueue_goal_dispatch)
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, dict]] = []
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": self.session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with patch("runtime.http_handler.issue_auth_context", return_value={"username": "root"}):
+            handler._do_POST_session_goal(
+                {"session_id": child_session_id, "goal_text": "Updated child goal"}
+            )
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(responses[0][1]["session_id"], child_session_id)
+        self.assertEqual(responses[0][1]["goal_text"], "Updated child goal")
+        self.assertEqual(dispatch_calls[0]["session_id"], child_session_id)
+
+        parent = get_session_settings(self.runtime_root, username="root", session_id=self.session_id)
+        child = get_session_settings(self.runtime_root, username="root", session_id=child_session_id)
+        assert parent is not None
+        assert child is not None
+        self.assertEqual(parent["goal_text"], "")
+        self.assertEqual(child["goal_text"], "Updated child goal")
+
+    def test_session_goal_state_honors_explicit_target_session_id(self) -> None:
+        update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            preferred_provider="claude",
+        )
+        child = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Child Goal State Target",
+        )
+        child_session_id = str(child["session_id"])
+        update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=child_session_id,
+            goal_text="Ship child state update",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=child_session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+
+        dispatch_calls: list[dict[str, object]] = []
+
+        def enqueue_goal_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            return "service-codex-003", ""
+
+        Handler = self._make_handler(enqueue_goal_dispatch)
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, dict]] = []
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": self.session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with patch("runtime.http_handler.issue_auth_context", return_value={"username": "root"}):
+            handler._do_POST_session_goal_state(
+                {"session_id": child_session_id, "preferred_provider": "codex"}
+            )
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(responses[0][1]["session_id"], child_session_id)
+        self.assertEqual(responses[0][1]["preferred_provider"], "codex")
+        self.assertEqual(dispatch_calls[0]["session_id"], child_session_id)
+
+        parent = get_session_settings(self.runtime_root, username="root", session_id=self.session_id)
+        child = get_session_settings(self.runtime_root, username="root", session_id=child_session_id)
+        assert parent is not None
+        assert child is not None
+        self.assertEqual(parent.get("preferred_provider"), "claude")
+        self.assertEqual(child["preferred_provider"], "codex")
 
     def test_message_multipart_upload_persists_message_directory_and_attachment_metadata(self) -> None:
         Handler = self._make_handler(lambda **kwargs: ("", ""))
@@ -542,10 +976,10 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             service_snapshots=lambda: {},
             session_runtime_payload=lambda *args, **kwargs: {},
             peer_descriptor=lambda *args, **kwargs: {},
-            resolve_session_service_for_dispatch=lambda *args, **kwargs: "",
+            resolve_session_service_for_dispatch=lambda *args, **kwargs: "service-codex-004",
             codex_service_candidates_for_session=lambda *args, **kwargs: [],
             current_llm_service_topology=lambda: (
-                ["service-codex-001", "service-codex-002"],
+                ["service-codex-001", "service-codex-002", "service-codex-004"],
                 [],
                 [],
                 service_kinds,
@@ -596,7 +1030,10 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
 
         sessions = list_sessions(self.runtime_root, username="root")
         created_sessions = [item for item in sessions if str(item.get("origin_session_id") or "") == session_id]
-        self.assertEqual(created_sessions, [])
+        self.assertEqual(len(created_sessions), 2)
+        forwarded_child = next(
+            item for item in created_sessions if str(item.get("label") or "") == "Development Task"
+        )
 
         interactive_pending = load_service_pending_inputs(
             self.runtime_root,
@@ -614,21 +1051,23 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         )
         self.assertEqual([item["kind"] for item in interactive_pending], ["user_dialogue"])
         self.assertEqual([item["kind"] for item in worker_pending], ["interactive_worker_request"])
-        self.assertNotIn("delegated_session_id", worker_pending[0])
-        self.assertNotIn("delegated_session", worker_pending[0]["text"])
+        self.assertIn("delegated_session", worker_pending[0]["text"])
+        self.assertIn(str(forwarded_child["session_id"]), worker_pending[0]["text"])
 
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
         self.assertEqual(
             dispatch_reasons,
-            ["goal_manager_review", "http_user_dialogue", "interactive_worker_request"],
+            ["goal_manager_review", "http_user_dialogue", "interactive_worker_request", "goal_feedback"],
         )
 
         history = get_history(self.runtime_root, username="root", session_id=session_id)
         last_out = next(entry for entry in reversed(history) if entry.get("direction") == "out")
         self.assertEqual(last_out["to"], "service-codex-001")
-        self.assertFalse(
+        self.assertTrue(
             any(
-                entry.get("direction") == "in" and entry.get("service_id") == "service-entrance-router"
+                entry.get("direction") == "in"
+                and entry.get("service_id") == "service-entrance-router"
+                and "Routed to AIze Development." in str(entry.get("text") or "")
                 for entry in history
             )
         )
@@ -639,7 +1078,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             session_id=session_id,
             limit=20,
         )
-        self.assertFalse(
+        self.assertTrue(
             any(
                 entry.get("direction") == "in"
                 and "Entrance will keep this session updated while that work runs." in str(entry.get("text") or "")
@@ -912,7 +1351,147 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
         self.assertEqual(dispatch_reasons, ["goal_manager_review", "http_user_dialogue", "interactive_worker_request"])
 
-    def test_get_overview_bypasses_ttl_cache_for_cache_busted_requests(self) -> None:
+    def test_message_prompt_with_launcher_only_entrance_does_not_auto_delegate(self) -> None:
+        talk = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+        )
+        session_id = str(talk["session_id"])
+        update_session_launcher_profile(
+            self.runtime_root,
+            username="root",
+            session_id=session_id,
+            launcher_template_id="entrance.service",
+            launcher_display_name="Entrance",
+            preferred_provider="codex",
+            selected_agents=[],
+            service_targets=[],
+            launcher_unit_kind="interface",
+            launcher_unit_class="service",
+            launcher_instance_policy="multi",
+            workspace_scope="unit",
+            workspace_path="./workspace/entrance",
+        )
+
+        router_calls: list[dict[str, object]] = []
+        service_kinds = {
+            "service-codex-001": "codex",
+            "service-codex-002": "codex",
+            "service-codex-003": "codex",
+        }
+        Handler = make_handler(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test"},
+            self_service={"service_id": "service-http-001"},
+            process_id="proc-http-001",
+            log_path=self.runtime_root / "logs" / "http.jsonl",
+            default_target="service-codex-001",
+            default_provider="codex",
+            history_limit=100,
+            tls_enabled=True,
+            codex_service_pool=["service-codex-001", "service-codex-002"],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+            llm_service_kinds=service_kinds,
+            pending=[],
+            awaiting_replies={},
+            subscribers={},
+            subscribers_lock=threading.Lock(),
+            stopped=threading.Event(),
+            _active_goal_audits={},
+            _active_goal_audits_lock=threading.Lock(),
+            _active_agent_turns={},
+            _active_agent_turns_lock=threading.Lock(),
+            release_stale_session_bindings=lambda: None,
+            subscriber_key=lambda *args, **kwargs: "",
+            append_history=lambda username, sid, entry: append_history(
+                self.runtime_root,
+                username=username,
+                session_id=sid,
+                entry=entry,
+                limit=100,
+            ),
+            send_router_control=lambda message: router_calls.append(message) or True,
+            enqueue_service_control=lambda *args, **kwargs: None,
+            service_snapshots=lambda: {},
+            session_runtime_payload=lambda *args, **kwargs: {},
+            peer_descriptor=lambda *args, **kwargs: {},
+            resolve_session_service_for_dispatch=lambda *args, **kwargs: "",
+            codex_service_candidates_for_session=lambda *args, **kwargs: [],
+            current_llm_service_topology=lambda: (
+                ["service-codex-001", "service-codex-002"],
+                [],
+                [],
+                service_kinds,
+            ),
+            resolve_bound_codex_session=lambda *args, **kwargs: "",
+            enqueue_goal_dispatch=lambda **kwargs: ("", ""),
+            session_auto_compact_threshold=lambda *args, **kwargs: 20,
+            context_status_from_entry=lambda *args, **kwargs: {},
+            latest_context_status=lambda *args, **kwargs: {},
+            stored_context_status=lambda *args, **kwargs: {},
+            refresh_context_status=lambda *args, **kwargs: {},
+            ensure_context_status=lambda *args, **kwargs: {},
+            manual_compact_current_session=lambda *args, **kwargs: None,
+            render_entry_html=lambda *args, **kwargs: "",
+            cookie_value=lambda *args, **kwargs: "",
+            request_parts=lambda *args, **kwargs: ("", {}),
+            requested_session_id=lambda *args, **kwargs: "",
+            request_positive_int=lambda *args, **kwargs: 0,
+            current_context=lambda *args, **kwargs: {},
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, dict]] = []
+        handler._require_user = lambda payload=None: {"username": "root", "session_id": session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with (
+            patch("runtime.http_handler.issue_auth_context", return_value={"username": "root"}),
+            patch("runtime.http_handler.threading.Thread", _ImmediateThread),
+            patch(
+                "runtime.http_handler._resolve_goal_manager_dispatch_service_for_session",
+                return_value="service-codex-003",
+            ),
+            patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}),
+        ):
+            handler._do_POST_message(
+                {
+                    "mode": "prompt",
+                    "text": "Please implement the development routing fix.",
+                    "session_id": session_id,
+                },
+                "application/json",
+            )
+
+        self.assertEqual(responses[0][0], 202)
+        created_sessions = [
+            item
+            for item in list_sessions(self.runtime_root, username="root")
+            if str(item.get("origin_session_id") or "") == session_id
+        ]
+        self.assertEqual(created_sessions, [])
+
+        history = get_history(self.runtime_root, username="root", session_id=session_id)
+        last_out = next(entry for entry in reversed(history) if entry.get("direction") == "out")
+        self.assertEqual(last_out["to"], "service-codex-001")
+        self.assertFalse(
+            any(
+                entry.get("direction") == "in"
+                and entry.get("service_id") == "service-entrance-router"
+                for entry in history
+            )
+        )
+
+        dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
+        self.assertEqual(
+            dispatch_reasons,
+            ["goal_manager_review", "http_user_dialogue", "interactive_worker_request"],
+        )
+
+    def test_get_overview_uses_ttl_cache_for_browser_cache_busters(self) -> None:
         Handler = self._make_handler(lambda **kwargs: ("", ""))
         handler = object.__new__(Handler)
         handler._require_user = lambda query=None: {"username": "root", "session_id": self.session_id}
@@ -948,6 +1527,55 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         )
 
         handler._do_GET_overview("/overview", {"_": ["1"]})
+        self.assertFalse(
+            responses[-1][1]["session_summaries"][0]["goal_completed"],
+        )
+
+        handler._do_GET_overview("/overview", {"live": ["1"]})
+        self.assertTrue(
+            responses[-1][1]["session_summaries"][0]["goal_completed"],
+        )
+
+    def test_get_sessions_uses_ttl_cache_for_browser_cache_busters(self) -> None:
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {
+            "username": "root",
+            "viewer_username": "root",
+            "session_id": self.session_id,
+        }
+
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        updated = update_session_goal(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_text="Keep this goal running",
+        )
+        self.assertIsNotNone(updated)
+
+        handler._do_GET_sessions("/sessions", {})
+        self.assertEqual(responses[-1][0], 200)
+        self.assertFalse(
+            responses[-1][1]["session_summaries"][0]["goal_completed"],
+        )
+
+        updated = update_session_goal_flags(
+            self.runtime_root,
+            username="root",
+            session_id=self.session_id,
+            goal_completed=True,
+        )
+        self.assertIsNotNone(updated)
+
+        handler._do_GET_sessions("/sessions", {"_": ["1"]})
+        self.assertFalse(
+            responses[-1][1]["session_summaries"][0]["goal_completed"],
+        )
+
+        handler._do_GET_sessions("/sessions", {"live": ["1"]})
         self.assertTrue(
             responses[-1][1]["session_summaries"][0]["goal_completed"],
         )
@@ -1003,6 +1631,46 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             entry for entry in payload["session_summaries"] if entry["session_id"] == resident_id
         )
         self.assertTrue(resident_summary["resident_unit_session"])
+
+    def test_get_sessions_and_overview_skip_reconcile_on_summary_reads(self) -> None:
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {
+            "username": "root",
+            "viewer_username": "root",
+            "session_id": self.session_id,
+            "roles": ["root", "superuser"],
+            "role": "root",
+            "is_superuser": True,
+        }
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        persisted_calls: list[bool] = []
+        audit_calls: list[bool] = []
+        original_persisted = http_handler.persisted_goal_manager_runtime_state
+        original_audit = http_handler.load_session_audit_summary
+
+        def wrapped_persisted(*args, **kwargs):
+            persisted_calls.append(bool(kwargs.get("allow_reconcile", True)))
+            return original_persisted(*args, **kwargs)
+
+        def wrapped_audit(*args, **kwargs):
+            audit_calls.append(bool(kwargs.get("allow_reconcile", True)))
+            return original_audit(*args, **kwargs)
+
+        with patch.object(http_handler, "persisted_goal_manager_runtime_state", side_effect=wrapped_persisted), patch.object(
+            http_handler, "load_session_audit_summary", side_effect=wrapped_audit
+        ):
+            handler._do_GET_sessions("/sessions", {"live": ["1"]})
+            handler._do_GET_overview("/overview", {"live": ["1"]})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(responses[1][0], 200)
+        self.assertTrue(persisted_calls)
+        self.assertTrue(audit_calls)
+        self.assertTrue(all(flag is False for flag in persisted_calls))
+        self.assertTrue(all(flag is False for flag in audit_calls))
 
     def test_cross_user_session_view_lists_session_owner_requests_for_owned_scope(self) -> None:
         repyt_session = create_conversation_session(self.runtime_root, username="repyt", label="Repyt Request")
@@ -1119,6 +1787,26 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertEqual(launched["goal_text"], "Route follow-up through Entrance")
         self.assertTrue(launched["goal_active"])
         self.assertFalse(launched["goal_completed"])
+        self.assertNotIn("apps", payload)
+
+    def test_get_session_templates_preserves_legacy_apps_alias(self) -> None:
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda query=None: {
+            "username": "root",
+            "viewer_username": "root",
+            "session_id": self.session_id,
+        }
+        responses: list[tuple[int, dict]] = []
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler._do_GET_units("/session-templates", {"_": ["1"]})
+
+        self.assertEqual(responses[-1][0], 200)
+        payload = responses[-1][1]
+        self.assertIn("units", payload)
+        self.assertIn("apps", payload)
+        self.assertEqual(payload["apps"], payload["units"])
 
     def test_units_launch_dispatches_active_in_progress_session_on_registration(self) -> None:
         dispatch_calls: list[dict[str, str]] = []

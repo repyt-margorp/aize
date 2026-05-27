@@ -35,6 +35,7 @@ from runtime.cli_service_adapter import (  # noqa: E402
     handle_goal_manager_compact_request,
     latest_goal_manager_runtime_state,
     manual_compact_clears_audit_state,
+    maybe_clear_stale_idle_agent_panic,
     maybe_enqueue_mid_turn_progress_inquiry,
     maybe_release_session_provider,
     pending_turn_completed_events_since_last_review,
@@ -50,17 +51,23 @@ from runtime.providers.claude import normalize_claude_stream_event, run_claude  
 from runtime.providers.codex import run_codex, run_codex_compaction  # noqa: E402
 from runtime.providers.gemini import run_gemini  # noqa: E402
 from runtime.providers import provider_supports_context_compaction  # noqa: E402
-from runtime.panic_recovery import ensure_panic_recovery_session  # noqa: E402
+from runtime.panic_recovery import ensure_panic_recovery_session, panic_recovery_goal_text  # noqa: E402
 from runtime.compaction import maybe_resume_after_restart  # noqa: E402
 from runtime.restart_recovery import build_restart_resume_claim_run_id  # noqa: E402
 from runtime.agent_service import (  # noqa: E402
+    _actionable_post_turn_input_present,
     _dispatch_spawn_initial_prompt,
     _ensure_dispatch_allowed_peer,
+    _ensure_in_progress_goal_has_followup_owner,
+    _maybe_enqueue_in_progress_goal_lifecycle_review,
     _resolve_audit_state_after_goal_manager_compact,
     _materialize_goal_child_sessions,
     _extract_user_response_wait_control,
     _dispatch_reason_uses_service_pending_only,
     _post_turn_followup_pending_state,
+    _should_enqueue_post_turn_goal_manager_followup,
+    _should_advance_goal_manager_review_cursor_without_followup,
+    _should_append_session_turn_completed_input,
     _should_defer_dispatch_for_completed_goal,
     _dispatch_provider_session_slot,
 )
@@ -88,6 +95,7 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     update_session_child_sharing,
     ensure_state,
     get_history,
+    load_agent_audit_state,
     list_session_agent_contacts,
     load_session_audit_summary,
     list_active_in_progress_child_sessions,
@@ -102,11 +110,13 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     load_codex_session,
     list_codex_sessions,
     load_pending_inputs,
+    get_session_service,
     join_session_agent,
     record_session_agent_contact,
     release_nonrunnable_session_services,
     reconcile_session_waiting_on_children,
     record_session_user_response_request,
+    read_json_file,
     resolve_session_agent_id,
     resolve_session_context,
     save_codex_session,
@@ -130,12 +140,15 @@ from runtime.persistent_state_pkg import (  # noqa: E402
     update_session_launcher_profile,
     update_session_skills,
     update_session_user_response_wait,
+    update_goal_manager_review_cursor,
     write_json_file,
 )
 from runtime.service_control import build_prompt  # noqa: E402
 from runtime.message_builder import build_aize_input_batch_xml, make_aize_pending_input  # noqa: E402
 from runtime.goal_persist import persist_goal_audit_failure, persist_goal_manager_runtime_reset  # noqa: E402
 from runtime.session_view import persisted_goal_manager_runtime_state, session_agent_assignment_counts  # noqa: E402
+from runtime.communication_goal import should_idle_goal_reconcile  # noqa: E402
+from runtime.session_lifecycle import enqueue_goal_manager_lifecycle_review  # noqa: E402
 
 
 TEST_USERNAME = "test-user"
@@ -156,6 +169,26 @@ class GoalManagerCompactTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_should_idle_goal_reconcile_skips_communication_sessions(self) -> None:
+        self.assertFalse(
+            should_idle_goal_reconcile(
+                {
+                    "session_ui_mode": "communication",
+                    "communication_agent_enabled": True,
+                }
+            )
+        )
+
+    def test_should_idle_goal_reconcile_keeps_standard_goal_sessions(self) -> None:
+        self.assertTrue(
+            should_idle_goal_reconcile(
+                {
+                    "session_ui_mode": "default",
+                    "communication_agent_enabled": False,
+                }
+            )
+        )
 
     def test_load_session_audit_summary_uses_strongest_agent_state(self) -> None:
         save_agent_audit_state(
@@ -198,6 +231,564 @@ class GoalManagerCompactTests(unittest.TestCase):
                 "service-gemini-001": "panic",
             },
         )
+
+    def test_maybe_clear_stale_idle_agent_panic_clears_idle_service_without_pending_work(self) -> None:
+        service_id = "service-codex-004"
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id=service_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id=service_id,
+            ),
+            {
+                "service_id": service_id,
+                "status": "idle",
+                "goal_manager": {
+                    "state": "idle",
+                    "progress_state": "in_progress",
+                    "audit_state": "panic",
+                    "goal_satisfied": False,
+                    "summary": "stale panic",
+                    "pending_work_items": [],
+                },
+            },
+        )
+
+        cleared = maybe_clear_stale_idle_agent_panic(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=service_id,
+        )
+
+        self.assertTrue(cleared)
+        self.assertEqual(
+            load_agent_audit_state(
+                self.runtime_root,
+                service_id=service_id,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            "all_clear",
+        )
+        service_state = read_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id=service_id,
+            )
+        )
+        self.assertEqual(service_state["goal_manager"]["audit_state"], "all_clear")
+        history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        self.assertEqual(history[-1]["event_type"], "service.stale_panic_cleared_after_idle_recovery")
+
+    def test_maybe_clear_stale_idle_agent_panic_keeps_panic_when_service_pending_work_exists(self) -> None:
+        service_id = "service-codex-004"
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id=service_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id=service_id,
+            ),
+            {
+                "service_id": service_id,
+                "status": "idle",
+                "goal_manager": {
+                    "state": "idle",
+                    "progress_state": "in_progress",
+                    "audit_state": "panic",
+                    "goal_satisfied": False,
+                    "summary": "still pending",
+                    "pending_work_items": [{"kind": "turn_completed"}],
+                },
+            },
+        )
+
+        cleared = maybe_clear_stale_idle_agent_panic(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=service_id,
+        )
+
+        self.assertFalse(cleared)
+        self.assertEqual(
+            load_agent_audit_state(
+                self.runtime_root,
+                service_id=service_id,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            "panic",
+        )
+
+    def test_maybe_clear_stale_idle_agent_panic_clears_released_service_without_status(self) -> None:
+        service_id = "service-codex-004"
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Resume after released worker binding.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id=service_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id=service_id,
+            ),
+            {
+                "service_id": service_id,
+                "provider_sessions": {
+                    "worker_agent": {
+                        "slot": "worker_agent",
+                        "provider": "codex",
+                        "codex_session_id": "provider-session-1",
+                    }
+                }
+            },
+        )
+
+        cleared = maybe_clear_stale_idle_agent_panic(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            service_id=service_id,
+        )
+
+        self.assertTrue(cleared)
+        self.assertEqual(
+            load_agent_audit_state(
+                self.runtime_root,
+                service_id=service_id,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            "all_clear",
+        )
+
+    def test_load_session_audit_summary_keeps_newer_service_audit_over_stale_goal_manager(self) -> None:
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).parents[1]
+            / "services"
+            / "service-codex-001.audit.json",
+            {
+                "service_id": "service-codex-001",
+                "audit_state": "panic",
+                "updated_at": "2026-05-22T12:00:00Z",
+            },
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-007",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "summary": "Older review before the newer per-service panic.",
+                "updated_at": "2026-05-21T12:00:00Z",
+            },
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(summary["audit_state"], "panic")
+        self.assertEqual(summary["updated_at"], "2026-05-22T12:00:00Z")
+
+    def test_load_session_audit_summary_prefers_newer_goal_manager_all_clear(self) -> None:
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).parents[1]
+            / "services"
+            / "service-codex-001.audit.json",
+            {
+                "service_id": "service-codex-001",
+                "audit_state": "panic",
+                "updated_at": "2026-05-21T12:00:00Z",
+            },
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-007",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "summary": "Newer review cleared the older worker panic.",
+                "updated_at": "2026-05-22T12:00:00Z",
+            },
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(summary["audit_state"], "all_clear")
+        self.assertEqual(summary["updated_at"], "2026-05-22T12:00:00Z")
+
+    def test_load_session_audit_summary_prefers_authoritative_idle_goal_manager_all_clear(self) -> None:
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).parents[1]
+            / "services"
+            / "service-codex-001.audit.json",
+            {
+                "service_id": "service-codex-001",
+                "audit_state": "panic",
+                "updated_at": "2026-05-22T12:00:00Z",
+            },
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-007",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "summary": "Live parent remains in progress after the stale worker panic.",
+                "updated_at": "2026-05-21T12:00:00Z",
+            },
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            preferred_service_id="service-codex-001",
+            prefer_authoritative_goal_manager=True,
+        )
+
+        self.assertEqual(summary["audit_state"], "all_clear")
+
+    def test_load_session_audit_summary_clears_agent_scoped_pending_for_reconciled_stale_service(self) -> None:
+        session_path = session_metadata_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        session_record = read_json_file(session_path) or {}
+        session_record["service_id"] = "service-codex-001"
+        write_json_file(session_path, session_record)
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-001",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "goal_satisfied": False,
+                "summary": "Authoritative idle state.",
+                "pending_work_items": [],
+                "updated_at": "2026-05-26T00:00:00Z",
+            },
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-004",
+            ),
+            {
+                "service_id": "service-codex-004",
+                "status": "idle",
+                "updated_at": "2026-05-25T23:24:08Z",
+                "goal_manager": {
+                    "state": "idle",
+                    "progress_state": "in_progress",
+                    "audit_state": "all_clear",
+                    "goal_satisfied": False,
+                    "summary": "Stale idle snapshot with orphaned queue file.",
+                    "pending_work_items": [],
+                    "updated_at": "2026-05-25T23:24:08Z",
+                },
+            },
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-004",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        interactive_agent_id = f"service-codex-004@@{self.session_id}@@interactive_agent"
+        append_service_pending_input(
+            self.runtime_root,
+            service_id="service-codex-004",
+            agent_id=interactive_agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=make_aize_pending_input(
+                kind="user_dialogue",
+                role="user",
+                text="stale queued prompt",
+            ),
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            preferred_service_id="service-codex-001",
+            prefer_authoritative_goal_manager=True,
+        )
+
+        remaining = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-004",
+            agent_id=interactive_agent_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        stale_service_state = read_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-004",
+            )
+        )
+
+        self.assertEqual(summary["audit_state"], "all_clear")
+        self.assertEqual(remaining, [])
+        assert isinstance(stale_service_state, dict)
+        self.assertEqual(stale_service_state["status"], "idle")
+        self.assertEqual(stale_service_state["goal_manager"]["state"], "idle")
+
+    def test_load_session_audit_summary_keeps_newer_nonpreferred_panic_visible(self) -> None:
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ).parents[1]
+            / "services"
+            / "service-codex-other.audit.json",
+            {
+                "service_id": "service-codex-other",
+                "audit_state": "panic",
+                "updated_at": "2026-05-22T12:00:00Z",
+            },
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-007",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "summary": "Stale review before the newer agent panic.",
+                "updated_at": "2026-05-21T12:00:00Z",
+            },
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            preferred_service_id="service-codex-001",
+            prefer_authoritative_goal_manager=True,
+        )
+
+        self.assertEqual(summary["audit_state"], "panic")
+        self.assertEqual(summary["updated_at"], "2026-05-22T12:00:00Z")
+
+    def test_update_goal_manager_review_cursor_clears_reviewed_pending_work(self) -> None:
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        write_json_file(
+            state_path,
+            {
+                "state": "queued",
+                "service_id": "service-codex-001",
+                "pending_work_items": [
+                    {
+                        "kind": "turn_completed",
+                        "ts": "2026-05-21T16:22:05Z",
+                        "service_id": "service-codex-001",
+                        "goal_id": "goal-1",
+                    }
+                ],
+                "stale_reason": "persisted_pending_work_after_stale_running_state",
+            },
+        )
+
+        update_goal_manager_review_cursor(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            last_turn_completed_at="2026-05-21T16:22:05Z",
+        )
+
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["last_reviewed_turn_completed_at"], "2026-05-21T16:22:05Z")
+        self.assertEqual(state["pending_work_items"], [])
+        self.assertEqual(state["state"], "idle")
+        self.assertNotIn("stale_reason", state)
+
+    def test_lease_session_service_clears_superseded_service_panic_state(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep the resident goal alive.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+        )
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                **get_session_settings(
+                    self.runtime_root,
+                    username=TEST_USERNAME,
+                    session_id=self.session_id,
+                ),
+                "service_id": "service-codex-004",
+            },
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-004",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-004",
+            ),
+            {
+                "service_id": "service-codex-004",
+                "status": "failed",
+                "goal_manager": {
+                    "state": "failed",
+                    "audit_state": "panic",
+                    "updated_at": "2026-05-21T17:11:50Z",
+                },
+            },
+        )
+
+        leased = lease_session_service(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            pool_service_ids=["service-codex-002"],
+        )
+
+        self.assertEqual(leased, "service-codex-002")
+        self.assertEqual(
+            get_session_service(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            "service-codex-002",
+        )
+        self.assertEqual(
+            load_agent_audit_state(
+                self.runtime_root,
+                service_id="service-codex-004",
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            "all_clear",
+        )
+        superseded_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-004",
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(superseded_state["status"], "idle")
+        self.assertEqual(superseded_state["goal_manager"]["state"], "idle")
+        self.assertEqual(superseded_state["goal_manager"]["audit_state"], "all_clear")
 
     def _register_running_service(self, service_id: str, *, kind: str = "codex") -> None:
         init_registry(
@@ -849,6 +1440,38 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(cleared["user_response_wait_last_timeout_at"])
         self.assertEqual(cleared["user_response_wait_requests"][-1]["status"], "timed_out")
 
+    def test_get_session_settings_clears_due_user_response_wait_state(self) -> None:
+        talk = update_session_user_response_wait(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            active=True,
+            request_id="req-timeout",
+            timeout_seconds=600,
+            prompt_text="Need the deployment region.",
+            source_service_id="service-codex-001",
+            requested_by_role="goal_manager",
+        )
+        assert talk is not None
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["user_response_wait_until_at"] = "2026-03-20T12:00:00Z"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+
+        refreshed = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+
+        assert refreshed is not None
+        self.assertFalse(refreshed["user_response_wait_active"])
+        self.assertTrue(refreshed["user_response_wait_last_timeout_at"])
+        self.assertEqual(refreshed["user_response_wait_requests"][-1]["status"], "timed_out")
+
     def test_user_response_wait_can_mark_multiple_request_ids_answered(self) -> None:
         first = update_session_user_response_wait(
             self.runtime_root,
@@ -1381,6 +2004,36 @@ class GoalManagerCompactTests(unittest.TestCase):
             )
         )
 
+    def test_in_progress_goal_without_followup_owner_falls_back_to_goal_manager(self) -> None:
+        directives = _ensure_in_progress_goal_has_followup_owner(
+            progress_state="in_progress",
+            audit_state="all_clear",
+            goal_manager_service_id="service-codex-003",
+            directives=[],
+            child_goal_requests=[],
+            user_response_requests=[],
+            summary="Still incomplete.",
+        )
+
+        self.assertEqual(len(directives), 1)
+        self.assertEqual(directives[0]["service_id"], "service-codex-003")
+        self.assertEqual(directives[0]["audit_state"], "all_clear")
+        self.assertIn("<aize_goal_feedback>", directives[0]["continue_xml"])
+        self.assertFalse(directives[0]["request_compact"])
+
+    def test_in_progress_goal_with_user_wait_does_not_add_fallback_owner(self) -> None:
+        directives = _ensure_in_progress_goal_has_followup_owner(
+            progress_state="in_progress",
+            audit_state="all_clear",
+            goal_manager_service_id="service-codex-003",
+            directives=[],
+            child_goal_requests=[],
+            user_response_requests=[{"question": "Need details"}],
+            summary="Need user input.",
+        )
+
+        self.assertEqual(directives, [])
+
     def test_completed_goal_releases_session_provider(self) -> None:
         released = maybe_release_session_provider(
             self.runtime_root,
@@ -1423,6 +2076,7 @@ class GoalManagerCompactTests(unittest.TestCase):
                 "goal_audit_job_id": "job-old",
                 "service_id": "service-codex-001",
                 "pending_work_items": [{"kind": "turn_completed"}],
+                "stale_reason": "persisted_pending_work_after_stale_running_state",
             },
         )
         audit = {
@@ -1459,6 +2113,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["state"], "idle")
         self.assertEqual(state["pending_work_items"], [])
+        self.assertNotIn("stale_reason", state)
 
     def test_persist_goal_audit_completion_mirrors_terminal_status_into_service_state(self) -> None:
         log_path = self.runtime_root / "logs" / "goal-manager.jsonl"
@@ -1558,6 +2213,67 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(history[0]["event"]["progress_state"], "in_progress")
         self.assertFalse(history[0]["event"]["goal_satisfied"])
 
+    def test_persist_goal_audit_completion_mirrors_state_into_bound_session_service(self) -> None:
+        log_path = self.runtime_root / "logs" / "goal-manager.jsonl"
+        session_path = session_metadata_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        session_record = read_json_file(session_path) or {}
+        session_record["service_id"] = "service-codex-001"
+        write_json_file(session_path, session_record)
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="worker-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+
+        persist_goal_audit_completion(
+            runtime_root=self.runtime_root,
+            log_path=log_path,
+            service_id="service-codex-development-lineage-check-001",
+            process_id="proc-1",
+            goal_audit_job_id="job-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit={
+                "goal_audit_session_id": "session-1",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "goal_satisfied": False,
+                "summary": "Entrance is healthy.",
+                "continue_xml": "",
+                "request_compact": False,
+                "request_compact_reason": "",
+            },
+        )
+
+        bound_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+            ).read_text(encoding="utf-8")
+        )
+        reviewer_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-development-lineage-check-001",
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(bound_state["status"], "idle")
+        self.assertEqual(bound_state["goal_manager"]["state"], "idle")
+        self.assertEqual(bound_state["goal_manager"]["summary"], "Entrance is healthy.")
+        self.assertEqual(bound_state["goal_manager"], reviewer_state["goal_manager"])
+        self.assertEqual(bound_state["provider_sessions"]["worker_agent"]["codex_session_id"], "worker-thread")
+
     def test_persist_goal_audit_failure_clears_stale_goal_manager_pending_work(self) -> None:
         log_path = self.runtime_root / "logs" / "goal-manager.jsonl"
         state_path = session_goal_manager_state_path(
@@ -1572,6 +2288,7 @@ class GoalManagerCompactTests(unittest.TestCase):
                 "goal_audit_job_id": "job-old",
                 "service_id": "service-codex-001",
                 "pending_work_items": [{"kind": "turn_completed"}],
+                "stale_reason": "persisted_pending_work_after_stale_running_state",
             },
         )
 
@@ -1592,6 +2309,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["state"], "failed")
         self.assertEqual(state["pending_work_items"], [])
+        self.assertNotIn("stale_reason", state)
 
     def test_persist_goal_manager_runtime_reset_clears_stale_goal_manager_state(self) -> None:
         state_path = session_goal_manager_state_path(
@@ -1606,6 +2324,7 @@ class GoalManagerCompactTests(unittest.TestCase):
                 "goal_audit_job_id": "goal-audit-old",
                 "service_id": "service-claude-001",
                 "pending_work_items": [{"kind": "turn_completed"}],
+                "stale_reason": "persisted_pending_work_after_stale_running_state",
             },
         )
 
@@ -1622,6 +2341,7 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(state["goal_audit_job_id"], "")
         self.assertEqual(state["service_id"], "")
         self.assertEqual(state["pending_work_items"], [])
+        self.assertNotIn("stale_reason", state)
 
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertEqual(history[-1]["event_type"], "service.goal_manager_reset")
@@ -2461,6 +3181,209 @@ class GoalManagerCompactTests(unittest.TestCase):
         )
         self.assertEqual(_dispatch_provider_session_slot({"payload": {"reason": "http_prompt"}}), "worker_agent")
 
+    def test_goal_manager_post_turn_does_not_enqueue_followup_for_its_own_turn(self) -> None:
+        self.assertFalse(
+            _should_enqueue_post_turn_goal_manager_followup(
+                provider_session_slot="goal_manager",
+                turn_completed_input_present=True,
+                goal_input_present=True,
+                actionable_input_present=False,
+                goal_text="Keep the resident goal active.",
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+                goal_audit_state="all_clear",
+                user_response_wait_active=False,
+                communication_agent_enabled=False,
+                visible_text_present=False,
+                spawn_request_count=0,
+            )
+        )
+        self.assertTrue(
+            _should_enqueue_post_turn_goal_manager_followup(
+                provider_session_slot="worker_agent",
+                turn_completed_input_present=True,
+                goal_input_present=False,
+                actionable_input_present=False,
+                goal_text="Keep the resident goal active.",
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+                goal_audit_state="all_clear",
+                user_response_wait_active=False,
+                communication_agent_enabled=False,
+                visible_text_present=False,
+                spawn_request_count=0,
+            )
+        )
+
+    def test_goal_manager_post_turn_skips_empty_communication_goal_status_turns(self) -> None:
+        self.assertFalse(
+            _should_enqueue_post_turn_goal_manager_followup(
+                provider_session_slot="worker_agent",
+                turn_completed_input_present=True,
+                goal_input_present=True,
+                actionable_input_present=False,
+                goal_text="Keep Entrance watching for work.",
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+                goal_audit_state="all_clear",
+                user_response_wait_active=False,
+                communication_agent_enabled=True,
+                visible_text_present=False,
+                spawn_request_count=0,
+            )
+        )
+        self.assertFalse(
+            _should_enqueue_post_turn_goal_manager_followup(
+                provider_session_slot="worker_agent",
+                turn_completed_input_present=True,
+                goal_input_present=True,
+                actionable_input_present=False,
+                goal_text="Keep Entrance watching for work.",
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+                goal_audit_state="all_clear",
+                user_response_wait_active=False,
+                communication_agent_enabled=True,
+                visible_text_present=True,
+                spawn_request_count=0,
+            )
+        )
+        self.assertTrue(
+            _should_enqueue_post_turn_goal_manager_followup(
+                provider_session_slot="worker_agent",
+                turn_completed_input_present=True,
+                goal_input_present=True,
+                actionable_input_present=True,
+                goal_text="Keep Entrance watching for work.",
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+                goal_audit_state="all_clear",
+                user_response_wait_active=False,
+                communication_agent_enabled=True,
+                visible_text_present=False,
+                spawn_request_count=0,
+            )
+        )
+        self.assertTrue(
+            _should_enqueue_post_turn_goal_manager_followup(
+                provider_session_slot="worker_agent",
+                turn_completed_input_present=True,
+                goal_input_present=True,
+                actionable_input_present=False,
+                goal_text="Keep Entrance watching for work.",
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+                goal_audit_state="all_clear",
+                user_response_wait_active=False,
+                communication_agent_enabled=True,
+                visible_text_present=False,
+                spawn_request_count=1,
+            )
+        )
+
+    def test_goal_manager_review_cursor_advances_for_suppressed_communication_status_turns(self) -> None:
+        self.assertTrue(
+            _should_advance_goal_manager_review_cursor_without_followup(
+                communication_agent_enabled=True,
+                actionable_input_present=False,
+                spawn_request_count=0,
+                goal_should_continue=False,
+            )
+        )
+        self.assertFalse(
+            _should_advance_goal_manager_review_cursor_without_followup(
+                communication_agent_enabled=True,
+                actionable_input_present=True,
+                spawn_request_count=0,
+                goal_should_continue=False,
+            )
+        )
+        self.assertFalse(
+            _should_advance_goal_manager_review_cursor_without_followup(
+                communication_agent_enabled=True,
+                actionable_input_present=False,
+                spawn_request_count=1,
+                goal_should_continue=False,
+            )
+        )
+        self.assertFalse(
+            _should_advance_goal_manager_review_cursor_without_followup(
+                communication_agent_enabled=False,
+                actionable_input_present=False,
+                spawn_request_count=0,
+                goal_should_continue=False,
+            )
+        )
+        self.assertFalse(
+            _should_advance_goal_manager_review_cursor_without_followup(
+                communication_agent_enabled=True,
+                actionable_input_present=False,
+                spawn_request_count=0,
+                goal_should_continue=True,
+            )
+        )
+
+    def test_session_turn_completed_input_skips_status_only_communication_turns(self) -> None:
+        self.assertFalse(
+            _should_append_session_turn_completed_input(
+                communication_agent_enabled=True,
+                actionable_input_present=False,
+                spawn_request_count=0,
+            )
+        )
+        self.assertTrue(
+            _should_append_session_turn_completed_input(
+                communication_agent_enabled=True,
+                actionable_input_present=True,
+                spawn_request_count=0,
+            )
+        )
+        self.assertTrue(
+            _should_append_session_turn_completed_input(
+                communication_agent_enabled=True,
+                actionable_input_present=False,
+                spawn_request_count=1,
+            )
+        )
+        self.assertTrue(
+            _should_append_session_turn_completed_input(
+                communication_agent_enabled=False,
+                actionable_input_present=False,
+                spawn_request_count=0,
+            )
+        )
+
+    def test_actionable_post_turn_input_present_ignores_restart_resume_for_communication_sessions(self) -> None:
+        restart_batch = (
+            "<aize_input_batch>"
+            '<input index="1" kind="restart_resume"><role>system</role><text>resume</text></input>'
+            "</aize_input_batch>"
+        )
+        self.assertFalse(
+            _actionable_post_turn_input_present(
+                restart_batch,
+                communication_agent_enabled=True,
+            )
+        )
+        self.assertTrue(
+            _actionable_post_turn_input_present(
+                restart_batch,
+                communication_agent_enabled=False,
+            )
+        )
+        self.assertTrue(
+            _actionable_post_turn_input_present(
+                "<aize_input_batch><input index=\"1\" kind=\"interactive_worker_result\"><role>system</role><text>done</text></input></aize_input_batch>",
+                communication_agent_enabled=True,
+            )
+        )
+
     def test_goal_manager_compact_falls_back_to_any_saved_codex_session_for_conversation(self) -> None:
         from runtime.compaction import goal_manager_compact_codex_session
 
@@ -2572,6 +3495,294 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(state["service_id"], "service-codex-002")
         self.assertEqual(len(state["pending_work_items"]), 1)
         self.assertEqual(state["pending_work_items"][0]["kind"], "turn_completed")
+
+    def test_persisted_goal_manager_runtime_state_refreshes_stale_bound_service_snapshot(self) -> None:
+        session_path = session_metadata_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        session_record = read_json_file(session_path) or {}
+        session_record["service_id"] = "service-codex-001"
+        write_json_file(session_path, session_record)
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="worker-thread",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        write_json_file(
+            state_path,
+            {
+                "state": "idle",
+                "service_id": "service-codex-development-lineage-check-001",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "goal_satisfied": False,
+                "summary": "Fresh summary.",
+                "pending_work_items": [],
+                "updated_at": "2026-05-22T04:43:39Z",
+            },
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+            ),
+            {
+                "service_id": "service-codex-001",
+                "status": "idle",
+                "updated_at": "2026-05-22T02:32:38Z",
+                "provider_sessions": {
+                    "worker_agent": {
+                        "slot": "worker_agent",
+                        "provider": "codex",
+                        "codex_session_id": "worker-thread",
+                    }
+                },
+                "goal_manager": {
+                    "state": "idle",
+                    "progress_state": "in_progress",
+                    "audit_state": "all_clear",
+                    "goal_satisfied": False,
+                    "summary": "Stale summary.",
+                    "pending_work_items": [],
+                    "updated_at": "2026-05-22T02:32:38Z",
+                },
+            },
+        )
+
+        state = persisted_goal_manager_runtime_state(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            bound_service_id="service-codex-001",
+        )
+
+        refreshed_state = json.loads(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["state"], "waiting")
+        self.assertEqual(state["service_id"], "service-codex-development-lineage-check-001")
+        self.assertEqual(refreshed_state["updated_at"], "2026-05-22T04:43:39Z")
+        self.assertEqual(refreshed_state["goal_manager"]["summary"], "Fresh summary.")
+        self.assertEqual(refreshed_state["provider_sessions"]["worker_agent"]["codex_session_id"], "worker-thread")
+
+    def test_persisted_goal_manager_runtime_state_reconciles_stale_nonpreferred_service_snapshots(self) -> None:
+        session_path = session_metadata_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        session_record = read_json_file(session_path) or {}
+        session_record["service_id"] = "service-codex-001"
+        write_json_file(session_path, session_record)
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        write_json_file(
+            state_path,
+            {
+                "state": "idle",
+                "service_id": "service-codex-001",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "pending_work_items": [],
+                "updated_at": "2026-05-24T18:10:35Z",
+            },
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-003",
+            ),
+            {
+                "service_id": "service-codex-003",
+                "status": "running",
+                "updated_at": "2026-05-24T17:47:42Z",
+                "goal_manager": {
+                    "state": "running",
+                    "progress_state": "in_progress",
+                    "audit_state": "all_clear",
+                    "goal_satisfied": False,
+                    "summary": "Stale summary.",
+                    "pending_work_items": [
+                        {
+                            "kind": "turn_completed",
+                            "ts": "2026-05-24T17:47:38Z",
+                            "service_id": "service-codex-002",
+                            "goal_id": "goal-1",
+                        }
+                    ],
+                    "updated_at": "2026-05-24T17:47:42Z",
+                },
+            },
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-003",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-claude-006",
+            ),
+            {
+                "service_id": "service-claude-006",
+                "status": "queued",
+                "updated_at": "2026-05-24T10:50:42Z",
+                "goal_manager": {
+                    "state": "queued",
+                    "progress_state": "in_progress",
+                    "audit_state": "all_clear",
+                    "goal_satisfied": False,
+                    "summary": "Queued stale summary.",
+                    "pending_work_items": [
+                        {
+                            "kind": "lifecycle_owner_lost",
+                            "ts": "2026-05-24T10:50:42Z",
+                            "service_id": "service-claude-006",
+                            "source_service_id": "service-codex-entrance-status-banner-001",
+                            "goal_id": "goal-1",
+                            "reason": "released_nonrunnable_session_service:service_missing",
+                        }
+                    ],
+                    "updated_at": "2026-05-24T10:50:42Z",
+                },
+            },
+        )
+
+        state = persisted_goal_manager_runtime_state(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            bound_service_id="service-codex-001",
+        )
+
+        stale_running = read_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-003",
+            )
+        )
+        stale_queued = read_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-claude-006",
+            )
+        )
+        self.assertEqual(state["state"], "waiting")
+        self.assertEqual(state["service_id"], "service-codex-001")
+        assert isinstance(stale_running, dict)
+        assert isinstance(stale_queued, dict)
+        self.assertEqual(stale_running["status"], "idle")
+        self.assertEqual(stale_running["goal_manager"]["state"], "idle")
+        self.assertEqual(stale_running["goal_manager"]["pending_work_items"], [])
+        self.assertEqual(load_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-003",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        ), "all_clear")
+        self.assertEqual(stale_queued["status"], "idle")
+        self.assertEqual(stale_queued["goal_manager"]["state"], "idle")
+        self.assertEqual(stale_queued["goal_manager"]["pending_work_items"], [])
+
+    def test_load_session_audit_summary_ignores_reconciled_stale_nonpreferred_panic(self) -> None:
+        session_path = session_metadata_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        session_record = read_json_file(session_path) or {}
+        session_record["service_id"] = "service-codex-001"
+        write_json_file(session_path, session_record)
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-001",
+                "progress_state": "in_progress",
+                "audit_state": "all_clear",
+                "pending_work_items": [],
+                "updated_at": "2026-05-24T18:10:35Z",
+            },
+        )
+        write_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-004",
+            ),
+            {
+                "service_id": "service-codex-004",
+                "status": "running",
+                "updated_at": "2026-05-24T15:00:57Z",
+                "goal_manager": {
+                    "state": "running",
+                    "progress_state": "in_progress",
+                    "audit_state": "all_clear",
+                    "pending_work_items": [
+                        {
+                            "kind": "turn_completed",
+                            "ts": "2026-05-24T15:00:53Z",
+                            "service_id": "service-claude-001",
+                            "goal_id": "goal-1",
+                        }
+                    ],
+                    "updated_at": "2026-05-24T15:00:57Z",
+                },
+            },
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-004",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="panic",
+        )
+
+        summary = load_session_audit_summary(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            preferred_service_id="service-codex-001",
+            prefer_authoritative_goal_manager=True,
+        )
+
+        self.assertEqual(summary["audit_state"], "all_clear")
 
     def test_persisted_goal_manager_runtime_state_backfills_service_state_snapshot(self) -> None:
         save_codex_session(
@@ -2852,12 +4063,12 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(summary["agent_running"])
         self.assertEqual(summary["session_id"], self.session_id)
         self.assertEqual(summary["worker"]["service_id"], "service-codex-002")
-        self.assertEqual(summary["worker"]["slot"], 2)
+        self.assertNotIn("slot", summary["worker"])
         self.assertEqual(summary["goal_manager_state"], "running")
         self.assertEqual(summary["runtime_execution_state"], "running")
         self.assertTrue(summary["runtime_in_progress"])
         self.assertEqual(summary["goal_manager_provider"], "codex")
-        self.assertEqual(summary["goal_manager_worker"]["slot"], 2)
+        self.assertNotIn("slot", summary["goal_manager_worker"])
         self.assertEqual(
             summary["agent_contacts"],
             [
@@ -3365,6 +4576,76 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(created[0].get("dispatch_service_id"), "service-codex-001")
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertTrue(any(entry.get("event_type") == "service.goal_child_sessions_created" for entry in history))
+
+    def test_materialize_goal_child_sessions_uses_canonical_development_parent(self) -> None:
+        entrance = create_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            label="Entrance",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+            session_skills=[
+                {
+                    "skill_id": "canonical-development-routing",
+                    "routing_mode": "create_child_session",
+                    "canonical_session_key": "aize.development",
+                    "route_parent_scope": "root_session",
+                    "target_unit_id": "aize-development.bug-hunting",
+                    "target_template_id": "aize-development.bug-hunting",
+                    "target_label": "AIze Development",
+                }
+            ],
+        )
+        canonical_parent = create_conversation_session(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            label="AIze Development",
+            parent_session_id="default",
+            origin_session_id=str(entrance["session_id"]),
+            session_skills=[
+                {
+                    "skill_id": "aize-development-session",
+                    "canonical_session_key": "aize.development",
+                }
+            ],
+        )
+        update_session_launcher_profile(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=str(canonical_parent["session_id"]),
+            launcher_template_id="aize-development.bug-hunting",
+            launcher_display_name="AIze Development",
+            preferred_provider="codex",
+            selected_agents=["codex_pool"],
+            service_targets=[],
+        )
+
+        created = _materialize_goal_child_sessions(
+            runtime_root=self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=str(entrance["session_id"]),
+            goal_id="goal-123",
+            goal_text="Entrance coordination",
+            goal_manager_service_id="service-codex-001",
+            child_goal_requests=[
+                {
+                    "label": "Fix bug",
+                    "provider": "codex",
+                    "goal_text": "Implement a fix",
+                }
+            ],
+        )
+
+        self.assertEqual(len(created), 1)
+        child = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=str(created[0]["session_id"]),
+        )
+        self.assertIsNotNone(child)
+        assert child is not None
+        self.assertEqual(child.get("parent_session_id"), canonical_parent["session_id"])
+        self.assertEqual(child.get("origin_session_id"), entrance["session_id"])
 
     def test_ensure_dispatch_allowed_peer_grants_selected_cross_service_target(self) -> None:
         init_registry(
@@ -4044,6 +5325,32 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(stored_recovery.get("recovery_source_session_id"), self.session_id)
         self.assertEqual(stored_recovery.get("parent_session_id"), self.session_id)
 
+    def test_panic_recovery_goal_text_is_english(self) -> None:
+        goal_text = panic_recovery_goal_text(
+            source_session_id="session-parent",
+            source_label="Recovery Target",
+            panic_service_id="service-codex-001",
+            event={
+                "type": "service.worker_failed",
+                "error": "transport channel closed",
+                "compaction": "failed",
+                "wait_status": "timed_out",
+                "left_percent": "18",
+            },
+        )
+
+        self.assertIn("User instruction: Recover the parent session that entered panic.", goal_text)
+        self.assertIn("Source session ID: session-parent", goal_text)
+        self.assertIn("Source session label: Recovery Target", goal_text)
+        self.assertIn("Panicking agent: service-codex-001", goal_text)
+        self.assertIn("Failure reason: transport channel closed", goal_text)
+        self.assertIn("Compaction state: failed", goal_text)
+        self.assertIn("Wait status: timed_out", goal_text)
+        self.assertIn("Context left_percent: 18", goal_text)
+        self.assertIn("Requirements:", goal_text)
+        self.assertIn("1. Identify the direct cause of the parent session panic.", goal_text)
+        self.assertNotIn("ユーザー指示", goal_text)
+
     def test_legacy_recovery_session_is_not_map_only(self) -> None:
         recovery = create_conversation_session(
             self.runtime_root,
@@ -4400,6 +5707,438 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert stored is not None
         self.assertTrue(stored["waiting_on_children"])
         self.assertEqual(stored.get("service_id"), "service-claude-001")
+
+    def test_lifecycle_owner_loss_queues_goal_manager_review(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep verifying this incomplete goal.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+
+        sent: list[dict[str, Any]] = []
+        result = enqueue_goal_manager_lifecycle_review(
+            self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            from_service_id="service-http-001",
+            process_id="proc-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            reason="released_nonrunnable_session_service:service_status:stopped",
+            source_service_id="service-codex-dead",
+            service_pools_by_provider={"codex": ["service-codex-002"], "claude": [], "gemini": []},
+            default_provider="codex",
+            send_dispatch=lambda message: sent.append(message) or True,
+        )
+
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["target_service_id"], "service-codex-002")
+        state = read_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+        )
+        assert isinstance(state, dict)
+        self.assertEqual(state["state"], "queued")
+        self.assertEqual(state["service_id"], "service-codex-002")
+        self.assertEqual(state["pending_work_items"][0]["kind"], "lifecycle_owner_lost")
+        service_pending = load_goal_manager_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual([item["kind"] for item in service_pending], ["lifecycle_owner_lost"])
+        contacts = list_session_agent_contacts(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertTrue(any(item.get("join_role") == "goal_manager" for item in contacts))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["payload"]["reason"], "goal_manager_review")
+        self.assertEqual(sent[0]["meta"]["agent_profile"], {"session_slot": "goal_manager"})
+        self.assertEqual(
+            persisted_goal_manager_runtime_state(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )["state"],
+            "queued",
+        )
+
+    def test_lifecycle_owner_loss_uses_existing_goal_manager(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep verifying this incomplete goal.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {"state": "running", "service_id": "service-codex-003", "pending_work_items": []},
+        )
+
+        sent: list[dict[str, Any]] = []
+        result = enqueue_goal_manager_lifecycle_review(
+            self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            from_service_id="service-http-001",
+            process_id="proc-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            reason="released_nonrunnable_session_service:process_missing",
+            source_service_id="service-codex-dead",
+            service_pools_by_provider={"codex": ["service-codex-003"], "claude": [], "gemini": []},
+            default_provider="codex",
+            send_dispatch=lambda message: sent.append(message) or True,
+        )
+
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["target_service_id"], "service-codex-003")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["to"], "service-codex-003")
+
+    def test_lifecycle_owner_loss_skips_continuous_communication_ephemeral_worker(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Act as Entrance's user communication layer.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        talk = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert talk is not None
+        talk["communication_agent_enabled"] = True
+        talk["session_ui_mode"] = "communication"
+        talk["goal_completion_policy"] = "continuous"
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            talk,
+        )
+
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        write_json_file(
+            state_path,
+            {
+                "state": "queued",
+                "service_id": "service-claude-002",
+                "pending_work_items": [
+                    {
+                        "kind": "lifecycle_owner_lost",
+                        "ts": "2026-05-24T17:43:03Z",
+                        "service_id": "service-claude-002",
+                        "source_service_id": "service-codex-002",
+                        "goal_id": "63a9c47af11c5297",
+                        "reason": "released_nonrunnable_session_service:service_missing",
+                    }
+                ],
+            },
+        )
+        append_goal_manager_pending_input(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry={
+                "kind": "lifecycle_owner_lost",
+                "ts": "2026-05-24T17:43:03Z",
+                "service_id": "service-claude-002",
+                "source_service_id": "service-codex-002",
+                "goal_id": "63a9c47af11c5297",
+                "reason": "released_nonrunnable_session_service:service_missing",
+            },
+        )
+
+        sent: list[dict[str, Any]] = []
+        result = enqueue_goal_manager_lifecycle_review(
+            self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            from_service_id="service-http-001",
+            process_id="proc-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            reason="released_nonrunnable_session_service:service_missing",
+            source_service_id="service-codex-002",
+            service_pools_by_provider={"codex": ["service-codex-007"], "claude": ["service-claude-002"], "gemini": []},
+            default_provider="codex",
+            send_dispatch=lambda message: sent.append(message) or True,
+        )
+
+        self.assertFalse(result["queued"])
+        self.assertEqual(result["error"], "skipped_continuous_communication_ephemeral_owner_restart")
+        self.assertEqual(sent, [])
+        state = read_json_file(state_path)
+        assert isinstance(state, dict)
+        self.assertEqual(state.get("pending_work_items"), [])
+        pending = load_goal_manager_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(pending, [])
+
+    def test_lifecycle_owner_loss_still_queues_for_standard_session_after_restart(self) -> None:
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Standard session work.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+
+        sent: list[dict[str, Any]] = []
+        result = enqueue_goal_manager_lifecycle_review(
+            self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            from_service_id="service-http-001",
+            process_id="proc-http-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            reason="released_nonrunnable_session_service:service_missing",
+            source_service_id="service-codex-dead",
+            service_pools_by_provider={"codex": ["service-codex-002"], "claude": [], "gemini": []},
+            default_provider="codex",
+            send_dispatch=lambda message: sent.append(message) or True,
+        )
+
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["target_service_id"], "service-codex-002")
+        self.assertEqual(len(sent), 1)
+
+    def test_non_goal_manager_turn_completion_requeues_goal_manager_when_session_would_be_ownerless(self) -> None:
+        init_registry(
+            self.runtime_root,
+            {
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [
+                    {
+                        "service_id": "service-codex-002",
+                        "kind": "codex",
+                        "display_name": "Codex 2",
+                        "persona": "test",
+                        "max_turns": 100,
+                    }
+                ],
+                "routes": [],
+            },
+        )
+        init_lifecycle_state(self.runtime_root, node_id="node-test", run_id="run-test")
+        register_process(
+            self.runtime_root,
+            process_id="proc-service-codex-002",
+            service_id="service-codex-002",
+            node_id="node-test",
+            status="running",
+        )
+        update_service_process(
+            self.runtime_root,
+            service_id="service-codex-002",
+            process_id="proc-service-codex-002",
+            status="running",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep verifying this incomplete goal.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        session = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        assert session is not None
+        session["service_id"] = "service-codex-001"
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            session,
+        )
+
+        sent: list[dict[str, Any]] = []
+        result = _maybe_enqueue_in_progress_goal_lifecycle_review(
+            runtime_root=self.runtime_root,
+            manifest={
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [{"service_id": "service-codex-002", "kind": "codex"}],
+            },
+            process_id="proc-codex-001",
+            service_id="service-codex-001",
+            provider_session_slot="worker_agent",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            default_provider="codex",
+            send_tx=lambda message: sent.append(message),
+            reason="non_goal_manager_turn_completed_without_owner",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["target_service_id"], "service-codex-002")
+        state = read_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+        )
+        assert isinstance(state, dict)
+        self.assertEqual(state["state"], "queued")
+        self.assertEqual(state["pending_work_items"][0]["kind"], "lifecycle_owner_lost")
+        self.assertEqual(len(sent), 1)
+
+    def test_non_goal_manager_turn_completion_preserves_waiting_on_children_without_requeue(self) -> None:
+        init_registry(
+            self.runtime_root,
+            {
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [
+                    {
+                        "service_id": "service-codex-002",
+                        "kind": "codex",
+                        "display_name": "Codex 2",
+                        "persona": "test",
+                        "max_turns": 100,
+                    }
+                ],
+                "routes": [],
+            },
+        )
+        init_lifecycle_state(self.runtime_root, node_id="node-test", run_id="run-test")
+        register_process(
+            self.runtime_root,
+            process_id="proc-service-codex-002",
+            service_id="service-codex-002",
+            node_id="node-test",
+            status="running",
+        )
+        update_service_process(
+            self.runtime_root,
+            service_id="service-codex-002",
+            process_id="proc-service-codex-002",
+            status="running",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep verifying this incomplete goal.",
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        session = get_session_settings(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        assert session is not None
+        session["service_id"] = "service-codex-001"
+        session["waiting_on_children"] = True
+        write_json_file(
+            session_metadata_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            session,
+        )
+
+        result = _maybe_enqueue_in_progress_goal_lifecycle_review(
+            runtime_root=self.runtime_root,
+            manifest={
+                "node_id": "node-test",
+                "run_id": "run-test",
+                "services": [{"service_id": "service-codex-002", "kind": "codex"}],
+            },
+            process_id="proc-codex-001",
+            service_id="service-codex-001",
+            provider_session_slot="worker_agent",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            default_provider="codex",
+            send_tx=lambda message: None,
+            reason="non_goal_manager_turn_completed_without_owner",
+        )
+
+        self.assertIsNone(result)
+        state = read_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+        )
+        self.assertFalse(isinstance(state, dict) and state.get("pending_work_items"))
 
     def test_run_goal_audit_parses_two_axis_state(self) -> None:
         with patch(
@@ -4863,6 +6602,14 @@ class GoalManagerCompactTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["type"], "service.goal_manager_compact_checked")
         self.assertEqual(event["compaction"], "suppressed_by_session_setting")
+        state = read_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+        )
+        self.assertEqual(state["audit_state"], "needs_compact")
         history = get_history(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
         self.assertEqual(history[0]["event_type"], "service.goal_manager_compact_checked")
         self.assertIn("No implementation progress", history[0]["text"])
@@ -4878,6 +6625,19 @@ class GoalManagerCompactTests(unittest.TestCase):
             "request_compact": True,
             "request_compact_reason": "Repeated sabotage",
         }
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": "service-codex-001",
+                "audit_state": "needs_compact",
+                "pending_work_items": [],
+            },
+        )
 
         with patch(
             "runtime.cli_service_adapter.goal_manager_compact_codex_session",
@@ -4915,6 +6675,98 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("service.goal_manager_compact_checked", event_types)
         checked_entry = next(entry for entry in history if entry.get("event_type") == "service.goal_manager_compact_checked")
         self.assertIn("Repeated sabotage", str(checked_entry.get("text", "")))
+        state = read_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+        )
+        self.assertEqual(state["state"], "idle")
+        self.assertEqual(state["audit_state"], "all_clear")
+        service_state = read_json_file(
+            session_service_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+            )
+        )
+        self.assertEqual(service_state["goal_manager"]["audit_state"], "all_clear")
+
+    def test_handle_goal_manager_compact_request_reconciles_stale_summary_when_audit_is_clear(self) -> None:
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_auto_compact_enabled=True,
+        )
+        service_id = "service-codex-001"
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id=service_id,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+        write_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            ),
+            {
+                "state": "idle",
+                "service_id": service_id,
+                "progress_state": "in_progress",
+                "audit_state": "needs_compact",
+                "goal_satisfied": False,
+                "summary": "stale summary that still says needs_compact",
+                "pending_work_items": [],
+            },
+        )
+        audit = {
+            "request_compact": True,
+            "request_compact_reason": "Repeated empty follow-up turns",
+        }
+
+        with patch(
+            "runtime.cli_service_adapter.goal_manager_compact_codex_session",
+            return_value=(
+                {
+                    "type": "service.goal_manager_compact_checked",
+                    "session_id": self.session_id,
+                    "left_percent": "12",
+                    "used_percent": "88",
+                    "compaction": "triggered",
+                },
+                0,
+            ),
+        ):
+            handle_goal_manager_compact_request(
+                runtime_root=self.runtime_root,
+                repo_root=ROOT,
+                log_path=self.runtime_root / "logs" / "goal-manager.jsonl",
+                service_id=service_id,
+                process_id="proc-1",
+                goal_audit_job_id="job-1",
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                audit=audit,
+            )
+
+        state = read_json_file(
+            session_goal_manager_state_path(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+            )
+        )
+        self.assertEqual(state["audit_state"], "all_clear")
+        self.assertEqual(
+            state["summary"],
+            "No user work is pending to proxy, track, or report. GoalManager compaction completed and the session is idle.",
+        )
 
     def test_handle_goal_manager_compact_request_keeps_noninteractive_helper_skip_as_checked(self) -> None:
         update_session_goal_flags(
@@ -5026,12 +6878,70 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(events[0]["type"], "claude.assistant.tool_use")
         self.assertEqual(events[0]["tool_name"], "StructuredOutput")
 
+    def test_run_claude_uses_streamed_result_text_for_nonzero_exit_without_stderr(self) -> None:
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = StringIO(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "type": "assistant",
+                                    "message": {
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": "You've hit your org's monthly usage limit",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "type": "result",
+                                    "is_error": True,
+                                    "result": "You've hit your org's monthly usage limit",
+                                    "session_id": "claude-session-1",
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n"
+                )
+                self.stderr = StringIO("")
+
+            def wait(self) -> int:
+                return 1
+
+        with patch("runtime.providers.claude.subprocess.Popen", return_value=FakeProc()):
+            with self.assertRaisesRegex(RuntimeError, "monthly usage limit"):
+                run_claude(
+                    "prompt",
+                    session_id="claude-session-1",
+                    response_schema_id="service_control_v1",
+                )
+
     def test_run_codex_coerces_minimal_reasoning_effort_when_tools_are_available(self) -> None:
         seen_cmds: list[list[str]] = []
+        seen_stdin: list[Any] = []
+
+        class FakeStdin:
+            def __init__(self) -> None:
+                self.buffer: list[str] = []
+                self.closed = False
+
+            def write(self, text: str) -> None:
+                self.buffer.append(text)
+
+            def close(self) -> None:
+                self.closed = True
 
         class FakeProc:
             def __init__(self, cmd: list[str]) -> None:
                 seen_cmds.append(list(cmd))
+                self.stdin = FakeStdin()
+                seen_stdin.append(self.stdin)
                 self.stdout = StringIO(
                     "\n".join(
                         [
@@ -5071,14 +6981,30 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertTrue(seen_cmds)
         self.assertIn('model_reasoning_effort="low"', seen_cmds[0])
         self.assertNotIn('model_reasoning_effort="minimal"', seen_cmds[0])
+        self.assertEqual(seen_stdin[0].buffer, ["prompt"])
+        self.assertTrue(seen_stdin[0].closed)
 
     def test_run_codex_retries_without_session_when_resumed_thread_is_missing(self) -> None:
         seen_cmds: list[list[str]] = []
         seen_stdin: list[Any] = []
+        seen_pipe_inputs: list[Any] = []
+
+        class FakeStdin:
+            def __init__(self) -> None:
+                self.buffer: list[str] = []
+                self.closed = False
+
+            def write(self, text: str) -> None:
+                self.buffer.append(text)
+
+            def close(self) -> None:
+                self.closed = True
 
         class FakeProc:
             def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
                 seen_cmds.append(list(cmd))
+                self.stdin = FakeStdin()
+                seen_pipe_inputs.append(self.stdin)
                 self.stdout = StringIO(stdout_text)
                 self.stderr = StringIO(stderr_text)
                 self._returncode = returncode
@@ -5128,16 +7054,32 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertEqual(final_text, '{"assistant_text":"recovered","spawn_requests":[]}')
         self.assertEqual(next_session_id, "fresh-session")
         self.assertEqual(len(seen_cmds), 2)
-        self.assertEqual(seen_stdin, [subprocess.DEVNULL, subprocess.DEVNULL])
+        self.assertEqual(seen_stdin, [subprocess.PIPE, subprocess.PIPE])
+        self.assertEqual([pipe.buffer for pipe in seen_pipe_inputs], [["prompt"], ["prompt"]])
+        self.assertTrue(all(pipe.closed for pipe in seen_pipe_inputs))
         self.assertIn("resume", seen_cmds[0])
         self.assertNotIn("resume", seen_cmds[1])
         self.assertNotIn("stale-session", seen_cmds[1])
 
     def test_run_codex_disconnects_stdin_for_noninteractive_exec(self) -> None:
         seen_stdin: list[Any] = []
+        fake_stdin: list[Any] = []
+
+        class FakeStdin:
+            def __init__(self) -> None:
+                self.buffer: list[str] = []
+                self.closed = False
+
+            def write(self, text: str) -> None:
+                self.buffer.append(text)
+
+            def close(self) -> None:
+                self.closed = True
 
         class FakeProc:
             def __init__(self) -> None:
+                self.stdin = FakeStdin()
+                fake_stdin.append(self.stdin)
                 self.stdout = StringIO(
                     "\n".join(
                         [
@@ -5174,14 +7116,30 @@ class GoalManagerCompactTests(unittest.TestCase):
 
         self.assertEqual(final_text, '{"assistant_text":"ok","spawn_requests":[]}')
         self.assertEqual(next_session_id, "codex-session-1")
-        self.assertEqual(seen_stdin, [subprocess.DEVNULL])
+        self.assertEqual(seen_stdin, [subprocess.PIPE])
+        self.assertEqual(fake_stdin[0].buffer, ["prompt"])
+        self.assertTrue(fake_stdin[0].closed)
 
     def test_run_codex_retries_without_session_when_resume_has_no_rollout(self) -> None:
         seen_cmds: list[list[str]] = []
+        seen_pipe_inputs: list[Any] = []
+
+        class FakeStdin:
+            def __init__(self) -> None:
+                self.buffer: list[str] = []
+                self.closed = False
+
+            def write(self, text: str) -> None:
+                self.buffer.append(text)
+
+            def close(self) -> None:
+                self.closed = True
 
         class FakeProc:
             def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
                 seen_cmds.append(list(cmd))
+                self.stdin = FakeStdin()
+                seen_pipe_inputs.append(self.stdin)
                 self.stdout = StringIO(stdout_text)
                 self.stderr = StringIO(stderr_text)
                 self._returncode = returncode
@@ -5233,13 +7191,29 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("resume", seen_cmds[0])
         self.assertNotIn("resume", seen_cmds[1])
         self.assertNotIn("stale-session", seen_cmds[1])
+        self.assertEqual([pipe.buffer for pipe in seen_pipe_inputs], [["prompt"], ["prompt"]])
+        self.assertTrue(all(pipe.closed for pipe in seen_pipe_inputs))
 
     def test_run_codex_retries_without_session_when_resume_hits_internal_tool_process_error(self) -> None:
         seen_cmds: list[list[str]] = []
+        seen_pipe_inputs: list[Any] = []
+
+        class FakeStdin:
+            def __init__(self) -> None:
+                self.buffer: list[str] = []
+                self.closed = False
+
+            def write(self, text: str) -> None:
+                self.buffer.append(text)
+
+            def close(self) -> None:
+                self.closed = True
 
         class FakeProc:
             def __init__(self, cmd: list[str], *, stdout_text: str, stderr_text: str, returncode: int) -> None:
                 seen_cmds.append(list(cmd))
+                self.stdin = FakeStdin()
+                seen_pipe_inputs.append(self.stdin)
                 self.stdout = StringIO(stdout_text)
                 self.stderr = StringIO(stderr_text)
                 self._returncode = returncode
@@ -5294,6 +7268,8 @@ class GoalManagerCompactTests(unittest.TestCase):
         self.assertIn("resume", seen_cmds[0])
         self.assertNotIn("resume", seen_cmds[1])
         self.assertNotIn("stale-session", seen_cmds[1])
+        self.assertEqual([pipe.buffer for pipe in seen_pipe_inputs], [["prompt"], ["prompt"]])
+        self.assertTrue(all(pipe.closed for pipe in seen_pipe_inputs))
 
     def test_run_gemini_aggregates_streamed_assistant_message_content(self) -> None:
         class FakeProc:
@@ -6183,6 +8159,185 @@ printf '%s\\n' '{"type":"turn.completed"}'
         self.assertEqual(message["payload"]["reason"], "goal_manager_review")
         log_text = (self.runtime_root / "logs" / "service-codex-001.jsonl").read_text(encoding="utf-8")
         self.assertIn("system_restart_active_in_progress", log_text)
+
+    def test_maybe_resume_after_restart_skips_idle_continuous_communication_goal(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep Entrance responsive.",
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["communication_agent_enabled"] = True
+        stored["goal_completion_policy"] = "continuous"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        self.assertEqual(router.writes, [])
+        gm_pending = load_service_pending_inputs(
+            self.runtime_root,
+            service_id="service-codex-001",
+            agent_id=resolve_session_agent_id(
+                self.runtime_root,
+                username=TEST_USERNAME,
+                session_id=self.session_id,
+                service_id="service-codex-001",
+                role="goal_manager",
+            ),
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(gm_pending, [])
+        log_text = (self.runtime_root / "logs" / "service-codex-001.jsonl").read_text(encoding="utf-8")
+        self.assertIn("idle_without_unfinished_turn_or_actionable_pending", log_text)
+        self.assertNotIn("system_restart_active_in_progress", log_text)
+
+    def test_maybe_resume_after_restart_purges_stale_continuous_communication_owner_lost(self) -> None:
+        self._register_running_service("service-codex-001", kind="codex")
+        save_codex_session(
+            self.runtime_root,
+            service_id="service-codex-001",
+            provider_session_id="provider-session-1",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            slot="worker_agent",
+        )
+        update_session_goal(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_text="Keep Entrance responsive.",
+        )
+        stored = get_session_settings(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id)
+        assert stored is not None
+        stored["communication_agent_enabled"] = True
+        stored["goal_completion_policy"] = "continuous"
+        write_json_file(
+            session_metadata_path(self.runtime_root, username=TEST_USERNAME, session_id=self.session_id),
+            stored,
+        )
+        update_session_goal_flags(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            goal_active=True,
+            goal_completed=False,
+            goal_progress_state="in_progress",
+            preferred_provider="codex",
+        )
+        save_agent_audit_state(
+            self.runtime_root,
+            service_id="service-codex-001",
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            audit_state="all_clear",
+        )
+
+        stale_owner_lost_item = {
+            "kind": "lifecycle_owner_lost",
+            "ts": "2026-05-24T17:43:03Z",
+            "service_id": "service-claude-002",
+            "source_service_id": "service-codex-002",
+            "goal_id": "stale-goal-id",
+            "reason": "released_nonrunnable_session_service:service_missing",
+        }
+        gm_state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        write_json_file(
+            gm_state_path,
+            {
+                "state": "queued",
+                "audit_state": "all_clear",
+                "service_id": "service-claude-002",
+                "pending_work_items": [stale_owner_lost_item],
+                "updated_at": "2026-05-24T17:43:03Z",
+            },
+        )
+        append_goal_manager_pending_input(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+            entry=dict(stale_owner_lost_item),
+        )
+
+        class _Router:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+        router = _Router()
+        maybe_resume_after_restart(
+            runtime_root=self.runtime_root,
+            manifest={"node_id": "node-test", "run_id": "run-test", "services": []},
+            self_service={"config": {"restart_resume": {"previous_status": "running", "previous_process_id": "proc-old"}}},
+            process_id="proc-new",
+            log_path=self.runtime_root / "logs" / "service-codex-001.jsonl",
+            service_id="service-codex-001",
+            router_conn=router,
+            service_kind="codex",
+        )
+
+        post_state = read_json_file(gm_state_path) or {}
+        self.assertEqual(post_state.get("pending_work_items"), [])
+        remaining_pending = load_goal_manager_pending_inputs(
+            self.runtime_root,
+            username=TEST_USERNAME,
+            session_id=self.session_id,
+        )
+        self.assertEqual(remaining_pending, [])
+        self.assertEqual(router.writes, [])
 
     def test_maybe_resume_after_restart_routes_unreviewed_turn_to_goal_manager(self) -> None:
         self._register_running_service("service-codex-001", kind="codex")

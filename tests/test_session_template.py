@@ -614,6 +614,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             skills = load_session_skills(runtime_root, username="repyt", session_id=session_id)
             self.assertEqual(skills[0]["skill_id"], "aize-system-monitor")
             self.assertEqual(skills[0]["canonical_session_key"], "aize.system-monitor")
+            self.assertTrue(skills[0]["files"][0]["preserve_existing"])
             self.assertIn(
                 "AIze System Monitor",
                 session_skill_file_path(
@@ -786,7 +787,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(second_stored["launcher_instance_policy"], "multi")
             route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
             self.assertFalse(route["allow_tag_routing"])
-            self.assertEqual(route["route_parent_scope"], "origin_session")
+            self.assertEqual(route["route_parent_scope"], "root_session")
             self.assertIn("separate port or isolated runtime", route["target_goal_text"])
             self.assertIn("final stop-and-migrate coordination", route["spawn_session_skills"][0]["prompt"])
             self.assertIn(

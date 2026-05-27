@@ -102,7 +102,28 @@ def run_claude(
     stderr = proc.stderr.read().strip() if proc.stderr is not None else ""
     rc = proc.wait()
     if rc != 0:
-        raise RuntimeError(stderr or f"claude failed with exit code {rc}")
+        result_error = next(
+            (
+                str(record.get("result") or "").strip()
+                for record in reversed(events)
+                if record.get("type") == "result" and record.get("is_error", False)
+            ),
+            "",
+        )
+        assistant_error = next(
+            (
+                str(record.get("text") or "").strip()
+                for record in reversed(events)
+                if record.get("type") == "claude.assistant.text" and str(record.get("text") or "").strip()
+            ),
+            "",
+        )
+        raise RuntimeError(
+            stderr
+            or result_error
+            or assistant_error
+            or f"claude failed with exit code {rc}"
+        )
     return final_text, events, next_session_id
 
 

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+import json
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -11,11 +12,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from runtime.agent_service import (
+    _canonical_spawn_handoff_parent_session_id,
     _completed_recovery_audit_if_parent_resumed,
     _finalize_superseded_panic_recovery_siblings,
     _handoff_spawn_request_to_child_session,
     _interactive_recent_context,
     _is_usage_limit_error_text,
+    _route_spawn_request_to_communication_child_session,
     _retry_after_seconds_from_error_text,
     _service_can_spawn_children,
     _worker_session_skills_block,
@@ -277,6 +280,218 @@ class ServiceControlParserTests(unittest.TestCase):
             assert child_session is not None
             self.assertEqual(child_session.get("parent_session_id"), session_id)
             self.assertEqual(child_session.get("goal_text"), "Investigate the routing failure and report back.")
+
+    def test_handoff_spawn_request_uses_canonical_development_parent_for_communication_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            route_skill = {
+                "skill_id": "canonical-development-routing",
+                "routing_mode": "create_child_session",
+                "canonical_session_key": "aize.development",
+                "route_parent_scope": "root_session",
+                "target_template_id": "aize-development.bug-hunting",
+                "target_label": "AIze Development",
+            }
+            entrance = create_conversation_session(
+                runtime_root,
+                username=TEST_USERNAME,
+                label="Entrance",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[route_skill],
+            )
+            canonical_parent = create_conversation_session(
+                runtime_root,
+                username=TEST_USERNAME,
+                label="AIze Development",
+                session_skills=[
+                    {
+                        "skill_id": "aize-development-session",
+                        "canonical_session_key": "aize.development",
+                    }
+                ],
+            )
+            update_session_goal_flags(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(canonical_parent["session_id"]),
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+            )
+            stored_parent = get_session_settings(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(canonical_parent["session_id"]),
+            )
+            assert stored_parent is not None
+            stored_parent["parent_session_id"] = "default"
+            stored_parent["launcher_template_id"] = "aize-development.bug-hunting"
+            stored_parent["launcher_unit_id"] = "aize-development.bug-hunting"
+            canonical_parent_path = next(
+                runtime_root.glob(f"**/{canonical_parent['session_id']}/session.json")
+            )
+            canonical_parent_path.write_text(json.dumps(stored_parent, indent=2) + "\n", encoding="utf-8")
+
+            created = _handoff_spawn_request_to_child_session(
+                runtime_root=runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(entrance["session_id"]),
+                goal_manager_service_id="service-codex-001",
+                control={
+                    "service": {
+                        "service_id": "service-codex-helper-001",
+                        "kind": "codex",
+                        "display_name": "Focused Helper",
+                    },
+                    "initial_prompt": "Fix the delegated routing path.",
+                },
+            )
+
+            self.assertEqual(len(created), 1)
+            child_session = get_session_settings(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=created[0]["session_id"],
+            )
+            assert child_session is not None
+            self.assertEqual(child_session.get("parent_session_id"), canonical_parent["session_id"])
+
+    def test_communication_spawn_handoff_uses_canonical_development_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            entrance = create_conversation_session(
+                runtime_root,
+                username=TEST_USERNAME,
+                label="Entrance",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[
+                    {
+                        "skill_id": "canonical-development-routing",
+                        "routing_mode": "create_child_session",
+                        "canonical_session_key": "aize.development",
+                        "target_label": "AIze Development",
+                    }
+                ],
+            )
+            canonical_parent = create_conversation_session(
+                runtime_root,
+                username=TEST_USERNAME,
+                label="AIze Development",
+                session_group="root",
+                session_skills=[
+                    {
+                        "skill_id": "aize-development-session",
+                        "canonical_session_key": "aize.development",
+                    }
+                ],
+            )
+            compatibility_parent = create_conversation_session(
+                runtime_root,
+                username=TEST_USERNAME,
+                label="AIze Development",
+                session_group="user",
+                session_skills=[
+                    {
+                        "skill_id": "legacy-development-session",
+                        "canonical_session_key": "aize.development",
+                    }
+                ],
+            )
+
+            update_session_goal_flags(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(canonical_parent["session_id"]),
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+            )
+            update_session_goal_flags(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(compatibility_parent["session_id"]),
+                goal_active=True,
+                goal_completed=False,
+                goal_progress_state="in_progress",
+            )
+
+            resolved = _canonical_spawn_handoff_parent_session_id(
+                runtime_root=runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(entrance["session_id"]),
+            )
+
+            self.assertEqual(resolved, canonical_parent["session_id"])
+
+    def test_route_spawn_request_to_communication_child_session_creates_canonical_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            entrance = create_conversation_session(
+                runtime_root,
+                username=TEST_USERNAME,
+                label="Entrance",
+                session_ui_mode="communication",
+                communication_agent_enabled=True,
+                session_skills=[
+                    {
+                        "skill_id": "canonical-development-routing",
+                        "routing_mode": "create_child_session",
+                        "route_when_unhandled": False,
+                        "canonical_session_key": "aize.development",
+                        "route_parent_scope": "root_session",
+                        "target_template_id": "aize-development.bug-hunting",
+                        "target_label": "AIze Development",
+                        "target_child_label": "AIze Development Task",
+                        "target_goal_text": "Implement the requested changes here.",
+                        "preferred_provider": "codex",
+                        "selected_agents": ["codex_pool"],
+                        "spawn_session_skills": [
+                            {
+                                "skill_id": "aize-development-session",
+                                "canonical_session_key": "aize.development",
+                            }
+                        ],
+                    }
+                ],
+            )
+            dispatched: list[str] = []
+            created = _route_spawn_request_to_communication_child_session(
+                runtime_root=runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(entrance["session_id"]),
+                goal_manager_service_id="service-codex-001",
+                control={
+                    "service": {
+                        "service_id": "service-codex-helper-001",
+                        "kind": "codex",
+                        "display_name": "Focused Helper",
+                    },
+                    "initial_prompt": "Fix the delegated routing path.",
+                },
+                dispatch_child_session=lambda child_session_id: (
+                    dispatched.append(child_session_id) or "service-codex-001"
+                ),
+            )
+
+            self.assertEqual(len(created), 1)
+            self.assertEqual(len(dispatched), 1)
+            child_session = get_session_settings(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=created[0]["session_id"],
+            )
+            assert child_session is not None
+            self.assertEqual(child_session.get("goal_text"), "Fix the delegated routing path.")
+            parent_session = get_session_settings(
+                runtime_root,
+                username=TEST_USERNAME,
+                session_id=str(child_session.get("parent_session_id") or ""),
+            )
+            assert parent_session is not None
+            self.assertEqual(parent_session.get("label"), "AIze Development")
+            self.assertEqual(parent_session.get("parent_session_id"), "default")
 
 
 class PanicRecoveryReturnPathTests(unittest.TestCase):

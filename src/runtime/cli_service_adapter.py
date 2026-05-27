@@ -39,6 +39,7 @@ from runtime.goal_audit import (
     pending_turn_completed_events_since_last_review,
     run_goal_audit,
 )
+from runtime.communication_goal import should_idle_goal_reconcile
 from runtime.providers import (
     provider_supports_context_compaction,
     run_claude,
@@ -82,10 +83,12 @@ from runtime.persistent_state_pkg import (
     load_gemini_session,
     active_agent_priority,
     normalize_auto_compact_threshold_left_percent,
+    read_json_file,
     resolve_session_agent_id,
     resolve_session,
     resolve_session_context,
     session_goal_context,
+    session_service_state_path,
     save_agent_audit_state,
     save_claude_session,
     save_codex_session,
@@ -97,6 +100,7 @@ from runtime.persistent_state_pkg import (
     update_session_goal,
     update_session_goal_flags,
     update_goal_manager_review_cursor,
+    write_json_file,
 )
 from runtime.service_control import (
     build_prompt,
@@ -153,6 +157,7 @@ from runtime.session_view import (
     build_progress_inquiry_xml,
     maybe_enqueue_mid_turn_progress_inquiry,
 )
+from runtime.session_lifecycle import enqueue_goal_manager_lifecycle_review
 from runtime.compaction import (
     context_status_from_history_entry,
     persist_session_context_status,
@@ -172,6 +177,7 @@ from runtime.compaction import (
     maybe_auto_compact_gemini_session,
 )
 from runtime.goal_persist import (
+    GOAL_AUDIT_HISTORY_LIMIT,
     goal_state_response_payload,
     goal_audit_history_text,
     persist_goal_audit_completion,
@@ -214,7 +220,16 @@ def session_agent_assignment_counts(
     assigned_agents: set[str] = set()
 
     def contact_key(item: dict[str, Any]) -> str:
-        return str(item.get("service_id") or item.get("agent_id") or "").strip()
+        raw = str(item.get("service_id") or item.get("agent_id") or "").strip()
+        if "@@" in raw:
+            return raw.split("@@", 1)[0].strip()
+        return raw
+
+    if not session_has_active_in_progress_goal(session):
+        return {
+            "goal_manager_reviewers": 0,
+            "assigned_agents": 0,
+        }
 
     welcomed_agents = session.get("welcomed_agents")
     if isinstance(welcomed_agents, list):
@@ -230,12 +245,12 @@ def session_agent_assignment_counts(
             else:
                 assigned_agents.add(key)
 
-    bound_service_id = str(session.get("service_id") or "").strip()
-    if bound_service_id:
-        assigned_agents.add(bound_service_id)
-
     replying = bool(session.get("agent_running", False)) if agent_running is None else bool(agent_running)
     if replying:
+        bound_service_id = str(session.get("service_id") or "").strip()
+        if bound_service_id:
+            assigned_agents.add(bound_service_id)
+
         if isinstance(worker, dict):
             worker_key = contact_key(worker)
             if worker_key:
@@ -264,6 +279,102 @@ def _resolve_bind_specs(requested_host: str) -> list[tuple[str, int]]:
         return [("0.0.0.0", socket.AF_INET), ("::", socket.AF_INET6)]
     family = socket.AF_INET6 if ":" in requested_host else socket.AF_INET
     return [(requested_host, family)]
+
+
+def maybe_clear_stale_idle_agent_panic(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+) -> bool:
+    current_audit_state = load_agent_audit_state(
+        runtime_root,
+        service_id=service_id,
+        username=username,
+        session_id=session_id,
+    )
+    if current_audit_state != "panic":
+        return False
+    service_state_path = session_service_state_path(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        service_id=service_id,
+    )
+    service_state = read_json_file(service_state_path) or {"service_id": service_id}
+    service_status = str(service_state.get("status") or "").strip().lower()
+    session = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+    bound_service_id = str(session.get("service_id") or "").strip()
+    if service_status != "idle":
+        # Released sessions can retain a minimal service state record without a runtime
+        # status after their old worker binding is dropped. Treat that as idle only when
+        # the session is no longer bound to this worker and no worker-specific input remains.
+        if (
+            service_status
+            or bound_service_id == service_id
+            or load_service_pending_inputs(
+                runtime_root,
+                service_id=service_id,
+                username=username,
+                session_id=session_id,
+            )
+        ):
+            return False
+    goal_manager_state = service_state.get("goal_manager")
+    if not isinstance(goal_manager_state, dict):
+        goal_manager_state = {}
+    goal_manager_runtime_state = str(goal_manager_state.get("state") or "").strip().lower()
+    pending_work_items = (
+        list(goal_manager_state.get("pending_work_items", []))
+        if isinstance(goal_manager_state.get("pending_work_items"), list)
+        else []
+    )
+    if goal_manager_runtime_state not in {"", "idle"}:
+        return False
+    if pending_work_items:
+        return False
+    if load_pending_inputs(runtime_root, username=username, session_id=session_id):
+        return False
+    if load_service_pending_inputs(
+        runtime_root,
+        service_id=service_id,
+        username=username,
+        session_id=session_id,
+    ):
+        return False
+    cleared_at = utc_ts()
+    save_agent_audit_state(
+        runtime_root,
+        service_id=service_id,
+        username=username,
+        session_id=session_id,
+        audit_state="all_clear",
+    )
+    goal_manager_state["audit_state"] = "all_clear"
+    goal_manager_state["updated_at"] = cleared_at
+    service_state["updated_at"] = cleared_at
+    service_state["goal_manager"] = goal_manager_state
+    write_json_file(service_state_path, service_state)
+    append_user_history(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+        entry={
+            "direction": "event",
+            "ts": cleared_at,
+            "service_id": service_id,
+            "event_type": "service.stale_panic_cleared_after_idle_recovery",
+            "text": "Cleared a stale panic state for an idle service with no pending work.",
+            "event": {
+                "type": "service.stale_panic_cleared_after_idle_recovery",
+                "previous_audit_state": "panic",
+                "new_audit_state": "all_clear",
+            },
+        },
+        limit=GOAL_AUDIT_HISTORY_LIMIT,
+    )
+    return True
 
 # Source-compat snippets for HTTPBridge UI tests.
 # The concrete renderer lives in runtime.html_renderer, but these pinned excerpts
@@ -437,27 +548,96 @@ def run_http_service(
     from kernel.ipc import connect_to_router as _connect_to_router
     if router_conn is None:
         router_conn = _connect_to_router(runtime_root, self_service["service_id"])
-    ensure_state(runtime_root)
-    for reconciled in reconcile_session_waiting_on_children(runtime_root):
+
+    def _run_startup_state_reconcile() -> None:
         write_jsonl(
             log_path,
             {
-                "type": "http.reconciled_session_waiting_on_children",
+                "type": "http.startup_state_reconcile.started",
                 "ts": utc_ts(),
                 "service_id": self_service["service_id"],
                 "process_id": process_id,
-                **reconciled,
             },
         )
-    for released in release_nonrunnable_session_services(runtime_root):
+        try:
+            ensure_state(runtime_root)
+            release_stale_session_bindings()
+        except Exception as exc:
+            write_jsonl(
+                log_path,
+                {
+                    "type": "http.startup_state_reconcile.failed",
+                    "ts": utc_ts(),
+                    "service_id": self_service["service_id"],
+                    "process_id": process_id,
+                    "error": repr(exc),
+                },
+            )
+            return
         write_jsonl(
             log_path,
             {
-                "type": "http.released_nonrunnable_session_service",
+                "type": "http.startup_state_reconcile.completed",
                 "ts": utc_ts(),
                 "service_id": self_service["service_id"],
                 "process_id": process_id,
-                **released,
+            },
+        )
+    def running_llm_service_pools() -> dict[str, list[str]]:
+        lifecycle_processes = load_lifecycle_state(runtime_root).get("processes", {})
+        pools: dict[str, list[str]] = {"codex": [], "claude": [], "gemini": []}
+        manifest_kinds = {
+            str(service.get("service_id") or ""): str(service.get("kind") or "").strip().lower()
+            for service in manifest.get("services", [])
+            if isinstance(service, dict)
+        }
+        for record in list_service_records(runtime_root):
+            service_id = str(record.get("service_id") or "").strip()
+            kind = str(record.get("kind") or manifest_kinds.get(service_id) or "").strip().lower()
+            if not service_id or kind not in pools or not is_canonical_llm_service_id(service_id):
+                continue
+            process_id_for_service = str(record.get("current_process_id") or "").strip()
+            process_record = lifecycle_processes.get(process_id_for_service)
+            if (
+                str(record.get("status") or "").strip().lower() == "running"
+                and isinstance(process_record, dict)
+                and str(process_record.get("status") or "").strip().lower() == "running"
+            ):
+                pools[kind].append(service_id)
+        for kind, service_ids in list(pools.items()):
+            pools[kind] = sorted(service_ids)
+        return pools
+
+    def queue_goal_manager_for_released_session(released: dict[str, Any]) -> None:
+        username = str(released.get("username") or "").strip()
+        session_id = str(released.get("session_id") or "").strip()
+        released_service_id = str(released.get("service_id") or "").strip()
+        if not username or not session_id or not released_service_id:
+            return
+        result = enqueue_goal_manager_lifecycle_review(
+            runtime_root,
+            manifest=manifest,
+            from_service_id=self_service["service_id"],
+            process_id=process_id,
+            username=username,
+            session_id=session_id,
+            reason=f"released_nonrunnable_session_service:{released.get('reason') or 'unknown'}",
+            source_service_id=released_service_id,
+            service_pools_by_provider=running_llm_service_pools(),
+            default_provider=default_provider,
+            send_dispatch=send_router_control,
+        )
+        write_jsonl(
+            log_path,
+            {
+                "type": "http.goal_manager_lifecycle_review",
+                "ts": utc_ts(),
+                "service_id": self_service["service_id"],
+                "process_id": process_id,
+                "username": username,
+                "session_id": session_id,
+                "released_service_id": released_service_id,
+                **result,
             },
         )
 
@@ -484,6 +664,7 @@ def run_http_service(
                     **released,
                 },
             )
+            queue_goal_manager_for_released_session(released)
 
     def subscriber_key(username: str, session_id: str) -> str:
         return f"{username}::{session_id}"
@@ -627,6 +808,9 @@ def run_http_service(
                 claude_service_pool=current_claude_service_pool,
                 gemini_service_pool=current_gemini_service_pool,
                 default_provider=default_provider,
+                runtime_root=runtime_root,
+                username=username,
+                allow_reconcile=False,
             )
             scope_key = f"{username}::{session_id}"
             active_turn = active_turns_snap.get(scope_key)
@@ -638,6 +822,7 @@ def run_http_service(
                 username=username,
                 session_id=session_id,
                 bound_service_id=bound_service_id,
+                allow_reconcile=False,
             )
             summary["goal_manager_state"] = str(persisted_goal_manager.get("state") or summary.get("goal_manager_state") or "idle")
             summary["goal_manager_pending_work_items"] = (
@@ -672,6 +857,7 @@ def run_http_service(
                 active_turn is None
                 and active_goal_audit is None
                 and session_has_active_in_progress_goal(session)
+                and should_idle_goal_reconcile(session)
                 and str(summary.get("goal_manager_state") or "").strip().lower() not in {"running", "queued"}
             ):
                 reconcile_key = f"{username}::{session_id}"
@@ -940,6 +1126,16 @@ def run_http_service(
         agent_audit_state = load_agent_audit_state(
             runtime_root, service_id=to_service, username=username, session_id=session_id
         )
+        if agent_audit_state == "panic":
+            maybe_clear_stale_idle_agent_panic(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                service_id=to_service,
+            )
+            agent_audit_state = load_agent_audit_state(
+                runtime_root, service_id=to_service, username=username, session_id=session_id
+            )
         if agent_audit_state == "panic":
             return None, "agent_audit_state_disallows_dispatch:panic"
         goal_update_lines = ["<aize_goal_update>"]
@@ -1574,6 +1770,8 @@ def run_http_service(
         server_thread.start()
         server_threads.append(server_thread)
 
+    threading.Thread(target=_run_startup_state_reconcile, daemon=True).start()
+
     # Start outbound WS peer client connections (config from runtime/ws_peer_clients.json)
     start_ws_peer_clients(
         runtime_root,
@@ -1746,6 +1944,7 @@ def run_http_service(
                 if message.get("type") != "prompt":
                     continue
                 incoming_text = resolve_payload_text(runtime_root, message)
+                message_meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
                 username, session_id = resolve_http_reply_scope(message, awaiting_replies)
                 with _active_agent_turns_lock:
                     _active_agent_turns.pop(f"{username}::{session_id}", None)
@@ -1759,6 +1958,7 @@ def run_http_service(
                         "from": message.get("from"),
                         "session_id": session_id,
                         "text": incoming_text,
+                        "message_id": str(message_meta.get("message_id") or ""),
                     },
                 )
                 refresh_context_status(username, session_id)

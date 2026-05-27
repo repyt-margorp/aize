@@ -71,7 +71,7 @@
         "allow_tag_routing": false,
         "route_when_unhandled": false,
         "canonical_session_key": "aize.development",
-        "route_parent_scope": "origin_session",
+        "route_parent_scope": "root_session",
         "target_unit_id": "aize-development.bug-hunting",
         "target_template_id": "aize-development.bug-hunting",
         "target_label": "AIze Development",

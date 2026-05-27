@@ -3,10 +3,14 @@
 .aize-runtime/
 .temp/
 temp/
+state/
+server.pid
+.codex
 .tmp-agent-test/
 .tmux-agent-chat/
 .tmux-agent-chat-loop/
 .tmux-aize/
+plugins/test_launcher_*/
 plugins/private/*
 !plugins/private/.gitkeep
 

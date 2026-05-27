@@ -135,7 +135,7 @@ def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
             items.append(text)
         return items
 
-    def _normalize_file_entry(raw_item: Any) -> dict[str, str] | None:
+    def _normalize_file_entry(raw_item: Any) -> dict[str, Any] | None:
         def _normalize_relative_path(raw_path: str) -> str:
             safe_parts = [
                 part
@@ -159,6 +159,10 @@ def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
         description = str(raw_item.get("description") or "").strip()
         if description:
             entry["description"] = description
+        durable_description = "durable" in description.lower()
+        append_only_template = "append one entry per scheduled run" in str(content or "").lower()
+        if bool(raw_item.get("preserve_existing")) or durable_description or append_only_template:
+            entry["preserve_existing"] = True
         return entry
 
     normalized: list[dict[str, Any]] = []
@@ -229,7 +233,7 @@ def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
         spawn_session_skills = raw_item.get("spawn_session_skills")
         if isinstance(spawn_session_skills, list):
             skill["spawn_session_skills"] = normalize_session_skills(spawn_session_skills)
-        files: list[dict[str, str]] = []
+        files: list[dict[str, Any]] = []
         for raw_file in raw_item.get("files", []):
             entry = _normalize_file_entry(raw_file)
             if entry is not None:
@@ -839,15 +843,15 @@ def write_session_skills(
             path = str(file_entry.get("path") or "").strip()
             if not path or "content" not in file_entry:
                 continue
-            _write_text_file(
-                session_skill_file_path(
-                    runtime_root,
-                    username=normalized_username,
-                    session_id=normalized_session_id,
-                    relative_path=path,
-                ),
-                str(file_entry.get("content") or ""),
+            target_path = session_skill_file_path(
+                runtime_root,
+                username=normalized_username,
+                session_id=normalized_session_id,
+                relative_path=path,
             )
+            if bool(file_entry.get("preserve_existing")) and target_path.exists():
+                continue
+            _write_text_file(target_path, str(file_entry.get("content") or ""))
 
 
 def load_session_skills(

@@ -14,6 +14,21 @@ def communication_goal_cycle_enabled(session_settings: dict[str, Any] | None) ->
     )
 
 
+def is_continuous_communication_session(session_settings: dict[str, Any] | None) -> bool:
+    settings = session_settings or {}
+    return bool(settings.get("communication_agent_enabled", False)) and (
+        session_goal_completion_policy(settings) == "continuous"
+    )
+
+
+def should_idle_goal_reconcile(session_settings: dict[str, Any] | None) -> bool:
+    settings = session_settings or {}
+    # Communication sessions receive work from explicit prompt routing,
+    # child-session signals, resume directives, and spawned follow-up work.
+    # They should not re-enter the generic idle reconcile loop while empty.
+    return not bool(settings.get("communication_agent_enabled", False))
+
+
 def should_complete_communication_goal_after_reply(
     session_settings: dict[str, Any] | None,
     *,

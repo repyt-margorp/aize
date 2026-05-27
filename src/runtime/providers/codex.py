@@ -58,7 +58,7 @@ def run_codex(
 ) -> tuple[str, list[dict[str, Any]], str | None]:
     sanitized_config_overrides = _sanitize_config_overrides(config_overrides)
 
-    def build_cmd(attempt_model: str | None, attempt_session_id: str | None) -> list[str]:
+    def build_cmd(attempt_model: str | None, attempt_session_id: str | None) -> tuple[list[str], str | None]:
         if attempt_session_id:
             cmd = [
                 "codex",
@@ -71,7 +71,7 @@ def run_codex(
                 cmd.extend(["--model", str(attempt_model)])
             for key, value in sanitized_config_overrides.items():
                 cmd.extend(["-c", f"{key}={json.dumps(str(value))}"])
-            cmd.extend([attempt_session_id, prompt])
+            cmd.extend([attempt_session_id, "-"])
         else:
             cmd = [
                 "codex",
@@ -91,8 +91,8 @@ def run_codex(
                 cmd.extend(["-c", 'web_search="disabled"'])
             if response_schema_id:
                 cmd.extend(["--output-schema", str(schema_path(response_schema_id))])
-            cmd.append(prompt)
-        return cmd
+            cmd.append("-")
+        return cmd, prompt
 
     attempts: list[tuple[str | None, str | None]] = [(model, session_id)]
     if model is not None:
@@ -108,15 +108,18 @@ def run_codex(
         if attempt_key in seen_attempts:
             continue
         seen_attempts.add(attempt_key)
-        attempt_cmd = build_cmd(attempt_model, attempt_session_id)
+        attempt_cmd, stdin_text = build_cmd(attempt_model, attempt_session_id)
         proc = subprocess.Popen(
             attempt_cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
         )
+        if proc.stdin is not None:
+            proc.stdin.write(stdin_text or "")
+            proc.stdin.close()
         events: list[dict[str, Any]] = []
         final_text = ""
         next_session_id = session_id

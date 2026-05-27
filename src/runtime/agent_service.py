@@ -56,6 +56,7 @@ from runtime.panic_recovery import (
     ensure_panic_recovery_session,
     panic_recovery_bootstrap_xml,
 )
+from runtime.session_lifecycle import enqueue_goal_manager_lifecycle_review
 from runtime.message_builder import (
     batch_has_input_kind,
     build_aize_input_batch_xml,
@@ -95,6 +96,7 @@ from runtime.persistent_state_pkg import (
     list_session_agent_contacts,
     list_session_parents,
     list_session_children,
+    list_sessions,
     release_session_service,
     resolve_session_agent_id,
     read_json_file,
@@ -116,6 +118,13 @@ from runtime.persistent_state_pkg import (
     write_json_file,
 )
 from runtime.providers import run_claude, run_codex, run_gemini
+from runtime.session_view import (
+    is_canonical_llm_service_id,
+    persisted_goal_manager_runtime_state,
+    session_agent_assignment_counts,
+    session_has_active_in_progress_goal,
+    worker_slot_badge,
+)
 from runtime.service_control import (
     build_interactive_prompt,
     build_prompt,
@@ -308,6 +317,244 @@ def _provider_from_service_id(service_id: str, *, default: str = "codex") -> str
     return default
 
 
+def _should_enqueue_post_turn_goal_manager_followup(
+    *,
+    provider_session_slot: str | None,
+    turn_completed_input_present: bool,
+    goal_input_present: bool,
+    actionable_input_present: bool,
+    goal_text: str,
+    goal_active: bool,
+    goal_completed: bool,
+    goal_progress_state: str,
+    goal_audit_state: str,
+    user_response_wait_active: bool,
+    communication_agent_enabled: bool,
+    visible_text_present: bool,
+    spawn_request_count: int,
+) -> bool:
+    if str(provider_session_slot or "").strip().lower() == "goal_manager":
+        return False
+    if (
+        communication_agent_enabled
+        and not actionable_input_present
+        and int(spawn_request_count or 0) <= 0
+    ):
+        return False
+    return bool(
+        turn_completed_input_present
+        and goal_text
+        and goal_active
+        and not goal_completed
+        and goal_progress_state == "in_progress"
+        and goal_audit_state in {"all_clear", "needs_compact"}
+        and not user_response_wait_active
+    )
+
+
+def _should_advance_goal_manager_review_cursor_without_followup(
+    *,
+    communication_agent_enabled: bool,
+    actionable_input_present: bool,
+    spawn_request_count: int,
+    goal_should_continue: bool,
+) -> bool:
+    return bool(
+        communication_agent_enabled
+        and not goal_should_continue
+        and not actionable_input_present
+        and int(spawn_request_count or 0) <= 0
+    )
+
+
+def _actionable_post_turn_input_present(
+    incoming_text: str,
+    *,
+    communication_agent_enabled: bool,
+) -> bool:
+    if (
+        batch_has_input_kind(incoming_text, "user_message")
+        or batch_has_input_kind(incoming_text, "interactive_worker_result")
+        or batch_has_input_kind(incoming_text, "goal_child_session_request")
+    ):
+        return True
+    if communication_agent_enabled:
+        return False
+    return bool(
+        batch_has_input_kind(incoming_text, "restart_resume")
+        or batch_has_input_kind(incoming_text, "scheduled_resume")
+    )
+
+
+def _should_append_session_turn_completed_input(
+    *,
+    communication_agent_enabled: bool,
+    actionable_input_present: bool,
+    spawn_request_count: int,
+) -> bool:
+    if (
+        communication_agent_enabled
+        and not actionable_input_present
+        and int(spawn_request_count or 0) <= 0
+    ):
+        return False
+    return True
+
+
+def _ensure_in_progress_goal_has_followup_owner(
+    *,
+    progress_state: str | None,
+    audit_state: str | None,
+    goal_manager_service_id: str,
+    directives: list[dict[str, Any]] | None,
+    child_goal_requests: list[dict[str, Any]] | None,
+    user_response_requests: list[dict[str, Any]] | None,
+    summary: str,
+) -> list[dict[str, Any]]:
+    normalized_directives = [
+        dict(item)
+        for item in (directives or [])
+        if isinstance(item, dict) and str(item.get("service_id") or "").strip()
+    ]
+    if normalized_directives:
+        return normalized_directives
+    if str(progress_state or "").strip().lower() != "in_progress":
+        return normalized_directives
+    if str(audit_state or "").strip().lower() != "all_clear":
+        return normalized_directives
+    if any(isinstance(item, dict) for item in (child_goal_requests or [])):
+        return normalized_directives
+    if any(isinstance(item, dict) for item in (user_response_requests or [])):
+        return normalized_directives
+    owner_service_id = str(goal_manager_service_id or "").strip()
+    if not owner_service_id:
+        return normalized_directives
+    fallback_summary = str(summary or "").strip() or (
+        "Goal is still in progress. Do not leave the session without an active owner."
+    )
+    normalized_directives.append(
+        {
+            "service_id": owner_service_id,
+            "audit_state": "all_clear",
+            "continue_xml": default_goal_continue_xml(summary=fallback_summary),
+            "request_compact": False,
+            "request_compact_reason": "",
+            "summary": fallback_summary,
+        }
+    )
+    return normalized_directives
+
+
+def _running_llm_service_pools(
+    *,
+    runtime_root: Path,
+    manifest: dict[str, Any],
+) -> dict[str, list[str]]:
+    pools: dict[str, list[str]] = {"codex": [], "claude": [], "gemini": []}
+    manifest_kinds = {
+        str(service.get("service_id") or ""): str(service.get("kind") or "").strip().lower()
+        for service in manifest.get("services", [])
+        if isinstance(service, dict)
+    }
+    for record in list_service_records(runtime_root):
+        service_id = str(record.get("service_id") or "").strip()
+        kind = str(record.get("kind") or manifest_kinds.get(service_id) or "").strip().lower()
+        if not service_id or kind not in pools or not is_canonical_llm_service_id(service_id):
+            continue
+        process_id = str(record.get("current_process_id") or "").strip()
+        try:
+            process = get_process_record(runtime_root, process_id) if process_id else {}
+        except KeyError:
+            process = {}
+        if (
+            str(record.get("status") or "").strip().lower() == "running"
+            and isinstance(process, dict)
+            and str(process.get("status") or "").strip().lower() == "running"
+        ):
+            pools[kind].append(service_id)
+    for provider, service_ids in list(pools.items()):
+        pools[provider] = sorted(set(service_ids))
+    return pools
+
+
+def _maybe_enqueue_in_progress_goal_lifecycle_review(
+    *,
+    runtime_root: Path,
+    manifest: dict[str, Any],
+    process_id: str,
+    service_id: str,
+    provider_session_slot: str,
+    username: str | None,
+    session_id: str | None,
+    default_provider: str,
+    send_tx: Callable[[dict[str, Any]], None],
+    reason: str,
+) -> dict[str, Any] | None:
+    normalized_username = str(username or "").strip()
+    normalized_session_id = str(session_id or "").strip()
+    if not (normalized_username and normalized_session_id):
+        return None
+    if str(provider_session_slot or "").strip().lower() == "goal_manager":
+        return None
+    session = get_session_settings(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_session_id,
+    ) or {}
+    if not session_has_active_in_progress_goal(session):
+        return None
+    if bool(session.get("user_response_wait_active", False)):
+        return None
+    if bool(session.get("waiting_on_children", False)):
+        return None
+
+    bound_service_id = str(session.get("service_id") or "").strip()
+    goal_manager_runtime = persisted_goal_manager_runtime_state(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_session_id,
+        bound_service_id=bound_service_id,
+    )
+    goal_manager_service_id = str(goal_manager_runtime.get("service_id") or bound_service_id).strip()
+    goal_manager_state = str(goal_manager_runtime.get("state") or "idle").strip().lower() or "idle"
+    goal_manager_worker = (
+        worker_slot_badge(
+            goal_manager_service_id,
+            codex_service_pool=[],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+        )
+        if goal_manager_service_id
+        else None
+    )
+    agent_counts = session_agent_assignment_counts(
+        session,
+        worker=None,
+        agent_running=False,
+        goal_manager_worker=goal_manager_worker,
+        goal_manager_state=goal_manager_state,
+    )
+    if agent_counts["assigned_agents"] > 0 or agent_counts["goal_manager_reviewers"] > 0:
+        return None
+
+    return enqueue_goal_manager_lifecycle_review(
+        runtime_root,
+        manifest=manifest,
+        from_service_id=service_id,
+        process_id=process_id,
+        username=normalized_username,
+        session_id=normalized_session_id,
+        reason=reason,
+        source_service_id=service_id,
+        service_pools_by_provider=_running_llm_service_pools(
+            runtime_root=runtime_root,
+            manifest=manifest,
+        ),
+        default_provider=default_provider,
+        send_dispatch=lambda message: send_tx(message) or True,
+    )
+
+
 def _resolve_audit_state_after_goal_manager_compact(
     audit_state: str | None,
     compact_event: dict[str, Any] | None,
@@ -322,6 +569,21 @@ def _resolve_audit_state_after_goal_manager_compact(
     if str(compact_event.get("compaction") or "").strip() == "suppressed_by_session_setting":
         return "needs_compact" if normalized_audit_state == "needs_compact" else normalized_audit_state
     return "all_clear"
+
+
+def _latest_goal_manager_turn_completed_ts(
+    work_items: list[dict[str, Any]] | None,
+) -> str:
+    latest = ""
+    for item in work_items or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip().lower() != "turn_completed":
+            continue
+        item_ts = str(item.get("ts") or "").strip()
+        if item_ts > latest:
+            latest = item_ts
+    return latest
 
 
 def _materialize_goal_child_sessions(
@@ -340,6 +602,17 @@ def _materialize_goal_child_sessions(
         for item in child_goal_requests
         if isinstance(item, dict) and str(item.get("goal_text") or "").strip()
     ]
+    source_session_settings = get_session_settings(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    ) or {}
+    target_parent_session_id = _resolve_spawn_request_parent_session_id(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        session_settings=source_session_settings,
+    )
     created_child_sessions: list[dict[str, str]] = []
     for child_request in normalized_requests:
         child_label = str(child_request.get("label") or "").strip() or "Subgoal"
@@ -354,12 +627,13 @@ def _materialize_goal_child_sessions(
         child_session = create_child_conversation_session(
             runtime_root,
             username=username,
-            parent_session_id=session_id,
+            parent_session_id=target_parent_session_id or session_id,
             label=child_label,
             goal_text=child_goal_text,
             created_by_username=GOAL_MANAGER_USERNAME,
             created_by_type="system",
             origin_session_id=session_id,
+            requester_session_id=target_parent_session_id or session_id,
             origin_goal_id=goal_id,
             origin_goal_text=goal_text,
         )
@@ -438,6 +712,69 @@ def _service_can_spawn_children(
     return False
 
 
+def _resolve_spawn_request_parent_session_id(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    session_settings: dict[str, Any],
+) -> str:
+    route = next(
+        (
+            skill
+            for skill in session_settings.get("session_skills", [])
+            if isinstance(skill, dict)
+            and str(skill.get("skill_id") or "").strip() == "canonical-development-routing"
+            and str(skill.get("routing_mode") or "").strip().lower() == "create_child_session"
+            and str(skill.get("canonical_session_key") or "").strip()
+        ),
+        None,
+    )
+    if not isinstance(route, dict):
+        return session_id
+    route_scope = str(route.get("route_parent_scope") or "").strip().lower()
+    if route_scope not in {"root_session", "canonical", "global"}:
+        return session_id
+    target_template_id = str(
+        route.get("target_unit_id") or route.get("target_template_id") or ""
+    ).strip()
+    if not target_template_id:
+        return session_id
+    canonical_key = str(route.get("canonical_session_key") or "").strip()
+    target_label = str(route.get("target_label") or "").strip()
+    candidates: list[dict[str, Any]] = []
+    for candidate in list_sessions(runtime_root, username=username):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("session_id") or "").strip()
+        if not candidate_id or candidate_id == session_id:
+            continue
+        launcher_template_id = str(
+            candidate.get("launcher_template_id") or candidate.get("launcher_unit_id") or ""
+        ).strip()
+        if launcher_template_id != target_template_id:
+            continue
+        if str(candidate.get("parent_session_id") or "").strip() != "default":
+            continue
+        if target_label and str(candidate.get("label") or "").strip() != target_label:
+            continue
+        if canonical_key and not any(
+            isinstance(skill, dict)
+            and str(skill.get("canonical_session_key") or "").strip() == canonical_key
+            for skill in candidate.get("session_skills", [])
+            if isinstance(candidate.get("session_skills"), list)
+        ):
+            continue
+        candidates.append(candidate)
+    if not candidates:
+        return session_id
+    candidates.sort(
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    return str(candidates[0].get("session_id") or "").strip() or session_id
+
+
 def _handoff_spawn_request_to_child_session(
     *,
     runtime_root: Path,
@@ -460,6 +797,12 @@ def _handoff_spawn_request_to_child_session(
         or f"spawn-fallback-{uuid.uuid4().hex[:8]}"
     ).strip()
     parent_goal_text = str(session_settings.get("goal_text") or "").strip() or initial_prompt
+    target_parent_session_id = _resolve_spawn_request_parent_session_id(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        session_settings=session_settings,
+    )
     child_request = {
         "label": str(service_spec.get("display_name") or "").strip()
         or str(service_spec.get("service_id") or "").strip()
@@ -471,13 +814,126 @@ def _handoff_spawn_request_to_child_session(
     return _materialize_goal_child_sessions(
         runtime_root=runtime_root,
         username=username,
-        session_id=session_id,
+        session_id=target_parent_session_id or session_id,
         goal_id=parent_goal_id,
         goal_text=parent_goal_text,
         goal_manager_service_id=goal_manager_service_id,
         child_goal_requests=[child_request],
         dispatch_child_session=dispatch_child_session,
     )
+
+
+def _route_spawn_request_to_communication_child_session(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    goal_manager_service_id: str,
+    control: dict[str, Any],
+    dispatch_child_session: Callable[[str], str] | None = None,
+) -> list[dict[str, str]]:
+    initial_prompt = str(control.get("initial_prompt") or "").strip()
+    if not initial_prompt:
+        return []
+    current_session = get_session_settings(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    )
+    if not isinstance(current_session, dict):
+        return []
+    if not (
+        bool(current_session.get("communication_agent_enabled"))
+        or str(current_session.get("session_ui_mode") or "").strip().lower() == "communication"
+    ):
+        return []
+    spawn_handoff_session = dict(current_session)
+    spawn_handoff_skills: list[dict[str, Any]] = []
+    for skill in current_session.get("session_skills", []):
+        if not isinstance(skill, dict):
+            continue
+        normalized_skill = dict(skill)
+        if (
+            str(normalized_skill.get("routing_mode") or "").strip().lower() == "create_child_session"
+            and str(normalized_skill.get("canonical_session_key") or "").strip()
+        ):
+            normalized_skill["route_when_unhandled"] = True
+        spawn_handoff_skills.append(normalized_skill)
+    if spawn_handoff_skills:
+        spawn_handoff_session["session_skills"] = spawn_handoff_skills
+    from runtime.http_handler import _materialize_communication_routed_child_session
+
+    routed_child = _materialize_communication_routed_child_session(
+        runtime_root,
+        username=username,
+        current_session=spawn_handoff_session,
+        prompt_text=initial_prompt,
+        sessions=list_sessions(runtime_root, username=username),
+    )
+    if not isinstance(routed_child, dict):
+        return []
+    child_session_id = str(routed_child.get("session_id") or "").strip()
+    if not child_session_id:
+        return []
+    dispatched_service_id = ""
+    if dispatch_child_session is not None:
+        dispatched_service_id = str(dispatch_child_session(child_session_id) or "").strip()
+    return [
+        {
+            "session_id": child_session_id,
+            "label": str(routed_child.get("label") or "").strip(),
+            "service_id": dispatched_service_id,
+        }
+    ]
+
+
+def _canonical_spawn_handoff_parent_session_id(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+) -> str:
+    session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
+    if str(session_settings.get("session_ui_mode") or "").strip().lower() != "communication":
+        return session_id
+    route_skills = [
+        skill
+        for skill in session_settings.get("session_skills", [])
+        if isinstance(skill, dict)
+        and str(skill.get("routing_mode") or "").strip().lower() == "create_child_session"
+        and str(skill.get("canonical_session_key") or "").strip()
+    ]
+    if not route_skills:
+        return session_id
+    sessions = list_sessions(runtime_root, username=username)
+    for route in route_skills:
+        canonical_key = str(route.get("canonical_session_key") or "").strip()
+        target_label = str(route.get("target_label") or "").strip()
+        candidates: list[tuple[tuple[int, str], str]] = []
+        for candidate in sessions:
+            candidate_id = str(candidate.get("session_id") or "").strip()
+            if not candidate_id or candidate_id == session_id:
+                continue
+            skills = candidate.get("session_skills")
+            if not isinstance(skills, list):
+                continue
+            if not any(
+                isinstance(skill, dict)
+                and str(skill.get("canonical_session_key") or "").strip() == canonical_key
+                for skill in skills
+            ):
+                continue
+            score = 0
+            if str(candidate.get("session_group") or "").strip().lower() == "root":
+                score += 4
+            if target_label and str(candidate.get("label") or "").strip() == target_label:
+                score += 2
+            if str(candidate.get("goal_progress_state") or "").strip().lower() == "in_progress":
+                score += 1
+            candidates.append(((score, str(candidate.get("updated_at") or "")), candidate_id))
+        if candidates:
+            return sorted(candidates, key=lambda item: item[0], reverse=True)[0][1]
+    return session_id
 
 
 def _await_spawn_initial_prompt_route(
@@ -1079,6 +1535,10 @@ def run_agent_service(
     if router_conn is None:
         router_conn = connect_to_router(runtime_root, service_id)
     config = dict(self_service.get("config", {}))
+    default_provider = (
+        str(config.get("default_provider") or self_service.get("kind") or "codex").strip().lower()
+        or "codex"
+    )
     history_limit = int(config.get("history_limit", 500))
     max_turns = int(self_service.get("max_turns", 100) or 0)
     reply_count = 0
@@ -2063,6 +2523,7 @@ def run_agent_service(
                 "goal_id": goal_id,
                 "goal_text": goal_text,
                 "pending_work_items": gm_work_items,
+                "last_queued_turn_completed_at": _latest_goal_manager_turn_completed_ts(gm_work_items),
                 "updated_at": utc_ts(),
             }
         )
@@ -2396,6 +2857,19 @@ def run_agent_service(
                         "summary": str(directive.get("summary") or "").strip(),
                     }
                 )
+            normalized_directives = _ensure_in_progress_goal_has_followup_owner(
+                progress_state=audit_progress_state,
+                audit_state=resolved_audit_state,
+                goal_manager_service_id=goal_manager_service_id,
+                directives=normalized_directives,
+                child_goal_requests=(
+                    list(audit.get("child_goal_requests", []))
+                    if audit is not None and isinstance(audit.get("child_goal_requests"), list)
+                    else []
+                ),
+                user_response_requests=user_response_requests,
+                summary=str(audit.get("summary") or "").strip() if audit is not None else "",
+            )
             if resolved_audit_state == "panic" and compact_event is not None:
                 spawn_panic_recovery(
                     username=username,
@@ -3296,7 +3770,7 @@ def run_agent_service(
                 visible_text = _interactive_worker_result_fallback_text(incoming_text)
             if scope_username and scope_session_id:
                 if isinstance(user_response_wait, dict):
-                    record_session_user_response_request(
+                    recorded_user_response_request = record_session_user_response_request(
                         runtime_root,
                         username=scope_username,
                         session_id=scope_session_id,
@@ -3307,6 +3781,20 @@ def run_agent_service(
                         request_reason=user_response_wait.get("request_reason") or "agent_not_authorized",
                         source_service_id=service_id,
                         requested_by_role=provider_session_slot or "agent",
+                    )
+                    recorded_request_id = str(
+                        (recorded_user_response_request or {}).get("user_response_wait_request_id")
+                        or user_response_wait.get("request_id")
+                        or ""
+                    ).strip()
+                    recorded_timeout_seconds = int(
+                        (recorded_user_response_request or {}).get("user_response_wait_timeout_seconds")
+                        or user_response_wait.get("timeout_seconds", 300)
+                        or 300
+                    )
+                    recorded_effective_timeout_seconds = int(
+                        (recorded_user_response_request or {}).get("user_response_wait_effective_timeout_seconds")
+                        or recorded_timeout_seconds
                     )
                     append_user_history(
                         runtime_root,
@@ -3320,9 +3808,16 @@ def run_agent_service(
                             "text": "Agent attempted to request a user reply, but only GoalManager may start a user response wait.",
                             "event": {
                                 "type": "service.user_response_wait_ignored",
-                                "timeout_seconds": int(user_response_wait.get("timeout_seconds", 300) or 300),
+                                "request_id": recorded_request_id,
+                                "generated_at": str(
+                                    (recorded_user_response_request or {}).get("user_response_wait_generated_at") or ""
+                                ),
+                                "timeout_seconds": recorded_timeout_seconds,
+                                "effective_timeout_seconds": recorded_effective_timeout_seconds,
+                                "until_at": str(
+                                    (recorded_user_response_request or {}).get("user_response_wait_until_at") or ""
+                                ),
                                 "prompt_text": visible_text,
-                                "request_id": str(user_response_wait.get("request_id") or "").strip(),
                                 "source_service_id": service_id,
                                 "requested_by_role": provider_session_slot or "agent",
                                 "reason": "agent_not_authorized",
@@ -3378,6 +3873,7 @@ def run_agent_service(
                 )
                 request_id = str(request_item.get("request_id") or uuid.uuid4().hex[:12])
                 source_user_text = str(request_item.get("source_user_text") or "").strip()
+                worker_result_text = visible_text or final_text
                 target_interactive_service_id, interactive_agent_id = _interactive_worker_resume_target(
                     request_item,
                     fallback_service_id=service_id,
@@ -3385,7 +3881,7 @@ def run_agent_service(
                 )
                 resume_text = _interactive_resume_xml(
                     request_id=request_id,
-                    worker_text=visible_text or final_text,
+                    worker_text=worker_result_text,
                     source_user_text=source_user_text,
                 )
                 resume_entry = make_aize_pending_input(
@@ -3456,16 +3952,108 @@ def run_agent_service(
                             "worker_service_id": service_id,
                             "interactive_service_id": target_interactive_service_id,
                             "interactive_agent_id": interactive_agent_id,
+                            "worker_result_text": worker_result_text,
                         },
                     },
                     limit=GOAL_AUDIT_HISTORY_LIMIT,
                 )
+                if (
+                    session_has_active_in_progress_goal(session_settings)
+                    and not bool(session_settings.get("user_response_wait_active", False))
+                ):
+                    goal_manager_service_id = resolve_goal_manager_dispatch_service(
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    )
+                    if goal_manager_service_id:
+                        append_goal_manager_pending_input(
+                            runtime_root,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            entry=make_aize_pending_input(
+                                kind="goal_manager_review",
+                                role="system",
+                                text=json.dumps(
+                                    {
+                                        "kind": "interactive_worker_result",
+                                        "request_id": request_id,
+                                        "worker_service_id": service_id,
+                                        "interactive_service_id": target_interactive_service_id,
+                                        "source_user_text": source_user_text,
+                                        "worker_result_text": worker_result_text,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        )
+                        _ensure_dispatch_allowed_peer(
+                            runtime_root,
+                            from_service_id=service_id,
+                            to_service_id=goal_manager_service_id,
+                        )
+                        send_tx(
+                            make_dispatch_pending_message(
+                                manifest=manifest,
+                                from_service_id=service_id,
+                                to_service_id=goal_manager_service_id,
+                                process_id=process_id,
+                                run_id=f"interactive-worker-goal-review-{uuid.uuid4().hex[:8]}",
+                                username=scope_username,
+                                session_id=scope_session_id,
+                                auth_context=message_meta_get(message, "auth")
+                                if isinstance(message_meta_get(message, "auth"), dict)
+                                else None,
+                                reason="goal_manager_review",
+                                reply_to_service_id=sender_service_id,
+                                session_agent_id=resolve_session_agent_id(
+                                    runtime_root,
+                                    username=scope_username,
+                                    session_id=scope_session_id,
+                                    service_id=goal_manager_service_id,
+                                ),
+                            )
+                        )
                 visible_text = ""
             for control in spawn_requests:
                 incoming_auth = message_meta_get(message, "auth")
                 incoming_auth_context = dict(incoming_auth) if isinstance(incoming_auth, dict) else None
+                handed_off_children: list[dict[str, str]] = []
+                if scope_username and scope_session_id:
+                    handed_off_children = _route_spawn_request_to_communication_child_session(
+                        runtime_root=runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                        goal_manager_service_id=service_id,
+                        control=control,
+                        dispatch_child_session=lambda child_session_id: (
+                            kickoff_goal_child_session_for_dispatch(
+                                username=scope_username,
+                                parent_session_id=scope_session_id,
+                                child_session_id=child_session_id,
+                                goal_manager_service_id=service_id,
+                            )
+                        ),
+                    )
+                    if handed_off_children:
+                        append_scoped_history(
+                            {
+                                "direction": "event",
+                                "ts": utc_ts(),
+                                "service_id": service_id,
+                                "event_type": "service.spawn_request_handed_off_to_child_session",
+                                "text": f"Delegation request was handed off to {len(handed_off_children)} child session(s).",
+                                "event": {
+                                    "type": "service.spawn_request_handed_off_to_child_session",
+                                    "requested_service_id": str(control.get("service", {}).get("service_id") or "").strip(),
+                                    "children": handed_off_children,
+                                },
+                            },
+                            limit=GOAL_AUDIT_HISTORY_LIMIT,
+                        )
+                        continue
                 if (
-                    not _service_can_spawn_children(
+                    not handed_off_children
+                    and not _service_can_spawn_children(
                         self_service=self_service,
                         auth_context=incoming_auth_context,
                     )
@@ -3639,6 +4227,22 @@ def run_agent_service(
 
             if scope_username and scope_session_id:
                     try:
+                        turn_completed_at = utc_ts()
+                        session_settings = (
+                            get_session_settings(runtime_root, username=scope_username, session_id=scope_session_id) or {}
+                        )
+                        communication_agent_enabled = bool(
+                            session_settings.get("communication_agent_enabled", False)
+                        )
+                        actionable_input_present = _actionable_post_turn_input_present(
+                            incoming_text,
+                            communication_agent_enabled=communication_agent_enabled,
+                        )
+                        append_session_turn_completed_input = _should_append_session_turn_completed_input(
+                            communication_agent_enabled=communication_agent_enabled,
+                            actionable_input_present=actionable_input_present,
+                            spawn_request_count=len(spawn_requests),
+                        )
                         scope_session_dir = session_dir(
                             runtime_root,
                             username=scope_username,
@@ -3649,29 +4253,30 @@ def run_agent_service(
                             username=scope_username,
                             session_id=scope_session_id,
                         )
-                        append_pending_input(
-                            runtime_root,
-                            username=scope_username,
-                            session_id=scope_session_id,
-                            entry=make_aize_pending_input(
-                                kind="turn_completed",
-                                role="system",
-                                text="\n".join(
-                                    [
-                                        "<aize_turn_completed>",
-                                        f"  <service_id>{html.escape(service_id)}</service_id>",
-                                        f"  <reply_index>{reply_index}</reply_index>",
-                                        f"  <process_id>{html.escape(process_id)}</process_id>",
-                                        f"  <run_id>{html.escape(str(message_meta_get(message, 'run_id') or ''))}</run_id>",
-                                        f"  <completed_at>{html.escape(utc_ts())}</completed_at>",
-                                        f"  <session_dir>{html.escape(str(scope_session_dir))}</session_dir>",
-                                        f"  <timeline_path>{html.escape(str(scope_timeline))}</timeline_path>",
-                                        "  <history_instruction>Read the session files directly for the completed reply and related events instead of relying on inline event text.</history_instruction>",
-                                        "</aize_turn_completed>",
-                                    ]
+                        if append_session_turn_completed_input:
+                            append_pending_input(
+                                runtime_root,
+                                username=scope_username,
+                                session_id=scope_session_id,
+                                entry=make_aize_pending_input(
+                                    kind="turn_completed",
+                                    role="system",
+                                    text="\n".join(
+                                        [
+                                            "<aize_turn_completed>",
+                                            f"  <service_id>{html.escape(service_id)}</service_id>",
+                                            f"  <reply_index>{reply_index}</reply_index>",
+                                            f"  <process_id>{html.escape(process_id)}</process_id>",
+                                            f"  <run_id>{html.escape(str(message_meta_get(message, 'run_id') or ''))}</run_id>",
+                                            f"  <completed_at>{html.escape(turn_completed_at)}</completed_at>",
+                                            f"  <session_dir>{html.escape(str(scope_session_dir))}</session_dir>",
+                                            f"  <timeline_path>{html.escape(str(scope_timeline))}</timeline_path>",
+                                            "  <history_instruction>Read the session files directly for the completed reply and related events instead of relying on inline event text.</history_instruction>",
+                                            "</aize_turn_completed>",
+                                        ]
+                                    ),
                                 ),
-                            ),
-                        )
+                            )
                         join_session_agent(
                             runtime_root,
                             username=scope_username,
@@ -3686,7 +4291,7 @@ def run_agent_service(
                             provider=str(self_service.get("kind", "")),
                             role="agent",
                             transport="local_dispatch",
-                            turn_completed_at=utc_ts(),
+                            turn_completed_at=turn_completed_at,
                         )
                         write_jsonl(
                             log_path,
@@ -3696,6 +4301,7 @@ def run_agent_service(
                                 "service_id": service_id,
                                 "process_id": process_id,
                                 "scope": {"username": scope_username, "session_id": scope_session_id},
+                                "appended": append_session_turn_completed_input,
                             },
                         )
                         current_audit_state = load_agent_audit_state(
@@ -3730,9 +4336,6 @@ def run_agent_service(
                                 },
                                 limit=GOAL_AUDIT_HISTORY_LIMIT,
                             )
-                        session_settings = (
-                            get_session_settings(runtime_root, username=scope_username, session_id=scope_session_id) or {}
-                        )
                         maybe_dispatch_panic_recovery_parent_resume(
                             runtime_root=runtime_root,
                             manifest=manifest,
@@ -3871,14 +4474,22 @@ def run_agent_service(
                             or batch_has_input_kind(incoming_text, "restart_resume")
                             or batch_has_input_kind(incoming_text, "scheduled_resume")
                         )
-                        goal_should_continue = bool(
-                            turn_completed_input_present
-                            and goal_text
-                            and goal_active
-                            and not goal_completed
-                            and goal_progress_state == "in_progress"
-                            and goal_audit_state in {"all_clear", "needs_compact"}
-                            and not bool(session_settings.get("user_response_wait_active", False))
+                        goal_should_continue = _should_enqueue_post_turn_goal_manager_followup(
+                            provider_session_slot=provider_session_slot,
+                            turn_completed_input_present=turn_completed_input_present,
+                            goal_input_present=goal_input_present,
+                            actionable_input_present=actionable_input_present,
+                            goal_text=goal_text,
+                            goal_active=goal_active,
+                            goal_completed=goal_completed,
+                            goal_progress_state=goal_progress_state,
+                            goal_audit_state=goal_audit_state,
+                            user_response_wait_active=bool(
+                                session_settings.get("user_response_wait_active", False)
+                            ),
+                            communication_agent_enabled=communication_agent_enabled,
+                            visible_text_present=bool(visible_text),
+                            spawn_request_count=len(spawn_requests),
                         )
                         write_jsonl(
                             log_path,
@@ -3894,9 +4505,36 @@ def run_agent_service(
                                 "goal_audit_state": goal_audit_state,
                                 "turn_completed_input_present": turn_completed_input_present,
                                 "goal_input_present": goal_input_present,
+                                "actionable_input_present": actionable_input_present,
                                 "goal_should_continue": goal_should_continue,
                             },
                         )
+                        advance_review_cursor_without_followup = (
+                            _should_advance_goal_manager_review_cursor_without_followup(
+                                communication_agent_enabled=communication_agent_enabled,
+                                actionable_input_present=actionable_input_present,
+                                spawn_request_count=len(spawn_requests),
+                                goal_should_continue=goal_should_continue,
+                            )
+                        )
+                        if advance_review_cursor_without_followup:
+                            update_goal_manager_review_cursor(
+                                runtime_root,
+                                username=scope_username,
+                                session_id=scope_session_id,
+                                last_turn_completed_at=turn_completed_at,
+                            )
+                            write_jsonl(
+                                log_path,
+                                {
+                                    "type": "service.post_turn_review_cursor_advanced",
+                                    "ts": utc_ts(),
+                                    "service_id": service_id,
+                                    "process_id": process_id,
+                                    "scope": {"username": scope_username, "session_id": scope_session_id},
+                                    "last_turn_completed_at": turn_completed_at,
+                                },
+                            )
                         if goal_should_continue:
                             gm_queue = append_goal_manager_pending_input(
                                 runtime_root,
@@ -3967,6 +4605,9 @@ def run_agent_service(
                                             "state": "queued",
                                             "service_id": goal_manager_service_id,
                                             "pending_work_items": gm_work_items,
+                                            "last_queued_turn_completed_at": _latest_goal_manager_turn_completed_ts(
+                                                gm_work_items
+                                            ),
                                             "updated_at": utc_ts(),
                                         }
                                     )
@@ -4168,6 +4809,33 @@ def run_agent_service(
                                     "scope": {"username": scope_username, "session_id": scope_session_id},
                                     "reason": "state_disallows_followup",
                                     "goal_audit_state": latest_goal_audit_state,
+                                },
+                            )
+                        lifecycle_review = _maybe_enqueue_in_progress_goal_lifecycle_review(
+                            runtime_root=runtime_root,
+                            manifest=manifest,
+                            process_id=process_id,
+                            service_id=service_id,
+                            provider_session_slot=provider_session_slot,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                            default_provider=default_provider,
+                            send_tx=send_tx,
+                            reason="non_goal_manager_turn_completed_without_owner",
+                        )
+                        if lifecycle_review is not None:
+                            write_jsonl(
+                                log_path,
+                                {
+                                    "type": "service.goal_manager_lifecycle_review",
+                                    "ts": utc_ts(),
+                                    "service_id": service_id,
+                                    "process_id": process_id,
+                                    "scope": {
+                                        "username": scope_username,
+                                        "session_id": scope_session_id,
+                                    },
+                                    **lifecycle_review,
                                 },
                             )
                     except Exception as exc:
