@@ -550,6 +550,49 @@ def run_http_service(
     if router_conn is None:
         router_conn = _connect_to_router(runtime_root, self_service["service_id"])
 
+    def _wait_for_startup_llm_pool_ready(*, timeout_seconds: float = 45.0) -> dict[str, list[str]]:
+        expected = {
+            "codex": len(codex_service_pool),
+            "claude": len(claude_service_pool),
+            "gemini": len(gemini_service_pool),
+        }
+        deadline = time.monotonic() + timeout_seconds
+        last_pools: dict[str, list[str]] = {"codex": [], "claude": [], "gemini": []}
+        while True:
+            last_pools = running_llm_service_pools()
+            ready = all(
+                len(last_pools.get(kind, [])) >= count
+                for kind, count in expected.items()
+                if count > 0
+            )
+            if ready:
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "http.startup_llm_pool_ready",
+                        "ts": utc_ts(),
+                        "service_id": self_service["service_id"],
+                        "process_id": process_id,
+                        "running_counts": {kind: len(last_pools.get(kind, [])) for kind in sorted(last_pools)},
+                        "expected_counts": expected,
+                    },
+                )
+                return last_pools
+            if time.monotonic() >= deadline:
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "http.startup_llm_pool_wait_timeout",
+                        "ts": utc_ts(),
+                        "service_id": self_service["service_id"],
+                        "process_id": process_id,
+                        "running_counts": {kind: len(last_pools.get(kind, [])) for kind in sorted(last_pools)},
+                        "expected_counts": expected,
+                    },
+                )
+                return last_pools
+            time.sleep(0.5)
+
     def _run_startup_state_reconcile() -> None:
         write_jsonl(
             log_path,
@@ -562,6 +605,7 @@ def run_http_service(
         )
         try:
             ensure_state(runtime_root)
+            _wait_for_startup_llm_pool_ready()
             release_stale_session_bindings()
         except Exception as exc:
             write_jsonl(
