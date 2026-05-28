@@ -16,6 +16,8 @@ AIze System Diagnostics now defaults to a 24-hour interval instead of hourly.
 The schedule editor now suppresses its own periodic re-render while a user is
 editing its inputs, so the 15-second Unit catalog refresh cannot erase an in-flight
 hourly cadence edit before the user presses Save Schedule.
+The guard also checks focus inside the schedule editor, so merely clicking into the
+hour field is enough to pause the catalog refresh until the user leaves or saves.
 
 ## Files Touched
 

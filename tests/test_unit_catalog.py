@@ -37,6 +37,7 @@ class UnitCatalogTests(unittest.TestCase):
         self.assertIn("unit-launcher-schedule-editor", source)
         self.assertIn("fetch('/units/schedule'", source)
         self.assertIn("unitScheduleEditingUnitId", source)
+        self.assertIn("unitScheduleEditorHasFocus", source)
 
     def test_unit_catalog_groups_launched_sessions_by_unit(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -50,7 +51,7 @@ class UnitCatalogTests(unittest.TestCase):
                 runtime_root,
                 username="repyt",
                 session_id=str(first["session_id"]),
-                launcher_unit_id="entrance.service",
+                launcher_template_id="entrance.service",
                 launcher_display_name="Entrance",
                 preferred_provider="codex",
                 selected_agents=[],
@@ -61,7 +62,7 @@ class UnitCatalogTests(unittest.TestCase):
                 runtime_root,
                 username="repyt",
                 session_id=str(second["session_id"]),
-                launcher_unit_id="entrance.service",
+                launcher_template_id="entrance.service",
                 launcher_display_name="Entrance",
                 preferred_provider="codex",
                 selected_agents=[],
@@ -72,7 +73,7 @@ class UnitCatalogTests(unittest.TestCase):
                 runtime_root,
                 username="repyt",
                 session_id=str(other["session_id"]),
-                launcher_unit_id="diagnostics.service",
+                launcher_template_id="diagnostics.service",
                 launcher_display_name="AIze System Diagnostics",
                 preferred_provider="codex",
                 selected_agents=[],
