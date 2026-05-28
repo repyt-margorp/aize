@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -77,6 +78,13 @@ SESSION_GROUP_DEFAULT_PERMISSIONS = {
         "auto_resume": True,
     },
 }
+
+_state_lock_guard = threading.RLock()
+_state_lock_local = threading.local()
+
+
+def _state_flock_enabled() -> bool:
+    return str(os.environ.get("AIZE_STATE_FLOCK", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def normalize_child_session_sharing_policy(policy: Any) -> dict[str, Any]:
@@ -722,30 +730,68 @@ def lock_path(runtime_root: Path) -> Path:
 
 @contextmanager
 def state_lock(runtime_root: Path):
-    path = lock_path(runtime_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    depth = int(getattr(_state_lock_local, "depth", 0) or 0)
+    if depth > 0:
+        _state_lock_local.depth = depth + 1
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _state_lock_local.depth = depth
+        return
+
+    path = lock_path(runtime_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock_guard:
+        if not _state_flock_enabled():
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+            return
+        with path.open("w", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
 def state_read_lock(runtime_root: Path):
     """Shared read lock — allows concurrent readers, blocks writers."""
-    path = lock_path(runtime_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH)
+    depth = int(getattr(_state_lock_local, "depth", 0) or 0)
+    if depth > 0:
+        _state_lock_local.depth = depth + 1
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+            _state_lock_local.depth = depth
+        return
+
+    path = lock_path(runtime_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock_guard:
+        if not _state_flock_enabled():
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+            return
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def write_state(runtime_root: Path, state: dict[str, Any]) -> None:
