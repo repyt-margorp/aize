@@ -551,20 +551,29 @@ def run_http_service(
         router_conn = _connect_to_router(runtime_root, self_service["service_id"])
 
     def _wait_for_startup_llm_pool_ready(*, timeout_seconds: float = 45.0) -> dict[str, list[str]]:
-        expected = {
-            "codex": len(codex_service_pool),
-            "claude": len(claude_service_pool),
-            "gemini": len(gemini_service_pool),
-        }
         deadline = time.monotonic() + timeout_seconds
         last_pools: dict[str, list[str]] = {"codex": [], "claude": [], "gemini": []}
+        stable_signature: tuple[tuple[str, int], ...] | None = None
+        stable_observations = 0
         while True:
             last_pools = running_llm_service_pools()
+            expected = {"codex": 0, "claude": 0, "gemini": 0}
+            for record in list_service_records(runtime_root):
+                service_id = str(record.get("service_id") or "").strip()
+                kind = str(record.get("kind") or "").strip().lower()
+                if kind in expected and is_canonical_llm_service_id(service_id):
+                    expected[kind] += 1
+            expected_signature = tuple(sorted(expected.items()))
+            if expected_signature == stable_signature:
+                stable_observations += 1
+            else:
+                stable_signature = expected_signature
+                stable_observations = 1
             ready = all(
                 len(last_pools.get(kind, [])) >= count
                 for kind, count in expected.items()
                 if count > 0
-            )
+            ) and sum(expected.values()) > 0 and stable_observations >= 3
             if ready:
                 write_jsonl(
                     log_path,
