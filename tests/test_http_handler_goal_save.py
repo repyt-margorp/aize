@@ -1558,7 +1558,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
                 "runtime.http_handler._resolve_goal_manager_dispatch_service_for_session",
                 return_value="service-codex-003",
             ),
-            patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}),
+            patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}),
         ):
             handler._do_POST_message(
                 {
@@ -1896,25 +1896,6 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertFalse(launched["goal_completed"])
         self.assertNotIn("apps", payload)
 
-    def test_get_session_templates_preserves_legacy_apps_alias(self) -> None:
-        Handler = self._make_handler(lambda **kwargs: ("", ""))
-        handler = object.__new__(Handler)
-        handler._require_user = lambda query=None: {
-            "username": "root",
-            "viewer_username": "root",
-            "session_id": self.session_id,
-        }
-        responses: list[tuple[int, dict]] = []
-        handler._json = lambda status, payload: responses.append((status, payload))
-
-        handler._do_GET_units("/session-templates", {"_": ["1"]})
-
-        self.assertEqual(responses[-1][0], 200)
-        payload = responses[-1][1]
-        self.assertIn("units", payload)
-        self.assertIn("apps", payload)
-        self.assertEqual(payload["apps"], payload["units"])
-
     def test_units_launch_dispatches_active_in_progress_session_on_registration(self) -> None:
         dispatch_calls: list[dict[str, str]] = []
 
@@ -1928,7 +1909,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         responses: list[tuple[int, dict]] = []
         handler._json = lambda status, payload: responses.append((status, payload))
 
-        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+        with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
             handler._do_POST_units_launch(
                 {
                     "unit_id": "aize-development.bug-hunting",

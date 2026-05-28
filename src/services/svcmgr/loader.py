@@ -1,7 +1,7 @@
 """
 Service descriptor loader for the Service Manager.
 
-Reads builtin and plugin-backed service.json files and expands them into
+Reads builtin and unit package-backed service.json files and expands them into
 concrete service specs, resolving environment variables.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-from plugin_catalog import list_plugin_service_descriptors
+from unit_package_catalog import list_unit_package_service_descriptors
 
 
 def _services_pkg_dir() -> Path:
@@ -34,7 +34,7 @@ def _builtin_service_descriptors() -> list[dict]:
 
 
 def _all_service_descriptors() -> list[dict]:
-    descriptors = _builtin_service_descriptors() + list_plugin_service_descriptors()
+    descriptors = _builtin_service_descriptors() + list_unit_package_service_descriptors()
     by_kind: dict[str, dict] = {}
     for descriptor in descriptors:
         kind = str(descriptor.get("kind", "")).strip()
@@ -52,7 +52,7 @@ def _all_service_descriptors() -> list[dict]:
 
 
 def list_service_descriptors(*, exclude_kinds: set[str] | None = None) -> list[dict]:
-    """Scan builtin and plugin descriptors and return enabled descriptors."""
+    """Scan builtin and unit package descriptors and return enabled descriptors."""
     exclude = exclude_kinds if exclude_kinds is not None else {"svcmgr"}
     descriptors = []
     for desc in _all_service_descriptors():

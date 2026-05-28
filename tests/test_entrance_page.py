@@ -536,7 +536,7 @@ class EntrancePageTests(unittest.TestCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0].get("direction"), "in")
 
-    def test_entrance_plugin_route_aliases_include_singular_unit(self) -> None:
+    def test_entrance_unit_routes_do_not_keep_package_alias(self) -> None:
         from pathlib import Path
 
         source = (Path(__file__).resolve().parents[1] / "src/runtime/http_handler.py").read_text(
@@ -545,7 +545,7 @@ class EntrancePageTests(unittest.TestCase):
 
         self.assertIn('"/unit/entrance"', source)
         self.assertIn('"/units/entrance"', source)
-        self.assertIn('"/plugins/entrance"', source)
+        self.assertNotIn('"/unit_packages/entrance"', source)
 
     def test_communication_prompt_dispatch_no_longer_uses_worker_text_heuristic(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "src/runtime/http_handler.py").read_text(
@@ -741,8 +741,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertNotIn("Allowed template IDs", page)
         self.assertNotIn("UnitFiles", page)
         self.assertNotIn("UnitFile", page)
-        self.assertNotIn("unit-launcher-open-plugin-ui", page)
-        self.assertNotIn("unitLauncherOpenPluginUi", page)
+        self.assertNotIn("unit-launcher-open-package-ui", page)
+        self.assertNotIn("unitLauncherOpenPackageUi", page)
         self.assertIn("id='session-status-strip' class='session-status-strip'", page)
         self.assertIn("<span class='session-status-chip is-active'>Goal Active</span>", page)
         self.assertIn("<span class='session-status-chip'>Goal In Progress</span>", page)
@@ -915,7 +915,7 @@ class EntrancePageTests(unittest.TestCase):
             "session_skills": [],
         }
 
-        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+        with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
             routes = _matching_communication_skill_routes(
                 current_session,
                 prompt_text="Please fix the implementation routing.",
@@ -1158,7 +1158,7 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",
@@ -1249,7 +1249,7 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",
@@ -1369,7 +1369,7 @@ class EntrancePageTests(unittest.TestCase):
             )
             entrance["launcher_template_id"] = "entrance.service"
 
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 routed = _materialize_communication_routed_child_session(
                     runtime_root,
                     username="repyt",
@@ -1467,7 +1467,7 @@ class EntrancePageTests(unittest.TestCase):
                 ],
             )
 
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",
@@ -1609,7 +1609,7 @@ class EntrancePageTests(unittest.TestCase):
             first_entrance["launcher_template_id"] = "entrance.service"
             second_entrance["launcher_template_id"] = "entrance.service"
 
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 first = _materialize_communication_routed_child_session(
                     runtime_root,
                     username="repyt",
@@ -1697,7 +1697,7 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",
@@ -1773,7 +1773,7 @@ class EntrancePageTests(unittest.TestCase):
                     }
                 ],
             )
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",

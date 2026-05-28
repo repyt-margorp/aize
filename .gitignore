@@ -10,9 +10,9 @@ server.pid
 .tmux-agent-chat/
 .tmux-agent-chat-loop/
 .tmux-aize/
-plugins/test_launcher_*/
-plugins/private/*
-!plugins/private/.gitkeep
+unit_packages/test_launcher_*/
+unit_packages/private/*
+!unit_packages/private/.gitkeep
 
 # Python
 __pycache__/

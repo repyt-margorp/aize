@@ -445,10 +445,7 @@ def _sync_canonical_route_parent_session(
             updates={
                 "display_name": str(unit_definition.get("display_name") or unit_id).strip() or unit_id,
                 "unit_id": unit_id,
-                "package_id": str(
-                    unit_definition.get("package_id") or unit_definition.get("plugin_id") or ""
-                ).strip(),
-                "plugin_id": str(unit_definition.get("plugin_id") or "").strip(),
+                "package_id": str(unit_definition.get("package_id") or "").strip(),
                 "last_session_id": session_id,
                 "last_parent_session_id": str(
                     launcher.get("resident_parent_session_id")
@@ -1446,8 +1443,7 @@ def _process_due_scheduled_unit_launch(
             updates={
                 "display_name": str(unit.get("display_name") or template_id).strip() or template_id,
                 "unit_id": template_id,
-                "package_id": str(unit.get("package_id") or unit.get("plugin_id") or "").strip(),
-                "plugin_id": str(unit.get("plugin_id") or "").strip(),
+                "package_id": str(unit.get("package_id") or "").strip(),
                 "schedule_state": {
                     "last_checked_at": utc_ts(),
                     "last_due_at": str(schedule_info.get("scheduled_for_utc") or "").strip(),
@@ -1670,10 +1666,6 @@ def _process_due_scheduled_unit_launch(
         "preferred_provider": preferred_provider,
         "schedule": schedule_info,
     }
-
-
-def _process_due_scheduled_app_launch(*, app: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any] | None:
-    return _process_due_scheduled_unit_launch(unit=app or {}, **kwargs)
 
 
 def _parse_multipart_bytes(raw: bytes, boundary: str) -> list[dict]:
@@ -2966,7 +2958,6 @@ def make_handler(
     def _unit_catalog_payload(
         *,
         viewer_username: str,
-        include_legacy_apps_alias: bool = False,
     ) -> dict[str, Any]:
         units = list_launchable_units(default_provider=default_provider, include_private=False)
         registered_states = {
@@ -3005,15 +2996,7 @@ def make_handler(
             "default_provider": default_provider,
             "ts": utc_ts(),
         }
-        if include_legacy_apps_alias:
-            payload["apps"] = merged_units
         return payload
-
-    def _app_catalog_payload(*, viewer_username: str) -> dict[str, Any]:
-        return _unit_catalog_payload(
-            viewer_username=viewer_username,
-            include_legacy_apps_alias=True,
-        )
 
     def _goal_manager_runtime_payload(
         *,
@@ -3571,7 +3554,7 @@ def make_handler(
                 return self._do_WS_upgrade()
             if path == "/":
                 return self._do_GET_root(path, query)
-            if path in {"/unit/entrance", "/units/entrance", "/plugins/entrance"}:
+            if path in {"/unit/entrance", "/units/entrance"}:
                 return self._do_GET_entrance_unit(path, query)
             if path == "/events":
                 return self._do_GET_events(path, query)
@@ -3593,7 +3576,7 @@ def make_handler(
                 return self._do_GET_messages(path, query)
             if path == "/session/runtime-log":
                 return self._do_GET_session_runtime_log(path, query)
-            if path in {"/units", "/session-templates"}:
+            if path == "/units":
                 return self._do_GET_units(path, query)
             if path == "/sessions":
                 return self._do_GET_sessions(path, query)
@@ -3984,10 +3967,6 @@ def make_handler(
             )
             return
 
-        def _do_GET_entrance_plugin(self, path: str, query: dict) -> None:
-            return self._do_GET_entrance_unit(path, query)
-
-
         def _do_GET_events(self, path: str, query: dict) -> None:
             context = self._require_user(query=query)
             if not context:
@@ -4221,24 +4200,7 @@ def make_handler(
                 {
                     **_unit_catalog_payload(
                         viewer_username=viewer_username,
-                        include_legacy_apps_alias=path == "/session-templates",
                     ),
-                    "username": context["username"],
-                    "viewer_username": viewer_username,
-                    "active_session_id": context["session_id"],
-                },
-            )
-            return
-
-        def _do_GET_apps(self, path: str, query: dict) -> None:
-            context = self._require_user(query=query)
-            if not context:
-                return
-            viewer_username = str(context.get("viewer_username") or context["username"])
-            self._json(
-                200,
-                {
-                    **_app_catalog_payload(viewer_username=viewer_username),
                     "username": context["username"],
                     "viewer_username": viewer_username,
                     "active_session_id": context["session_id"],
@@ -4374,7 +4336,7 @@ def make_handler(
                 return self._do_POST_account_password(payload)
             if path == "/sessions":
                 return self._do_POST_sessions(payload, content_type)
-            if path in {"/units/launch", "/session-templates/launch"}:
+            if path == "/units/launch":
                 return self._do_POST_units_launch(payload)
             if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
@@ -6523,7 +6485,7 @@ def make_handler(
                         },
                     )
 
-    def _app_schedule_watcher() -> None:
+    def _unit_schedule_watcher() -> None:
         while not stopped.wait(timeout=3.5):
             try:
                 ensure_auto_scheduled_root_unit_states(
@@ -6577,7 +6539,7 @@ def make_handler(
                     )
 
     threading.Thread(target=_overview_cache_warmer, daemon=True).start()
-    threading.Thread(target=_app_schedule_watcher, daemon=True).start()
+    threading.Thread(target=_unit_schedule_watcher, daemon=True).start()
     threading.Thread(target=_auto_resume_watcher, daemon=True).start()
     threading.Thread(target=_user_response_wait_watcher, daemon=True).start()
 

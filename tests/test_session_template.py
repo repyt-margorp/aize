@@ -15,7 +15,6 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from session_template import (
-    describe_app_schedule,
     describe_session_template_schedule,
     ensure_auto_scheduled_root_unit_states,
     get_launchable_session_template,
@@ -41,19 +40,19 @@ from runtime.persistent_state_pkg import (
 
 class SessionTemplateLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.plugin_dir = Path(tempfile.mkdtemp(prefix="test_launcher_", dir=ROOT / "plugins"))
-        (self.plugin_dir / "plugin.json").write_text(
+        self.unit_package_dir = Path(tempfile.mkdtemp(prefix="test_launcher_", dir=ROOT / "unit_packages"))
+        (self.unit_package_dir / "unit-package.json").write_text(
             json.dumps(
                 {
-                    "plugin_id": self.plugin_dir.name,
-                    "display_name": "Launcher Plugin",
+                    "package_id": self.unit_package_dir.name,
+                    "display_name": "Launcher Unit Package",
                     "catalog_visibility": "private",
                 }
             )
             + "\n",
             encoding="utf-8",
         )
-        session_template_dir = self.plugin_dir / "units" / "research_launcher"
+        session_template_dir = self.unit_package_dir / "units" / "research_launcher"
         session_template_dir.mkdir(parents=True, exist_ok=True)
         (session_template_dir / "unit.json").write_text(
             json.dumps(
@@ -81,7 +80,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        communication_template_dir = self.plugin_dir / "units" / "communication_launcher"
+        communication_template_dir = self.unit_package_dir / "units" / "communication_launcher"
         communication_template_dir.mkdir(parents=True, exist_ok=True)
         (communication_template_dir / "unit.json").write_text(
             json.dumps(
@@ -124,10 +123,10 @@ class SessionTemplateLauncherTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        shutil.rmtree(self.plugin_dir)
+        shutil.rmtree(self.unit_package_dir)
 
     def test_catalog_returns_launch_plan(self) -> None:
-        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+        with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
             templates = list_launchable_session_templates(default_provider="codex")
             template = get_launchable_session_template("research_launcher", default_provider="codex")
 
@@ -143,8 +142,8 @@ class SessionTemplateLauncherTests(unittest.TestCase):
         self.assertEqual(template["launcher"]["schedule"]["daily_time"], "05:42")
         self.assertTrue(bool(template["launcher"]["schedule"]["enabled"]))
 
-    def test_public_catalog_includes_entrance_and_development_units(self) -> None:
-        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+    def test_catalog_can_hide_private_units_without_breaking_direct_launch_lookup(self) -> None:
+        with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
             public_templates = list_launchable_session_templates(
                 default_provider="codex",
                 include_private=False,
@@ -154,26 +153,17 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 "aize-development.bug-hunting",
                 default_provider="codex",
             )
-            entrance_unit = get_launchable_session_template(
-                "entrance.service",
-                default_provider="codex",
-                include_private=False,
-            )
 
-        self.assertIn("entrance.service", public_ids)
-        self.assertIn("aize-development.bug-hunting", public_ids)
+        self.assertEqual(public_ids, {"entrance.service"})
+        self.assertNotIn("aize-development.bug-hunting", public_ids)
         self.assertEqual(development_unit["template_id"], "aize-development.bug-hunting")
-        self.assertEqual(development_unit["display_name"], "AIze Development")
-        self.assertEqual(development_unit["unit_class"], "service")
-        self.assertEqual(development_unit["instance_policy"], "singleton")
-        self.assertEqual(entrance_unit["template_id"], "entrance.service")
 
     def test_launch_session_template_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 app = get_launchable_session_template("research_launcher", default_provider="codex")
                 launched = launch_session_template(
                     runtime_root,
@@ -225,7 +215,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             entrance = create_conversation_session(runtime_root, username="repyt", label="Entrance")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",
@@ -270,7 +260,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 app = get_launchable_session_template("research_launcher", default_provider="codex")
                 first = launch_session_template(
                     runtime_root,
@@ -296,7 +286,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 app = get_launchable_session_template("communication_launcher", default_provider="codex")
                 launched = launch_session_template(
                     runtime_root,
@@ -345,7 +335,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template("aize-development.bug-hunting", default_provider="codex")
                 launched = launch_session_template(
                     runtime_root,
@@ -450,7 +440,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 label="AIze Development",
             )
             orphan_parent_session_id = str(orphan_parent["session_id"])
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template(
                     "aize-development.bug-hunting",
                     default_provider="codex",
@@ -461,7 +451,6 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 template_id="aize-development.bug-hunting",
                 updates={
                     "display_name": "AIze Bug Hunting",
-                    "plugin_id": "aize-development",
                     "package_id": "aize-development",
                     "last_session_id": orphan_parent_session_id,
                     "last_parent_session_id": "",
@@ -518,7 +507,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             entrance = create_conversation_session(runtime_root, username="repyt", label="Entrance")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 development_unit = get_launchable_session_template("aize-development.bug-hunting", default_provider="codex")
                 development = launch_session_template(
                     runtime_root,
@@ -603,7 +592,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 label="Root",
                 session_group="root",
             )
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 diagnostics_unit = get_launchable_session_template(
                     "aize-development.system-diagnostics",
                     default_provider="codex",
@@ -643,7 +632,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 registered = ensure_auto_scheduled_root_unit_states(
                     runtime_root,
                     default_provider="codex",
@@ -669,7 +658,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 label="Root",
                 session_group="root",
             )
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 monitor_unit = get_launchable_session_template(
                     "aize-development.system-monitor",
                     default_provider="codex",
@@ -708,7 +697,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 registered = ensure_auto_scheduled_root_unit_states(
                     runtime_root,
                     default_provider="codex",
@@ -763,7 +752,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             entrance = create_conversation_session(runtime_root, username="repyt", label="Entrance")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 development_unit = get_launchable_session_template("aize-development.bug-hunting", default_provider="codex")
                 development = launch_session_template(
                     runtime_root,
@@ -800,7 +789,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template("entrance.service", default_provider="codex")
                 launched = launch_session_template(
                     runtime_root,
@@ -825,18 +814,22 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(stored["launcher_instance_policy"], "multi")
             self.assertIn("conversation and coordination layer", unit["launcher"]["goal_text"])
             self.assertIn("belongs in this conversation first", unit["launcher"]["initial_prompt"])
-            self.assertNotIn(
-                "canonical-development-routing",
-                {skill["skill_id"] for skill in unit["launcher"]["skills"]},
+            skill_ids = {skill["skill_id"] for skill in unit["launcher"]["skills"]}
+            self.assertIn("canonical-development-routing", skill_ids)
+            route_skill = next(
+                skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing"
             )
-            self.assertNotIn("aize-development", json.dumps(unit, sort_keys=True))
+            self.assertEqual(route_skill["routing_mode"], "create_child_session")
+            self.assertEqual(route_skill["route_parent_scope"], "root_session")
+            self.assertEqual(route_skill["target_template_id"], "aize-development.bug-hunting")
+            self.assertEqual(route_skill["spawn_session_skills"][0]["skill_id"], "aize-development-session")
 
     def test_entrance_unit_launch_supports_multiple_instances(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 unit = get_launchable_session_template("entrance.service", default_provider="codex")
                 first = launch_session_template(
                     runtime_root,
@@ -866,7 +859,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(second_stored["launcher_unit_id"], "entrance.service")
             self.assertEqual(first_stored["launcher_instance_policy"], "multi")
             self.assertEqual(second_stored["launcher_instance_policy"], "multi")
-            self.assertNotIn(
+            self.assertIn(
                 "canonical-development-routing",
                 {skill["skill_id"] for skill in unit["launcher"]["skills"]},
             )
@@ -885,7 +878,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             runtime_root = Path(runtime_dir)
             ensure_state(runtime_root)
             parent = create_conversation_session(runtime_root, username="repyt", label="Parent")
-            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            with patch.dict("os.environ", {"AIZE_UNIT_PACKAGE_ROOTS": str(ROOT / "unit_packages")}):
                 app = get_launchable_session_template("research_launcher", default_provider="codex")
                 launched = launch_session_template(
                     runtime_root,
@@ -906,16 +899,6 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             template_state["schedule_state"] = {"last_triggered_occurrence_at": "2026-04-20T09:42:00Z"}
             schedule_info = describe_session_template_schedule(app, template_state=template_state, now=now)
             self.assertFalse(bool(schedule_info["due"]))
-
-    def test_describe_app_schedule_alias_remains_compatible(self) -> None:
-        schedule_info = describe_app_schedule(
-            {"launcher": {"schedule": {"enabled": False}}},
-            app_state={"schedule_state": {}},
-            now=datetime(2026, 4, 20, 9, 42, tzinfo=UTC),
-        )
-
-        self.assertTrue(bool(schedule_info["unit_registered"]))
-        self.assertTrue(bool(schedule_info["app_registered"]))
 
 if __name__ == "__main__":
     unittest.main()

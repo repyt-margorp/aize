@@ -575,15 +575,6 @@ def describe_session_template_schedule(
     return descriptor
 
 
-def describe_app_schedule(
-    app: dict[str, Any],
-    *,
-    app_state: dict[str, Any] | None = None,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    return describe_session_template_schedule(app, template_state=app_state, now=now)
-
-
 def describe_unit_schedule(
     unit: dict[str, Any],
     *,
@@ -650,20 +641,6 @@ def resolve_session_template_launch_parent_session_id(
     return str(sessions[0].get("session_id") or "").strip() or None
 
 
-def resolve_app_launch_parent_session_id(
-    runtime_root: Path,
-    *,
-    username: str,
-    app_state: dict[str, Any] | None = None,
-) -> str | None:
-    return resolve_session_template_launch_parent_session_id(
-        runtime_root,
-        username=username,
-        template_state=app_state,
-        session_template=app_state,
-    )
-
-
 def resolve_unit_launch_parent_session_id(
     runtime_root: Path,
     *,
@@ -688,10 +665,6 @@ def build_scheduled_session_template_session_label(session_template: dict[str, A
     return f"{display_name} {local_when} {timezone_name}"
 
 
-def build_scheduled_app_session_label(app: dict[str, Any], schedule_info: dict[str, Any]) -> str:
-    return build_scheduled_session_template_session_label(app, schedule_info)
-
-
 def build_scheduled_unit_session_label(unit: dict[str, Any], schedule_info: dict[str, Any]) -> str:
     return build_scheduled_session_template_session_label(unit, schedule_info)
 
@@ -709,10 +682,6 @@ def build_scheduled_session_template_initial_prompt(session_template: dict[str, 
     ]
     schedule_prompt = "\n".join(lines).strip()
     return f"{schedule_prompt}\n\n{base_prompt}".strip() if base_prompt else schedule_prompt
-
-
-def build_scheduled_app_initial_prompt(app: dict[str, Any], schedule_info: dict[str, Any]) -> str:
-    return build_scheduled_session_template_initial_prompt(app, schedule_info)
 
 
 def build_scheduled_unit_initial_prompt(unit: dict[str, Any], schedule_info: dict[str, Any]) -> str:
@@ -765,8 +734,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
     normalized = {
         "unit_id": template_id,
         "template_id": template_id,
-        "package_id": str(descriptor.get("package_id") or descriptor.get("plugin_id") or "").strip(),
-        "plugin_id": str(descriptor.get("plugin_id") or "").strip(),
+        "package_id": str(descriptor.get("package_id") or "").strip(),
         "unit_kind": unit_kind,
         "kind": unit_kind,
         "unit_class": str(descriptor.get("unit_class") or descriptor.get("class") or ("service" if instance_policy == "singleton" else "template")).strip().lower(),
@@ -826,7 +794,7 @@ def list_launchable_session_templates(
             or str(descriptor.get("catalog_visibility") or "public").strip().lower() == "public"
         )
     ]
-    apps.sort(key=lambda item: (str(item.get("plugin_id") or ""), str(item.get("display_name") or "")))
+    apps.sort(key=lambda item: (str(item.get("package_id") or ""), str(item.get("display_name") or "")))
     return apps
 
 
@@ -882,8 +850,7 @@ def ensure_auto_scheduled_root_unit_states(
                 updates={
                     "unit_id": template_id,
                     "display_name": str(app.get("display_name") or template_id).strip() or template_id,
-                    "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
-                    "plugin_id": str(app.get("plugin_id") or "").strip(),
+                    "package_id": str(app.get("package_id") or "").strip(),
                     "last_parent_session_id": "default",
                     "schedule_state": {},
                 },
@@ -909,6 +876,13 @@ def get_launchable_session_template(
     ):
         if app["template_id"] == normalized_template_id:
             return app
+    if not include_private:
+        for app in list_launchable_session_templates(
+            default_provider=default_provider,
+            include_private=True,
+        ):
+            if app["template_id"] == normalized_template_id:
+                return app
     raise KeyError(normalized_template_id)
 
 
@@ -1034,7 +1008,7 @@ def launch_session_template(
                         username=normalized_username,
                         template_id=template_id,
                         display_name=str(app.get("display_name") or ""),
-                        plugin_id=str(app.get("plugin_id") or ""),
+                        package_id=str(app.get("package_id") or ""),
                         session_id=session_id,
                     )
                 )
@@ -1045,8 +1019,7 @@ def launch_session_template(
                 updates={
                     "unit_id": unit_id,
                     "display_name": str(app.get("display_name") or unit_id or template_id).strip(),
-                    "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
-                    "plugin_id": str(app.get("plugin_id") or "").strip(),
+                    "package_id": str(app.get("package_id") or "").strip(),
                     "workspace_path": workspace_path,
                     "last_session_id": session_id,
                     "last_parent_session_id": str(existing_session.get("parent_session_id") or parent_session_id or "").strip(),
@@ -1167,7 +1140,7 @@ def launch_session_template(
                 username=normalized_username,
                 template_id=str(app.get("template_id") or ""),
                 display_name=str(app.get("display_name") or ""),
-                plugin_id=str(app.get("plugin_id") or ""),
+                package_id=str(app.get("package_id") or ""),
                 session_id=session_id,
             )
         )
@@ -1186,8 +1159,7 @@ def launch_session_template(
         updates={
             "unit_id": str(app.get("unit_id") or app.get("template_id") or "").strip(),
             "display_name": str(app.get("display_name") or app.get("unit_id") or app.get("template_id") or "").strip(),
-            "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
-            "plugin_id": str(app.get("plugin_id") or "").strip(),
+            "package_id": str(app.get("package_id") or "").strip(),
             "workspace_path": workspace_path,
             "last_session_id": session_id,
             "last_parent_session_id": str(parent_session_id or "").strip(),

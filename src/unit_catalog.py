@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from plugin_catalog import (
+from unit_package_catalog import (
     configured_unit_package_roots,
     list_unit_file_descriptors,
     list_unit_package_dirs,
