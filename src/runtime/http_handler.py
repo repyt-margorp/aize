@@ -2959,7 +2959,7 @@ def make_handler(
         *,
         viewer_username: str,
     ) -> dict[str, Any]:
-        units = list_launchable_units(default_provider=default_provider, include_private=False)
+        units = list_launchable_units(default_provider=default_provider, include_private=True)
         registered_states = {
             str(state.get("unit_id") or state.get("template_id") or "").strip(): state
             for state in list_registered_unit_states(runtime_root)

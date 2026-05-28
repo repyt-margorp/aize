@@ -18,6 +18,14 @@ from runtime.persistent_state_pkg import (
 
 
 class UnitCatalogTests(unittest.TestCase):
+    def test_authenticated_units_catalog_includes_private_units(self) -> None:
+        source = (ROOT / "src" / "runtime" / "http_handler.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "list_launchable_units(default_provider=default_provider, include_private=True)",
+            source,
+        )
+
     def test_unit_catalog_groups_launched_sessions_by_unit(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             runtime_root = Path(tempdir) / ".aize-runtime"
