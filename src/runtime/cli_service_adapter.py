@@ -53,6 +53,7 @@ from runtime.providers import (
 )
 from runtime.persistent_state_pkg import (
     append_history as append_user_history,
+    append_goal_manager_pending_input,
     append_pending_input,
     append_service_pending_input,
     create_conversation_session,
@@ -70,6 +71,7 @@ from runtime.persistent_state_pkg import (
     release_nonrunnable_session_services,
     reconcile_session_waiting_on_children,
     load_agent_audit_state,
+    load_goal_manager_pending_inputs,
     load_pending_inputs,
     load_service_pending_inputs,
     reset_agent_audit_states_for_session,
@@ -616,6 +618,8 @@ def run_http_service(
             ensure_state(runtime_root)
             _wait_for_startup_llm_pool_ready()
             release_stale_session_bindings()
+            current_codex_pool, current_claude_pool, current_gemini_pool, _ = current_llm_service_topology()
+            current_goal_manager_services = set(current_codex_pool) | set(current_claude_pool) | set(current_gemini_pool)
             for session in list_all_sessions_with_users(runtime_root):
                 if not isinstance(session, dict):
                     continue
@@ -625,12 +629,6 @@ def run_http_service(
                     continue
                 if not session_has_active_in_progress_goal(session):
                     continue
-                if not should_idle_goal_reconcile(session):
-                    continue
-                if bool(session.get("user_response_wait_active", False)):
-                    continue
-                if bool(session.get("waiting_on_children", False)):
-                    continue
                 goal_manager = persisted_goal_manager_runtime_state(
                     runtime_root,
                     username=username,
@@ -638,7 +636,86 @@ def run_http_service(
                     bound_service_id=str(session.get("service_id") or "").strip(),
                     allow_reconcile=False,
                 )
-                if str(goal_manager.get("state") or "idle").strip().lower() in {"running", "queued"}:
+                goal_manager_state = str(goal_manager.get("state") or "idle").strip().lower()
+                goal_manager_pending_work_items = (
+                    list(goal_manager.get("pending_work_items", []))
+                    if isinstance(goal_manager.get("pending_work_items"), list)
+                    else []
+                )
+                if goal_manager_state == "queued" and goal_manager_pending_work_items:
+                    target_goal_manager_service_id = str(goal_manager.get("service_id") or "").strip()
+                    if target_goal_manager_service_id in current_goal_manager_services:
+                        if not load_goal_manager_pending_inputs(
+                            runtime_root,
+                            username=username,
+                            session_id=session_id,
+                        ):
+                            for item in goal_manager_pending_work_items:
+                                if isinstance(item, dict):
+                                    append_goal_manager_pending_input(
+                                        runtime_root,
+                                        username=username,
+                                        session_id=session_id,
+                                        entry=dict(item),
+                                    )
+                        dispatch_message = make_dispatch_pending_message(
+                            manifest=manifest,
+                            from_service_id=self_service["service_id"],
+                            to_service_id=target_goal_manager_service_id,
+                            process_id=process_id,
+                            run_id=f"startup-goal-manager-queue-{uuid.uuid4().hex[:8]}",
+                            username=username,
+                            session_id=session_id,
+                            auth_context=None,
+                            reason="goal_manager_review",
+                            session_agent_id=resolve_session_agent_id(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                                service_id=target_goal_manager_service_id,
+                                role="goal_manager",
+                            ),
+                            agent_profile={"session_slot": "goal_manager"},
+                            dispatch_priority=dispatch_priority("goal_manager_review"),
+                        )
+                        dispatch_sent = send_router_control(dispatch_message)
+                        write_jsonl(
+                            log_path,
+                            {
+                                "type": "http.startup_queued_goal_manager_reconcile",
+                                "ts": utc_ts(),
+                                "service_id": self_service["service_id"],
+                                "process_id": process_id,
+                                "username": username,
+                                "session_id": session_id,
+                                "to": target_goal_manager_service_id,
+                                "dispatch_sent": bool(dispatch_sent),
+                                "pending_work_item_count": len(goal_manager_pending_work_items),
+                            },
+                        )
+                    else:
+                        write_jsonl(
+                            log_path,
+                            {
+                                "type": "http.startup_queued_goal_manager_reconcile_skipped",
+                                "ts": utc_ts(),
+                                "service_id": self_service["service_id"],
+                                "process_id": process_id,
+                                "username": username,
+                                "session_id": session_id,
+                                "goal_manager_service_id": target_goal_manager_service_id,
+                                "reason": "goal_manager_service_not_running",
+                                "pending_work_item_count": len(goal_manager_pending_work_items),
+                            },
+                        )
+                    continue
+                if goal_manager_state == "running":
+                    continue
+                if not should_idle_goal_reconcile(session):
+                    continue
+                if bool(session.get("user_response_wait_active", False)):
+                    continue
+                if bool(session.get("waiting_on_children", False)):
                     continue
                 dispatched_to, dispatch_error = enqueue_goal_dispatch(
                     username=username,

@@ -20,6 +20,7 @@ from runtime.compaction import (
     wait_for_service_record,
 )
 from runtime.communication_goal import (
+    is_continuous_communication_session,
     should_complete_communication_goal_after_reply as _should_complete_communication_goal_after_reply,
     should_preserve_prompt_cycle_progress_during_goal_review as _should_preserve_prompt_cycle_progress_during_goal_review,
 )
@@ -92,6 +93,7 @@ from runtime.persistent_state_pkg import (
     load_gemini_session,
     load_session_skills,
     load_pending_inputs,
+    load_goal_manager_pending_inputs,
     load_service_pending_inputs,
     list_session_agent_contacts,
     list_session_parents,
@@ -443,6 +445,112 @@ def _ensure_in_progress_goal_has_followup_owner(
         }
     )
     return normalized_directives
+
+
+def _normalize_continuous_communication_audit_summary(
+    *,
+    runtime_root: Path,
+    username: str,
+    session_id: str,
+    goal_manager_service_id: str,
+    session_settings: dict[str, Any] | None,
+    audit: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    def _session_pending_requires_summary_preservation(entries: list[dict[str, Any]]) -> bool:
+        for item in entries:
+            if not isinstance(item, dict):
+                return True
+            kind = str(item.get("kind") or "").strip().lower()
+            if kind not in {"restart_resume", "scheduled_resume"}:
+                return True
+        return False
+
+    if not isinstance(audit, dict):
+        return audit
+    if not is_continuous_communication_session(session_settings):
+        return audit
+    if str(audit.get("audit_state") or "").strip().lower() != "all_clear":
+        return audit
+    if str(audit.get("progress_state") or "").strip().lower() != "in_progress":
+        return audit
+    if bool((session_settings or {}).get("user_response_wait_active", False)):
+        return audit
+    if bool((session_settings or {}).get("waiting_on_children", False)):
+        return audit
+    if any(isinstance(item, dict) for item in (audit.get("child_goal_requests") or [])):
+        return audit
+    if any(isinstance(item, dict) for item in (audit.get("user_response_requests") or [])):
+        return audit
+    if _session_pending_requires_summary_preservation(
+        load_pending_inputs(runtime_root, username=username, session_id=session_id)
+    ):
+        return audit
+    if load_goal_manager_pending_inputs(runtime_root, username=username, session_id=session_id):
+        return audit
+    for contact in list_session_agent_contacts(runtime_root, username=username, session_id=session_id):
+        if not isinstance(contact, dict):
+            continue
+        contact_service_id = str(contact.get("service_id") or "").strip()
+        if not contact_service_id:
+            continue
+        contact_agent_id = str(contact.get("agent_id") or "").strip() or None
+        if load_service_pending_inputs(
+            runtime_root,
+            service_id=contact_service_id,
+            agent_id=contact_agent_id,
+            username=username,
+            session_id=session_id,
+        ):
+            return audit
+    normalized = dict(audit)
+    normalized["summary"] = (
+        "No user work is pending to proxy, track, or report. "
+        "Entrance remains active as a continuous communication session."
+    )
+    return normalized
+
+
+def _load_or_repair_goal_manager_pending_inputs(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    pending = load_goal_manager_pending_inputs(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    )
+    if pending:
+        return pending
+    goal_manager_state = read_json_file(
+        session_goal_manager_state_path(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+        )
+    ) or {}
+    pending_work_items = goal_manager_state.get("pending_work_items")
+    if not isinstance(pending_work_items, list):
+        return []
+    repaired = False
+    for item in pending_work_items:
+        if not isinstance(item, dict):
+            continue
+        append_goal_manager_pending_input(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            entry=dict(item),
+        )
+        repaired = True
+    if not repaired:
+        return []
+    return load_goal_manager_pending_inputs(
+        runtime_root,
+        username=username,
+        session_id=session_id,
+    )
 
 
 def _running_llm_service_pools(
@@ -797,12 +905,18 @@ def _handoff_spawn_request_to_child_session(
         or f"spawn-fallback-{uuid.uuid4().hex[:8]}"
     ).strip()
     parent_goal_text = str(session_settings.get("goal_text") or "").strip() or initial_prompt
-    target_parent_session_id = _resolve_spawn_request_parent_session_id(
+    target_parent_session_id = _canonical_spawn_handoff_parent_session_id(
         runtime_root=runtime_root,
         username=username,
         session_id=session_id,
-        session_settings=session_settings,
     )
+    if target_parent_session_id == session_id:
+        target_parent_session_id = _resolve_spawn_request_parent_session_id(
+            runtime_root=runtime_root,
+            username=username,
+            session_id=session_id,
+            session_settings=session_settings,
+        )
     child_request = {
         "label": str(service_spec.get("display_name") or "").strip()
         or str(service_spec.get("service_id") or "").strip()
@@ -885,6 +999,25 @@ def _route_spawn_request_to_communication_child_session(
             "service_id": dispatched_service_id,
         }
     ]
+
+
+def _should_force_spawn_request_child_handoff(session_settings: dict[str, Any] | None) -> bool:
+    if not isinstance(session_settings, dict):
+        return False
+    if not (
+        bool(session_settings.get("communication_agent_enabled"))
+        or str(session_settings.get("session_ui_mode") or "").strip().lower() == "communication"
+    ):
+        return False
+    skills = session_settings.get("session_skills")
+    if not isinstance(skills, list):
+        return False
+    return any(
+        isinstance(skill, dict)
+        and str(skill.get("routing_mode") or "").strip().lower() == "create_child_session"
+        and str(skill.get("canonical_session_key") or "").strip()
+        for skill in skills
+    )
 
 
 def _canonical_spawn_handoff_parent_session_id(
@@ -2612,6 +2745,19 @@ def run_agent_service(
                     provider_kind=str(self_service.get("kind", "")),
                     on_event=goal_provider_event_sink,
                 )
+                audit = _normalize_continuous_communication_audit_summary(
+                    runtime_root=runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    goal_manager_service_id=goal_manager_service_id,
+                    session_settings=get_session_settings(
+                        runtime_root,
+                        username=username,
+                        session_id=session_id,
+                    )
+                    or {},
+                    audit=audit,
+                )
                 persist_goal_audit_completion(
                     runtime_root=runtime_root,
                     log_path=log_path,
@@ -3192,7 +3338,14 @@ def run_agent_service(
                 username=scope_username,
                 session_id=scope_session_id,
             )
-            if not (session_pending_inputs or service_pending_inputs):
+            goal_manager_pending_inputs = []
+            if dispatch_reason == "goal_manager_review":
+                goal_manager_pending_inputs = _load_or_repair_goal_manager_pending_inputs(
+                    runtime_root,
+                    username=scope_username,
+                    session_id=scope_session_id,
+                )
+            if not (session_pending_inputs or service_pending_inputs or goal_manager_pending_inputs):
                 write_jsonl(
                     log_path,
                     {
@@ -3210,7 +3363,11 @@ def run_agent_service(
                 username=scope_username,
                 session_id=scope_session_id,
             ) or {}
-            pending_inputs_preview = list(session_pending_inputs) + list(service_pending_inputs)
+            pending_inputs_preview = (
+                list(session_pending_inputs)
+                + list(service_pending_inputs)
+                + list(goal_manager_pending_inputs)
+            )
             if _should_defer_dispatch_for_completed_goal(
                 session_settings=dispatch_session_settings,
                 pending_inputs=pending_inputs_preview,
@@ -3286,6 +3443,11 @@ def run_agent_service(
                         session_id=scope_session_id,
                     )
                     if dispatch_reason == "goal_manager_review":
+                        _load_or_repair_goal_manager_pending_inputs(
+                            runtime_root,
+                            username=scope_username,
+                            session_id=scope_session_id,
+                        )
                         for gm_pending_item in drain_goal_manager_pending_inputs(
                             runtime_root,
                             username=scope_username,
@@ -4018,6 +4180,17 @@ def run_agent_service(
                 incoming_auth = message_meta_get(message, "auth")
                 incoming_auth_context = dict(incoming_auth) if isinstance(incoming_auth, dict) else None
                 handed_off_children: list[dict[str, str]] = []
+                spawn_scope_session: dict[str, Any] | None = None
+                force_spawn_child_handoff = False
+                if scope_username and scope_session_id:
+                    spawn_scope_session = get_session_settings(
+                        runtime_root,
+                        username=scope_username,
+                        session_id=scope_session_id,
+                    )
+                    force_spawn_child_handoff = _should_force_spawn_request_child_handoff(
+                        spawn_scope_session
+                    )
                 if scope_username and scope_session_id:
                     handed_off_children = _route_spawn_request_to_communication_child_session(
                         runtime_root=runtime_root,
@@ -4053,12 +4226,15 @@ def run_agent_service(
                         continue
                 if (
                     not handed_off_children
-                    and not _service_can_spawn_children(
-                        self_service=self_service,
-                        auth_context=incoming_auth_context,
-                    )
                     and scope_username
                     and scope_session_id
+                    and (
+                        force_spawn_child_handoff
+                        or not _service_can_spawn_children(
+                            self_service=self_service,
+                            auth_context=incoming_auth_context,
+                        )
+                    )
                 ):
                     handed_off_children = _handoff_spawn_request_to_child_session(
                         runtime_root=runtime_root,
