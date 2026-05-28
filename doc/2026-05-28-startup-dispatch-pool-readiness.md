@@ -3,6 +3,7 @@
 ## Behavior Changed
 - HttpBridge startup reconcile now waits for local LLM services from the runtime service registry to register as running before releasing stale session bindings and requeueing active sessions.
 - This avoids startup races where active sessions are marked as missing their old service, but dispatch immediately fails with `no_available_*_worker` because Codex, Claude, and Gemini services have not finished registering yet.
+- Startup reconcile also requeues standard active/in-progress sessions whose GoalManager is idle and has no queued work, so daemon restart does not depend on opening the SessionMap overview to repair them.
 
 ## Files Touched
 - `src/runtime/cli_service_adapter.py`

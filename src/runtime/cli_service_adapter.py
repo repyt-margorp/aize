@@ -616,6 +616,49 @@ def run_http_service(
             ensure_state(runtime_root)
             _wait_for_startup_llm_pool_ready()
             release_stale_session_bindings()
+            for session in list_all_sessions_with_users(runtime_root):
+                if not isinstance(session, dict):
+                    continue
+                username = str(session.get("username") or "").strip()
+                session_id = str(session.get("session_id") or "").strip()
+                if not username or not session_id:
+                    continue
+                if not session_has_active_in_progress_goal(session):
+                    continue
+                if not should_idle_goal_reconcile(session):
+                    continue
+                if bool(session.get("user_response_wait_active", False)):
+                    continue
+                if bool(session.get("waiting_on_children", False)):
+                    continue
+                goal_manager = persisted_goal_manager_runtime_state(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    bound_service_id=str(session.get("service_id") or "").strip(),
+                    allow_reconcile=False,
+                )
+                if str(goal_manager.get("state") or "idle").strip().lower() in {"running", "queued"}:
+                    continue
+                dispatched_to, dispatch_error = enqueue_goal_dispatch(
+                    username=username,
+                    session_id=session_id,
+                    auth_context=None,
+                    reason="active_in_progress_idle_reconcile",
+                )
+                write_jsonl(
+                    log_path,
+                    {
+                        "type": "http.startup_active_goal_idle_reconcile",
+                        "ts": utc_ts(),
+                        "service_id": self_service["service_id"],
+                        "process_id": process_id,
+                        "username": username,
+                        "session_id": session_id,
+                        "to": dispatched_to,
+                        "dispatch_error": dispatch_error,
+                    },
+                )
         except Exception as exc:
             write_jsonl(
                 log_path,
