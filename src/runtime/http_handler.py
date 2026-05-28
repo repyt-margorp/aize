@@ -42,7 +42,11 @@ from kernel.peers import list_peers, register_peer
 from kernel.registry import get_service_record
 from runtime.goal_audit import default_goal_continue_xml
 from runtime.communication_goal import should_idle_goal_reconcile
-from runtime.goal_persist import goal_state_response_payload, persist_goal_manager_runtime_reset
+from runtime.goal_persist import (
+    goal_state_response_payload,
+    persist_goal_manager_runtime_queued,
+    persist_goal_manager_runtime_reset,
+)
 from runtime.message_builder import (
     maybe_release_session_provider,
     make_dispatch_pending_message,
@@ -52,6 +56,7 @@ from runtime.http_dispatch import (
     communication_dispatch_plan as _communication_dispatch_plan,
     send_http_dispatch_plan,
 )
+from runtime.status_gateway import build_runtime_status
 from runtime.persistent_state_pkg import (
     append_pending_input,
     append_goal_manager_pending_input,
@@ -2512,6 +2517,14 @@ def _parse_recent_window_seconds(query: dict[str, list[str]] | None) -> int:
     return max(0, parsed)
 
 
+def _parse_optional_recent_window_seconds(query: dict[str, list[str]] | None) -> int:
+    if not isinstance(query, dict):
+        return 0
+    if "session_window_seconds" not in query and "session_window" not in query:
+        return 0
+    return _parse_recent_window_seconds(query)
+
+
 def _parse_utc_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -2955,7 +2968,7 @@ def make_handler(
         viewer_username: str,
         include_legacy_apps_alias: bool = False,
     ) -> dict[str, Any]:
-        units = list_launchable_units(default_provider=default_provider)
+        units = list_launchable_units(default_provider=default_provider, include_private=False)
         registered_states = {
             str(state.get("unit_id") or state.get("template_id") or "").strip(): state
             for state in list_registered_unit_states(runtime_root)
@@ -3435,6 +3448,7 @@ def make_handler(
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
 
         def _json_with_cookie(self, status: int, payload: dict[str, Any], token: str | None) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3446,6 +3460,7 @@ def make_handler(
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
 
         def _redirect(self, location: str, *, token: str | None | object = ... ) -> None:
             self.send_response(303)
@@ -3627,20 +3642,6 @@ def make_handler(
             initial_session_map_open = requested_session_id(self, query=query) is None
             initial_context_status = stored_context_status(username, session_id)
             session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
-            initial_history = build_session_ui_history(
-                runtime_root,
-                username=username,
-                session_id=session_id,
-                limit=INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT,
-            )
-            initial_history = _history_tail_with_latest_goal_cluster(
-                initial_history,
-                limit=INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT,
-            )
-            if _is_communication_session_settings(session_settings):
-                initial_history = _collapse_communication_duplicate_outputs(initial_history)
-            initial_history_for_http = [_history_entry_for_http(entry) for entry in initial_history]
-            entries_json = json.dumps(initial_history_for_http, ensure_ascii=False).replace("</", "<\\/")
             initial_runtime_journal_summary_json = json.dumps(
                 _runtime_journal_summary_from_session(session_settings),
                 ensure_ascii=False,
@@ -3714,6 +3715,26 @@ def make_handler(
             initial_user_response_wait_effective_timeout_seconds = int(
                 session_settings.get("user_response_wait_effective_timeout_seconds", 300) or 300
             )
+            preload_initial_history = not (
+                initial_session_map_open
+                and initial_user_response_wait_status == "idle"
+            )
+            initial_history: list[dict[str, Any]] = []
+            if preload_initial_history:
+                initial_history = build_session_ui_history(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    limit=INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT,
+                )
+                initial_history = _history_tail_with_latest_goal_cluster(
+                    initial_history,
+                    limit=INITIAL_HTTPBRIDGE_PAGE_HISTORY_LIMIT,
+                )
+                if _is_communication_session_settings(session_settings):
+                    initial_history = _collapse_communication_duplicate_outputs(initial_history)
+            initial_history_for_http = [_history_entry_for_http(entry) for entry in initial_history]
+            entries_json = json.dumps(initial_history_for_http, ensure_ascii=False).replace("</", "<\\/")
             initial_user_response_wait_started_at = str(session_settings.get("user_response_wait_started_at", "") or "")
             initial_user_response_wait_until_at = str(session_settings.get("user_response_wait_until_at", "") or "")
             initial_user_response_wait_request_id = str(session_settings.get("user_response_wait_request_id", "") or "")
@@ -3840,18 +3861,12 @@ def make_handler(
                     active_session_id=session_id,
                     recent_window_seconds=initial_session_window_seconds,
                 )
-                try:
-                    _paged_ov = _get_overview_cached(
-                        viewer_username=session_list_username,
-                        include_all=(initial_session_scope == "all"),
-                        active_session_id=session_id,
-                        recent_window_seconds=initial_session_window_seconds,
-                    )
-                    initial_session_summaries_json = json.dumps(_paged_ov["session_summaries"], ensure_ascii=False).replace("</", "<\\/")
-                    initial_worker_counts_json = json.dumps(_paged_ov["worker_counts"], ensure_ascii=False).replace("</", "<\\/")
-                except Exception:
-                    initial_session_summaries_json = "[]"
-                    initial_worker_counts_json = "{}"
+                # The SessionMap HTML already includes the first-frame session list
+                # and goal board markup. Avoid embedding the same overview payload a
+                # second time into the root page; the client refreshes /overview
+                # immediately after boot when SessionMap is open.
+                initial_session_summaries_json = "[]"
+                initial_worker_counts_json = "{}"
             else:
                 initial_session_summaries = []
                 initial_session_summaries_json = "[]"
@@ -4123,7 +4138,7 @@ def make_handler(
                 default=DEFAULT_RUNTIME_JOURNAL_LIMIT,
                 maximum=MAX_RUNTIME_JOURNAL_LIMIT,
             )
-            recent_window_seconds = _parse_recent_window_seconds(query)
+            recent_window_seconds = _parse_optional_recent_window_seconds(query)
             entries = _read_runtime_journal(
                 runtime_root,
                 username=context["username"],
@@ -5581,15 +5596,7 @@ def make_handler(
                 self._json(404, {"error": "session_not_found"})
                 return
             mode = str(payload.get("mode", "prompt")).strip().lower() or "prompt"
-            auth_context = issue_auth_context(runtime_root, username=username)
             provider_override = str(payload.get("provider", "")).strip().lower()
-            if provider_override in {"codex", "claude", "gemini"}:
-                update_session_goal_flags(
-                    runtime_root,
-                    username=username,
-                    session_id=session_id,
-                    preferred_provider=provider_override,
-                )
             payload.setdefault("to", default_target)
             text = payload.get("text")
             has_uploads = bool(uploaded_attachments)
@@ -5618,6 +5625,7 @@ def make_handler(
                     return
                 def process_goal_dispatch() -> None:
                     try:
+                        auth_context = issue_auth_context(runtime_root, username=username)
                         write_jsonl(
                             log_path,
                             {
@@ -5747,6 +5755,26 @@ def make_handler(
             prompt_text = text.strip()
             entrance_local_only = _payload_prefers_entrance_local_handling(payload)
             uploaded_files = [dict(item) for item in uploaded_attachments or [] if isinstance(item, dict)]
+            accept_is_interactive_session = bool(
+                talk.get("session_interactive", False)
+                or talk.get("communication_agent_enabled", False)
+                or session_ui_mode(talk) == "communication"
+            )
+            accept_communication_agent_enabled = bool(
+                talk.get("communication_agent_enabled", accept_is_interactive_session)
+            )
+            accept_runtime_status: dict[str, Any] = {}
+            queued_work_item: dict[str, Any] = {}
+            if accept_communication_agent_enabled:
+                accept_runtime_status = build_runtime_status(
+                    agent_running=True,
+                    goal_manager_state="queued",
+                )
+                queued_work_item = {
+                    "kind": "user_prompt",
+                    "reason": "http_user_dialogue",
+                    "queued_at": utc_ts(),
+                }
 
             def process_prompt_submission() -> None:
                 dispatch_error: str | None = None
@@ -5761,6 +5789,16 @@ def make_handler(
                 message_meta: dict[str, Any] = {}
                 transport_text = prompt_text
                 try:
+                    auth_context = issue_auth_context(runtime_root, username=username)
+                    if accept_communication_agent_enabled:
+                        persist_goal_manager_runtime_queued(
+                            runtime_root=runtime_root,
+                            service_id=str(self_service.get("service_id") or ""),
+                            username=username,
+                            session_id=session_id,
+                            reason="http_user_dialogue",
+                            pending_work_items=[queued_work_item],
+                        )
                     previous_session_settings = get_session_settings(
                         runtime_root,
                         username=username,
@@ -5942,55 +5980,7 @@ def make_handler(
                             normalized_provider = str(selected_agent_profile.get("provider") or "").strip().lower()
                             if normalized_provider in {"codex", "claude", "gemini"}:
                                 preferred_provider = normalized_provider
-                    visible_sessions = list_sessions(runtime_root, username=username)
                     forwarded_session: dict[str, Any] | None = None
-                    if communication_agent_enabled and not entrance_local_only:
-                        forwarded_session = _materialize_communication_routed_child_session(
-                            runtime_root,
-                            username=username,
-                            current_session=session_settings,
-                            prompt_text=transport_text,
-                            sessions=visible_sessions,
-                        )
-                        if isinstance(forwarded_session, dict):
-                            forwarded_session_id = str(forwarded_session.get("session_id") or "").strip() or None
-                            if forwarded_session_id:
-                                parent_session_id = str(forwarded_session.get("parent_session_id") or "").strip()
-                                if parent_session_id and parent_session_id != session_id:
-                                    forwarded_parent = get_session_settings(
-                                        runtime_root,
-                                        username=username,
-                                        session_id=parent_session_id,
-                                    ) or {}
-                                    forwarded_label = str(forwarded_parent.get("label") or "").strip()
-                                forwarded_pending_input, forwarded_dispatch_reason = _forwarded_session_pending_input(
-                                    forwarded_session,
-                                    prompt_text=transport_text,
-                                    submitted_by_username=username,
-                                    user_response_request_ids=response_request_ids,
-                                    message_meta=message_meta,
-                                )
-                                append_pending_input(
-                                    runtime_root,
-                                    username=username,
-                                    session_id=forwarded_session_id,
-                                    entry=forwarded_pending_input,
-                                )
-                                resolved_forwarded_service_id = resolve_session_service_for_dispatch(
-                                    username=username,
-                                    session_id=forwarded_session_id,
-                                )
-                                forwarded_service_id = str(resolved_forwarded_service_id or "").strip() or None
-                                _append_communication_immediate_ack(
-                                    append_history,
-                                    username=username,
-                                    session_id=session_id,
-                                    text=_communication_immediate_ack_text(
-                                        forwarded_session=forwarded_session,
-                                        forwarded_label=forwarded_label
-                                        or str(forwarded_session.get("label") or "").strip(),
-                                    ),
-                                )
                     current_codex_service_pool, current_claude_service_pool, current_gemini_service_pool, _current_llm_service_kinds = (
                         current_llm_service_topology()
                     )
@@ -6076,6 +6066,20 @@ def make_handler(
                             current_llm_service_topology=current_llm_service_topology,
                         )
                         if goal_manager_service_id:
+                            persist_goal_manager_runtime_queued(
+                                runtime_root=runtime_root,
+                                service_id=goal_manager_service_id,
+                                username=username,
+                                session_id=session_id,
+                                reason="goal_manager_review",
+                                pending_work_items=[
+                                    {
+                                        "kind": "goal_manager_review",
+                                        "reason": "user_prompt",
+                                        "queued_at": utc_ts(),
+                                    }
+                                ],
+                            )
                             append_goal_manager_pending_input(
                                 runtime_root,
                                 username=username,
@@ -6353,7 +6357,7 @@ def make_handler(
                         },
                     )
 
-            threading.Thread(target=process_prompt_submission, daemon=True).start()
+            prompt_submission_thread = threading.Thread(target=process_prompt_submission, daemon=True)
             if "application/json" in content_type:
                 self._json(
                     202,
@@ -6367,9 +6371,12 @@ def make_handler(
                         "session_id": session_id,
                         "service_id": self_service["service_id"],
                         "dispatch_error": None,
+                        **accept_runtime_status,
                     },
                 )
+                prompt_submission_thread.start()
                 return
+            prompt_submission_thread.start()
             self._redirect(f"/?{urlencode({'session_id': session_id})}")
 
         def log_message(self, format: str, *args: Any) -> None:

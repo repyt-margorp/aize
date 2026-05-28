@@ -171,6 +171,48 @@ def _persist_goal_manager_runtime_state(
         write_json_file(service_state_path, service_state)
 
 
+def persist_goal_manager_runtime_queued(
+    *,
+    runtime_root: Path,
+    service_id: str,
+    username: str,
+    session_id: str,
+    reason: str,
+    pending_work_items: list[dict[str, Any]] | None = None,
+    history_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    work_items = pending_work_items if isinstance(pending_work_items, list) else []
+    event = {
+        "type": "service.goal_manager_review_queued",
+        "reason": str(reason or ""),
+        "session_id": str(session_id or ""),
+        "pending_work_items": work_items,
+    }
+    _persist_goal_manager_runtime_state(
+        runtime_root=runtime_root,
+        username=username,
+        session_id=session_id,
+        payload={
+            "state": "queued",
+            "service_id": str(service_id or ""),
+            "_service_snapshot_id": str(service_id or ""),
+            "pending_work_items": work_items,
+            "progress_state": "in_progress",
+            "queued_reason": str(reason or ""),
+        },
+    )
+    history_entry = {
+        "direction": "event",
+        "ts": utc_ts(),
+        "service_id": str(service_id or ""),
+        "event_type": event["type"],
+        "text": "GoalManager review queued",
+        "event": event,
+    }
+    if history_sink is not None:
+        history_sink(history_entry)
+
+
 def goal_state_response_payload(
     talk: dict[str, Any],
     *,

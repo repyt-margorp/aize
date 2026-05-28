@@ -34,7 +34,14 @@ class PluginCatalogTests(unittest.TestCase):
         self.tempdir = tempfile.mkdtemp(prefix="test_plugin_", dir=ROOT / "plugins")
         self.plugin_dir = Path(self.tempdir)
         (self.plugin_dir / "plugin.json").write_text(
-            json.dumps({"plugin_id": self.plugin_dir.name, "display_name": "Test Plugin"}) + "\n",
+            json.dumps(
+                {
+                    "plugin_id": self.plugin_dir.name,
+                    "display_name": "Test Plugin",
+                    "catalog_visibility": "private",
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         service_dir = self.plugin_dir / "services" / "secret_worker"
@@ -92,6 +99,7 @@ class PluginCatalogTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "secret_worker" for item in unit_services))
         template = next(item for item in templates if item["unit_id"] == "launcher")
         self.assertEqual(template["plugin_id"], self.plugin_dir.name)
+        self.assertEqual(template["catalog_visibility"], "private")
         self.assertTrue(any(item.get("unit_id") == "launcher" for item in unit_files))
         app = next(
             item
@@ -99,6 +107,7 @@ class PluginCatalogTests(unittest.TestCase):
             if str(item.get("unit_id") or item.get("template_id") or "") == "launcher"
         )
         self.assertEqual(app["plugin_id"], self.plugin_dir.name)
+        self.assertEqual(app["catalog_visibility"], "private")
 
     def test_legacy_plugin_app_descriptor_alias_remains_compatible(self) -> None:
         with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):

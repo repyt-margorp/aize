@@ -50,6 +50,17 @@ class _ImmediateThread:
         self._target(*self._args, **self._kwargs)
 
 
+class _NoStartThread:
+    def __init__(self, *, target, daemon=None, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+        self.daemon = daemon
+
+    def start(self) -> None:
+        return
+
+
 class HttpHandlerGoalSaveTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -146,6 +157,89 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             )
         chunks.append(f"--{boundary}--\r\n".encode())
         return b"".join(chunks)
+
+    def test_message_prompt_returns_running_before_dispatch_thread(self) -> None:
+        talk = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+        )
+        session_id = str(talk["session_id"])
+        responses: list[tuple[int, dict]] = []
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda payload=None, query=None: {"username": "root", "session_id": session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with patch("runtime.http_handler.threading.Thread", _NoStartThread):
+            handler._do_POST_message(
+                {
+                    "mode": "prompt",
+                    "text": "Please start working immediately.",
+                    "session_id": session_id,
+                    "communication_target": "entrance",
+                },
+                "application/json",
+            )
+
+        self.assertEqual(responses[0][0], 202)
+        payload = responses[0][1]
+        self.assertTrue(payload["runtime_in_progress"])
+        self.assertTrue(payload["agent_running"])
+        self.assertEqual(payload["runtime_execution_state"], "running")
+        self.assertEqual(payload["goal_manager_state"], "queued")
+
+    def test_message_prompt_persists_communication_runtime_when_dispatch_thread_runs(self) -> None:
+        talk = create_conversation_session(
+            self.runtime_root,
+            username="root",
+            label="Entrance",
+            session_ui_mode="communication",
+            communication_agent_enabled=True,
+        )
+        session_id = str(talk["session_id"])
+        responses: list[tuple[int, dict]] = []
+        Handler = self._make_handler(lambda **kwargs: ("", ""))
+        handler = object.__new__(Handler)
+        handler._require_user = lambda payload=None, query=None: {"username": "root", "session_id": session_id}
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        with patch("runtime.http_handler.threading.Thread", _ImmediateThread):
+            handler._do_POST_message(
+                {
+                    "mode": "prompt",
+                    "text": "Please persist queued runtime.",
+                    "session_id": session_id,
+                    "communication_target": "entrance",
+                },
+                "application/json",
+            )
+
+        self.assertEqual(responses[0][0], 202)
+        state_path = session_goal_manager_state_path(
+            self.runtime_root,
+            username="root",
+            session_id=session_id,
+        )
+        queued_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(queued_state["state"], "queued")
+        self.assertEqual(queued_state["pending_work_items"][0]["kind"], "user_prompt")
+
+        history = get_history(self.runtime_root, username="root", session_id=session_id)
+        summary = http_handler.build_http_session_runtime_summary(
+            get_session_settings(self.runtime_root, username="root", session_id=session_id) or {},
+            history_entries=history,
+            codex_service_pool=[],
+            claude_service_pool=[],
+            gemini_service_pool=[],
+            default_provider="codex",
+            runtime_root=self.runtime_root,
+            username="root",
+        )
+        self.assertEqual(summary["goal_manager_state"], "queued")
+        self.assertEqual(summary["runtime_execution_state"], "running")
 
     def test_root_page_renders_session_map_with_registered_unit_metadata(self) -> None:
         update_session_goal(
@@ -263,6 +357,30 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             handler._do_GET_root("/", {})
 
         self.assertEqual(calls, [("root", self.session_id)])
+
+    def test_root_page_session_map_initial_load_skips_history_prefetch_when_idle(self) -> None:
+        Handler = self._make_handler(
+            lambda **kwargs: ("", ""),
+            current_context=lambda *args, **kwargs: {
+                "username": "root",
+                "viewer_username": "root",
+                "session_id": self.session_id,
+                "roles": ["root", "superuser"],
+                "role": "root",
+                "is_superuser": True,
+            },
+            requested_session_id=lambda *args, **kwargs: None,
+        )
+        handler = object.__new__(Handler)
+        responses: list[tuple[int, str]] = []
+        handler._trace_auth_request = lambda *args, **kwargs: None
+        handler._html = lambda status, body: responses.append((status, body))
+
+        with patch.object(http_handler, "build_session_ui_history", side_effect=AssertionError("history preload should be skipped")):
+            handler._do_GET_root("/", {})
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertIn("session-map-pane", responses[0][1])
 
     def test_root_page_status_strip_uses_strongest_session_audit_state(self) -> None:
         update_session_goal(
@@ -892,7 +1010,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         self.assertTrue(any(entry.get("direction") == "in" and entry.get("text") == "http skill: echo through http skill" for entry in ui_history))
         self.assertEqual(router_calls, [])
 
-    def test_message_prompt_keeps_entrance_request_inside_entrance_before_goal_manager_routing(self) -> None:
+    def test_message_prompt_keeps_entrance_request_inside_entrance_without_child_routing(self) -> None:
         talk = create_conversation_session(
             self.runtime_root,
             username="root",
@@ -1030,10 +1148,7 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
 
         sessions = list_sessions(self.runtime_root, username="root")
         created_sessions = [item for item in sessions if str(item.get("origin_session_id") or "") == session_id]
-        self.assertEqual(len(created_sessions), 2)
-        forwarded_child = next(
-            item for item in created_sessions if str(item.get("label") or "") == "Development Task"
-        )
+        self.assertEqual(created_sessions, [])
 
         interactive_pending = load_service_pending_inputs(
             self.runtime_root,
@@ -1051,26 +1166,18 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
         )
         self.assertEqual([item["kind"] for item in interactive_pending], ["user_dialogue"])
         self.assertEqual([item["kind"] for item in worker_pending], ["interactive_worker_request"])
-        self.assertIn("delegated_session", worker_pending[0]["text"])
-        self.assertIn(str(forwarded_child["session_id"]), worker_pending[0]["text"])
+        self.assertNotIn("delegated_session", worker_pending[0]["text"])
 
         dispatch_reasons = [call.get("payload", {}).get("reason") for call in router_calls]
         self.assertEqual(
             dispatch_reasons,
-            ["goal_manager_review", "http_user_dialogue", "interactive_worker_request", "goal_feedback"],
+            ["goal_manager_review", "http_user_dialogue", "interactive_worker_request"],
         )
 
         history = get_history(self.runtime_root, username="root", session_id=session_id)
         last_out = next(entry for entry in reversed(history) if entry.get("direction") == "out")
         self.assertEqual(last_out["to"], "service-codex-001")
-        self.assertTrue(
-            any(
-                entry.get("direction") == "in"
-                and entry.get("service_id") == "service-entrance-router"
-                and "Routed to AIze Development." in str(entry.get("text") or "")
-                for entry in history
-            )
-        )
+        self.assertFalse(any("Routed to AIze Development." in str(entry.get("text") or "") for entry in history))
 
         ui_history = build_session_ui_history(
             self.runtime_root,
@@ -1078,12 +1185,8 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
             session_id=session_id,
             limit=20,
         )
-        self.assertTrue(
-            any(
-                entry.get("direction") == "in"
-                and "Entrance will keep this session updated while that work runs." in str(entry.get("text") or "")
-                for entry in ui_history
-            )
+        self.assertFalse(
+            any("Entrance will keep this session updated while that work runs." in str(entry.get("text") or "") for entry in ui_history)
         )
 
         reopened = get_session_settings(self.runtime_root, username="root", session_id=session_id)
@@ -1780,7 +1883,11 @@ class HttpHandlerGoalSaveTests(unittest.TestCase):
 
         self.assertEqual(responses[-1][0], 200)
         payload = responses[-1][1]
+        self.assertEqual({unit["unit_id"] for unit in payload["units"]}, {"entrance.service"})
         entrance_unit = next(unit for unit in payload["units"] if unit["unit_id"] == "entrance.service")
+        self.assertFalse(
+            any(unit["unit_id"] == "aize-development.bug-hunting" for unit in payload["units"])
+        )
         self.assertGreaterEqual(int(entrance_unit["launched_session_count"]), 1)
         launched = next(item for item in entrance_unit["launched_sessions"] if item["session_id"] == entrance_session_id)
         self.assertEqual(launched["label"], "Entrance Thread")

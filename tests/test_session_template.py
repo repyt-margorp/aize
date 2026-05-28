@@ -43,7 +43,14 @@ class SessionTemplateLauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin_dir = Path(tempfile.mkdtemp(prefix="test_launcher_", dir=ROOT / "plugins"))
         (self.plugin_dir / "plugin.json").write_text(
-            json.dumps({"plugin_id": self.plugin_dir.name, "display_name": "Launcher Plugin"}) + "\n",
+            json.dumps(
+                {
+                    "plugin_id": self.plugin_dir.name,
+                    "display_name": "Launcher Plugin",
+                    "catalog_visibility": "private",
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         session_template_dir = self.plugin_dir / "units" / "research_launcher"
@@ -135,6 +142,22 @@ class SessionTemplateLauncherTests(unittest.TestCase):
         self.assertEqual(template["launcher"]["schedule"]["timezone"], "America/New_York")
         self.assertEqual(template["launcher"]["schedule"]["daily_time"], "05:42")
         self.assertTrue(bool(template["launcher"]["schedule"]["enabled"]))
+
+    def test_catalog_can_hide_private_units_without_breaking_direct_launch_lookup(self) -> None:
+        with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+            public_templates = list_launchable_session_templates(
+                default_provider="codex",
+                include_private=False,
+            )
+            public_ids = {item["template_id"] for item in public_templates}
+            development_unit = get_launchable_session_template(
+                "aize-development.bug-hunting",
+                default_provider="codex",
+            )
+
+        self.assertEqual(public_ids, {"entrance.service"})
+        self.assertNotIn("aize-development.bug-hunting", public_ids)
+        self.assertEqual(development_unit["template_id"], "aize-development.bug-hunting")
 
     def test_launch_session_template_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -746,9 +769,11 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(stored["launcher_instance_policy"], "multi")
             self.assertIn("conversation and coordination layer", unit["launcher"]["goal_text"])
             self.assertIn("belongs in this conversation first", unit["launcher"]["initial_prompt"])
-            route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
-            self.assertIn("development-cycle goal", route["description"])
-            self.assertFalse(route["route_when_unhandled"])
+            self.assertNotIn(
+                "canonical-development-routing",
+                {skill["skill_id"] for skill in unit["launcher"]["skills"]},
+            )
+            self.assertNotIn("aize-development", json.dumps(unit, sort_keys=True))
 
     def test_entrance_unit_launch_supports_multiple_instances(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -785,11 +810,10 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertEqual(second_stored["launcher_unit_id"], "entrance.service")
             self.assertEqual(first_stored["launcher_instance_policy"], "multi")
             self.assertEqual(second_stored["launcher_instance_policy"], "multi")
-            route = next(skill for skill in unit["launcher"]["skills"] if skill["skill_id"] == "canonical-development-routing")
-            self.assertFalse(route["allow_tag_routing"])
-            self.assertEqual(route["route_parent_scope"], "root_session")
-            self.assertIn("separate port or isolated runtime", route["target_goal_text"])
-            self.assertIn("final stop-and-migrate coordination", route["spawn_session_skills"][0]["prompt"])
+            self.assertNotIn(
+                "canonical-development-routing",
+                {skill["skill_id"] for skill in unit["launcher"]["skills"]},
+            )
             self.assertIn(
                 "def handle(context):",
                 session_skill_file_path(

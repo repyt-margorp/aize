@@ -143,6 +143,10 @@ def list_unit_file_descriptors() -> list[dict]:
                     descriptor = _descriptor_with_defaults(descriptor_path, descriptor_type="app")
                     descriptor.setdefault("plugin_id", package_manifest["plugin_id"])
                     descriptor.setdefault("package_id", package_manifest.get("package_id") or package_manifest["plugin_id"])
+                    descriptor.setdefault(
+                        "catalog_visibility",
+                        str(package_manifest.get("catalog_visibility") or "").strip().lower() or "public",
+                    )
                     descriptors.append(descriptor)
     return descriptors
 

@@ -72,6 +72,9 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("enter-send", page)
         self.assertIn("Enter sends message", page)
         self.assertIn("submitEntrancePrompt", page)
+        self.assertIn("goal_manager_state:'queued'", page)
+        self.assertIn("if(payload?.runtime_execution_state||payload?.runtime_in_progress!==undefined)renderEntranceState(payload);", page)
+        self.assertIn("setTimeout(refreshEntranceState,500)", page)
         self.assertIn("/overview?scope=all", page)
         self.assertIn("visibleAssistantText", page)
         self.assertIn("assistanttext", page)
@@ -79,7 +82,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("if(messageId&&(direction==='out'||direction==='user'||direction==='session_input'||direction==='in'))return `message:${messageId}`;", page)
         self.assertIn("mergeMessages", page)
         self.assertIn("kind==='agent'?[role,kind,value,turnBucket].join('|')", page)
-        self.assertIn("duplicateVisibleItem(role,kind,value,ts)", page)
+        self.assertIn("duplicateVisibleItem(role,kind,value,ts,messageId)", page)
+        self.assertIn("if(messageId||item.messageId)return true;", page)
         self.assertIn("Math.abs(current-previous)<=5000", page)
         self.assertIn("renderChat([entry])", page)
         self.assertIn("if(direction==='out'||direction==='user'||direction==='session_input'){refreshChat();return;}", page)
@@ -100,9 +104,13 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("update.user_response_wait_generated_at=String(event.generated_at||entry?.ts||'');", page)
         self.assertIn("update.user_response_wait_until_at=String(event.until_at||'');", page)
         self.assertIn("renderEntranceUploadList();setStatus('Sending input to Entrance...')", page)
-        self.assertIn("refreshChat();refreshEntranceState();setStatus('Input sent. Waiting for Entrance updates...')", page)
-        self.assertNotIn("entranceOptimisticText", page)
-        self.assertNotIn("renderChat([{direction:'out'", page)
+        self.assertIn("renderChat([{direction:'out',ts:new Date().toISOString(),session_id:entranceSessionId,text:text||", page)
+        self.assertIn("message_id:`entrance-local-${Date.now()}`", page)
+        self.assertLess(
+            page.index("message_id:`entrance-local-${Date.now()}`"),
+            page.index("payload=await jsonFetch('/message'"),
+        )
+        self.assertIn("refreshChat();setTimeout(refreshEntranceState,500);setStatus('Input sent. Waiting for Entrance updates...')", page)
         self.assertIn("/messages?session_id=", page)
         self.assertIn("pollTimer=setInterval(()=>{refreshChat();},2500)", page)
         self.assertIn("let statePollTimer=0;", page)
@@ -245,6 +253,8 @@ class EntrancePageTests(unittest.TestCase):
         self.assertIn("data-unit-session-open-interface", page)
         self.assertIn("Open Unit Interface", page)
         self.assertIn("Open Workspace", page)
+        self.assertIn("launcherCatalogUnits = Array.isArray(payload.units) ? payload.units : [];", page)
+        self.assertNotIn("Array.isArray(payload.apps)", page)
         self.assertIn("Open Latest Unit Session", page)
 
     def test_entrance_immediate_ack_does_not_claim_agent_activity_without_state(self) -> None:

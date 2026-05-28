@@ -747,18 +747,29 @@ def normalize_unit_descriptor(descriptor: dict[str, Any], *, default_provider: s
     return normalize_session_template_descriptor(descriptor, default_provider=default_provider)
 
 
-def list_launchable_session_templates(*, default_provider: str) -> list[dict[str, Any]]:
+def list_launchable_session_templates(
+    *,
+    default_provider: str,
+    include_private: bool = True,
+) -> list[dict[str, Any]]:
     apps = [
         normalize_session_template_descriptor(descriptor, default_provider=default_provider)
         for descriptor in list_unit_file_descriptors()
         if bool(descriptor.get("enabled", True))
+        and (
+            include_private
+            or str(descriptor.get("catalog_visibility") or "public").strip().lower() == "public"
+        )
     ]
     apps.sort(key=lambda item: (str(item.get("plugin_id") or ""), str(item.get("display_name") or "")))
     return apps
 
 
-def list_launchable_units(*, default_provider: str) -> list[dict[str, Any]]:
-    return list_launchable_session_templates(default_provider=default_provider)
+def list_launchable_units(*, default_provider: str, include_private: bool = True) -> list[dict[str, Any]]:
+    return list_launchable_session_templates(
+        default_provider=default_provider,
+        include_private=include_private,
+    )
 
 
 def ensure_auto_scheduled_root_unit_states(

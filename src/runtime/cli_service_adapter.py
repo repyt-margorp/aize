@@ -87,6 +87,7 @@ from runtime.persistent_state_pkg import (
     resolve_session_agent_id,
     resolve_session,
     resolve_session_context,
+    session_metadata_path,
     session_goal_context,
     session_service_state_path,
     save_agent_audit_state,
@@ -1624,6 +1625,10 @@ def run_http_service(
             return maximum
         return value
 
+    auth_context_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+    auth_context_cache_lock = threading.Lock()
+    auth_context_cache_ttl_seconds = 5.0
+
     def current_context(
         handler: BaseHTTPRequestHandler,
         *,
@@ -1631,13 +1636,30 @@ def run_http_service(
         query: dict[str, list[str]] | None = None,
     ) -> dict[str, Any] | None:
         token = cookie_value("bridge_session", handler.headers.get("Cookie"))
-        base_context = resolve_session_context(runtime_root, token)
+        explicit_session_id = requested_session_id(handler, payload=payload, query=query)
+        now = time.monotonic()
+        base_context: dict[str, Any] | None = None
+        if token:
+            with auth_context_cache_lock:
+                cached = auth_context_cache.get(token)
+                if cached and cached[0] > now:
+                    base_context = dict(cached[1])
+        if base_context is None:
+            base_context = resolve_session_context(runtime_root, token)
+            if base_context and token:
+                cache_context = {
+                    "username": str(base_context.get("username") or ""),
+                    "session_id": str(base_context.get("session_id") or ""),
+                    "roles": list(base_context.get("roles") or ["user"]),
+                    "role": str(base_context.get("role") or "user"),
+                }
+                with auth_context_cache_lock:
+                    auth_context_cache[token] = (now + auth_context_cache_ttl_seconds, cache_context)
         if not base_context:
             return None
-        auth = issue_auth_context(runtime_root, username=base_context.get("username", ""))
-        is_superuser = auth_context_allows(auth, "superuser")
-        explicit_session_id = requested_session_id(handler, payload=payload, query=query)
         if not explicit_session_id:
+            auth = issue_auth_context(runtime_root, username=base_context.get("username", ""))
+            is_superuser = auth_context_allows(auth, "superuser")
             return {
                 "username": base_context["username"],
                 "viewer_username": base_context["username"],
@@ -1646,11 +1668,25 @@ def run_http_service(
                 "role": base_context.get("role", "user"),
                 "is_superuser": is_superuser,
             }
-        direct_session = get_session_settings(
-            runtime_root,
-            username=base_context.get("username", ""),
-            session_id=explicit_session_id,
+        direct_session = read_json_file(
+            session_metadata_path(
+                runtime_root,
+                username=str(base_context.get("username") or ""),
+                session_id=explicit_session_id,
+            )
         )
+        if isinstance(direct_session, dict):
+            base_roles = list(base_context.get("roles") or ["user"])
+            return {
+                "username": base_context["username"],
+                "viewer_username": base_context["username"],
+                "session_id": explicit_session_id,
+                "roles": base_roles,
+                "role": base_context.get("role", "user"),
+                "is_superuser": bool({"root", "superuser"} & {str(role) for role in base_roles}),
+            }
+        auth = issue_auth_context(runtime_root, username=base_context.get("username", ""))
+        is_superuser = auth_context_allows(auth, "superuser")
         if not isinstance(direct_session, dict):
             if not is_superuser:
                 return None

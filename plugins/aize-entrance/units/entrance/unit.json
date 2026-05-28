@@ -60,38 +60,6 @@
             "content": "def handle(context):\n    text = str(context.get('prompt_text') or '').strip()\n    normalized = ' '.join(text.lower().split())\n    if not normalized:\n        return {'handled': True, 'assistant_text': 'Send a message and Entrance will keep it in this conversation first.'}\n    if normalized in {'ping', 'hello', 'hi', 'help', 'status'} or normalized.startswith('status '):\n        return {'handled': True, 'assistant_text': 'Entrance is active. Messages stay in Entrance first; its agents can coordinate delegated work when needed.'}\n    return {'handled': False}\n"
           }
         ]
-      },
-      {
-        "skill_id": "canonical-development-routing",
-        "kind": "routing",
-        "skill_scope": "unit",
-        "title": "Canonical Development Routing",
-        "description": "Route implementation requests into the canonical non-UI AIzeDevelopment parent Unit, which stays under Root, keeps the development-cycle goal, and materializes each concrete request as a delegated child session under that parent.",
-        "routing_mode": "create_child_session",
-        "allow_tag_routing": false,
-        "route_when_unhandled": false,
-        "canonical_session_key": "aize.development",
-        "route_parent_scope": "root_session",
-        "target_unit_id": "aize-development.bug-hunting",
-        "target_template_id": "aize-development.bug-hunting",
-        "target_label": "AIze Development",
-        "target_child_label": "AIze Development Task",
-        "target_goal_text": "Operate as the canonical non-UI AIzeDevelopment parent session for implementation work routed out of Entrance. This session is a child of the Root session and must remain subordinate to the Root session's overall goal. Treat the Root goal as the constitutional objective for the whole AIze tree, and treat every delegated development goal under this parent as a subordinate law-like subgoal that exists only to satisfy that higher goal. Keep the development workflow explicit: each concrete request should run in a delegated child task session, verification should happen against a separate port or isolated runtime before touching the active AIze runtime, and completed work should only cut over after a careful stop-and-migrate step from the currently running AIze system to the newly verified one. Maintain narrow, verifiable changes, keep service boundaries explicit, and keep implementation philosophy aligned with MINIX-style separation. Do not treat positive evidence alone as enough for GoalCompleted: require a negative regression check for neighboring promised behavior before closure, especially around goal-state UI, runtime-state UI, routing lineage, and permissions when those areas are touched. Keep only this parent resident; debug, audit, verification, and implementation children are finite and must be marked complete or blocked with evidence when their request is handled.",
-        "preferred_provider": "codex",
-        "selected_agents": ["codex_pool"],
-        "spawn_session_skills": [
-          {
-            "skill_id": "aize-development-session",
-            "kind": "development",
-            "skill_scope": "unit",
-            "title": "AIze Development Session",
-            "canonical_session_key": "aize.development",
-            "description": "Canonical delegated child implementation session for AIze development work routed out of Entrance through the persistent AIzeDevelopment parent workflow and Root-goal lineage.",
-            "when_to_use": "Use this skill when the request requires real implementation work such as code edits, debugging, refactoring, or targeted test fixes. Do not keep that work inside Entrance or in the AIzeDevelopment parent coordinator.",
-            "usage": "Treat this session as the delegated implementation workspace under the AIzeDevelopment parent workflow. Read the active goal and this skill guidance together, perform the code changes here, verify on a separate port or isolated runtime before any cutover, and report concrete results back without sending the implementation work back to Entrance. For UI fixes, browser verification is mandatory: open the affected page, inspect the rendered result, and confirm that the requested change is visibly present to a human. A code-only change is not completion evidence for UI work. After code edits, record the behavior changed, files touched, verification run, and residual risk in ./doc/. This child remains a subordinate subgoal under the Root session's overall goal. This child is finite: once the requested work is implemented, verified, or blocked with evidence, mark the task complete instead of staying resident.",
-            "prompt": "This session is a delegated AIze development child task under the canonical parent workflow routed out of Entrance by skill. It remains subordinate to the Root session's overall goal. Execute the requested changes here, verify them on a separate port or isolated runtime, and leave final stop-and-migrate coordination to the parent session. For UI changes, browser verification is required before reporting completion: open the affected page, inspect the rendered result, and confirm that the requested change is actually visible to a human. Do not treat a successful code edit by itself as completion evidence for UI work. Before reporting completion, verify both the requested positive result and the negative side that adjacent promised behavior was not violated, especially for goal-state visibility, runtime-state visibility, routing lineage, and permissions when those surfaces were touched. After code edits, add or update a concise implementation log under ./doc/. Treat Session skills as durable session conventions and AdaptiveSkill content as reusable task code/procedures for repeated work; do not silently remove user-visible behavior. This task session is not resident; do not spawn additional debug/audit services unless explicitly delegated, and close or mark complete after reporting the concrete result or blocker."
-          }
-        ]
       }
     ],
     "workspace_scope": "unit",
