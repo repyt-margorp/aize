@@ -143,30 +143,15 @@ def session_agent_assignment_counts(
             "assigned_agents": 0,
         }
 
-    welcomed_agents = session.get("welcomed_agents")
-    if isinstance(welcomed_agents, list):
-        for item in welcomed_agents:
-            if not isinstance(item, dict):
-                continue
-            key = contact_key(item)
-            if not key:
-                continue
-            role = str(item.get("join_role") or "agent").strip().lower() or "agent"
-            if role == "goal_manager":
-                gm_agents.add(key)
-            else:
-                assigned_agents.add(key)
-
     replying = bool(session.get("agent_running", False)) if agent_running is None else bool(agent_running)
     if replying:
-        bound_service_id = str(session.get("service_id") or "").strip()
-        if bound_service_id:
-            assigned_agents.add(bound_service_id)
-
+        worker_key = ""
         if isinstance(worker, dict):
             worker_key = contact_key(worker)
-            if worker_key:
-                assigned_agents.add(worker_key)
+        if not worker_key:
+            worker_key = str(session.get("service_id") or "").strip()
+        if worker_key:
+            assigned_agents.add(worker_key)
 
     gm_state = str(goal_manager_state or "").strip().lower()
     if isinstance(goal_manager_worker, dict):
@@ -614,13 +599,6 @@ def build_worker_count_summary(
                 goal_manager_reviewers[provider].add(service_id)
             else:
                 assigned_slots[provider].add(service_id)
-
-        assignment_contacts = talk.get("agent_contacts") if isinstance(talk.get("agent_contacts"), list) else []
-        if not assignment_contacts:
-            assignment_contacts = talk.get("welcomed_agents") if isinstance(talk.get("welcomed_agents"), list) else []
-        for item in assignment_contacts:
-            if isinstance(item, dict):
-                track_welcomed_assignment(item)
 
         if talk.get("agent_running"):
             track_assignment(

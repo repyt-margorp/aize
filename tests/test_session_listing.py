@@ -408,10 +408,10 @@ class SessionListingTests(unittest.TestCase):
             goal_manager_state="running",
         )
 
-        self.assertEqual(counts["assigned_agents"], 2)
-        self.assertEqual(counts["goal_manager_reviewers"], 2)
+        self.assertEqual(counts["assigned_agents"], 1)
+        self.assertEqual(counts["goal_manager_reviewers"], 1)
 
-    def test_session_agent_assignment_counts_include_idle_assignments(self) -> None:
+    def test_session_agent_assignment_counts_ignore_idle_historical_contacts(self) -> None:
         counts = session_agent_assignment_counts(
             {
                 "service_id": "service-codex-001",
@@ -427,8 +427,8 @@ class SessionListingTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(counts["assigned_agents"], 2)
-        self.assertEqual(counts["goal_manager_reviewers"], 1)
+        self.assertEqual(counts["assigned_agents"], 0)
+        self.assertEqual(counts["goal_manager_reviewers"], 0)
 
 
 if __name__ == "__main__":
