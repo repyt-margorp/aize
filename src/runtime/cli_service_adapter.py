@@ -754,6 +754,10 @@ def run_http_service(
                     continue
                 if not session_has_active_in_progress_goal(session):
                     continue
+                if active_agent_turn_state(
+                    get_user_history(runtime_root, username=username, session_id=session_id)
+                ):
+                    continue
                 goal_manager = persisted_goal_manager_runtime_state(
                     runtime_root,
                     username=username,
@@ -1134,6 +1138,12 @@ def run_http_service(
             )
             scope_key = f"{username}::{session_id}"
             active_turn = active_turns_snap.get(scope_key)
+            if active_turn is None:
+                history_active_turn = active_agent_turn_state(
+                    get_user_history(runtime_root, username=username, session_id=session_id)
+                )
+                if history_active_turn is not None:
+                    active_turn = dict(history_active_turn)
             active_goal_audit = active_audits_snap.get(scope_key)
             bound_service_id = str(session.get("service_id") or "").strip()
             active_service_id = str((active_turn or {}).get("service_id") or "").strip()
