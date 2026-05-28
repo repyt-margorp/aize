@@ -143,7 +143,7 @@ class SessionTemplateLauncherTests(unittest.TestCase):
         self.assertEqual(template["launcher"]["schedule"]["daily_time"], "05:42")
         self.assertTrue(bool(template["launcher"]["schedule"]["enabled"]))
 
-    def test_catalog_can_hide_private_units_without_breaking_direct_launch_lookup(self) -> None:
+    def test_public_catalog_includes_entrance_and_development_units(self) -> None:
         with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
             public_templates = list_launchable_session_templates(
                 default_provider="codex",
@@ -154,10 +154,19 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                 "aize-development.bug-hunting",
                 default_provider="codex",
             )
+            entrance_unit = get_launchable_session_template(
+                "entrance.service",
+                default_provider="codex",
+                include_private=False,
+            )
 
-        self.assertEqual(public_ids, {"entrance.service"})
-        self.assertNotIn("aize-development.bug-hunting", public_ids)
+        self.assertIn("entrance.service", public_ids)
+        self.assertIn("aize-development.bug-hunting", public_ids)
         self.assertEqual(development_unit["template_id"], "aize-development.bug-hunting")
+        self.assertEqual(development_unit["display_name"], "AIze Development")
+        self.assertEqual(development_unit["unit_class"], "service")
+        self.assertEqual(development_unit["instance_policy"], "singleton")
+        self.assertEqual(entrance_unit["template_id"], "entrance.service")
 
     def test_launch_session_template_creates_configured_child_session(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -210,6 +219,51 @@ class SessionTemplateLauncherTests(unittest.TestCase):
             self.assertIsNotNone(unit_state)
             assert unit_state is not None
             self.assertEqual(unit_state["last_session_id"], str(session["session_id"]))
+
+    def test_aize_development_unit_reuses_singleton_session(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            runtime_root = Path(runtime_dir)
+            ensure_state(runtime_root)
+            entrance = create_conversation_session(runtime_root, username="repyt", label="Entrance")
+            with patch.dict("os.environ", {"AIZE_PLUGIN_ROOTS": str(ROOT / "plugins")}):
+                unit = get_launchable_session_template(
+                    "aize-development.bug-hunting",
+                    default_provider="codex",
+                    include_private=False,
+                )
+                first = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=unit,
+                )
+                second = launch_session_template(
+                    runtime_root,
+                    username="repyt",
+                    parent_session_id=str(entrance["session_id"]),
+                    app=unit,
+                )
+
+            first_session_id = str(first["session"]["session_id"])
+            second_session_id = str(second["session"]["session_id"])
+            self.assertEqual(first_session_id, second_session_id)
+            self.assertFalse(bool(first["launch_plan"].get("reused_existing_session")))
+            self.assertTrue(bool(second["launch_plan"].get("reused_existing_session")))
+            stored = get_session_settings(runtime_root, username="repyt", session_id=first_session_id)
+            self.assertIsNotNone(stored)
+            assert stored is not None
+            self.assertEqual(stored["label"], "AIze Development")
+            self.assertEqual(stored["launcher_unit_id"], "aize-development.bug-hunting")
+            self.assertEqual(stored["launcher_unit_class"], "service")
+            self.assertEqual(stored["launcher_instance_policy"], "singleton")
+            unit_state = get_registered_unit_state(
+                runtime_root,
+                username="repyt",
+                unit_id="aize-development.bug-hunting",
+            )
+            self.assertIsNotNone(unit_state)
+            assert unit_state is not None
+            self.assertEqual(unit_state["last_session_id"], first_session_id)
 
     def test_launch_session_template_reuses_template_workspace_across_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir:
@@ -300,7 +354,9 @@ class SessionTemplateLauncherTests(unittest.TestCase):
                     app=unit,
                 )
 
-            self.assertEqual(unit["display_name"], "AIze Bug Hunting")
+            self.assertEqual(unit["display_name"], "AIze Development")
+            self.assertEqual(unit["unit_class"], "service")
+            self.assertEqual(unit["instance_policy"], "singleton")
             self.assertEqual(unit["launcher"]["workspace_scope"], "unit")
             self.assertEqual(unit["launcher"]["resident_parent_session_id"], "default")
             self.assertEqual(unit["launcher"]["session_group"], "root")

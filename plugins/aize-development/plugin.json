@@ -3,5 +3,5 @@
   "package_id": "aize-development",
   "display_name": "AIze Development",
   "description": "Development-focused units for bug hunting, refactoring, and message-system work.",
-  "catalog_visibility": "private"
+  "catalog_visibility": "public"
 }

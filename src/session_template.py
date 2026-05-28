@@ -42,6 +42,7 @@ POOL_TOKENS = {"codex_pool": "codex", "claude_pool": "claude", "gemini_pool": "g
 WORKSPACE_SCOPES = {"none", "unit", "app"}
 SCHEDULE_KINDS = {"daily", "interval"}
 SCHEDULE_RETRY_AFTER_SECONDS = 60
+SINGLETON_INSTANCE_POLICIES = {"singleton", "single", "mono"}
 
 
 def _ensure_resident_parent_session(
@@ -138,6 +139,70 @@ def _ensure_session_parent_link(
         parent_session_id=normalized_parent_session_id,
         child_session_id=normalized_session_id,
     )
+
+
+def _normalize_instance_policy(value: Any) -> str:
+    policy = str(value or "multi").strip().lower() or "multi"
+    if policy in SINGLETON_INSTANCE_POLICIES:
+        return "singleton"
+    return policy
+
+
+def _session_matches_unit(session: dict[str, Any], *, template_id: str, unit_id: str) -> bool:
+    expected = {item for item in {str(template_id or "").strip(), str(unit_id or "").strip()} if item}
+    if not expected:
+        return False
+    return (
+        str(session.get("launcher_template_id") or "").strip() in expected
+        or str(session.get("launcher_unit_id") or "").strip() in expected
+    )
+
+
+def _find_existing_singleton_session(
+    runtime_root: Path,
+    *,
+    username: str,
+    template_id: str,
+    unit_id: str,
+) -> dict[str, Any] | None:
+    normalized_username = normalize_username(username)
+    state = get_registered_session_template_state(
+        runtime_root,
+        username=normalized_username,
+        template_id=template_id,
+    )
+    if isinstance(state, dict):
+        last_session_id = str(state.get("last_session_id") or "").strip()
+        if last_session_id:
+            session = get_session_settings(
+                runtime_root,
+                username=normalized_username,
+                session_id=last_session_id,
+            )
+            if isinstance(session, dict) and _session_matches_unit(
+                session,
+                template_id=template_id,
+                unit_id=unit_id,
+            ):
+                return session
+
+    candidates = [
+        session
+        for session in list_sessions(runtime_root, username=normalized_username)
+        if isinstance(session, dict)
+        and _session_matches_unit(session, template_id=template_id, unit_id=unit_id)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            str(item.get("updated_at") or ""),
+            str(item.get("created_at") or ""),
+            str(item.get("session_id") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
 
 
 def _repair_registered_template_lineage(
@@ -693,7 +758,7 @@ def normalize_session_template_descriptor(descriptor: dict[str, Any], *, default
                 priority_item["session_slot"] = "interactive_agent"
     default_label = str(launcher.get("default_label") or descriptor.get("display_name") or template_id).strip() or template_id
     unit_kind = str(descriptor.get("unit_kind") or descriptor.get("kind") or "session").strip().lower() or "session"
-    instance_policy = str(descriptor.get("instance_policy") or launcher.get("instance_policy") or "multi").strip().lower() or "multi"
+    instance_policy = _normalize_instance_policy(descriptor.get("instance_policy") or launcher.get("instance_policy") or "multi")
     interfaces = dict(descriptor.get("interfaces") or {})
     if str(launcher.get("ui_url") or "").strip() and "web" not in interfaces:
         interfaces["web"] = str(launcher.get("ui_url") or "").strip()
@@ -831,16 +896,33 @@ def list_registered_unit_states(runtime_root: Path) -> list[dict[str, Any]]:
     return list_registered_session_template_states(runtime_root)
 
 
-def get_launchable_session_template(template_id: str, *, default_provider: str) -> dict[str, Any]:
+def get_launchable_session_template(
+    template_id: str,
+    *,
+    default_provider: str,
+    include_private: bool = True,
+) -> dict[str, Any]:
     normalized_template_id = str(template_id or "").strip()
-    for app in list_launchable_session_templates(default_provider=default_provider):
+    for app in list_launchable_session_templates(
+        default_provider=default_provider,
+        include_private=include_private,
+    ):
         if app["template_id"] == normalized_template_id:
             return app
     raise KeyError(normalized_template_id)
 
 
-def get_launchable_unit(unit_id: str, *, default_provider: str) -> dict[str, Any]:
-    return get_launchable_session_template(unit_id, default_provider=default_provider)
+def get_launchable_unit(
+    unit_id: str,
+    *,
+    default_provider: str,
+    include_private: bool = True,
+) -> dict[str, Any]:
+    return get_launchable_session_template(
+        unit_id,
+        default_provider=default_provider,
+        include_private=include_private,
+    )
 
 
 def get_registered_unit_state(runtime_root: Path, *, username: str, unit_id: str) -> dict[str, Any] | None:
@@ -931,6 +1013,98 @@ def launch_session_template(
     goal_completion_policy = str(launcher.get("goal_completion_policy") or "standard").strip().lower()
     if goal_completion_policy not in {"standard", "continuous", "per_prompt"}:
         goal_completion_policy = "standard"
+
+    template_id = str(app.get("template_id") or app.get("unit_id") or "").strip()
+    unit_id = str(app.get("unit_id") or template_id).strip()
+    instance_policy = _normalize_instance_policy(app.get("instance_policy") or "")
+    if instance_policy == "singleton":
+        existing_session = _find_existing_singleton_session(
+            runtime_root,
+            username=normalized_username,
+            template_id=template_id,
+            unit_id=unit_id,
+        )
+        if isinstance(existing_session, dict):
+            session_id = str(existing_session.get("session_id") or "").strip()
+            workspace_path = str(existing_session.get("workspace_path") or "").strip()
+            if workspace_scope == "unit" and not workspace_path:
+                workspace_path = str(
+                    ensure_session_template_workspace(
+                        runtime_root,
+                        username=normalized_username,
+                        template_id=template_id,
+                        display_name=str(app.get("display_name") or ""),
+                        plugin_id=str(app.get("plugin_id") or ""),
+                        session_id=session_id,
+                    )
+                )
+            update_registered_session_template_state(
+                runtime_root,
+                username=normalized_username,
+                template_id=template_id,
+                updates={
+                    "unit_id": unit_id,
+                    "display_name": str(app.get("display_name") or unit_id or template_id).strip(),
+                    "package_id": str(app.get("package_id") or app.get("plugin_id") or "").strip(),
+                    "plugin_id": str(app.get("plugin_id") or "").strip(),
+                    "workspace_path": workspace_path,
+                    "last_session_id": session_id,
+                    "last_parent_session_id": str(existing_session.get("parent_session_id") or parent_session_id or "").strip(),
+                },
+            )
+            update_session_goal_flags(
+                runtime_root,
+                username=normalized_username,
+                session_id=session_id,
+                preferred_provider=effective_provider,
+            )
+            update_session_selected_agents(
+                runtime_root,
+                username=normalized_username,
+                session_id=session_id,
+                selected_agents=effective_agents,
+            )
+            update_session_skills(
+                runtime_root,
+                username=normalized_username,
+                session_id=session_id,
+                session_skills=session_skills,
+            )
+            update_session_launcher_profile(
+                runtime_root,
+                username=normalized_username,
+                session_id=session_id,
+                launcher_template_id=template_id,
+                launcher_display_name=str(app.get("display_name") or ""),
+                preferred_provider=effective_provider,
+                selected_agents=effective_agents,
+                service_targets=_service_targets(effective_agents, preferred_provider=effective_provider),
+                launcher_unit_kind=str(app.get("unit_kind") or app.get("kind") or "").strip().lower(),
+                launcher_unit_class=str(app.get("unit_class") or "").strip().lower(),
+                launcher_instance_policy=instance_policy,
+                workspace_scope=workspace_scope,
+                workspace_path=workspace_path,
+                goal_completion_policy=goal_completion_policy,
+            )
+            updated_session = (
+                get_session_settings(runtime_root, username=normalized_username, session_id=session_id)
+                or existing_session
+            )
+            return {
+                "app": app,
+                "unit": app,
+                "session": updated_session,
+                "launch_plan": {
+                    "preferred_provider": effective_provider,
+                    "selected_agents": effective_agents,
+                    "service_targets": _service_targets(effective_agents, preferred_provider=effective_provider),
+                    "initial_prompt": "",
+                    "workspace_scope": workspace_scope,
+                    "workspace_path": workspace_path,
+                    "auto_send_initial_prompt": False,
+                    "reused_existing_session": True,
+                },
+            }
 
     if mode == "create_session":
         session = create_conversation_session(
