@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlencode, urlsplit
 from collections import defaultdict, deque
+from datetime import UTC, datetime, timedelta
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -389,7 +390,58 @@ PROVIDER_FATAL_ERROR_MARKERS = (
     "usage limit",
     "authentication",
     "unauthorized",
+    "filenotfounderror",
 )
+PROVIDER_FATAL_ERROR_MAX_AGE = timedelta(hours=2)
+
+
+def _runtime_log_dirs(runtime_root: Path) -> list[Path]:
+    candidates = [runtime_root / "logs", runtime_root / ".aize-runtime" / "logs"]
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(path)
+    return ordered
+
+
+def _record_is_recent(record: dict[str, Any]) -> bool:
+    text = str(record.get("updated_at") or record.get("ts") or "").strip()
+    if not text:
+        return False
+    try:
+        if text.endswith("Z"):
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return parsed.astimezone(UTC) >= datetime.now(UTC) - PROVIDER_FATAL_ERROR_MAX_AGE
+
+
+def _fatal_error_text_from_service_state(record: dict[str, Any]) -> str:
+    parts = [
+        record.get("error"),
+        record.get("last_error"),
+        record.get("failure_reason"),
+        record.get("status_reason"),
+    ]
+    goal_manager = record.get("goal_manager")
+    if isinstance(goal_manager, dict) and str(goal_manager.get("state") or "").strip().lower() == "failed":
+        parts.extend(
+            [
+                goal_manager.get("error"),
+                goal_manager.get("last_error"),
+                goal_manager.get("failure_reason"),
+            ]
+        )
+    return "\n".join(str(part or "") for part in parts).lower()
 
 
 def provider_has_recent_fatal_error(runtime_root: Path, *, provider: str) -> bool:
@@ -397,15 +449,49 @@ def provider_has_recent_fatal_error(runtime_root: Path, *, provider: str) -> boo
     if normalized_provider not in {"codex", "claude", "gemini"}:
         return False
     root = sessions_dir(runtime_root)
-    if not root.exists():
-        return False
-    for path in root.glob(f"*/*/services/service-{normalized_provider}-*.json"):
-        record = read_json_file(path)
-        if not isinstance(record, dict):
+    if root.exists():
+        for path in root.glob(f"*/*/services/service-{normalized_provider}-*.json"):
+            record = read_json_file(path)
+            if not isinstance(record, dict):
+                continue
+            if not _record_is_recent(record):
+                continue
+            haystack = _fatal_error_text_from_service_state(record)
+            if any(marker in haystack for marker in PROVIDER_FATAL_ERROR_MARKERS):
+                return True
+    for log_dir in _runtime_log_dirs(runtime_root):
+        if not log_dir.exists():
             continue
-        haystack = json.dumps(record, ensure_ascii=False).lower()
-        if any(marker in haystack for marker in PROVIDER_FATAL_ERROR_MARKERS):
-            return True
+        for path in sorted(log_dir.glob(f"service-{normalized_provider}-*.jsonl")):
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-40:]
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                event = record.get("event")
+                event_type = str(record.get("type") or "").strip()
+                if event_type != "service.worker_failed" and isinstance(event, dict):
+                    event_type = str(event.get("type") or "").strip()
+                if event_type != "service.worker_failed":
+                    continue
+                haystack = "\n".join(
+                    str(part or "")
+                    for part in (
+                        record.get("error"),
+                        record.get("reason"),
+                        record.get("text"),
+                        event.get("error") if isinstance(event, dict) else "",
+                        event.get("reason") if isinstance(event, dict) else "",
+                    )
+                ).lower()
+                if any(marker in haystack for marker in PROVIDER_FATAL_ERROR_MARKERS):
+                    return True
     return False
 
 
