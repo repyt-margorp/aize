@@ -84,12 +84,15 @@ from runtime.persistent_state_pkg import (
     load_codex_session,
     load_gemini_session,
     active_agent_priority,
+    active_goal_manager_priority,
     normalize_auto_compact_threshold_left_percent,
     read_json_file,
     resolve_session_agent_id,
     resolve_session,
     resolve_session_context,
+    sessions_dir,
     session_metadata_path,
+    session_goal_manager_state_path,
     session_goal_context,
     session_service_state_path,
     save_agent_audit_state,
@@ -379,6 +382,33 @@ def maybe_clear_stale_idle_agent_panic(
     )
     return True
 
+
+PROVIDER_FATAL_ERROR_MARKERS = (
+    "not logged in",
+    "monthly usage limit",
+    "usage limit",
+    "authentication",
+    "unauthorized",
+)
+
+
+def provider_has_recent_fatal_error(runtime_root: Path, *, provider: str) -> bool:
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider not in {"codex", "claude", "gemini"}:
+        return False
+    root = sessions_dir(runtime_root)
+    if not root.exists():
+        return False
+    for path in root.glob(f"*/*/services/service-{normalized_provider}-*.json"):
+        record = read_json_file(path)
+        if not isinstance(record, dict):
+            continue
+        haystack = json.dumps(record, ensure_ascii=False).lower()
+        if any(marker in haystack for marker in PROVIDER_FATAL_ERROR_MARKERS):
+            return True
+    return False
+
+
 # Source-compat snippets for HTTPBridge UI tests.
 # The concrete renderer lives in runtime.html_renderer, but these pinned excerpts
 # are kept here so the adapter source still advertises the expected UI contract.
@@ -605,6 +635,86 @@ def run_http_service(
             time.sleep(0.5)
 
     def _run_startup_state_reconcile() -> None:
+        def session_service_blocked_by_panic(*, username: str, session_id: str, service_id: str) -> bool:
+            normalized_service_id = str(service_id or "").strip()
+            if not normalized_service_id:
+                return True
+            agent_audit_state = load_agent_audit_state(
+                runtime_root,
+                service_id=normalized_service_id,
+                username=username,
+                session_id=session_id,
+            )
+            if agent_audit_state == "panic":
+                maybe_clear_stale_idle_agent_panic(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    service_id=normalized_service_id,
+                )
+                agent_audit_state = load_agent_audit_state(
+                    runtime_root,
+                    service_id=normalized_service_id,
+                    username=username,
+                    session_id=session_id,
+                )
+            return agent_audit_state == "panic"
+
+        def choose_startup_goal_manager_service(
+            *,
+            session: dict[str, Any],
+            username: str,
+            session_id: str,
+            goal_manager: dict[str, Any],
+            service_pools: dict[str, list[str]],
+            current_goal_manager_services: set[str],
+        ) -> str:
+            existing_service_id = str(goal_manager.get("service_id") or "").strip()
+            if (
+                existing_service_id in current_goal_manager_services
+                and not session_service_blocked_by_panic(
+                    username=username,
+                    session_id=session_id,
+                    service_id=existing_service_id,
+                )
+            ):
+                return existing_service_id
+            priority = active_goal_manager_priority(session.get("goal_manager_priority"), available_kinds=None)
+            if not priority:
+                preferred = str(session.get("preferred_provider") or default_provider or "codex").strip().lower() or "codex"
+                priority = [preferred]
+            for provider in priority:
+                pool = [
+                    service_id
+                    for service_id in service_pools.get(str(provider or "").strip().lower(), [])
+                    if not session_service_blocked_by_panic(
+                        username=username,
+                        session_id=session_id,
+                        service_id=service_id,
+                    )
+                ]
+                if not pool:
+                    continue
+                leased = lease_session_service(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    pool_service_ids=pool,
+                )
+                if not leased:
+                    continue
+                join_session_agent(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    service_id=leased,
+                    provider=str(provider),
+                    role="goal_manager",
+                    transport="startup_queue_reconcile",
+                )
+                return str(leased)
+            return ""
+
         write_jsonl(
             log_path,
             {
@@ -619,7 +729,22 @@ def run_http_service(
             _wait_for_startup_llm_pool_ready()
             release_stale_session_bindings()
             current_codex_pool, current_claude_pool, current_gemini_pool, _ = current_llm_service_topology()
-            current_goal_manager_services = set(current_codex_pool) | set(current_claude_pool) | set(current_gemini_pool)
+            service_pools_by_provider = {
+                "codex": []
+                if provider_has_recent_fatal_error(runtime_root, provider="codex")
+                else current_codex_pool,
+                "claude": []
+                if provider_has_recent_fatal_error(runtime_root, provider="claude")
+                else current_claude_pool,
+                "gemini": []
+                if provider_has_recent_fatal_error(runtime_root, provider="gemini")
+                else current_gemini_pool,
+            }
+            current_goal_manager_services = {
+                service_id
+                for pool in service_pools_by_provider.values()
+                for service_id in pool
+            }
             for session in list_all_sessions_with_users(runtime_root):
                 if not isinstance(session, dict):
                     continue
@@ -643,7 +768,14 @@ def run_http_service(
                     else []
                 )
                 if goal_manager_state == "queued" and goal_manager_pending_work_items:
-                    target_goal_manager_service_id = str(goal_manager.get("service_id") or "").strip()
+                    target_goal_manager_service_id = choose_startup_goal_manager_service(
+                        session=session,
+                        username=username,
+                        session_id=session_id,
+                        goal_manager=goal_manager,
+                        service_pools=service_pools_by_provider,
+                        current_goal_manager_services=current_goal_manager_services,
+                    )
                     if target_goal_manager_service_id in current_goal_manager_services:
                         if not load_goal_manager_pending_inputs(
                             runtime_root,
@@ -658,6 +790,20 @@ def run_http_service(
                                         session_id=session_id,
                                         entry=dict(item),
                                     )
+                        repaired_goal_manager_state = dict(goal_manager)
+                        repaired_goal_manager_state["state"] = "queued"
+                        repaired_goal_manager_state["service_id"] = target_goal_manager_service_id
+                        repaired_goal_manager_state["updated_at"] = utc_ts()
+                        if target_goal_manager_service_id != str(goal_manager.get("service_id") or "").strip():
+                            repaired_goal_manager_state.pop("error", None)
+                        write_json_file(
+                            session_goal_manager_state_path(
+                                runtime_root,
+                                username=username,
+                                session_id=session_id,
+                            ),
+                            repaired_goal_manager_state,
+                        )
                         dispatch_message = make_dispatch_pending_message(
                             manifest=manifest,
                             from_service_id=self_service["service_id"],
@@ -1107,9 +1253,36 @@ def run_http_service(
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
 
+        def service_blocked_by_panic(service_id: str | None) -> bool:
+            normalized_service_id = str(service_id or "").strip()
+            if not normalized_service_id:
+                return True
+            agent_audit_state = load_agent_audit_state(
+                runtime_root,
+                service_id=normalized_service_id,
+                username=username,
+                session_id=session_id,
+            )
+            if agent_audit_state == "panic":
+                maybe_clear_stale_idle_agent_panic(
+                    runtime_root,
+                    username=username,
+                    session_id=session_id,
+                    service_id=normalized_service_id,
+                )
+                agent_audit_state = load_agent_audit_state(
+                    runtime_root,
+                    service_id=normalized_service_id,
+                    username=username,
+                    session_id=session_id,
+                )
+            return agent_audit_state == "panic"
+
         def joined(service_id: str | None, *, provider: str = "") -> str | None:
             normalized_service_id = str(service_id or "").strip()
             if not normalized_service_id:
+                return None
+            if service_blocked_by_panic(normalized_service_id):
                 return None
             resolved_provider = provider
             if not resolved_provider:
@@ -1119,6 +1292,8 @@ def run_http_service(
                     resolved_provider = "claude"
                 elif normalized_service_id in current_gemini_service_pool:
                     resolved_provider = "gemini"
+            if provider_blocked.get(str(resolved_provider or "").strip().lower(), False):
+                return None
             join_session_agent(
                 runtime_root,
                 username=username,
@@ -1136,6 +1311,20 @@ def run_http_service(
             if str(item).strip()
         ]
         all_local_service_ids = set(current_codex_service_pool) | set(current_claude_service_pool) | set(current_gemini_service_pool)
+        provider_blocked = {
+            "codex": provider_has_recent_fatal_error(runtime_root, provider="codex"),
+            "claude": provider_has_recent_fatal_error(runtime_root, provider="claude"),
+            "gemini": provider_has_recent_fatal_error(runtime_root, provider="gemini"),
+        }
+        usable_codex_service_pool = [
+            service_id for service_id in current_codex_service_pool if not service_blocked_by_panic(service_id)
+        ] if not provider_blocked["codex"] else []
+        usable_claude_service_pool = [
+            service_id for service_id in current_claude_service_pool if not service_blocked_by_panic(service_id)
+        ] if not provider_blocked["claude"] else []
+        usable_gemini_service_pool = [
+            service_id for service_id in current_gemini_service_pool if not service_blocked_by_panic(service_id)
+        ] if not provider_blocked["gemini"] else []
         has_local = any(
             service_id in {"codex_pool", "claude_pool", "gemini_pool"} or service_id in all_local_service_ids
             for service_id in selected_agents_cfg
@@ -1174,24 +1363,28 @@ def run_http_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
-                    pool_service_ids=current_codex_service_pool,
+                    pool_service_ids=usable_codex_service_pool,
                 ), provider="codex")
             if "claude_pool" in selected_agents_cfg:
                 return joined(lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
-                    pool_service_ids=current_claude_service_pool,
+                    pool_service_ids=usable_claude_service_pool,
                 ), provider="claude")
             if "gemini_pool" in selected_agents_cfg:
                 return joined(lease_session_service(
                     runtime_root,
                     username=username,
                     session_id=session_id,
-                    pool_service_ids=current_gemini_service_pool,
+                    pool_service_ids=usable_gemini_service_pool,
                 ), provider="gemini")
 
-            selected_local = [service_id for service_id in selected_agents_cfg if service_id in all_local_service_ids]
+            selected_local = [
+                service_id
+                for service_id in selected_agents_cfg
+                if service_id in all_local_service_ids and not service_blocked_by_panic(service_id)
+            ]
             if selected_local:
                 return joined(lease_session_service(
                     runtime_root,
@@ -1208,9 +1401,9 @@ def run_http_service(
             agent_priority = [preferred_provider]
 
         pool_for_kind: dict[str, list[str]] = {
-            "codex": current_codex_service_pool,
-            "claude": current_claude_service_pool,
-            "gemini": current_gemini_service_pool,
+            "codex": usable_codex_service_pool,
+            "claude": usable_claude_service_pool,
+            "gemini": usable_gemini_service_pool,
         }
 
         # If already leased, keep it if it belongs to any provider in the priority list

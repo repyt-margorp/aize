@@ -14,13 +14,41 @@ from runtime.persistent_state_pkg import (
     get_session_service,
     join_session_agent,
     lease_session_service,
+    load_agent_audit_state,
     read_json_file,
     resolve_session_agent_id,
+    sessions_dir,
     session_goal_manager_state_path,
     write_json_file,
 )
 from runtime.session_view import session_has_active_in_progress_goal
 from wire.protocol import utc_ts
+
+
+PROVIDER_FATAL_ERROR_MARKERS = (
+    "not logged in",
+    "monthly usage limit",
+    "usage limit",
+    "authentication",
+    "unauthorized",
+)
+
+
+def _provider_has_recent_fatal_error(runtime_root: Path, *, provider: str) -> bool:
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider not in {"codex", "claude", "gemini"}:
+        return False
+    root = sessions_dir(runtime_root)
+    if not root.exists():
+        return False
+    for path in root.glob(f"*/*/services/service-{normalized_provider}-*.json"):
+        record = read_json_file(path)
+        if not isinstance(record, dict):
+            continue
+        haystack = str(record).lower()
+        if any(marker in haystack for marker in PROVIDER_FATAL_ERROR_MARKERS):
+            return True
+    return False
 
 
 def _dedupe_work_items(items: list[Any], new_item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -68,12 +96,38 @@ def _resolve_goal_manager_service(
         for service_ids in service_pools_by_provider.values()
         for service_id in service_ids
     }
-    if existing_state in {"running", "queued"} and existing_gm_service_id in all_pool_services:
+    def service_is_usable(service_id: str) -> bool:
+        normalized_service_id = str(service_id or "").strip()
+        if not normalized_service_id:
+            return False
+        provider = _provider_from_service_id(normalized_service_id)
+        if provider and _provider_has_recent_fatal_error(runtime_root, provider=provider):
+            return False
+        return (
+            load_agent_audit_state(
+                runtime_root,
+                service_id=normalized_service_id,
+                username=username,
+                session_id=session_id,
+            )
+            != "panic"
+        )
+
+    if (
+        existing_state in {"running", "queued"}
+        and existing_gm_service_id in all_pool_services
+        and service_is_usable(existing_gm_service_id)
+    ):
         return existing_gm_service_id
 
     bound_service_id = str(get_session_service(runtime_root, username=username, session_id=session_id) or "").strip()
     bound_provider = _provider_from_service_id(bound_service_id)
-    if bound_service_id and bound_provider and bound_service_id in service_pools_by_provider.get(bound_provider, []):
+    if (
+        bound_service_id
+        and bound_provider
+        and bound_service_id in service_pools_by_provider.get(bound_provider, [])
+        and service_is_usable(bound_service_id)
+    ):
         join_session_agent(
             runtime_root,
             username=username,
@@ -90,7 +144,11 @@ def _resolve_goal_manager_service(
         preferred = str(session.get("preferred_provider") or default_provider or "codex").strip().lower() or "codex"
         priority = [preferred]
     for provider in priority:
-        pool = service_pools_by_provider.get(str(provider or "").strip().lower(), [])
+        pool = [
+            service_id
+            for service_id in service_pools_by_provider.get(str(provider or "").strip().lower(), [])
+            if service_is_usable(service_id)
+        ]
         if not pool:
             continue
         leased = lease_session_service(
