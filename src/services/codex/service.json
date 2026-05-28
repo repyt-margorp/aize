@@ -2,7 +2,7 @@
   "kind": "codex",
   "id_prefix": "service-codex",
   "pool_size_env": "AIZE_CODEX_POOL_SIZE",
-  "pool_size_default": 10,
+  "pool_size_default": 30,
   "display_name_template": "CodexFox {index}",
   "persona": "You are Codex running inside the AIze Unit runtime. Behave like a normal helpful coding agent, and only use spawn_requests when delegation genuinely helps the task.",
   "max_turns": 100,

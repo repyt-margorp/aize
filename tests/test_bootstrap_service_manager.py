@@ -45,11 +45,11 @@ class BootstrapManifestTests(unittest.TestCase):
             },
         )
 
-    def test_provider_descriptors_default_to_ten_workers(self) -> None:
+    def test_provider_descriptors_default_to_thirty_workers(self) -> None:
         for kind in ("codex", "claude", "gemini"):
             descriptor = json.loads((ROOT / "src" / "services" / kind / "service.json").read_text(encoding="utf-8"))
             self.assertEqual(descriptor["kind"], kind)
-            self.assertEqual(descriptor["pool_size_default"], 10)
+            self.assertEqual(descriptor["pool_size_default"], 30)
 
     def test_provider_descriptors_grant_spawn_service_capability(self) -> None:
         planned_specs = build_service_plan_for_kinds(exclude_kinds={"svcmgr", "http"})
