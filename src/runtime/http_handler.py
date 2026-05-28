@@ -137,6 +137,25 @@ from wire.protocol import (
     write_jsonl,
 )
 
+
+def _bootstrap_needed_without_blocking_state_lock(runtime_root: Path) -> bool:
+    """Best-effort login-page bootstrap check that never waits on persistent.lock."""
+    persistent_path = runtime_root.parent / ".aize-state" / "persistent.json"
+    if runtime_root.name != ".aize-runtime":
+        persistent_path = runtime_root / ".aize-state" / "persistent.json"
+    try:
+        state = json.loads(persistent_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return True
+    users = state.get("users")
+    if not isinstance(users, dict):
+        return True
+    return not any(
+        isinstance(record, dict) and not bool(record.get("system_account"))
+        for record in users.values()
+    )
+
+
 DEFAULT_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 100
 MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT = 5000
 DEFAULT_RUNTIME_JOURNAL_LIMIT = 200
@@ -3590,7 +3609,7 @@ def make_handler(
                     if req_session_id
                     else ""
                 )
-                bootstrap_needed = not has_users(runtime_root)
+                bootstrap_needed = _bootstrap_needed_without_blocking_state_lock(runtime_root)
                 self._html(200, render_login_page(
                     display_name=str(self_service["display_name"]),
                     bootstrap_needed=bootstrap_needed,
