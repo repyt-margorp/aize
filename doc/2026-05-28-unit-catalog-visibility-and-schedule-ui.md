@@ -13,6 +13,10 @@ existence/reuse rather than repeated interval launches.
 
 AIze System Diagnostics now defaults to a 24-hour interval instead of hourly.
 
+The schedule editor now suppresses its own periodic re-render while a user is
+editing its inputs, so the 15-second Unit catalog refresh cannot erase an in-flight
+hourly cadence edit before the user presses Save Schedule.
+
 ## Files Touched
 
 - `src/runtime/http_handler.py`

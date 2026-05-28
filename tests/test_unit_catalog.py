@@ -36,6 +36,7 @@ class UnitCatalogTests(unittest.TestCase):
         self.assertIn("include_private=${visibilityParam}", source)
         self.assertIn("unit-launcher-schedule-editor", source)
         self.assertIn("fetch('/units/schedule'", source)
+        self.assertIn("unitScheduleEditingUnitId", source)
 
     def test_unit_catalog_groups_launched_sessions_by_unit(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
