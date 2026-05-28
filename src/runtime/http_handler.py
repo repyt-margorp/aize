@@ -277,16 +277,16 @@ def _matching_communication_skill_routes(
     normalized_prompt = " ".join(prompt.strip().lower().split())
     session_skills = session.get("session_skills", []) if isinstance(session.get("session_skills"), list) else []
     if not session_skills:
-        launcher_unit_id = str(session.get("launcher_unit_id") or session.get("launcher_template_id") or "").strip()
+        launcher_unit_id = str(session.get("launcher_unit_id") or "").strip()
         if launcher_unit_id:
             try:
-                template = get_launchable_unit(launcher_unit_id, default_provider="codex")
+                unit = get_launchable_unit(launcher_unit_id, default_provider="codex")
             except KeyError:
-                template = None
-            launcher = template.get("launcher") if isinstance(template, dict) else None
-            template_skills = launcher.get("skills") if isinstance(launcher, dict) else None
-            if isinstance(template_skills, list):
-                session_skills = template_skills
+                unit = None
+            launcher = unit.get("launcher") if isinstance(unit, dict) else None
+            unit_skills = launcher.get("skills") if isinstance(launcher, dict) else None
+            if isinstance(unit_skills, list):
+                session_skills = unit_skills
     for skill in session_skills:
         if not isinstance(skill, dict):
             continue
@@ -295,8 +295,8 @@ def _matching_communication_skill_routes(
             "forward_to_canonical_session",
             "direct_unit",
             "launch_unit",
-            "direct_session_template",
-            "launch_session_template",
+            "direct_unit_file",
+            "launch_unit_file",
             "create_child_session",
         }:
             continue
@@ -314,7 +314,7 @@ def _matching_communication_skill_routes(
             continue
         if any(tag.lower() in normalized_prompt for tag in tags):
             matches.append(skill)
-    return default_matches or matches
+    return matches or default_matches
 
 
 def _score_communication_route_parent_candidate(
@@ -322,15 +322,13 @@ def _score_communication_route_parent_candidate(
     *,
     canonical_session_key: str,
     target_label: str,
-    target_template_id: str = "",
+    target_unit_id: str = "",
 ) -> tuple[int, str, str]:
     candidate = session if isinstance(session, dict) else {}
     label = str(candidate.get("label") or "").strip().lower()
     target_label_text = str(target_label or "").strip().lower()
     parent_session_id = str(candidate.get("parent_session_id") or "").strip()
-    launcher_template_id = str(
-        candidate.get("launcher_template_id") or candidate.get("launcher_unit_id") or ""
-    ).strip()
+    launcher_unit_id = str(candidate.get("launcher_unit_id") or "").strip()
     session_group = str(candidate.get("session_group") or "").strip().lower()
     progress_state = str(
         candidate.get("goal_progress_state")
@@ -343,7 +341,7 @@ def _score_communication_route_parent_candidate(
         score += 14
     if session_group in {"root", "unit", "resident", "system"}:
         score += 12
-    if target_template_id and launcher_template_id == target_template_id:
+    if target_unit_id and launcher_unit_id == target_unit_id:
         score += 30
     if bool(candidate.get("goal_active", False)):
         score += 10
@@ -368,13 +366,11 @@ def _score_communication_route_parent_candidate(
 def _canonical_route_parent_session(
     session: dict[str, Any] | None,
     *,
-    target_template_id: str,
+    target_unit_id: str,
 ) -> bool:
     candidate = session if isinstance(session, dict) else {}
-    launcher_template_id = str(
-        candidate.get("launcher_template_id") or candidate.get("launcher_unit_id") or ""
-    ).strip()
-    if not target_template_id or launcher_template_id != target_template_id:
+    launcher_unit_id = str(candidate.get("launcher_unit_id") or "").strip()
+    if not target_unit_id or launcher_unit_id != target_unit_id:
         return False
     parent_session_id = str(candidate.get("parent_session_id") or "").strip()
     session_group = str(candidate.get("session_group") or "").strip().lower()
@@ -383,19 +379,46 @@ def _canonical_route_parent_session(
 
 def _canonical_route_unit_definition(
     *,
-    target_template_id: str,
+    target_unit_id: str,
     preferred_provider: str,
 ) -> dict[str, Any] | None:
-    normalized_template_id = str(target_template_id or "").strip()
-    if not normalized_template_id:
+    normalized_unit_id = str(target_unit_id or "").strip()
+    if not normalized_unit_id:
         return None
     try:
         return get_launchable_unit(
-            normalized_template_id,
+            normalized_unit_id,
             default_provider=str(preferred_provider or "codex").strip().lower() or "codex",
         )
     except KeyError:
         return None
+
+
+def _normalize_origin_scoped_registered_sessions(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for raw_origin_session_id, raw_session_id in value.items():
+        origin_session_id = str(raw_origin_session_id or "").strip()
+        session_id = str(raw_session_id or "").strip()
+        if origin_session_id and session_id:
+            normalized[origin_session_id] = session_id
+    return normalized
+
+
+def _registered_route_parent_session_id(
+    registered_state: dict[str, Any] | None,
+    *,
+    current_session_id: str,
+    route_parent_scope: str,
+) -> str:
+    normalized_scope = str(route_parent_scope or "").strip().lower()
+    if normalized_scope == "origin_session":
+        origin_scoped = _normalize_origin_scoped_registered_sessions(
+            (registered_state or {}).get("origin_scoped_last_session_ids")
+        )
+        return str(origin_scoped.get(current_session_id) or "").strip()
+    return str((registered_state or {}).get("last_session_id") or "").strip()
 
 
 def _sync_canonical_route_parent_session(
@@ -405,6 +428,7 @@ def _sync_canonical_route_parent_session(
     session_id: str,
     current_session_id: str,
     unit_definition: dict[str, Any] | None,
+    route_parent_scope: str = "",
 ) -> dict[str, Any] | None:
     if not unit_definition:
         return None
@@ -436,8 +460,18 @@ def _sync_canonical_route_parent_session(
             session_id=session_id,
             selected_agents=[str(item) for item in selected_agents if str(item).strip()],
         )
-    unit_id = str(unit_definition.get("unit_id") or unit_definition.get("template_id") or "").strip()
+    unit_id = str(unit_definition.get("unit_id") or "").strip()
     if unit_id:
+        registered_state = get_registered_unit_state(
+            runtime_root,
+            username=username,
+            unit_id=unit_id,
+        )
+        origin_scoped_last_session_ids = _normalize_origin_scoped_registered_sessions(
+            (registered_state or {}).get("origin_scoped_last_session_ids")
+        )
+        if str(route_parent_scope or "").strip().lower() == "origin_session" and current_session_id:
+            origin_scoped_last_session_ids[current_session_id] = session_id
         update_registered_unit_state(
             runtime_root,
             username=username,
@@ -453,6 +487,7 @@ def _sync_canonical_route_parent_session(
                     or current_session_id
                     or ""
                 ).strip(),
+                "origin_scoped_last_session_ids": origin_scoped_last_session_ids,
             },
         )
     return get_session_settings(runtime_root, username=username, session_id=session_id)
@@ -466,7 +501,7 @@ def _resolve_communication_route_parent_session_id(
     current_session_id: str,
     canonical_session_key: str,
     target_label: str = "",
-    target_template_id: str = "",
+    target_unit_id: str = "",
     route_parent_scope: str = "",
 ) -> str | None:
     normalized_key = str(canonical_session_key or "").strip()
@@ -491,13 +526,13 @@ def _resolve_communication_route_parent_session_id(
         )
     ]
     candidates = [session for session in candidates if _matches_origin_scope(session)]
-    if target_template_id:
+    if target_unit_id:
         canonical_candidates = [
             session
             for session in candidates
             if _canonical_route_parent_session(
                 session,
-                target_template_id=target_template_id,
+                target_unit_id=target_unit_id,
             )
         ]
         if not canonical_candidates:
@@ -508,17 +543,21 @@ def _resolve_communication_route_parent_session_id(
                 and _matches_origin_scope(session)
                 and _canonical_route_parent_session(
                     session,
-                    target_template_id=target_template_id,
+                    target_unit_id=target_unit_id,
                 )
             ]
         candidates = canonical_candidates
-    if not candidates and target_template_id:
+    if not candidates and target_unit_id:
         registered_state = get_registered_unit_state(
             runtime_root,
             username=username,
-            unit_id=target_template_id,
+            unit_id=target_unit_id,
         )
-        registered_session_id = str((registered_state or {}).get("last_session_id") or "").strip()
+        registered_session_id = _registered_route_parent_session_id(
+            registered_state,
+            current_session_id=current_session_id,
+            route_parent_scope=route_parent_scope,
+        )
         if registered_session_id and registered_session_id != current_session_id:
             registered_session = get_session_settings(
                 runtime_root,
@@ -527,7 +566,7 @@ def _resolve_communication_route_parent_session_id(
             )
             if _canonical_route_parent_session(
                 registered_session,
-                target_template_id=target_template_id,
+                target_unit_id=target_unit_id,
             ) and _matches_origin_scope(registered_session):
                 return registered_session_id
         return None
@@ -539,7 +578,7 @@ def _resolve_communication_route_parent_session_id(
                 session,
                 canonical_session_key=normalized_key,
                 target_label=target_label,
-                target_template_id=target_template_id,
+                target_unit_id=target_unit_id,
             ),
             session,
         )
@@ -547,13 +586,17 @@ def _resolve_communication_route_parent_session_id(
     ]
     ranked = sorted(scored, key=lambda item: item[0], reverse=True)
     if len(ranked) > 1 and ranked[0][0][:2] == ranked[1][0][:2]:
-        if target_template_id:
+        if target_unit_id:
             registered_state = get_registered_unit_state(
                 runtime_root,
                 username=username,
-                unit_id=target_template_id,
+                unit_id=target_unit_id,
             )
-            registered_session_id = str((registered_state or {}).get("last_session_id") or "").strip()
+            registered_session_id = _registered_route_parent_session_id(
+                registered_state,
+                current_session_id=current_session_id,
+                route_parent_scope=route_parent_scope,
+            )
             ranked_ids = {str(item[1].get("session_id") or "").strip() for item in ranked}
             registered_session = (
                 get_session_settings(
@@ -594,8 +637,8 @@ def _infer_communication_forward_target_session_id(
             "create_child_session",
             "direct_unit",
             "launch_unit",
-            "direct_session_template",
-            "launch_session_template",
+            "direct_unit_file",
+            "launch_unit_file",
         }:
             continue
         target_session_id = str(route.get("target_session_id") or "").strip()
@@ -611,9 +654,7 @@ def _infer_communication_forward_target_session_id(
             current_session_id=current_session_id,
             canonical_session_key=canonical_session_key,
             target_label=str(route.get("target_label") or "").strip(),
-            target_template_id=str(
-                route.get("target_unit_id") or route.get("target_template_id") or ""
-            ).strip(),
+            target_unit_id=str(route.get("target_unit_id") or "").strip(),
             route_parent_scope=str(route.get("route_parent_scope") or "").strip(),
         )
         if resolved_parent_session_id:
@@ -641,19 +682,17 @@ def _materialize_communication_routed_child_session(
         target_label = str(route.get("target_label") or "").strip()
         target_goal_text = str(route.get("target_goal_text") or "").strip()
         target_child_label = str(route.get("target_child_label") or "").strip()
-        direct_route = routing_mode in {"direct_unit", "launch_unit", "direct_session_template", "launch_session_template"}
+        direct_route = routing_mode in {"direct_unit", "launch_unit", "direct_unit_file", "launch_unit_file"}
         should_create = routing_mode == "create_child_session"
         should_create = should_create or bool(target_label) or bool(target_goal_text)
         if not should_create and not direct_route:
             continue
         canonical_session_key = str(route.get("canonical_session_key") or "").strip()
         parent_session_id = current_session_id
-        target_template_id = str(
-            route.get("target_unit_id") or route.get("target_template_id") or ""
-        ).strip()
+        target_unit_id = str(route.get("target_unit_id") or "").strip()
         preferred_provider = str(route.get("preferred_provider") or "").strip().lower() or "codex"
         canonical_unit = _canonical_route_unit_definition(
-            target_template_id=target_template_id,
+            target_unit_id=target_unit_id,
             preferred_provider=preferred_provider,
         )
         canonical_parent_goal_text = str(
@@ -667,7 +706,7 @@ def _materialize_communication_routed_child_session(
                 current_session_id=current_session_id,
                 canonical_session_key=canonical_session_key,
                 target_label=target_label,
-                target_template_id=target_template_id,
+                target_unit_id=target_unit_id,
                 route_parent_scope=str(route.get("route_parent_scope") or "").strip(),
             )
             if resolved_parent_session_id:
@@ -679,7 +718,7 @@ def _materialize_communication_routed_child_session(
                     if isinstance(stored, dict):
                         return stored
                 parent_session_id = resolved_parent_session_id
-        target_template_id = target_template_id if direct_route or parent_session_id == current_session_id else ""
+        target_unit_id = target_unit_id if direct_route or parent_session_id == current_session_id else ""
         if parent_session_id != current_session_id and canonical_unit:
             _sync_canonical_route_parent_session(
                 runtime_root,
@@ -687,33 +726,39 @@ def _materialize_communication_routed_child_session(
                 session_id=parent_session_id,
                 current_session_id=current_session_id,
                 unit_definition=canonical_unit,
+                route_parent_scope=str(route.get("route_parent_scope") or "").strip(),
             )
-        if target_template_id:
+        if target_unit_id:
             selected_agents = [
                 str(item).strip()
                 for item in route.get("selected_agents", [])
                 if str(item).strip()
             ] if isinstance(route.get("selected_agents"), list) else None
-            template = canonical_unit
-            if isinstance(template, dict):
-                template_for_launch = dict(template)
-                launcher = dict(template_for_launch.get("launcher") or {})
+            unit_definition = canonical_unit
+            if isinstance(unit_definition, dict):
+                unit_for_launch = dict(unit_definition)
+                launcher = dict(unit_for_launch.get("launcher") or {})
                 if direct_route and not (
                     str(launcher.get("resident_parent_session_id") or "").strip()
                     or str(launcher.get("parent_unit_id") or "").strip()
                 ):
                     launcher["mode"] = "create_session"
-                template_for_launch["launcher"] = launcher
+                unit_for_launch["launcher"] = launcher
                 launched = launch_unit(
                     runtime_root,
                     username=username,
                     parent_session_id=parent_session_id,
-                    app=template_for_launch,
+                    unit=unit_for_launch,
                     label=target_label or None,
                     goal_text=(prompt_text if direct_route else canonical_parent_goal_text) or None,
                     preferred_provider=preferred_provider,
                     selected_agents=selected_agents,
                     origin_session_id=current_session_id,
+                    singleton_origin_session_id=(
+                        current_session_id
+                        if str(route.get("route_parent_scope") or "").strip().lower() == "origin_session"
+                        else None
+                    ),
                 )
                 session = launched.get("session") if isinstance(launched, dict) else None
                 if isinstance(session, dict):
@@ -723,7 +768,8 @@ def _materialize_communication_routed_child_session(
                             username=username,
                             session_id=str(session.get("session_id") or "").strip(),
                             current_session_id=current_session_id,
-                            unit_definition=template,
+                            unit_definition=unit_definition,
+                            route_parent_scope=str(route.get("route_parent_scope") or "").strip(),
                         )
                     if direct_route:
                         return (
@@ -835,7 +881,7 @@ def _materialize_communication_routed_child_session(
             label=target_child_label or ("Development Task" if parent_session_id != current_session_id else target_label) or "Delegated Session",
             goal_text=prompt_text if parent_session_id != current_session_id else target_goal_text,
             created_by_username=username,
-            created_by_type="unit" if parent_session_id != current_session_id and target_template_id else "user",
+            created_by_type="unit" if parent_session_id != current_session_id and target_unit_id else "user",
             origin_session_id=current_session_id,
             origin_goal_id=str(
                 current_session.get("active_goal_id")
@@ -847,7 +893,7 @@ def _materialize_communication_routed_child_session(
             communication_agent_enabled=bool(route.get("communication_agent_enabled", False)),
             session_skills=child_skills if isinstance(child_skills, list) else None,
             requester_session_id=parent_session_id,
-            requester_template_id=target_template_id or None,
+            requester_unit_id=target_unit_id or None,
         )
         if child:
             child_session_id = str(child.get("session_id") or "").strip()
@@ -1277,6 +1323,26 @@ def _build_scheduled_auto_resume_xml(
     )
 
 
+def _unit_with_schedule_override(unit: dict[str, Any], unit_state: dict[str, Any] | None) -> dict[str, Any]:
+    override = dict((unit_state or {}).get("schedule_override") or {})
+    if not override:
+        return unit
+    cloned = dict(unit)
+    launcher = dict(cloned.get("launcher") or {})
+    schedule = dict(launcher.get("schedule") or {})
+    schedule.update(override)
+    if str(schedule.get("kind") or "").strip().lower() == "interval":
+        try:
+            every_hours = int(schedule.get("every_hours") or schedule.get("interval_hours") or 24)
+        except (TypeError, ValueError):
+            every_hours = 24
+        schedule["every_hours"] = max(1, min(every_hours, 24 * 30))
+        schedule["summary"] = f"every {schedule['every_hours']}h"
+    launcher["schedule"] = schedule
+    cloned["launcher"] = launcher
+    return cloned
+
+
 def _process_due_auto_resume_session(
     *,
     runtime_root: Path,
@@ -1424,14 +1490,15 @@ def _process_due_scheduled_unit_launch(
     unit: dict[str, Any],
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    template_id = str(unit.get("unit_id") or unit.get("template_id") or "").strip()
-    if not template_id:
+    unit_id = str(unit.get("unit_id") or "").strip()
+    if not unit_id:
         return None
     effective_now = (now or datetime.now(UTC)).astimezone(UTC)
-    app_state = get_registered_unit_state(runtime_root, username=username, unit_id=template_id)
-    if not isinstance(app_state, dict):
+    unit_state = get_registered_unit_state(runtime_root, username=username, unit_id=unit_id)
+    if not isinstance(unit_state, dict):
         return None
-    schedule_info = describe_unit_schedule(unit, unit_state=app_state, now=effective_now)
+    unit = _unit_with_schedule_override(unit, unit_state)
+    schedule_info = describe_unit_schedule(unit, unit_state=unit_state, now=effective_now)
     if not bool(schedule_info.get("due")):
         return None
 
@@ -1439,10 +1506,10 @@ def _process_due_scheduled_unit_launch(
         return update_registered_unit_state(
             runtime_root,
             username=username,
-            unit_id=template_id,
+            unit_id=unit_id,
             updates={
-                "display_name": str(unit.get("display_name") or template_id).strip() or template_id,
-                "unit_id": template_id,
+                "display_name": str(unit.get("display_name") or unit_id).strip() or unit_id,
+                "unit_id": unit_id,
                 "package_id": str(unit.get("package_id") or "").strip(),
                 "schedule_state": {
                     "last_checked_at": utc_ts(),
@@ -1456,7 +1523,7 @@ def _process_due_scheduled_unit_launch(
     parent_session_id = resolve_unit_launch_parent_session_id(
         runtime_root,
         username=username,
-        unit_state=app_state,
+        unit_state=unit_state,
         unit=unit,
     )
     if not parent_session_id:
@@ -1473,7 +1540,7 @@ def _process_due_scheduled_unit_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "template_id": template_id,
+                "unit_id": unit_id,
                 "error": "parent_session_not_found",
             },
         )
@@ -1499,7 +1566,7 @@ def _process_due_scheduled_unit_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "template_id": template_id,
+                "unit_id": unit_id,
                 "preferred_provider": preferred_provider,
                 "reason": "no_running_worker",
                 "retry_not_before_at": retry_not_before_at,
@@ -1514,7 +1581,7 @@ def _process_due_scheduled_unit_launch(
             runtime_root,
             username=username,
             parent_session_id=parent_session_id,
-            app=unit,
+            unit=unit,
             label=launch_label,
             initial_prompt=scheduled_prompt,
         )
@@ -1532,7 +1599,7 @@ def _process_due_scheduled_unit_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "template_id": template_id,
+                "unit_id": unit_id,
                 "error": str(exc),
             },
         )
@@ -1575,8 +1642,8 @@ def _process_due_scheduled_unit_launch(
             "text": "Unit schedule created a fresh session and queued its scheduled instructions.",
             "event": {
                 "type": "service.unit_schedule_triggered",
-                "unit_id": template_id,
-                "template_id": template_id,
+                "unit_id": unit_id,
+                "unit_id": unit_id,
                 "scheduled_for_utc": str(schedule_info.get("scheduled_for_utc") or ""),
                 "dispatch_service_id": target_service_id or "",
             },
@@ -1591,7 +1658,7 @@ def _process_due_scheduled_unit_launch(
             "ts": utc_ts(),
             "service_id": self_service_id,
             "to": target_service_id or "",
-            "text": f"Unit schedule for {template_id} created this session and queued the scheduled instructions automatically.",
+            "text": f"Unit schedule for {unit_id} created this session and queued the scheduled instructions automatically.",
         },
     )
 
@@ -1626,8 +1693,8 @@ def _process_due_scheduled_unit_launch(
                 "service_id": self_service_id,
                 "process_id": process_id,
                 "username": username,
-                "unit_id": template_id,
-                "template_id": template_id,
+                "unit_id": unit_id,
+                "unit_id": unit_id,
                 "session_id": session_id,
                 "dispatch_service_id": target_service_id,
                 "preferred_provider": preferred_provider,
@@ -1635,7 +1702,6 @@ def _process_due_scheduled_unit_launch(
         )
         return {
             "unit": unit,
-            "app": unit,
             "session": session,
             "dispatch_service_id": target_service_id,
             "preferred_provider": preferred_provider,
@@ -1652,15 +1718,14 @@ def _process_due_scheduled_unit_launch(
             "service_id": self_service_id,
             "process_id": process_id,
             "username": username,
-            "unit_id": template_id,
-            "template_id": template_id,
+            "unit_id": unit_id,
+            "unit_id": unit_id,
             "session_id": session_id,
             "preferred_provider": preferred_provider,
         },
     )
     return {
         "unit": unit,
-        "app": unit,
         "session": session,
         "dispatch_service_id": "",
         "preferred_provider": preferred_provider,
@@ -2568,7 +2633,7 @@ def _unit_launched_sessions_for_user(
     for session in sessions:
         if not isinstance(session, dict):
             continue
-        unit_id = str(session.get("launcher_unit_id") or session.get("launcher_template_id") or "").strip()
+        unit_id = str(session.get("launcher_unit_id") or "").strip()
         session_id = str(session.get("session_id") or "").strip()
         if not unit_id or not session_id:
             continue
@@ -2958,10 +3023,11 @@ def make_handler(
     def _unit_catalog_payload(
         *,
         viewer_username: str,
+        include_private: bool = True,
     ) -> dict[str, Any]:
-        units = list_launchable_units(default_provider=default_provider, include_private=True)
+        units = list_launchable_units(default_provider=default_provider, include_private=include_private)
         registered_states = {
-            str(state.get("unit_id") or state.get("template_id") or "").strip(): state
+            str(state.get("unit_id") or state.get("unit_id") or "").strip(): state
             for state in list_registered_unit_states(runtime_root)
             if str(state.get("username") or "").strip() == str(viewer_username or "").strip()
         }
@@ -2971,8 +3037,9 @@ def make_handler(
         )
         merged_units: list[dict[str, Any]] = []
         for unit in units:
-            unit_id = str(unit.get("unit_id") or unit.get("template_id") or "").strip()
+            unit_id = str(unit.get("unit_id") or "").strip()
             unit_state = registered_states.get(unit_id)
+            unit = _unit_with_schedule_override(unit, unit_state)
             state_payload = {
                 "registered": bool(unit_state),
                 "workspace_path": str((unit_state or {}).get("workspace_path") or "").strip(),
@@ -2980,6 +3047,7 @@ def make_handler(
                 "last_parent_session_id": str((unit_state or {}).get("last_parent_session_id") or "").strip(),
                 "created_at": str((unit_state or {}).get("created_at") or "").strip(),
                 "updated_at": str((unit_state or {}).get("updated_at") or "").strip(),
+                "schedule_override": dict((unit_state or {}).get("schedule_override") or {}),
                 "schedule_state": dict((unit_state or {}).get("schedule_state") or {}),
             }
             merged_units.append(
@@ -2994,6 +3062,7 @@ def make_handler(
         payload = {
             "units": merged_units,
             "default_provider": default_provider,
+            "include_private": include_private,
             "ts": utc_ts(),
         }
         return payload
@@ -3229,7 +3298,7 @@ def make_handler(
             wait_active = bool(summary.get("user_response_wait_active", False))
             registered_at = str(summary.get("registered_at") or summary.get("created_at") or "").strip()
             goal_updated_at = str(summary.get("goal_updated_at") or summary.get("updated_at") or "").strip()
-            unit_id = str(summary.get("associated_unit_id") or summary.get("associated_template_id") or "").strip()
+            unit_id = str(summary.get("associated_unit_id") or summary.get("associated_unit_id") or "").strip()
             unit_display = str(summary.get("associated_unit_display_name") or unit_id).strip()
             resident_unit = bool(summary.get("resident_unit_session", False))
             has_unit_file = bool(summary.get("has_associated_unit_file", False) or unit_id)
@@ -3324,7 +3393,7 @@ def make_handler(
             wait_active = bool(summary.get("user_response_wait_active", False))
             registered_at = str(summary.get("registered_at") or summary.get("created_at") or "").strip()
             goal_updated_at = str(summary.get("goal_updated_at") or summary.get("updated_at") or "").strip()
-            unit_id = str(summary.get("associated_unit_id") or summary.get("associated_template_id") or "").strip()
+            unit_id = str(summary.get("associated_unit_id") or summary.get("associated_unit_id") or "").strip()
             unit_display = str(summary.get("associated_unit_display_name") or unit_id).strip()
             resident_unit = bool(summary.get("resident_unit_session", False))
             has_unit_file = bool(summary.get("has_associated_unit_file", False) or unit_id)
@@ -4195,11 +4264,16 @@ def make_handler(
             if not context:
                 return
             viewer_username = str(context.get("viewer_username") or context["username"])
+            raw_include_private = str(
+                (query.get("include_private") or query.get("private") or query.get("visibility") or ["0"])[0]
+            ).strip().lower()
+            include_private = raw_include_private not in {"0", "false", "no", "public", "public_only"}
             self._json(
                 200,
                 {
                     **_unit_catalog_payload(
                         viewer_username=viewer_username,
+                        include_private=include_private,
                     ),
                     "username": context["username"],
                     "viewer_username": viewer_username,
@@ -4338,6 +4412,8 @@ def make_handler(
                 return self._do_POST_sessions(payload, content_type)
             if path == "/units/launch":
                 return self._do_POST_units_launch(payload)
+            if path == "/units/schedule":
+                return self._do_POST_units_schedule(payload)
             if path == "/session/select":
                 return self._do_POST_session_select(payload, content_type)
             if path == "/session/rename":
@@ -4585,8 +4661,9 @@ def make_handler(
                 origin_goal_id=str(parent_talk.get("active_goal_id") or parent_talk.get("goal_id") or "").strip(),
                 origin_goal_text=str(parent_talk.get("goal_text") or ""),
                 requester_session_id=context["session_id"],
-                requester_unit_id=str(requester_talk.get("launcher_unit_id") or requester_talk.get("launcher_template_id") or "").strip(),
-                requester_template_id=str(requester_talk.get("launcher_template_id") or requester_talk.get("launcher_unit_id") or "").strip(),
+                requester_unit_id=str(
+                    requester_talk.get("launcher_unit_id") or ""
+                ).strip(),
             )
             if not talk:
                 self._json(403, {"error": "child_session_creation_not_allowed"})
@@ -4610,8 +4687,8 @@ def make_handler(
             context = self._require_user(payload=payload)
             if not context:
                 return
-            template_id = str(payload.get("unit_id") or payload.get("template_id") or "").strip()
-            if not template_id:
+            unit_id = str(payload.get("unit_id") or "").strip()
+            if not unit_id:
                 self._json(400, {"error": "unit_id_required"})
                 return
             parent_session_id = str(payload.get("parent_session_id") or context["session_id"] or "").strip()
@@ -4619,9 +4696,9 @@ def make_handler(
                 self._json(400, {"error": "parent_session_id_required"})
                 return
             try:
-                app = get_launchable_unit(template_id, default_provider=default_provider)
+                unit = get_launchable_unit(unit_id, default_provider=default_provider)
             except KeyError:
-                self._json(404, {"error": "unit_not_found", "unit_id": template_id, "template_id": template_id})
+                self._json(404, {"error": "unit_not_found", "unit_id": unit_id, "unit_id": unit_id})
                 return
             selected_agents = payload.get("selected_agents")
             if selected_agents is not None and not isinstance(selected_agents, list):
@@ -4632,7 +4709,7 @@ def make_handler(
                     runtime_root,
                     username=context["username"],
                     parent_session_id=parent_session_id,
-                    app=app,
+                    unit=unit,
                     label=str(payload.get("label") or "").strip() or None,
                     goal_text=str(payload.get("goal_text") or "").strip() if "goal_text" in payload else None,
                     initial_prompt=str(payload.get("initial_prompt") or "").strip() if "initial_prompt" in payload else None,
@@ -4640,7 +4717,7 @@ def make_handler(
                     selected_agents=selected_agents,
                 )
             except RuntimeError as exc:
-                self._json(400, {"error": str(exc), "unit_id": template_id, "template_id": template_id})
+                self._json(400, {"error": str(exc), "unit_id": unit_id, "unit_id": unit_id})
                 return
             session = launched.get("session") if isinstance(launched, dict) else {}
             session_id = str((session or {}).get("session_id") or "").strip()
@@ -4670,14 +4747,76 @@ def make_handler(
                 201,
                 {
                     "ok": True,
-                    "app": launched.get("app"),
-                    "unit": launched.get("unit") or launched.get("app"),
+                    "unit": launched.get("unit"),
                     "session": session,
                     "session_id": session_id,
                     "active_session_id": session_id,
                     "launch_plan": launched.get("launch_plan"),
                     "dispatched_to": dispatched_to,
                     "dispatch_error": dispatch_error,
+                },
+            )
+            return
+
+        def _do_POST_units_schedule(self, payload: dict) -> None:
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            unit_id = str(payload.get("unit_id") or "").strip()
+            if not unit_id:
+                self._json(400, {"error": "unit_id_required"})
+                return
+            try:
+                unit = get_launchable_unit(unit_id, default_provider=default_provider)
+            except KeyError:
+                self._json(404, {"error": "unit_not_found", "unit_id": unit_id})
+                return
+            if str(unit.get("instance_policy") or "").strip().lower() == "singleton":
+                self._json(400, {"error": "singleton_unit_schedule_not_editable", "unit_id": unit_id})
+                return
+            enabled = payload.get("enabled")
+            enabled_bool = bool(enabled) if isinstance(enabled, bool) else str(enabled).strip().lower() in {"1", "true", "yes", "on"}
+            try:
+                every_hours = int(payload.get("every_hours") or payload.get("interval_hours") or 24)
+            except (TypeError, ValueError):
+                self._json(400, {"error": "every_hours_must_be_integer", "unit_id": unit_id})
+                return
+            if every_hours < 1 or every_hours > 24 * 30:
+                self._json(400, {"error": "every_hours_out_of_range", "unit_id": unit_id, "min": 1, "max": 24 * 30})
+                return
+            timezone = str(payload.get("timezone") or "UTC").strip() or "UTC"
+            override = {
+                "enabled": enabled_bool,
+                "kind": "interval",
+                "every_hours": every_hours,
+                "timezone": timezone,
+                "summary": f"every {every_hours}h",
+            }
+            unit_state = update_registered_unit_state(
+                runtime_root,
+                username=context["username"],
+                unit_id=unit_id,
+                updates={
+                    "display_name": str(unit.get("display_name") or unit_id).strip() or unit_id,
+                    "unit_id": unit_id,
+                    "package_id": str(unit.get("package_id") or "").strip(),
+                    "schedule_override": override,
+                    "schedule_state": {
+                        "last_error": "",
+                        "retry_not_before_at": "",
+                    },
+                },
+            )
+            scheduled_unit = _unit_with_schedule_override(unit, unit_state)
+            schedule_status = describe_unit_schedule(scheduled_unit, unit_state=unit_state)
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "unit_id": unit_id,
+                    "schedule_override": override,
+                    "schedule_status": schedule_status,
+                    "state": unit_state,
                 },
             )
             return
@@ -4695,8 +4834,7 @@ def make_handler(
                 sharing_payload = {
                     "mode": payload.get("mode"),
                     "allowed_source_session_ids": payload.get("allowed_source_session_ids"),
-                    "allowed_source_unit_ids": payload.get("allowed_source_unit_ids") or payload.get("allowed_source_template_ids"),
-                    "allowed_source_template_ids": payload.get("allowed_source_template_ids") or payload.get("allowed_source_unit_ids"),
+                    "allowed_source_unit_ids": payload.get("allowed_source_unit_ids") or payload.get("allowed_source_unit_ids"),
                 }
             updated = update_session_child_sharing(
                 runtime_root,
@@ -6493,7 +6631,7 @@ def make_handler(
                     default_provider=default_provider,
                 )
                 units = {
-                    str(unit.get("unit_id") or unit.get("template_id") or "").strip(): unit
+                    str(unit.get("unit_id") or "").strip(): unit
                     for unit in list_launchable_units(default_provider=default_provider)
                 }
                 registered_units = list_registered_unit_states(runtime_root)
@@ -6503,10 +6641,10 @@ def make_handler(
                 if not isinstance(unit_state, dict):
                     continue
                 username = str(unit_state.get("username") or "").strip()
-                template_id = str(unit_state.get("unit_id") or unit_state.get("template_id") or "").strip()
-                if not username or not template_id:
+                unit_id = str(unit_state.get("unit_id") or unit_state.get("unit_id") or "").strip()
+                if not username or not unit_id:
                     continue
-                unit = units.get(template_id)
+                unit = units.get(unit_id)
                 if not isinstance(unit, dict) or not bool(unit.get("enabled", True)):
                     continue
                 try:
@@ -6532,8 +6670,8 @@ def make_handler(
                             "service_id": self_service["service_id"],
                             "process_id": process_id,
                             "username": username,
-                            "unit_id": template_id,
-                            "template_id": template_id,
+                            "unit_id": unit_id,
+                            "unit_id": unit_id,
                             "error": repr(exc),
                         },
                     )

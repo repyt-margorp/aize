@@ -1,7 +1,7 @@
 {
   "unit_id": "aize-development.system-diagnostics",
   "unit_kind": "session",
-  "unit_class": "template",
+  "unit_class": "session",
   "instance_policy": "multi",
   "lifecycle": "auto",
   "restart_policy": "schedule",
@@ -41,7 +41,7 @@
           {
             "path": "README.md",
             "description": "Operating contract for the hourly diagnostics Unit.",
-            "content": "# AIze System Diagnostics Unit\n\nThis unit runs hourly as a child of the Root session.\n\nCadence:\n- Run every 1 hour through the unit interval schedule.\n- Start each pass by reading this workspace's previous records.\n- Inspect unfinished sessions, unprocessed user input, incomplete goals, and sessions that appear stopped or stuck.\n- Use existing AIze state and diagnostics surfaces before adding ad hoc checks.\n\nEvidence sources:\n- Session pending-input queues.\n- Goal-audit state and goal history events.\n- Session and child-session metadata.\n- Restart diagnostics from `python3 scripts/diagnostics/probe_restart.py` when restart health matters.\n\nRecord one entry per run in `diagnostics-log.md` with findings, evidence, checks run, actions taken, and exact blockers.\n"
+            "content": "# AIze System Diagnostics Unit\n\nThis unit runs hourly as a child of the Root session.\n\nCadence:\n- Run every hour through the unit interval schedule.\n- Start each pass by reading this workspace's previous records.\n- Inspect unfinished sessions, unprocessed user input, incomplete goals, and sessions that appear stopped or stuck.\n- Use existing AIze state and diagnostics surfaces before adding ad hoc checks.\n\nEvidence sources:\n- Session pending-input queues.\n- Goal-audit state and goal history events.\n- Session and child-session metadata.\n- Restart diagnostics from `python3 scripts/diagnostics/probe_restart.py` when restart health matters.\n\nRecord one entry per run in `diagnostics-log.md` with findings, evidence, checks run, actions taken, and exact blockers.\n"
           },
           {
             "path": "diagnostics-log.md",
