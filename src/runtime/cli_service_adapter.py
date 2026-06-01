@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import faulthandler
 import html
 import json
 import os
 import queue
 import re
 import select
+import signal
 import socket
 import ssl
 import sys
@@ -602,6 +604,24 @@ def run_http_service(
     log_path: Path,
     router_conn: Any = None,
 ) -> int:
+    thread_dump_file = None
+    if str(self_service.get("service_id") or "") == "service-http-001":
+        try:
+            thread_dump_file = (log_path.parent / "service-http-001.thread-dump.log").open("a", encoding="utf-8")
+
+            def _dump_http_thread_stacks(signum: int, frame: Any) -> None:
+                thread_dump_file.write(f"\n=== SIGUSR1 thread dump {utc_ts()} ===\n")
+                for thread in threading.enumerate():
+                    thread_dump_file.write(
+                        f"thread name={thread.name!r} ident={thread.ident!r} native_id={getattr(thread, 'native_id', None)!r}\n"
+                    )
+                thread_dump_file.flush()
+                faulthandler.dump_traceback(file=thread_dump_file, all_threads=True)
+                thread_dump_file.flush()
+
+            signal.signal(signal.SIGUSR1, _dump_http_thread_stacks)
+        except Exception:
+            thread_dump_file = None
     config = dict(self_service.get("config", {}))
     host = str(config.get("host", "127.0.0.1"))
     port = int(config.get("port", 4123))
@@ -840,10 +860,9 @@ def run_http_service(
                     continue
                 if not session_has_active_in_progress_goal(session):
                     continue
-                if active_agent_turn_state(
-                    get_user_history(runtime_root, username=username, session_id=session_id)
-                ):
-                    continue
+                # Startup reconciliation must stay metadata-first. Reading the
+                # full timeline for each active session can make HttpBridge
+                # unavailable when many sessions exist.
                 goal_manager = persisted_goal_manager_runtime_state(
                     runtime_root,
                     username=username,
@@ -1196,6 +1215,10 @@ def run_http_service(
     def current_llm_service_topology() -> tuple[list[str], list[str], list[str], dict[str, str]]:
         return _resolve_llm_service_topology(runtime_root, manifest)
 
+    idle_goal_reconcile_seen: dict[str, float] = {}
+    idle_goal_reconcile_lock = threading.Lock()
+    idle_goal_reconcile_ttl_seconds = 120.0
+
     def session_runtime_payload(username: str, preloaded_histories: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
         release_stale_session_bindings()
         sessions = list_sessions(runtime_root, username=username)
@@ -1207,7 +1230,6 @@ def run_http_service(
             active_turns_snap = dict(_active_agent_turns)
         with _active_goal_audits_lock:
             active_audits_snap = dict(_active_goal_audits)
-        idle_goal_reconciled_sessions: set[str] = set()
         summaries: list[dict[str, Any]] = []
         for session in sessions:
             session_id = str(session.get("session_id") or "")
@@ -1277,8 +1299,14 @@ def run_http_service(
                 and str(summary.get("goal_manager_state") or "").strip().lower() not in {"running", "queued"}
             ):
                 reconcile_key = f"{username}::{session_id}"
-                if reconcile_key not in idle_goal_reconciled_sessions:
-                    idle_goal_reconciled_sessions.add(reconcile_key)
+                should_reconcile_idle_goal = False
+                now = time.monotonic()
+                with idle_goal_reconcile_lock:
+                    last_seen = idle_goal_reconcile_seen.get(reconcile_key, 0.0)
+                    if (now - last_seen) >= idle_goal_reconcile_ttl_seconds:
+                        idle_goal_reconcile_seen[reconcile_key] = now
+                        should_reconcile_idle_goal = True
+                if should_reconcile_idle_goal:
                     dispatched_to, dispatch_error = enqueue_goal_dispatch(
                         username=username,
                         session_id=session_id,
@@ -1298,6 +1326,14 @@ def run_http_service(
                             "dispatch_error": dispatch_error,
                         },
                     )
+                    if dispatched_to and not dispatch_error:
+                        summary["goal_manager_state"] = "queued"
+                        summary["goal_manager_worker"] = worker_slot_badge(
+                            str(dispatched_to),
+                            codex_service_pool=current_codex_service_pool,
+                            claude_service_pool=current_claude_service_pool,
+                            gemini_service_pool=current_gemini_service_pool,
+                        )
             agent_counts = session_agent_assignment_counts(
                 session,
                 worker=summary.get("worker") if isinstance(summary.get("worker"), dict) else None,

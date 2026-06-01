@@ -2749,6 +2749,7 @@ def make_handler(
     _idle_goal_reconcile_seen: dict[str, float] = {}
     _idle_goal_reconcile_lock = threading.Lock()
     _OV_CACHE_TTL = 3.5  # seconds
+    _UNIT_SCHEDULE_WATCH_INTERVAL_SECONDS = 60.0
 
     def _scope_include_all(*, context: dict[str, Any] | None, query: dict[str, list[str]] | None = None) -> bool:
         if not isinstance(context, dict) or not bool(context.get("is_superuser")):
@@ -6624,7 +6625,7 @@ def make_handler(
                     )
 
     def _unit_schedule_watcher() -> None:
-        while not stopped.wait(timeout=3.5):
+        while not stopped.wait(timeout=_UNIT_SCHEDULE_WATCH_INTERVAL_SECONDS):
             try:
                 ensure_auto_scheduled_root_unit_states(
                     runtime_root,
@@ -6676,9 +6677,6 @@ def make_handler(
                         },
                     )
 
-    threading.Thread(target=_overview_cache_warmer, daemon=True).start()
     threading.Thread(target=_unit_schedule_watcher, daemon=True).start()
-    threading.Thread(target=_auto_resume_watcher, daemon=True).start()
-    threading.Thread(target=_user_response_wait_watcher, daemon=True).start()
 
     return Handler
