@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 import sys
 import tempfile
@@ -12,7 +13,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from runtime.persistent_state_pkg.conversation import create_conversation_session, list_sessions
+from runtime.persistent_state_pkg.conversation import (
+    create_conversation_session,
+    list_session_time_index_entries,
+    list_sessions,
+    list_sessions_with_users_updated_since,
+)
 from runtime.persistent_state_pkg.agent_audit import save_agent_audit_state
 from runtime.persistent_state_pkg._core import session_goal_manager_state_path, session_metadata_path, write_json_file
 import runtime.session_view as session_view
@@ -37,6 +43,40 @@ class SessionListingTests(unittest.TestCase):
 
             self.assertGreaterEqual(len(sessions), 1)
             ensure_storage.assert_not_called()
+
+    def test_session_time_index_filters_before_loading_session_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / ".aize-runtime"
+            runtime_root.mkdir(parents=True)
+            old_session = create_conversation_session(runtime_root, username="root", label="Old")
+            recent_session = create_conversation_session(runtime_root, username="root", label="Recent")
+
+            old_path = session_metadata_path(
+                runtime_root,
+                username="root",
+                session_id=str(old_session["session_id"]),
+            )
+            old_payload = json.loads(old_path.read_text(encoding="utf-8"))
+            old_payload["created_at"] = "2026-05-01T00:00:00Z"
+            old_payload["updated_at"] = "2026-05-01T00:00:00Z"
+            write_json_file(old_path, old_payload)
+
+            recent_path = session_metadata_path(
+                runtime_root,
+                username="root",
+                session_id=str(recent_session["session_id"]),
+            )
+            recent_payload = json.loads(recent_path.read_text(encoding="utf-8"))
+            recent_payload["created_at"] = "2026-06-01T00:00:00Z"
+            recent_payload["updated_at"] = "2026-06-01T00:00:00Z"
+            write_json_file(recent_path, recent_payload)
+
+            since = datetime.fromisoformat("2026-05-31T00:00:00+00:00")
+            entries = list_session_time_index_entries(runtime_root, username="root", since=since)
+            self.assertEqual([item["session_id"] for item in entries], [recent_session["session_id"]])
+
+            sessions = list_sessions_with_users_updated_since(runtime_root, username="root", since=since)
+            self.assertEqual([item["session_id"] for item in sessions], [recent_session["session_id"]])
 
     def test_session_summary_exposes_registration_and_unit_metadata(self) -> None:
         session = {

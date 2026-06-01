@@ -47,6 +47,7 @@ from ._core import (
     session_agent_outbox_dir,
     session_agent_acl_path,
     session_metadata_path,
+    session_time_index_dir,
     session_goal_manager_state_path,
     session_service_state_path,
     session_timeline_path,
@@ -260,6 +261,108 @@ def list_all_sessions_with_users(runtime_root: Path) -> list[dict[str, Any]]:
             entry["username"] = username
             result.append(entry)
     return result
+
+
+def _session_index_days(*, since: datetime | None, until: datetime | None = None) -> list[datetime]:
+    if since is None:
+        return []
+    start = since.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = (until or datetime.now(UTC)).astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    days: list[datetime] = []
+    current = start
+    while current <= end:
+        days.append(current)
+        current = current + timedelta(days=1)
+    return days
+
+
+def rebuild_session_time_index(runtime_root: Path) -> None:
+    sessions_root = sessions_dir(runtime_root)
+    if not sessions_root.exists():
+        return
+    index_root = sessions_root / ".index"
+    if index_root.exists():
+        for path in sorted(index_root.rglob("*.json")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir() and path.name != ".index"):
+        username = normalize_username(user_dir.name)
+        for talk_dir in sorted(path for path in user_dir.iterdir() if path.is_dir()):
+            stored = read_json_file(session_metadata_path(runtime_root, username=username, session_id=talk_dir.name))
+            if isinstance(stored, dict):
+                write_json_file(session_metadata_path(runtime_root, username=username, session_id=talk_dir.name), stored)
+
+
+def list_session_time_index_entries(
+    runtime_root: Path,
+    *,
+    username: str | None = None,
+    since: datetime | None = None,
+) -> list[dict[str, Any]]:
+    index_root = session_time_index_dir(runtime_root)
+    if not index_root.exists():
+        rebuild_session_time_index(runtime_root)
+    normalized_user = normalize_username(username) if username else ""
+    files: list[Path] = []
+    days = _session_index_days(since=since)
+    if days:
+        for day in days:
+            day_dir = index_root / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d")
+            if day_dir.exists():
+                files.extend(sorted(day_dir.glob("*.json")))
+    else:
+        files = sorted(index_root.rglob("*.json")) if index_root.exists() else []
+    entries: list[dict[str, Any]] = []
+    for path in files:
+        entry = read_json_file(path)
+        if not isinstance(entry, dict):
+            continue
+        entry_user = normalize_username(str(entry.get("username") or ""))
+        session_id = str(entry.get("session_id") or "").strip()
+        if not entry_user or not session_id:
+            continue
+        if normalized_user and entry_user != normalized_user:
+            continue
+        updated_at = _parse_utc_ts(entry.get("updated_at") or entry.get("created_at"))
+        if since is not None and updated_at is not None and updated_at < since:
+            continue
+        entries.append(
+            {
+                "username": entry_user,
+                "session_id": session_id,
+                "created_at": str(entry.get("created_at") or "").strip(),
+                "updated_at": str(entry.get("updated_at") or "").strip(),
+            }
+        )
+    return entries
+
+
+def list_sessions_with_users_updated_since(
+    runtime_root: Path,
+    *,
+    since: datetime | None,
+    username: str | None = None,
+) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in list_session_time_index_entries(runtime_root, username=username, since=since):
+        entry_user = normalize_username(str(entry.get("username") or ""))
+        session_id = str(entry.get("session_id") or "").strip()
+        if not entry_user or not session_id:
+            continue
+        key = (entry_user, session_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        stored = read_json_file(session_metadata_path(runtime_root, username=entry_user, session_id=session_id))
+        if not isinstance(stored, dict):
+            continue
+        _ensure_session_defaults_unlocked(stored)
+        stored["username"] = entry_user
+        sessions.append(dict(stored))
+    return sessions
 
 
 # ---------------------------------------------------------------------------

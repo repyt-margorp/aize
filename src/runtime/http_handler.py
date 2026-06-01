@@ -74,6 +74,7 @@ from runtime.persistent_state_pkg import (
     list_peer_joinable_sessions,
     release_session_service,
     list_all_sessions_with_users,
+    list_sessions_with_users_updated_since,
     list_session_agent_contacts,
     list_sessions,
     load_agent_audit_state,
@@ -2758,15 +2759,20 @@ def make_handler(
         raw_value = str(raw_values[0] if raw_values else "").strip().lower()
         return raw_value == "all"
 
-    def _visible_session_records(*, viewer_username: str, include_all: bool) -> list[dict[str, Any]]:
+    def _visible_session_records(
+        *,
+        viewer_username: str,
+        include_all: bool,
+        recent_window_seconds: int = DEFAULT_SESSION_DISPLAY_WINDOW_SECONDS,
+    ) -> list[dict[str, Any]]:
+        since = (
+            datetime.now(UTC) - timedelta(seconds=recent_window_seconds)
+            if recent_window_seconds > 0
+            else None
+        )
         if include_all:
-            return list_all_sessions_with_users(runtime_root)
-        records: list[dict[str, Any]] = []
-        for talk in list_sessions(runtime_root, username=viewer_username):
-            entry = dict(talk)
-            entry["username"] = viewer_username
-            records.append(entry)
-        return records
+            return list_sessions_with_users_updated_since(runtime_root, since=since)
+        return list_sessions_with_users_updated_since(runtime_root, username=viewer_username, since=since)
 
     def _compute_overview_payload(
         *,
@@ -2777,7 +2783,11 @@ def make_handler(
     ) -> dict:  # type: ignore[misc]
         release_stale_session_bindings()
         all_sessions = _filter_display_sessions(
-            _visible_session_records(viewer_username=viewer_username, include_all=include_all),
+            _visible_session_records(
+                viewer_username=viewer_username,
+                include_all=include_all,
+                recent_window_seconds=recent_window_seconds,
+            ),
             runtime_root=runtime_root,
             viewer_username=viewer_username,
             include_all=include_all,
@@ -3133,7 +3143,11 @@ def make_handler(
             include_all=include_all,
         )
         for talk in _filter_display_sessions(
-            _visible_session_records(viewer_username=viewer_username, include_all=include_all),
+            _visible_session_records(
+                viewer_username=viewer_username,
+                include_all=include_all,
+                recent_window_seconds=recent_window_seconds,
+            ),
             runtime_root=runtime_root,
             viewer_username=viewer_username,
             include_all=include_all,

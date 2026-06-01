@@ -8,6 +8,7 @@ import tempfile
 import threading
 from collections.abc import Iterable
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 import re
 import uuid
@@ -525,6 +526,10 @@ def session_metadata_path(runtime_root: Path, *, username: str, session_id: str)
     return session_dir(runtime_root, username=username, session_id=session_id) / "session.json"
 
 
+def session_time_index_dir(runtime_root: Path) -> Path:
+    return sessions_dir(runtime_root) / ".index" / "updated"
+
+
 def session_timeline_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
     return session_dir(runtime_root, username=username, session_id=session_id) / "timeline.jsonl"
 
@@ -822,7 +827,7 @@ def write_state(runtime_root: Path, state: dict[str, Any]) -> None:
             os.unlink(temp_path)
 
 
-def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write_json_file(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -834,6 +839,61 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> None:
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+def _parse_session_index_ts(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(text).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _maybe_update_session_time_index(path: Path, payload: dict[str, Any]) -> None:
+    if path.name != "session.json" or not isinstance(payload, dict) or ".index" in path.parts:
+        return
+    session_dir_path = path.parent
+    user_dir = session_dir_path.parent
+    sessions_root = user_dir.parent
+    if not session_dir_path.name or not user_dir.name or sessions_root.name != "sessions":
+        return
+    username = normalize_username(user_dir.name)
+    session_id = str(payload.get("session_id") or session_dir_path.name).strip()
+    if not session_id:
+        return
+    created_at = str(payload.get("created_at") or payload.get("updated_at") or utc_ts()).strip()
+    updated_at_text = str(payload.get("updated_at") or created_at or utc_ts()).strip()
+    updated_at = _parse_session_index_ts(updated_at_text) or _parse_session_index_ts(created_at) or datetime.now(UTC)
+    bucket = updated_at.strftime("%Y/%m/%d")
+    index_root = sessions_root / ".index"
+    pointer_path = index_root / "by-session" / username / f"{Path(session_id).name}.json"
+    target_path = index_root / "updated" / bucket / f"{username}@@{Path(session_id).name}.json"
+    previous = read_json_file(pointer_path)
+    previous_path_text = str((previous or {}).get("index_path") or "")
+    if previous_path_text:
+        previous_path = Path(previous_path_text)
+        if previous_path != target_path and previous_path.exists():
+            try:
+                previous_path.unlink()
+            except OSError:
+                pass
+    entry = {
+        "username": username,
+        "session_id": session_id,
+        "created_at": created_at,
+        "updated_at": updated_at_text,
+    }
+    _atomic_write_json_file(target_path, entry)
+    _atomic_write_json_file(pointer_path, {**entry, "bucket": bucket, "index_path": str(target_path)})
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_json_file(path, payload)
+    _maybe_update_session_time_index(path, payload)
 
 
 def read_json_file(path: Path) -> dict[str, Any] | None:
