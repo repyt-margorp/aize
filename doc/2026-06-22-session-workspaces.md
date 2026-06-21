@@ -8,6 +8,10 @@
 - External GoalManager and WorkerAgent processes run with the current Session
   workspace as their process working directory.
 - Agents also receive `AIZE_SESSION_WORKSPACE`.
+- Every Unit now has a shared `workspace_path`.
+- Unit-derived Session workspaces contain a `unit-workspace` symlink pointing to
+  the Unit workspace.
+- Agents for Unit-derived Sessions also receive `AIZE_UNIT_WORKSPACE`.
 
 ## Files touched
 
@@ -25,5 +29,5 @@
 
 ## Remaining risk
 
-- Unit-level shared workspaces are not implemented yet. This change only
-  creates and uses per-Session workspaces.
+- Existing Session workspace directories may need to be inspected manually if a
+  user-created file already occupies the reserved `unit-workspace` link path.

@@ -14,6 +14,7 @@ Minimal AIze rebuild focused on a small MINIX-style core:
 - GoalManager `Complete` / `Incomplete` evaluation
 - per-session GoalManager and WorkerAgent threads
 - per-session Agent workspaces
+- per-Unit shared workspaces linked from Unit-derived Sessions
 - CLI dispatch with durable run records
 - console startup dispatch for queued Active/Incomplete Sessions
 - CLI-only status inspection
@@ -69,6 +70,16 @@ Each Session receives a workspace under the runtime state root:
 External GoalManager and WorkerAgent providers run with that Session workspace
 as their process working directory. The same path is also exposed to Agents as
 `AIZE_SESSION_WORKSPACE`.
+
+Each Unit also receives a shared workspace:
+
+```text
+.aize-state/workspaces/units/{unit-id}-{hash}/
+```
+
+When a Session is created from a Unit, the Session workspace contains a
+`unit-workspace` symlink to that Unit workspace. External Agents also receive
+the absolute Unit workspace path as `AIZE_UNIT_WORKSPACE`.
 
 ## Units / Session Templates
 

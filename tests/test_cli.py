@@ -422,6 +422,11 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(run_cli(state_root, "init").returncode, 0)
             self.assertEqual(run_cli(state_root, "create-unit", "worker").returncode, 0)
+            units = json.loads(run_cli(state_root, "units").stdout)
+            worker_unit = next(unit for unit in units if unit["unit_id"] == "worker")
+            self.assertTrue(worker_unit["workspace_path"].startswith("workspaces/units/worker-"))
+            worker_workspace = state_root / worker_unit["workspace_path"]
+            self.assertTrue(worker_workspace.is_dir())
 
             plain = run_cli(state_root, "create-session", "plain")
             self.assertEqual(plain.returncode, 0, plain.stderr)
@@ -435,6 +440,13 @@ class CliTests(unittest.TestCase):
             root_session = next(session for session in sessions if session["session_id"] == "root")
             self.assertTrue(root_session["workspace_path"].startswith("workspaces/sessions/root-"))
             self.assertTrue((state_root / root_session["workspace_path"]).is_dir())
+
+            unit_backed = run_cli(state_root, "create-session", "unit-backed", "--unit", "worker")
+            self.assertEqual(unit_backed.returncode, 0, unit_backed.stderr)
+            unit_session = json.loads(unit_backed.stdout)
+            unit_link = state_root / unit_session["workspace_path"] / "unit-workspace"
+            self.assertTrue(unit_link.is_symlink())
+            self.assertEqual(unit_link.resolve(), worker_workspace.resolve())
 
             orphan = run_cli(state_root, "create-session", "orphan", "--unit", "worker", "--parent", "missing")
             self.assertEqual(orphan.returncode, 2)
@@ -1266,7 +1278,7 @@ class CliTests(unittest.TestCase):
                     [
                         "#!/usr/bin/env python3",
                         "import json, os, pathlib",
-                        "payload = {'cwd': os.getcwd(), 'workspace': os.environ.get('AIZE_SESSION_WORKSPACE'), 'session': os.environ.get('AIZE_SESSION_ID')}",
+                        "payload = {'cwd': os.getcwd(), 'workspace': os.environ.get('AIZE_SESSION_WORKSPACE'), 'unit_workspace': os.environ.get('AIZE_UNIT_WORKSPACE'), 'session': os.environ.get('AIZE_SESSION_ID')}",
                         f"pathlib.Path({str(log_path)!r}).write_text(json.dumps(payload), encoding='utf-8')",
                         "print('<aize-output>')",
                         "print('AIZE_GOAL_STATUS: completed')",
@@ -1283,7 +1295,10 @@ class CliTests(unittest.TestCase):
             }
 
             self.assertEqual(run_cli_with_env(state_root, env, "init").returncode, 0)
-            created = run_cli_with_env(state_root, env, "create-session", "workspace-session")
+            self.assertEqual(run_cli_with_env(state_root, env, "create-unit", "worker").returncode, 0)
+            units = json.loads(run_cli_with_env(state_root, env, "units").stdout)
+            worker_unit = next(unit for unit in units if unit["unit_id"] == "worker")
+            created = run_cli_with_env(state_root, env, "create-session", "workspace-session", "--unit", "worker")
             self.assertEqual(created.returncode, 0, created.stderr)
             session = json.loads(created.stdout)
             self.assertEqual(
@@ -1305,6 +1320,7 @@ class CliTests(unittest.TestCase):
             expected_workspace = str(state_root / session["workspace_path"])
             self.assertEqual(payload["cwd"], expected_workspace)
             self.assertEqual(payload["workspace"], expected_workspace)
+            self.assertEqual(payload["unit_workspace"], str(state_root / worker_unit["workspace_path"]))
             self.assertEqual(payload["session"], "workspace-session")
 
     def test_goal_manager_must_be_local_but_worker_can_be_remote_aize(self) -> None:

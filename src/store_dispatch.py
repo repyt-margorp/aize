@@ -69,6 +69,7 @@ class DispatchMixin:
                         role=GOAL_MANAGER_ROLE,
                         run_id=run_id,
                         session=session,
+                        unit=unit,
                     ),
                 )
                 result = {
@@ -100,6 +101,7 @@ class DispatchMixin:
                         role=WORKER_AGENT_ROLE,
                         run_id=run_id,
                         session=session,
+                        unit=unit,
                     ),
                 )
                 result = {
@@ -500,15 +502,26 @@ class DispatchMixin:
             }
         )
 
-    def _agent_runtime_env(self, *, session_id: str, role: str, run_id: str, session: dict[str, Any]) -> dict[str, str]:
+    def _agent_runtime_env(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        run_id: str,
+        session: dict[str, Any],
+        unit: dict[str, Any] | None,
+    ) -> dict[str, str]:
         workspace_path = self._session_workspace_abs_path(session)
-        return {
+        env = {
             "AIZE_STATE_ROOT": str(self.root),
             "AIZE_SESSION_ID": session_id,
             "AIZE_SESSION_WORKSPACE": str(workspace_path),
             "AIZE_AGENT_ROLE": role,
             "AIZE_RUN_ID": run_id,
         }
+        if unit is not None:
+            env["AIZE_UNIT_WORKSPACE"] = str(self._unit_workspace_abs_path(unit))
+        return env
 
     def _append_dispatch_step_message(
         self,

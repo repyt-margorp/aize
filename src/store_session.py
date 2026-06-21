@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,38 @@ from store_defs import (
 
 
 class SessionGoalMixin:
+    def _safe_workspace_name(self, value: str, *, fallback: str) -> str:
+        safe_value = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
+        safe_value = safe_value.strip("-_") or fallback
+        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+        return f"{safe_value}-{digest}"
+
+    def _unit_workspace_relpath(self, unit_id: str) -> str:
+        return f"workspaces/units/{self._safe_workspace_name(unit_id, fallback='unit')}"
+
+    def _ensure_unit_workspace(self, unit: dict[str, Any]) -> bool:
+        unit_id = str(unit.get("unit_id") or "").strip()
+        if not unit_id:
+            raise StoreError("unit_id is required for workspace creation")
+        workspace_path = str(unit.get("workspace_path") or "").strip()
+        if not workspace_path:
+            workspace_path = self._unit_workspace_relpath(unit_id)
+            unit["workspace_path"] = workspace_path
+            changed = True
+        else:
+            changed = False
+        workspace = Path(workspace_path)
+        if workspace.is_absolute() or ".." in workspace.parts:
+            raise StoreError(f"invalid unit workspace path: {workspace_path}")
+        (self.root / workspace_path).mkdir(parents=True, exist_ok=True)
+        return changed
+
+    def _unit_workspace_abs_path(self, unit: dict[str, Any]) -> Path:
+        self._ensure_unit_workspace(unit)
+        return self.root / str(unit["workspace_path"])
+
     def _session_workspace_relpath(self, session_id: str) -> str:
-        safe_session_id = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in session_id)
-        safe_session_id = safe_session_id.strip("-_") or "session"
-        digest = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:8]
-        return f"workspaces/sessions/{safe_session_id}-{digest}"
+        return f"workspaces/sessions/{self._safe_workspace_name(session_id, fallback='session')}"
 
     def _ensure_session_workspace(self, session: dict[str, Any]) -> bool:
         session_id = str(session.get("session_id") or "").strip()
@@ -47,15 +75,36 @@ class SessionGoalMixin:
         (self.root / workspace_path).mkdir(parents=True, exist_ok=True)
         return changed
 
-    def _session_workspace_abs_path(self, session: dict[str, Any]):
+    def _session_workspace_abs_path(self, session: dict[str, Any]) -> Path:
         self._ensure_session_workspace(session)
         return self.root / str(session["workspace_path"])
 
+    def _ensure_session_unit_workspace_link(self, session: dict[str, Any], unit: dict[str, Any] | None) -> bool:
+        if unit is None:
+            return False
+        session_workspace = self._session_workspace_abs_path(session)
+        unit_workspace = self._unit_workspace_abs_path(unit)
+        link_path = session_workspace / "unit-workspace"
+        target = os.path.relpath(unit_workspace, start=session_workspace)
+        if link_path.is_symlink():
+            if os.readlink(link_path) == target:
+                return False
+            link_path.unlink()
+        elif link_path.exists():
+            raise StoreError(f"reserved unit workspace link already exists: {link_path}")
+        link_path.symlink_to(target, target_is_directory=True)
+        return False
+
     def _ensure_session_metadata(self, state: dict[str, Any]) -> bool:
         changed = False
+        for unit in state.get("units", {}).values():
+            if self._ensure_unit_workspace(unit):
+                changed = True
         for session in state.get("sessions", {}).values():
             if self._ensure_session_workspace(session):
                 changed = True
+            unit_id = str(session.get("unit_id") or "").strip()
+            self._ensure_session_unit_workspace_link(session, state.get("units", {}).get(unit_id) if unit_id else None)
             if session.get("capabilities") != DEFAULT_SESSION_CAPABILITIES:
                 session["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
                 changed = True
@@ -88,8 +137,10 @@ class SessionGoalMixin:
             goal_text=str(goal_text or "").strip(),
             initial_prompt=str(initial_prompt or "").strip(),
             schedule=normalized_schedule,
+            workspace_path=self._unit_workspace_relpath(unit_id),
         )
         units[unit_id] = unit.to_dict()
+        self._ensure_unit_workspace(units[unit_id])
         self.save(state)
         return unit
 
@@ -267,6 +318,7 @@ class SessionGoalMixin:
         )
         sessions[session_id] = session.to_dict()
         self._ensure_session_workspace(sessions[session_id])
+        self._ensure_session_unit_workspace_link(sessions[session_id], unit)
         if unit and unit.get("instance_policy") == "singleton":
             unit["singleton_session_id"] = session_id
             sessions[session_id]["singleton"] = True
@@ -347,6 +399,7 @@ class SessionGoalMixin:
         )
         state["sessions"][session_id] = session.to_dict()
         self._ensure_session_workspace(state["sessions"][session_id])
+        self._ensure_session_unit_workspace_link(state["sessions"][session_id], unit)
         state["sessions"][session_id]["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
         for parent_session_id in normalized_parent_ids:
             self._link_sessions_in_state(state, parent_session_id, session_id)

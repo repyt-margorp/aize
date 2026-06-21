@@ -46,6 +46,7 @@ class Unit:
     goal_text: str = ""
     initial_prompt: str = ""
     schedule: dict[str, Any] | None = None
+    workspace_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +60,7 @@ class Unit:
             "goal_text": self.goal_text,
             "initial_prompt": self.initial_prompt,
             "schedule": dict(self.schedule or {}),
+            "workspace_path": self.workspace_path,
         }
 
 
