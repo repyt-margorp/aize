@@ -303,6 +303,45 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(len(json.loads(due_again.stdout)), 1)
 
+    def test_daemon_starts_due_scheduled_units_and_dispatches_them(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "monitor",
+                "--goal-text",
+                "Inspect system state and report findings.",
+                "--initial-prompt",
+                "Run diagnostics now.",
+                "--schedule-every-hours",
+                "1",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+
+            daemon = run_cli(
+                state_root,
+                "daemon",
+                "--max-cycles",
+                "3",
+                "--schedule-interval",
+                "60",
+                "--dispatch-interval",
+                "0.01",
+            )
+            self.assertEqual(daemon.returncode, 0, daemon.stderr)
+            payload = json.loads(daemon.stdout)
+            self.assertEqual(payload["scheduled_count"], 1)
+            self.assertGreaterEqual(payload["dispatched_count"], 1)
+            session_id = payload["scheduled"][0]["session"]["session_id"]
+
+            sessions = json.loads(run_cli(state_root, "sessions").stdout)
+            self.assertTrue(any(session["session_id"] == session_id for session in sessions))
+            runs = json.loads(run_cli(state_root, "dispatch-runs", session_id).stdout)
+            self.assertTrue(runs)
+
     def test_session_graph_rejects_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"

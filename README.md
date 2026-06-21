@@ -80,6 +80,18 @@ default. The created Session receives the Unit `goal_text` as its SessionGoal.
 If `initial_prompt` is set, it is recorded as User input on that Session so
 normal Session dispatch can process it.
 
+For normal operation, run the daemon. It initializes state if needed, polls due
+Unit schedules, creates Sessions for due Units, and dispatches queued Session
+work in the same foreground process:
+
+```bash
+PYTHONPATH=src python3 -m cli --root .aize-state daemon
+```
+
+The daemon runs until stopped. For service managers or tests, `--max-cycles`,
+`--idle-timeout`, `--schedule-interval`, and `--dispatch-interval` can bound or
+tune the loop.
+
 Sessions have a user-controlled `active` flag. Goals have a GoalManager-owned
 `completion_state` of `incomplete` or `complete`. Dispatch only selects Goals
 that are both in an active Session and still incomplete.
@@ -196,8 +208,8 @@ the console starts a detached background worker with a recovery context. That
 context is stored on the dispatch-run record and passed to GoalManager and
 WorkerAgent prompts; it is not appended to MessageLog.
 
-For automatic queue processing, run a foreground dispatch worker in another
-shell:
+For dispatch-only queue processing without schedule polling, run a foreground
+dispatch worker in another shell:
 
 ```bash
 PYTHONPATH=src python3 -m cli --root .aize-state dispatch-worker

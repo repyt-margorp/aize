@@ -11,7 +11,7 @@ from cli_render import (
     print_json,
     tail_items,
 )
-from cli_workers import run_dispatch_loop, run_dispatch_worker
+from cli_workers import run_daemon, run_dispatch_loop, run_dispatch_worker
 from store import Store
 from store_defs import StoreError
 
@@ -155,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_worker.add_argument("--idle-timeout", type=float)
     dispatch_worker.add_argument("--interval", type=float, default=1.0)
     dispatch_worker.add_argument("--recovery-context")
+
+    daemon = sub.add_parser("daemon", help="run scheduled Units and dispatch work continuously")
+    daemon.add_argument("--parent", default="root", dest="parent_session_id")
+    daemon.add_argument("--created-by", default="root", dest="created_by")
+    daemon.add_argument("--schedule-interval", type=float, default=60.0)
+    daemon.add_argument("--dispatch-interval", type=float, default=1.0)
+    daemon.add_argument("--max-cycles", type=int)
+    daemon.add_argument("--idle-timeout", type=float)
+    daemon.add_argument("--recovery-context")
 
     console = sub.add_parser("console", help="login and operate sessions interactively")
     console.add_argument("--username")
@@ -321,6 +330,19 @@ def run(argv: list[str] | None = None) -> int:
                     max_dispatches=args.max_dispatches,
                     idle_timeout=args.idle_timeout,
                     interval=args.interval,
+                    recovery_context=args.recovery_context,
+                )
+            )
+        elif args.command == "daemon":
+            print_json(
+                run_daemon(
+                    store,
+                    parent_session_id=args.parent_session_id,
+                    created_by=args.created_by,
+                    schedule_interval=args.schedule_interval,
+                    dispatch_interval=args.dispatch_interval,
+                    max_cycles=args.max_cycles,
+                    idle_timeout=args.idle_timeout,
                     recovery_context=args.recovery_context,
                 )
             )
