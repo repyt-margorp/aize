@@ -1,6 +1,0 @@
-{
-  "package_id": "aize-entrance",
-  "display_name": "AIze Entrance",
-  "description": "A unit package for routing user feedback into the appropriate AIze session.",
-  "catalog_visibility": "public"
-}

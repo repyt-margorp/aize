@@ -1,38 +1,5 @@
-# Runtime state — never commit
-.aize-state/
-.aize-runtime/
+.new-aize-state*
 .temp/
-temp/
-state/
-server.pid
-.codex
-.tmp-agent-test/
-.tmux-agent-chat/
-.tmux-agent-chat-loop/
-.tmux-aize/
-unit_packages/test_launcher_*/
-unit_packages/private/*
-!unit_packages/private/.gitkeep
-
-# Python
 __pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
-env/
-
-# TLS keys (extra safety)
-*.key
-*.pem
-
-# Editor / OS
-.DS_Store
-.idea/
-.vscode/
-*.swp
-*~
+*.pyc
+.pytest_cache/
