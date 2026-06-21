@@ -254,12 +254,15 @@ class CliTests(unittest.TestCase):
                 "Run diagnostics now.",
                 "--schedule-every-hours",
                 "1",
+                "--schedule-next-run-at",
+                "2026-06-22T00:00:00Z",
             )
             self.assertEqual(created.returncode, 0, created.stderr)
             unit = json.loads(created.stdout)
             self.assertEqual(unit["goal_text"], "Inspect system state and report findings.")
             self.assertEqual(unit["initial_prompt"], "Run diagnostics now.")
             self.assertEqual(unit["schedule"]["every_hours"], 1)
+            self.assertEqual(unit["schedule"]["next_run_at"], "2026-06-22T00:00:00Z")
 
             started = run_cli(
                 state_root,
@@ -286,6 +289,10 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(len(messages), 1)
             self.assertEqual(messages[0]["payload"]["scheduled_unit_id"], "monitor")
+            units_after_first_run = json.loads(run_cli(state_root, "units").stdout)
+            monitor = next(unit for unit in units_after_first_run if unit["unit_id"] == "monitor")
+            self.assertEqual(monitor["schedule"]["last_run_at"], "2026-06-22T00:00:00Z")
+            self.assertEqual(monitor["schedule"]["next_run_at"], "2026-06-22T01:00:00Z")
 
             not_due = run_cli(
                 state_root,
@@ -302,6 +309,38 @@ class CliTests(unittest.TestCase):
                 "2026-06-22T01:00:00Z",
             )
             self.assertEqual(len(json.loads(due_again.stdout)), 1)
+            units_after_second_run = json.loads(run_cli(state_root, "units").stdout)
+            monitor = next(unit for unit in units_after_second_run if unit["unit_id"] == "monitor")
+            self.assertEqual(monitor["schedule"]["next_run_at"], "2026-06-22T02:00:00Z")
+
+    def test_late_scheduled_unit_run_advances_next_run_to_future_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "monitor",
+                "--goal-text",
+                "Inspect system state and report findings.",
+                "--schedule-every-hours",
+                "1",
+                "--schedule-next-run-at",
+                "2026-06-22T00:00:00Z",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+
+            started = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T02:30:00Z",
+            )
+            self.assertEqual(len(json.loads(started.stdout)), 1)
+            units = json.loads(run_cli(state_root, "units").stdout)
+            monitor = next(unit for unit in units if unit["unit_id"] == "monitor")
+            self.assertEqual(monitor["schedule"]["next_run_at"], "2026-06-22T03:00:00Z")
 
     def test_daemon_starts_due_scheduled_units_and_dispatches_them(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

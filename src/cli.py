@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_unit.add_argument("--goal-text", default="")
     create_unit.add_argument("--initial-prompt", default="")
     create_unit.add_argument("--schedule-every-hours", type=int)
+    create_unit.add_argument("--schedule-next-run-at")
 
     run_scheduled_units = sub.add_parser("run-scheduled-units", help="start due scheduled Unit sessions")
     run_scheduled_units.add_argument("--parent", default="root", dest="parent_session_id")
@@ -203,6 +204,7 @@ def run(argv: list[str] | None = None) -> int:
                     "enabled": True,
                     "kind": "interval",
                     "every_hours": args.schedule_every_hours,
+                    "next_run_at": args.schedule_next_run_at,
                     "timezone": "UTC",
                 }
             print_json(

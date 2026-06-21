@@ -11,14 +11,20 @@ Units now carry the SessionTemplate-like fields needed for scheduled startup:
 - `schedule`
 
 An interval schedule can be set through `create-unit --schedule-every-hours N`.
-Running `run-scheduled-units` starts each due scheduled Unit as a child Session
-under `root` by default.
+The schedule is managed by `schedule.next_run_at`; `every_hours` is the interval
+used to advance that next run timestamp after each due launch.
+
+Running `run-scheduled-units` starts each Unit whose `schedule.next_run_at` is
+due as a child Session under `root` by default.
 
 The created Session uses:
 
 - Unit `display_name` as the Session title.
 - Unit `goal_text` as the SessionGoal body.
 - Unit `initial_prompt` as a Session user-input Message when present.
+
+After launch, `schedule.next_run_at` advances to the next future interval
+boundary.
 
 ## Files touched
 

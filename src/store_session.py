@@ -129,6 +129,10 @@ class SessionGoalMixin:
             unit["last_scheduled_at"] = now_text
             unit["updated_at"] = now_text
             unit["scheduled_run_count"] = int(unit.get("scheduled_run_count") or 0) + 1
+            schedule = unit.get("schedule")
+            if isinstance(schedule, dict):
+                schedule["last_run_at"] = now_text
+                schedule["next_run_at"] = self._next_unit_run_at(schedule, now_dt=now_dt)
             started.append(payload)
         self.save(state)
         return started
@@ -347,8 +351,11 @@ class SessionGoalMixin:
             "enabled": enabled,
             "kind": kind,
             "every_hours": every_hours,
+            "next_run_at": str(schedule.get("next_run_at") or utc_now()).strip(),
             "timezone": str(schedule.get("timezone") or "UTC").strip() or "UTC",
         }
+        if enabled:
+            self._parse_utc(normalized["next_run_at"])
         return normalized
 
     def _unit_schedule_due(self, unit: dict[str, Any], *, now_dt: datetime) -> bool:
@@ -360,11 +367,21 @@ class SessionGoalMixin:
         every_hours = int(schedule.get("every_hours") or 0)
         if every_hours < 1:
             return False
-        last_scheduled_at = str(unit.get("last_scheduled_at") or "").strip()
-        if not last_scheduled_at:
+        next_run_at = str(schedule.get("next_run_at") or "").strip()
+        if not next_run_at:
             return True
-        last_dt = self._parse_utc(last_scheduled_at)
-        return last_dt + timedelta(hours=every_hours) <= now_dt
+        return self._parse_utc(next_run_at) <= now_dt
+
+    def _next_unit_run_at(self, schedule: dict[str, Any], *, now_dt: datetime) -> str:
+        every_hours = int(schedule.get("every_hours") or 0)
+        if every_hours < 1:
+            raise StoreError("interval schedules require every_hours >= 1")
+        interval = timedelta(hours=every_hours)
+        next_run_at = str(schedule.get("next_run_at") or "").strip()
+        next_dt = self._parse_utc(next_run_at) if next_run_at else now_dt
+        while next_dt <= now_dt:
+            next_dt += interval
+        return next_dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     def _parse_utc(self, value: str) -> datetime:
         try:

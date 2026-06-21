@@ -63,22 +63,26 @@ PYTHONPATH=src python3 -m cli --root .aize-state create-session task --parent ro
 
 In this CLI runtime, a Unit is the durable SessionTemplate-like record used to
 start Sessions. It can carry the default SessionGoal body, an initial prompt,
-and an interval schedule.
+and a schedule. Schedules are managed by each Unit's `schedule.next_run_at`.
+`--schedule-every-hours` defines how far to advance `next_run_at` after a run.
 
 ```bash
 PYTHONPATH=src python3 -m cli --root .aize-state create-unit monitor \
   --display-name "System Monitor" \
   --goal-text "Inspect system state and report findings." \
   --initial-prompt "Run diagnostics now." \
-  --schedule-every-hours 1
+  --schedule-every-hours 1 \
+  --schedule-next-run-at "2026-06-22T00:00:00Z"
 
 PYTHONPATH=src python3 -m cli --root .aize-state run-scheduled-units
 ```
 
-`run-scheduled-units` starts due scheduled Unit Sessions under `root` by
-default. The created Session receives the Unit `goal_text` as its SessionGoal.
-If `initial_prompt` is set, it is recorded as User input on that Session so
-normal Session dispatch can process it.
+`run-scheduled-units` starts Unit Sessions whose `schedule.next_run_at` is due
+under `root` by default. The created Session receives the Unit `goal_text` as
+its SessionGoal. If `initial_prompt` is set, it is recorded as User input on
+that Session so normal Session dispatch can process it. After a due Unit starts
+a Session, `schedule.next_run_at` is advanced to the next future interval
+boundary.
 
 For normal operation, run the daemon. It initializes state if needed, polls due
 Unit schedules, creates Sessions for due Units, and dispatches queued Session
