@@ -1014,7 +1014,7 @@ class CliTests(unittest.TestCase):
             after = (state_root / "state.json").read_text(encoding="utf-8")
             self.assertEqual(after, before)
 
-    def test_goal_manager_incomplete_schedules_retry_queue_entry(self) -> None:
+    def test_goal_manager_incomplete_creates_implicit_worker_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
             bin_dir = Path(tmp) / "bin"
@@ -1063,17 +1063,100 @@ class CliTests(unittest.TestCase):
             payload = json.loads(dispatched.stdout)
             self.assertEqual(payload["goal"]["completion_state"], "incomplete")
             self.assertEqual(payload["run"]["completion_state"], "incomplete")
+            self.assertTrue(payload["message"]["payload"]["implicit_worker_request"])
 
             queue = json.loads(run_cli_with_env(state_root, env, "dispatch-index", "retry-session").stdout)
-            retry_entries = [entry for entry in queue if entry.get("status") == "queued"]
-            self.assertEqual(len(retry_entries), 1)
-            self.assertEqual(retry_entries[0]["priority"], 25)
-            self.assertIn("available_after", retry_entries[0])
-            self.assertIn("waiting for more work", retry_entries[0]["reason"])
+            worker_entries = [
+                entry
+                for entry in queue
+                if entry.get("status") == "queued" and entry.get("role") == "WorkerAgent"
+            ]
+            self.assertEqual(len(worker_entries), 1)
+            self.assertEqual(worker_entries[0]["priority"], 150)
+            self.assertNotIn("available_after", worker_entries[0])
+            self.assertIn("requires WorkerAgent work", worker_entries[0]["reason"])
 
             goals = json.loads(run_cli_with_env(state_root, env, "goals", "retry-session").stdout)
             self.assertIn("waiting for more work", goals[0]["completion_reason"])
-            self.assertFalse(json.loads(run_cli_with_env(state_root, env, "messages", "retry-session").stdout))
+            messages = json.loads(run_cli_with_env(state_root, env, "messages", "retry-session").stdout)
+            worker_requests = [
+                message
+                for message in messages
+                if message.get("to") == "session:retry-session"
+                and message.get("payload", {}).get("worker_request") is True
+            ]
+            self.assertEqual(len(worker_requests), 1)
+            self.assertTrue(worker_requests[0]["payload"]["implicit_worker_request"])
+            self.assertIn("waiting for more work", worker_requests[0]["payload"]["body"])
+
+    def test_incomplete_worker_report_then_goal_manager_completion_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            codex_path = bin_dir / "codex"
+            codex_path.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import os, sys",
+                        "prompt = sys.argv[-1]",
+                        "role = os.environ.get('AIZE_AGENT_ROLE')",
+                        "if role == 'GoalManager':",
+                        "    print('<aize-output role=\"GoalManager\" provider=\"codex\">')",
+                        "    if 'WorkerAgent finished delegated work' in prompt:",
+                        "        print('AIZE_GOAL_STATUS: completed')",
+                        "        print('AIZE_GOAL_REASON: worker result satisfies the goal')",
+                        "    else:",
+                        "        print('AIZE_GOAL_STATUS: incomplete')",
+                        "        print('AIZE_GOAL_REASON: implement the delegated work and report back to Session')",
+                        "    print('</aize-output>')",
+                        "elif role == 'WorkerAgent':",
+                        "    from agent_api import send_session_message",
+                        "    send_session_message('WorkerAgent finished delegated work.')",
+                        "    print('<aize-output role=\"WorkerAgent\" provider=\"codex\">worker reported to Session</aize-output>')",
+                        "else:",
+                        "    print('<aize-output role=\"unknown\" provider=\"codex\">unexpected</aize-output>')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            codex_path.chmod(0o755)
+            env = {
+                "PYTHONPATH": str(ROOT / "src"),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
+
+            self.assertEqual(run_cli_with_env(state_root, env, "init").returncode, 0)
+            self.assertEqual(
+                run_cli_with_env(
+                    state_root,
+                    env,
+                    "start-goal",
+                    "cycle-session",
+                    "--label",
+                    "Cycle",
+                    "--created-by",
+                    "root",
+                ).returncode,
+                0,
+            )
+
+            first = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
+            self.assertEqual(first["run"]["role"], "GoalManager")
+            self.assertEqual(first["goal"]["completion_state"], "incomplete")
+            self.assertTrue(first["message"]["payload"]["implicit_worker_request"])
+
+            second = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
+            self.assertEqual(second["run"]["role"], "WorkerAgent")
+
+            third = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
+            self.assertEqual(third["run"]["role"], "GoalManager")
+            self.assertEqual(third["goal"]["completion_state"], "complete")
+
+            messages = json.loads(run_cli_with_env(state_root, env, "messages", "cycle-session", "--limit", "0").stdout)
+            self.assertTrue(any(message.get("payload", {}).get("implicit_worker_request") for message in messages))
+            self.assertTrue(any("WorkerAgent finished delegated work" in message.get("payload", {}).get("body", "") for message in messages))
 
     def test_goal_manager_review_prompt_includes_session_message_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

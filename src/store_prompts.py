@@ -95,6 +95,8 @@ class PromptMixin:
             "  <role-policy>",
             "    GoalManager verifies the SessionGoal state, checks whether work can proceed, and decides completion.",
             "    GoalManager should delegate implementation and concrete task work by writing Worker requests to Session.",
+            "    If the goal is incomplete, write AIZE_GOAL_REASON as an actionable WorkerAgent instruction.",
+            "    Runtime treats an incomplete GoalManager result without an explicit Worker request as an implicit WorkerAgent request.",
             "    GoalManager should not perform implementation work itself unless it is only a minimal verification needed to make the completion decision.",
             "  </role-policy>",
         ]
@@ -113,7 +115,7 @@ class PromptMixin:
         prompt.extend(
             [
                 "  <instruction>Decide whether the SessionGoal can proceed or is completed.</instruction>",
-                "  <output-format>Return an aize-output XML block and include AIZE_GOAL_STATUS: completed or incomplete plus AIZE_GOAL_REASON: one concise reason.</output-format>",
+                "  <output-format>Return an aize-output XML block and include AIZE_GOAL_STATUS: completed or incomplete plus AIZE_GOAL_REASON: one concise actionable reason/instruction.</output-format>",
                 "</aize-agent-input>",
             ]
         )
