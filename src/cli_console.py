@@ -201,7 +201,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                         store.create_session(
                             args[0],
                             parent_session_ids=[current_session_id],
-                        ).to_dict()
+                        )
                     )
                 elif command == "unit-session":
                     if len(args) != 2:
@@ -211,7 +211,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                             args[0],
                             unit_id=args[1],
                             parent_session_ids=[current_session_id],
-                        ).to_dict()
+                        )
                     )
                 elif command == "sessions":
                     print_sessions(store.sessions())

@@ -13,6 +13,7 @@ Minimal AIze rebuild focused on a small MINIX-style core:
 - Session `Active` / `Inactive` user control
 - GoalManager `Complete` / `Incomplete` evaluation
 - per-session GoalManager and WorkerAgent threads
+- per-session Agent workspaces
 - CLI dispatch with durable run records
 - console startup dispatch for queued Active/Incomplete Sessions
 - CLI-only status inspection
@@ -58,6 +59,16 @@ does not need a Unit. A Session can also have multiple parents by passing
 ```bash
 PYTHONPATH=src python3 -m cli --root .aize-state create-session task --parent root --parent notes
 ```
+
+Each Session receives a workspace under the runtime state root:
+
+```text
+.aize-state/workspaces/sessions/{session-id}-{hash}/
+```
+
+External GoalManager and WorkerAgent providers run with that Session workspace
+as their process working directory. The same path is also exposed to Agents as
+`AIZE_SESSION_WORKSPACE`.
 
 ## Units / Session Templates
 

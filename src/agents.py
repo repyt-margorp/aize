@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class AgentError(RuntimeError):
@@ -36,6 +37,7 @@ class AgentRunner:
         prompt: str,
         resume_token: str | None = None,
         runtime_env: dict[str, str] | None = None,
+        cwd: str | Path | None = None,
     ) -> AgentResult:
         normalized = provider.strip().lower()
         if normalized == "local":
@@ -81,6 +83,7 @@ class AgentRunner:
                     prompt=prompt,
                     resume_token=resume_token,
                     runtime_env=runtime_env,
+                    cwd=cwd,
                 ),
                 resume_token=resume_token,
             )
@@ -113,6 +116,7 @@ class AgentRunner:
         prompt: str,
         resume_token: str | None,
         runtime_env: dict[str, str] | None = None,
+        cwd: str | Path | None = None,
     ) -> str:
         executable = shutil.which(provider)
         if not executable:
@@ -134,6 +138,7 @@ class AgentRunner:
             command = [executable, "-p", resumed_prompt]
         completed = subprocess.run(
             command,
+            cwd=str(cwd) if cwd is not None else None,
             text=True,
             capture_output=True,
             check=False,

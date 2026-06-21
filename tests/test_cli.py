@@ -428,6 +428,13 @@ class CliTests(unittest.TestCase):
             plain_session = json.loads(plain.stdout)
             self.assertEqual(plain_session["session_id"], "plain")
             self.assertIsNone(plain_session["unit_id"])
+            self.assertTrue(plain_session["workspace_path"].startswith("workspaces/sessions/plain-"))
+            self.assertTrue((state_root / plain_session["workspace_path"]).is_dir())
+
+            sessions = json.loads(run_cli(state_root, "sessions").stdout)
+            root_session = next(session for session in sessions if session["session_id"] == "root")
+            self.assertTrue(root_session["workspace_path"].startswith("workspaces/sessions/root-"))
+            self.assertTrue((state_root / root_session["workspace_path"]).is_dir())
 
             orphan = run_cli(state_root, "create-session", "orphan", "--unit", "worker", "--parent", "missing")
             self.assertEqual(orphan.returncode, 2)
@@ -1195,6 +1202,8 @@ class CliTests(unittest.TestCase):
 
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
+            cwd_path = Path(tmp) / "session-workspace"
+            cwd_path.mkdir()
             log_path = Path(tmp) / "codex-args.json"
             codex_path = bin_dir / "codex"
             codex_path.write_text(
@@ -1202,7 +1211,7 @@ class CliTests(unittest.TestCase):
                     [
                         "#!/usr/bin/env python3",
                         "import json, os, pathlib, sys",
-                        "payload = {'argv': sys.argv[1:], 'env': {key: os.environ.get(key) for key in ['AIZE_STATE_ROOT', 'AIZE_SESSION_ID', 'AIZE_AGENT_ROLE', 'AIZE_RUN_ID']}}",
+                        "payload = {'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env': {key: os.environ.get(key) for key in ['AIZE_STATE_ROOT', 'AIZE_SESSION_ID', 'AIZE_SESSION_WORKSPACE', 'AIZE_AGENT_ROLE', 'AIZE_RUN_ID']}}",
                         f"pathlib.Path({str(log_path)!r}).write_text(json.dumps(payload), encoding='utf-8')",
                         "print('codex ok')",
                     ]
@@ -1221,9 +1230,11 @@ class CliTests(unittest.TestCase):
                     runtime_env={
                         "AIZE_STATE_ROOT": "state-root",
                         "AIZE_SESSION_ID": "session-1",
+                        "AIZE_SESSION_WORKSPACE": str(cwd_path),
                         "AIZE_AGENT_ROLE": "WorkerAgent",
                         "AIZE_RUN_ID": "run-1",
                     },
+                    cwd=cwd_path,
                 )
             finally:
                 os.environ["PATH"] = old_path
@@ -1236,10 +1247,65 @@ class CliTests(unittest.TestCase):
             self.assertIn("danger-full-access", argv)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
             self.assertIn("Resume durable AIZE agent thread: resume-1", argv[-1])
+            self.assertEqual(payload["cwd"], str(cwd_path))
             self.assertEqual(payload["env"]["AIZE_STATE_ROOT"], "state-root")
             self.assertEqual(payload["env"]["AIZE_SESSION_ID"], "session-1")
+            self.assertEqual(payload["env"]["AIZE_SESSION_WORKSPACE"], str(cwd_path))
             self.assertEqual(payload["env"]["AIZE_AGENT_ROLE"], "WorkerAgent")
             self.assertEqual(payload["env"]["AIZE_RUN_ID"], "run-1")
+
+    def test_dispatch_runs_external_agent_in_session_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log_path = Path(tmp) / "codex-cwd.json"
+            codex_path = bin_dir / "codex"
+            codex_path.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, pathlib",
+                        "payload = {'cwd': os.getcwd(), 'workspace': os.environ.get('AIZE_SESSION_WORKSPACE'), 'session': os.environ.get('AIZE_SESSION_ID')}",
+                        f"pathlib.Path({str(log_path)!r}).write_text(json.dumps(payload), encoding='utf-8')",
+                        "print('<aize-output>')",
+                        "print('AIZE_GOAL_STATUS: completed')",
+                        "print('AIZE_GOAL_REASON: workspace verified')",
+                        "print('</aize-output>')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            codex_path.chmod(0o755)
+            env = {
+                "PYTHONPATH": str(ROOT / "src"),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
+
+            self.assertEqual(run_cli_with_env(state_root, env, "init").returncode, 0)
+            created = run_cli_with_env(state_root, env, "create-session", "workspace-session")
+            self.assertEqual(created.returncode, 0, created.stderr)
+            session = json.loads(created.stdout)
+            self.assertEqual(
+                run_cli_with_env(
+                    state_root,
+                    env,
+                    "update-goal",
+                    "workspace-session",
+                    "Verify workspace",
+                    "--created-by",
+                    "root",
+                ).returncode,
+                0,
+            )
+            dispatched = run_cli_with_env(state_root, env, "dispatch-once")
+            self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
+
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+            expected_workspace = str(state_root / session["workspace_path"])
+            self.assertEqual(payload["cwd"], expected_workspace)
+            self.assertEqual(payload["workspace"], expected_workspace)
+            self.assertEqual(payload["session"], "workspace-session")
 
     def test_goal_manager_must_be_local_but_worker_can_be_remote_aize(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

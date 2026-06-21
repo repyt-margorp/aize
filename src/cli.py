@@ -232,7 +232,7 @@ def run(argv: list[str] | None = None) -> int:
                     args.session_id,
                     unit_id=args.unit_id,
                     parent_session_ids=args.parent_session_ids,
-                ).to_dict()
+                )
             )
         elif args.command == "activate-session":
             print_json(store.set_session_active(args.session_id, active=True))

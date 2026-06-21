@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from model import Goal, Session, Unit, new_id, utc_now
@@ -22,9 +24,38 @@ from store_defs import (
 
 
 class SessionGoalMixin:
+    def _session_workspace_relpath(self, session_id: str) -> str:
+        safe_session_id = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in session_id)
+        safe_session_id = safe_session_id.strip("-_") or "session"
+        digest = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:8]
+        return f"workspaces/sessions/{safe_session_id}-{digest}"
+
+    def _ensure_session_workspace(self, session: dict[str, Any]) -> bool:
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id:
+            raise StoreError("session_id is required for workspace creation")
+        workspace_path = str(session.get("workspace_path") or "").strip()
+        if not workspace_path:
+            workspace_path = self._session_workspace_relpath(session_id)
+            session["workspace_path"] = workspace_path
+            changed = True
+        else:
+            changed = False
+        workspace = Path(workspace_path)
+        if workspace.is_absolute() or ".." in workspace.parts:
+            raise StoreError(f"invalid session workspace path: {workspace_path}")
+        (self.root / workspace_path).mkdir(parents=True, exist_ok=True)
+        return changed
+
+    def _session_workspace_abs_path(self, session: dict[str, Any]):
+        self._ensure_session_workspace(session)
+        return self.root / str(session["workspace_path"])
+
     def _ensure_session_metadata(self, state: dict[str, Any]) -> bool:
         changed = False
         for session in state.get("sessions", {}).values():
+            if self._ensure_session_workspace(session):
+                changed = True
             if session.get("capabilities") != DEFAULT_SESSION_CAPABILITIES:
                 session["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
                 changed = True
@@ -208,7 +239,7 @@ class SessionGoalMixin:
         *,
         unit_id: str | None = None,
         parent_session_ids: list[str] | None = None,
-    ) -> Session:
+    ) -> dict[str, Any]:
         state = self.load()
         normalized_unit_id = str(unit_id or "").strip() or None
         if normalized_unit_id and normalized_unit_id not in state["units"]:
@@ -235,6 +266,7 @@ class SessionGoalMixin:
             title=session_id,
         )
         sessions[session_id] = session.to_dict()
+        self._ensure_session_workspace(sessions[session_id])
         if unit and unit.get("instance_policy") == "singleton":
             unit["singleton_session_id"] = session_id
             sessions[session_id]["singleton"] = True
@@ -243,7 +275,7 @@ class SessionGoalMixin:
             for parent_session_id in normalized_parent_ids:
                 self._link_sessions_in_state(state, parent_session_id, session_id)
         self.save(state)
-        return session
+        return dict(sessions[session_id])
 
     def start_goal_session(
         self,
@@ -314,6 +346,7 @@ class SessionGoalMixin:
             title=session_title,
         )
         state["sessions"][session_id] = session.to_dict()
+        self._ensure_session_workspace(state["sessions"][session_id])
         state["sessions"][session_id]["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
         for parent_session_id in normalized_parent_ids:
             self._link_sessions_in_state(state, parent_session_id, session_id)
