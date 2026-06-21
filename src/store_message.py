@@ -259,10 +259,14 @@ class MessageMixin:
             raise StoreError(f"unknown account: {sender}")
         normalized_reply_to = str(reply_to or "").strip()
         now = utc_now()
+        active_worker_run = self._active_worker_run_for_session(state, session_id=session_id)
         payload: dict[str, Any] = {
             "body": body,
             "user_input": True,
         }
+        if active_worker_run:
+            payload["worker_followup"] = True
+            payload["defer_goal_manager_until_worker_report"] = True
         if normalized_reply_to:
             payload["reply_to"] = normalized_reply_to
         message = self._message(
@@ -281,15 +285,16 @@ class MessageMixin:
             priority=DISPATCH_PRIORITY_USER_INPUT,
             created_at=now,
             trigger_message_id=message["message_id"],
+            enqueue_on_incomplete=active_worker_run is None,
         )
         message["payload"]["reprocess_goal_id"] = target_goal["goal_id"]
         message["payload"]["reprocess_recorded_at"] = now
-        active_worker_run = self._active_worker_run_for_session(state, session_id=session_id)
         if active_worker_run:
             worker_payload = {
                 "body": body,
                 "user_input": True,
                 "forwarded_from": message["message_id"],
+                "worker_followup": True,
                 "run_id": active_worker_run["run_id"],
                 "worker_request": True,
                 "worker_role": WORKER_AGENT_ROLE,
@@ -304,6 +309,15 @@ class MessageMixin:
             )
             state["messages"].append(worker_message)
             self._index_message_for_session(state, worker_message, session_id)
+            if target_goal and target_goal.get("completion_state") == "incomplete":
+                self._enqueue_dispatch(
+                    state,
+                    target_goal,
+                    priority=DISPATCH_PRIORITY_WORKER_REQUEST,
+                    reason=f"UserInput message {message['message_id']} should be delivered to active WorkerAgent.",
+                    role=WORKER_AGENT_ROLE,
+                    trigger_message_id=worker_message["message_id"],
+                )
         sessions[session_id]["updated_at"] = now
         self.save(state)
         return message

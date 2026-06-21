@@ -9,6 +9,7 @@ from store_defs import (
     DISPATCH_PRIORITY_RETRY,
     DISPATCH_RETRY_DELAY_SECONDS,
     GOAL_MANAGER_ROLE,
+    WORKER_AGENT_ROLE,
 )
 
 
@@ -104,6 +105,8 @@ class DispatchQueueMixin:
             if goal.get("completion_state") != "incomplete":
                 continue
             goal_id = str(goal.get("goal_id") or "")
+            if self._has_live_worker_signal_for_goal(state, goal_id):
+                continue
             if any(
                 entry.get("goal_id") == goal_id
                 and entry.get("status") in {"queued", "acquired"}
@@ -142,6 +145,13 @@ class DispatchQueueMixin:
                 continue
             if not session or session.get("active") is not True:
                 continue
+            entry_role = str(entry.get("role") or GOAL_MANAGER_ROLE)
+            if self._has_acquired_role_run(
+                state,
+                session_id=str(entry.get("session_id") or ""),
+                role=entry_role,
+            ):
+                continue
             candidates.append((queue_index, entry))
         if not candidates:
             return None
@@ -170,6 +180,33 @@ class DispatchQueueMixin:
             .replace(microsecond=0)
             + timedelta(seconds=DISPATCH_RETRY_DELAY_SECONDS)
         ).isoformat().replace("+00:00", "Z")
+
+    def _has_acquired_role_run(self, state: dict[str, Any], *, session_id: str, role: str) -> bool:
+        if role not in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE}:
+            return False
+        return any(
+            str(run.get("session_id") or "") == session_id
+            and str(run.get("role") or "") == role
+            and run.get("lease_state") == "acquired"
+            for run in state.get("dispatch_runs", {}).values()
+        )
+
+    def _has_live_worker_signal_for_goal(self, state: dict[str, Any], goal_id: str) -> bool:
+        if not goal_id:
+            return False
+        if any(
+            entry.get("goal_id") == goal_id
+            and entry.get("role", GOAL_MANAGER_ROLE) == WORKER_AGENT_ROLE
+            and entry.get("status") in {"queued", "acquired"}
+            for entry in state.setdefault("dispatch_queue", [])
+        ):
+            return True
+        return any(
+            run.get("goal_id") == goal_id
+            and run.get("role") == WORKER_AGENT_ROLE
+            and run.get("lease_state") == "acquired"
+            for run in state.get("dispatch_runs", {}).values()
+        )
 
     def _ensure_retry_dispatch_entry(
         self,

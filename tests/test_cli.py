@@ -683,6 +683,72 @@ class CliTests(unittest.TestCase):
             self.assertEqual(worker_messages[0]["payload"]["forwarded_from"], message["message_id"])
             self.assertEqual(worker_messages[0]["payload"]["run_id"], "run-active-worker")
             self.assertEqual(worker_messages[0]["payload"]["body"], "new user input while worker is running")
+            queue = store.dispatch_queue("running-session")
+            worker_entries = [
+                entry
+                for entry in queue
+                if entry.get("status") == "queued"
+                and entry.get("role") == "WorkerAgent"
+                and entry.get("trigger_message_id") == worker_messages[0]["message_id"]
+            ]
+            self.assertEqual(len(worker_entries), 1)
+
+    def test_active_worker_followup_waits_for_worker_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+            from model import Goal, utc_now
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("running-session", parent_session_ids=["root"])
+            now = utc_now()
+            goal = Goal(
+                goal_id="goal-active-worker",
+                session_id="running-session",
+                body="handle active worker followup",
+                created_by="root",
+                created_at=now,
+            ).to_dict()
+            state = store.load()
+            state["agent_profiles"]["WorkerAgent"]["provider"] = "local"
+            state["goals"][goal["goal_id"]] = goal
+            state["dispatch_runs"]["run-active-worker"] = {
+                "run_id": "run-active-worker",
+                "goal_id": goal["goal_id"],
+                "session_id": "running-session",
+                "role": "WorkerAgent",
+                "lease_state": "acquired",
+                "current_phase": "WorkerAgent",
+                "created_at": now,
+                "lease_acquired_at": now,
+                "steps": [],
+            }
+            store.save(state)
+
+            message = store.append_user_input(
+                "running-session",
+                sender="root",
+                body="new user input while worker is running",
+            )
+            state = store.load()
+            worker_message = next(
+                item
+                for item in state["messages"]
+                if item.get("payload", {}).get("forwarded_from") == message["message_id"]
+            )
+            self.assertIsNone(store.dispatch_once(session_id="running-session"))
+
+            state = store.load()
+            state["dispatch_runs"]["run-active-worker"]["lease_state"] = "released"
+            state["dispatch_runs"]["run-active-worker"].pop("current_phase", None)
+            store.save(state)
+
+            dispatched = store.dispatch_once(session_id="running-session")
+            self.assertIsNotNone(dispatched)
+            assert dispatched is not None
+            self.assertEqual(dispatched["run"]["role"], "WorkerAgent")
+            self.assertEqual(dispatched["run"]["trigger_message_id"], worker_message["message_id"])
 
     def test_worker_session_report_enqueues_goal_manager_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

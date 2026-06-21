@@ -621,6 +621,7 @@ class SessionGoalMixin:
         priority: int,
         created_at: str,
         trigger_message_id: str | None = None,
+        enqueue_on_incomplete: bool = True,
     ) -> dict[str, Any]:
         target_goal = self._current_goal_for_session(state, session_id)
         if not target_goal:
@@ -640,6 +641,7 @@ class SessionGoalMixin:
             actor=actor,
             priority=priority,
             trigger_message_id=trigger_message_id,
+            enqueue_on_incomplete=enqueue_on_incomplete,
         )
         return target_goal
 

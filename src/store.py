@@ -122,6 +122,11 @@ class Store(
                 if not isinstance(payload, dict) or not payload.get("user_input"):
                     continue
                 reason = f"UserInput message {message.get('message_id')} requires Session processing."
+                if (
+                    payload.get("defer_goal_manager_until_worker_report") is True
+                    or payload.get("worker_request") is True
+                ):
+                    continue
                 if payload.get("reprocess_goal_id"):
                     goal = state.get("goals", {}).get(str(payload.get("reprocess_goal_id") or ""))
                     if goal:
@@ -160,6 +165,8 @@ class Store(
             if goal.get("completion_state") != "incomplete":
                 continue
             goal_id = str(goal.get("goal_id") or "")
+            if self._has_live_worker_signal_for_goal(state, goal_id):
+                continue
             has_live_entry = any(
                 entry.get("goal_id") == goal_id and entry.get("status") in {"queued", "acquired"}
                 for entry in state.setdefault("dispatch_queue", [])

@@ -228,6 +228,11 @@ that Session, and returns the prompt without waiting for Agent execution.
 While the console stays open, it polls new `UserConsole` Messages for the
 current Session and prints Agent replies as they arrive.
 
+If a WorkerAgent run is already active for the Session, new UserInput is also
+recorded as a WorkerAgent follow-up Message. That follow-up waits until the
+current WorkerAgent run releases, then dispatch resumes the same WorkerAgent
+thread with the updated Session MessageLog.
+
 When the interactive console starts, it also checks for queued Active/Incomplete
 SessionGoals. If queued work exists and no dispatch lease is currently acquired,
 the console starts a detached background worker with a recovery context. That
