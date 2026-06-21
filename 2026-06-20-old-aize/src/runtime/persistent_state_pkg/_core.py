@@ -1,0 +1,1757 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import secrets
+import tempfile
+import threading
+from collections.abc import Iterable
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+import re
+import uuid
+from typing import Any
+
+import fcntl
+
+from wire.protocol import utc_ts
+
+
+PBKDF2_ROUNDS = 200_000
+DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT = 30
+DEFAULT_PENDING_INPUT_LIMIT = 100
+DEFAULT_SESSION_GROUP = "user"
+DEFAULT_AUTO_RESUME_INTERVAL_SECONDS = 6 * 60 * 60
+DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS = 5 * 60
+AGENT_PRIORITY_BORDER = "border"
+NATIVE_PROVIDER_KINDS = ("codex", "claude", "gemini")
+DEFAULT_AGENT_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
+DEFAULT_GOAL_MANAGER_PRIORITY = ["codex", "claude", "gemini", AGENT_PRIORITY_BORDER]
+DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY = [
+    {
+        "provider": "codex",
+        "profile": "interactive-fast",
+        "model": "gpt-5.4-mini",
+        "session_slot": "interactive_agent",
+        "session_mode": "ephemeral",
+        "ephemeral": True,
+    },
+    AGENT_PRIORITY_BORDER,
+    "claude",
+    "gemini",
+]
+GOAL_MANAGER_USERNAME = "goalmanager"
+DEFAULT_SESSION_UI_MODE = "standard"
+SESSION_UI_MODES = {"standard", "map_only", "communication"}
+GOAL_COMPLETION_POLICIES = {"standard", "continuous", "per_prompt"}
+CONTINUOUS_GOAL_TEMPLATE_IDS = {"entrance.service", "aize-entrance"}
+SESSION_GROUP_DEFAULT_PERMISSIONS = {
+    "root": {
+        "create_session": False,
+        "create_child_session": False,
+        "update_session_goal": False,
+        "update_goal": False,
+        "send_user_prompt": False,
+        "send_prompt": False,
+        "auto_spawn_recovery": True,
+        "auto_resume": True,
+    },
+    "user": {
+        "create_session": True,
+        "create_child_session": True,
+        "update_session_goal": True,
+        "update_goal": True,
+        "send_user_prompt": True,
+        "send_prompt": True,
+        "auto_spawn_recovery": True,
+        "auto_resume": True,
+    },
+    "error": {
+        "create_session": False,
+        "create_child_session": False,
+        "update_session_goal": False,
+        "update_goal": False,
+        "send_user_prompt": False,
+        "send_prompt": False,
+        "auto_spawn_recovery": False,
+        "auto_resume": True,
+    },
+}
+
+_state_lock_guard = threading.RLock()
+_state_lock_local = threading.local()
+
+
+def _state_flock_enabled() -> bool:
+    return str(os.environ.get("AIZE_STATE_FLOCK", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_child_session_sharing_policy(policy: Any) -> dict[str, Any]:
+    record = dict(policy or {}) if isinstance(policy, dict) else {}
+    mode = str(record.get("mode") or "").strip().lower()
+    if mode not in {"private", "public", "allowlist"}:
+        mode = "private"
+
+    def _normalize_id_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    return {
+        "mode": mode,
+        "allowed_source_session_ids": _normalize_id_list(record.get("allowed_source_session_ids")),
+        "allowed_source_unit_ids": _normalize_id_list(
+            record.get("allowed_source_unit_ids") or record.get("allowed_source_template_ids")
+        ),
+        "allowed_source_template_ids": _normalize_id_list(
+            record.get("allowed_source_template_ids") or record.get("allowed_source_unit_ids")
+        ),
+    }
+
+
+def normalize_session_skills(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    def _normalize_skill_scope(raw_value: Any) -> str:
+        value = str(raw_value or "").strip().lower()
+        if value in {"unit", "unit_skill", "unitskill", "template", "template_skill", "templateskill"}:
+            return "unit"
+        if value in {"adaptive", "adaptive_skill", "adaptiveskill", "session"}:
+            return "adaptive"
+        return ""
+
+    def _normalize_text_list(raw_value: Any) -> list[str]:
+        if not isinstance(raw_value, list):
+            return []
+        items: list[str] = []
+        seen: set[str] = set()
+        for item in raw_value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            items.append(text)
+        return items
+
+    def _normalize_file_entry(raw_item: Any) -> dict[str, Any] | None:
+        def _normalize_relative_path(raw_path: str) -> str:
+            safe_parts = [
+                part
+                for part in Path(str(raw_path or "").lstrip("/")).parts
+                if part not in {"", ".", ".."}
+            ]
+            return Path(*safe_parts).as_posix() if safe_parts else ""
+
+        if isinstance(raw_item, str):
+            path = _normalize_relative_path(raw_item)
+            return {"path": path} if path else None
+        if not isinstance(raw_item, dict):
+            return None
+        path = _normalize_relative_path(str(raw_item.get("path") or raw_item.get("name") or ""))
+        if not path:
+            return None
+        entry = {"path": path}
+        content = raw_item.get("content")
+        if isinstance(content, str):
+            entry["content"] = content
+        description = str(raw_item.get("description") or "").strip()
+        if description:
+            entry["description"] = description
+        durable_description = "durable" in description.lower()
+        append_only_template = "append one entry per scheduled run" in str(content or "").lower()
+        if bool(raw_item.get("preserve_existing")) or durable_description or append_only_template:
+            entry["preserve_existing"] = True
+        return entry
+
+    normalized: list[dict[str, Any]] = []
+    seen_skill_ids: set[str] = set()
+    for raw_item in value:
+        if isinstance(raw_item, str):
+            raw_item = {"skill_id": raw_item}
+        if not isinstance(raw_item, dict):
+            continue
+        skill_id = str(
+            raw_item.get("skill_id")
+            or raw_item.get("id")
+            or raw_item.get("name")
+            or ""
+        ).strip()
+        if not skill_id or skill_id in seen_skill_ids:
+            continue
+        seen_skill_ids.add(skill_id)
+        skill: dict[str, Any] = {
+            "skill_id": skill_id,
+            "kind": str(raw_item.get("kind") or "general").strip().lower() or "general",
+            "skill_scope": _normalize_skill_scope(
+                raw_item.get("skill_scope")
+                or raw_item.get("scope")
+                or raw_item.get("skill_class")
+            ),
+            "title": str(raw_item.get("title") or skill_id).strip() or skill_id,
+            "description": str(raw_item.get("description") or raw_item.get("summary") or "").strip(),
+            "prompt": str(raw_item.get("prompt") or "").strip(),
+            "usage": str(
+                raw_item.get("usage")
+                or raw_item.get("how_to_use")
+                or raw_item.get("instructions")
+                or ""
+            ).strip(),
+            "when_to_use": str(
+                raw_item.get("when_to_use")
+                or raw_item.get("use_when")
+                or ""
+            ).strip(),
+            "routing_tags": _normalize_text_list(raw_item.get("routing_tags")),
+            "allow_tag_routing": bool(raw_item.get("allow_tag_routing", False)),
+            "route_when_unhandled": bool(
+                raw_item.get("route_when_unhandled", raw_item.get("default_route", False))
+            ),
+            "canonical_session_key": str(raw_item.get("canonical_session_key") or "").strip(),
+            "routing_mode": str(raw_item.get("routing_mode") or "").strip().lower(),
+            "handler_file": str(
+                raw_item.get("handler_file")
+                or raw_item.get("entrypoint")
+                or raw_item.get("handler")
+                or ""
+            ).strip(),
+            "target_session_id": str(raw_item.get("target_session_id") or "").strip(),
+            "target_unit_id": str(raw_item.get("target_unit_id") or raw_item.get("target_template_id") or "").strip(),
+            "target_template_id": str(raw_item.get("target_template_id") or raw_item.get("target_unit_id") or "").strip(),
+            "target_label": str(raw_item.get("target_label") or "").strip(),
+            "target_child_label": str(raw_item.get("target_child_label") or "").strip(),
+            "target_goal_text": str(raw_item.get("target_goal_text") or "").strip(),
+            "preferred_provider": str(raw_item.get("preferred_provider") or "").strip().lower(),
+            "route_parent_scope": str(raw_item.get("route_parent_scope") or "").strip().lower(),
+            "session_ui_mode": str(raw_item.get("session_ui_mode") or "").strip().lower(),
+            "communication_agent_enabled": bool(raw_item.get("communication_agent_enabled", False)),
+            "create_as_child": bool(raw_item.get("create_as_child", True)),
+            "selected_agents": _normalize_text_list(raw_item.get("selected_agents")),
+            "allowed_source_template_ids": _normalize_text_list(raw_item.get("allowed_source_template_ids")),
+        }
+        spawn_session_skills = raw_item.get("spawn_session_skills")
+        if isinstance(spawn_session_skills, list):
+            skill["spawn_session_skills"] = normalize_session_skills(spawn_session_skills)
+        files: list[dict[str, Any]] = []
+        for raw_file in raw_item.get("files", []):
+            entry = _normalize_file_entry(raw_file)
+            if entry is not None:
+                files.append(entry)
+        skill["files"] = files
+        normalized.append(skill)
+    return normalized
+
+
+def normalize_auto_compact_threshold_left_percent(value: Any) -> int:
+    try:
+        threshold = int(value)
+    except (TypeError, ValueError):
+        threshold = DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT
+    threshold = max(5, min(95, threshold))
+    return threshold - (threshold % 5)
+
+
+def normalize_agent_priority(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return list(DEFAULT_AGENT_PRIORITY)
+    active: list[str] = []
+    saved: list[str] = []
+    seen: set[str] = set()
+    border_seen = False
+    for raw_item in value:
+        item = str(raw_item or "").strip().lower()
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        if item == AGENT_PRIORITY_BORDER:
+            border_seen = True
+            continue
+        if border_seen:
+            saved.append(item)
+        else:
+            active.append(item)
+    for provider in NATIVE_PROVIDER_KINDS:
+        if provider not in seen:
+            saved.append(provider)
+    normalized = active
+    if border_seen or saved:
+        normalized.append(AGENT_PRIORITY_BORDER)
+        normalized.extend(saved)
+    return normalized or list(DEFAULT_AGENT_PRIORITY)
+
+
+def active_agent_priority(value: Any, *, available_kinds: set[str] | None = None) -> list[str]:
+    available = available_kinds or set(NATIVE_PROVIDER_KINDS)
+    active: list[str] = []
+    for item in normalize_agent_priority(value):
+        if item == AGENT_PRIORITY_BORDER:
+            break
+        if item in available and item not in active:
+            active.append(item)
+    fallback = [kind for kind in DEFAULT_AGENT_PRIORITY if kind in available]
+    return active or fallback
+
+
+def normalize_agent_profile_priority(value: Any, *, default_priority: list[Any] | None = None) -> list[dict[str, Any]]:
+    source = value if isinstance(value, list) else (default_priority or DEFAULT_AGENT_PRIORITY)
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    border_seen = False
+    for raw_item in source:
+        if isinstance(raw_item, dict):
+            provider = str(raw_item.get("provider") or raw_item.get("kind") or "").strip().lower()
+            if not provider:
+                continue
+            item: dict[str, Any] = {"provider": provider}
+            for key in ("profile", "model"):
+                text = str(raw_item.get(key) or "").strip()
+                if text:
+                    item[key] = text
+            for slot_key in ("session_slot", "lot"):
+                slot_text = str(raw_item.get(slot_key) or "").strip().lower()
+                if slot_text:
+                    item["session_slot"] = slot_text
+                    break
+            session_mode = str(raw_item.get("session_mode") or "").strip().lower()
+            if session_mode:
+                item["session_mode"] = session_mode
+            if "ephemeral" in raw_item:
+                item["ephemeral"] = bool(raw_item.get("ephemeral"))
+            config: dict[str, str] = {}
+            for config_key in (
+                "model_reasoning_effort",
+                "model_reasoning_summary",
+                "model_verbosity",
+                "reasoning_effort",
+                "verbosity",
+            ):
+                config_value = raw_item.get(config_key)
+                if isinstance(config_value, (str, int, float, bool)) and str(config_value).strip():
+                    normalized_key = {
+                        "reasoning_effort": "model_reasoning_effort",
+                        "verbosity": "model_verbosity",
+                    }.get(config_key, config_key)
+                    config[normalized_key] = str(config_value).strip()
+            raw_config = raw_item.get("config") or raw_item.get("config_overrides")
+            if isinstance(raw_config, dict):
+                for config_key, config_value in raw_config.items():
+                    if isinstance(config_value, (str, int, float, bool)) and str(config_value).strip():
+                        config[str(config_key).strip()] = str(config_value).strip()
+            if config:
+                item["config"] = config
+        else:
+            provider = str(raw_item or "").strip().lower()
+            if not provider:
+                continue
+            item = {"provider": provider}
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider == AGENT_PRIORITY_BORDER:
+            if not border_seen:
+                normalized.append({"provider": AGENT_PRIORITY_BORDER})
+                border_seen = True
+            continue
+        identity = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(item)
+    return normalized or normalize_agent_profile_priority(DEFAULT_AGENT_PRIORITY)
+
+
+def active_agent_profile_priority(
+    value: Any,
+    *,
+    available_kinds: set[str] | None = None,
+    default_priority: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    available = available_kinds or set(NATIVE_PROVIDER_KINDS)
+    active: list[dict[str, Any]] = []
+    for item in normalize_agent_profile_priority(value, default_priority=default_priority):
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider == AGENT_PRIORITY_BORDER:
+            break
+        if provider in available:
+            active.append(dict(item))
+    return active
+
+
+def normalize_goal_manager_priority(value: Any) -> list[str]:
+    if value is None:
+        return list(DEFAULT_GOAL_MANAGER_PRIORITY)
+    return normalize_agent_priority(value)
+
+
+def active_goal_manager_priority(value: Any, *, available_kinds: set[str] | None = None) -> list[str]:
+    available = available_kinds or set(NATIVE_PROVIDER_KINDS)
+    active: list[str] = []
+    for item in normalize_goal_manager_priority(value):
+        if item == AGENT_PRIORITY_BORDER:
+            break
+        if item in available and item not in active:
+            active.append(item)
+    fallback = [kind for kind in DEFAULT_GOAL_MANAGER_PRIORITY if kind in available]
+    return active or fallback
+
+
+def normalize_username(username: str) -> str:
+    return username.strip().lower()
+
+
+def hash_password(password: str, salt: bytes) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ROUNDS,
+    ).hex()
+
+
+def digest_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def history_state_key(username: str, session_id: str) -> str:
+    return f"{normalize_username(username)}::{session_id}"
+
+
+def codex_session_key(service_id: str, *, username: str | None, session_id: str | None) -> str:
+    if username and session_id:
+        return f"{service_id}::{normalize_username(username)}::{session_id}"
+    return service_id
+
+
+def claude_session_key(service_id: str, *, username: str | None, session_id: str | None) -> str:
+    if username and session_id:
+        return f"{service_id}::{normalize_username(username)}::{session_id}"
+    return service_id
+
+
+def agent_state_key(service_id: str, username: str, session_id: str) -> str:
+    return f"{service_id}::{normalize_username(username)}::{session_id}"
+
+
+def service_pending_state_key(service_id: str, username: str, session_id: str) -> str:
+    return f"{service_id}::{normalize_username(username)}::{session_id}"
+
+
+def state_dir(runtime_root: Path) -> Path:
+    runtime_root = Path(runtime_root)
+    # The canonical repo runtime lives at .aize-runtime/, so durable state
+    # should sit beside it. Ephemeral/test runtimes use an isolated nested state
+    # directory to avoid cross-run collisions under shared parents like /tmp.
+    if runtime_root.name.startswith(".aize-runtime"):
+        return runtime_root.parent / ".aize-state"
+    return runtime_root / ".aize-state"
+
+
+def sessions_dir(runtime_root: Path) -> Path:
+    return state_dir(runtime_root) / "sessions"
+
+
+def session_user_dir(runtime_root: Path, *, username: str) -> Path:
+    return sessions_dir(runtime_root) / normalize_username(username)
+
+
+def session_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_user_dir(runtime_root, username=username) / session_id
+
+
+def session_pending_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "pending"
+
+
+def session_services_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "services"
+
+
+def session_goal_manager_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "goal_manager"
+
+
+def session_messages_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "messages"
+
+
+def session_message_dir(runtime_root: Path, *, username: str, session_id: str, message_id: str) -> Path:
+    return session_messages_dir(runtime_root, username=username, session_id=session_id) / message_id
+
+
+def session_message_attachments_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    message_id: str,
+) -> Path:
+    return session_message_dir(runtime_root, username=username, session_id=session_id, message_id=message_id) / "attachments"
+
+
+def session_dag_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "dag"
+
+
+def session_goals_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "goals"
+
+
+def session_goal_dir(runtime_root: Path, *, username: str, session_id: str, goal_id: str) -> Path:
+    return session_goals_dir(runtime_root, username=username, session_id=session_id) / goal_id
+
+
+def session_goal_attachments_dir(runtime_root: Path, *, username: str, session_id: str, goal_id: str) -> Path:
+    return session_goal_dir(runtime_root, username=username, session_id=session_id, goal_id=goal_id) / "attachments"
+
+
+def session_message_meta_path(runtime_root: Path, *, username: str, session_id: str, message_id: str) -> Path:
+    return session_message_dir(runtime_root, username=username, session_id=session_id, message_id=message_id) / "meta.json"
+
+
+def session_message_body_path(runtime_root: Path, *, username: str, session_id: str, message_id: str) -> Path:
+    return session_message_dir(runtime_root, username=username, session_id=session_id, message_id=message_id) / "body.txt"
+
+
+def session_metadata_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "session.json"
+
+
+def session_time_index_dir(runtime_root: Path) -> Path:
+    return sessions_dir(runtime_root) / ".index" / "updated"
+
+
+def session_timeline_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "timeline.jsonl"
+
+
+def session_runtime_journal_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "runtime_journal.jsonl"
+
+
+def session_pending_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_pending_dir(runtime_root, username=username, session_id=session_id) / "session.jsonl"
+
+
+def session_goal_manager_pending_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_pending_dir(runtime_root, username=username, session_id=session_id) / "goal_manager.jsonl"
+
+
+def session_agent_pending_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_pending_dir(runtime_root, username=username, session_id=session_id) / "agents" / f"{agent_id}.jsonl"
+
+
+def session_service_pending_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+) -> Path:
+    return session_pending_dir(runtime_root, username=username, session_id=session_id) / "services" / f"{service_id}.jsonl"
+
+
+def session_service_state_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+) -> Path:
+    return session_services_dir(runtime_root, username=username, session_id=session_id) / f"{service_id}.json"
+
+
+def session_goal_manager_state_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_goal_manager_dir(runtime_root, username=username, session_id=session_id) / "state.json"
+
+
+def session_goal_manager_reviews_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_goal_manager_dir(runtime_root, username=username, session_id=session_id) / "reviews.jsonl"
+
+
+def session_dag_parents_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dag_dir(runtime_root, username=username, session_id=session_id) / "parents.json"
+
+
+def session_dag_children_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dag_dir(runtime_root, username=username, session_id=session_id) / "children.json"
+
+
+def session_agent_state_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    service_id: str,
+) -> Path:
+    return session_services_dir(runtime_root, username=username, session_id=session_id) / f"{service_id}.audit.json"
+
+
+def safe_agent_id_for_path(agent_id: str) -> str:
+    """Return a filesystem-safe version of agent_id (replaces @@ with __ and strips unsafe chars)."""
+    return str(agent_id or "").replace("@@", "__").replace("/", "_").replace("\\", "_").replace("..", "_")
+
+
+def session_agent_files_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "agent_files"
+
+
+def safe_template_id_for_path(template_id: str) -> str:
+    return str(template_id or "").replace("/", "_").replace("\\", "_").replace("..", "_").strip() or "app"
+
+
+def safe_unit_id_for_path(unit_id: str) -> str:
+    return safe_template_id_for_path(unit_id)
+
+
+def units_dir(runtime_root: Path) -> Path:
+    return state_dir(runtime_root) / "units"
+
+
+def unit_user_dir(runtime_root: Path, *, username: str) -> Path:
+    return units_dir(runtime_root) / normalize_username(username)
+
+
+def unit_dir(runtime_root: Path, *, username: str, unit_id: str) -> Path:
+    return unit_user_dir(runtime_root, username=username) / safe_unit_id_for_path(unit_id)
+
+
+def unit_workspace_dir(runtime_root: Path, *, username: str, unit_id: str) -> Path:
+    return unit_dir(runtime_root, username=username, unit_id=unit_id) / "workspace"
+
+
+def unit_metadata_path(runtime_root: Path, *, username: str, unit_id: str) -> Path:
+    return unit_dir(runtime_root, username=username, unit_id=unit_id) / "unit.json"
+
+
+def session_templates_dir(runtime_root: Path) -> Path:
+    # Legacy state root for unit-launched workspaces.
+    return state_dir(runtime_root) / "apps"
+
+
+def session_template_user_dir(runtime_root: Path, *, username: str) -> Path:
+    return session_templates_dir(runtime_root) / normalize_username(username)
+
+
+def session_template_dir(runtime_root: Path, *, username: str, template_id: str) -> Path:
+    return session_template_user_dir(runtime_root, username=username) / safe_template_id_for_path(template_id)
+
+
+def session_template_workspace_dir(runtime_root: Path, *, username: str, template_id: str) -> Path:
+    return session_template_dir(runtime_root, username=username, template_id=template_id) / "workspace"
+
+
+def session_template_metadata_path(runtime_root: Path, *, username: str, template_id: str) -> Path:
+    return session_template_dir(runtime_root, username=username, template_id=template_id) / "unit.json"
+
+
+def session_skills_dir(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_dir(runtime_root, username=username, session_id=session_id) / "skills"
+
+
+def session_skills_manifest_path(runtime_root: Path, *, username: str, session_id: str) -> Path:
+    return session_skills_dir(runtime_root, username=username, session_id=session_id) / "manifest.json"
+
+
+def session_skill_file_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    relative_path: str,
+) -> Path:
+    safe_parts = [
+        part
+        for part in Path(str(relative_path or "").lstrip("/")).parts
+        if part not in {"", ".", ".."}
+    ]
+    safe_relative = Path(*safe_parts).as_posix() if safe_parts else ""
+    return session_skills_dir(runtime_root, username=username, session_id=session_id) / safe_relative
+
+
+def session_agent_entry_files_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_agent_files_dir(runtime_root, username=username, session_id=session_id) / safe_agent_id_for_path(agent_id)
+
+
+def session_agent_inbox_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_agent_entry_files_dir(runtime_root, username=username, session_id=session_id, agent_id=agent_id) / "inbox"
+
+
+def session_agent_outbox_dir(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    return session_agent_entry_files_dir(runtime_root, username=username, session_id=session_id, agent_id=agent_id) / "outbox"
+
+
+def session_agent_acl_path(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    agent_id: str,
+) -> Path:
+    """Path to the ACL metadata file for a specific agent file directory."""
+    return session_agent_entry_files_dir(runtime_root, username=username, session_id=session_id, agent_id=agent_id) / ".acl.json"
+
+
+def state_path(runtime_root: Path) -> Path:
+    return state_dir(runtime_root) / "persistent.json"
+
+
+def lock_path(runtime_root: Path) -> Path:
+    return state_dir(runtime_root) / "persistent.lock"
+
+
+@contextmanager
+def state_lock(runtime_root: Path):
+    depth = int(getattr(_state_lock_local, "depth", 0) or 0)
+    if depth > 0:
+        _state_lock_local.depth = depth + 1
+        try:
+            yield
+        finally:
+            _state_lock_local.depth = depth
+        return
+
+    path = lock_path(runtime_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock_guard:
+        if not _state_flock_enabled():
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+            return
+        with path.open("w", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def state_read_lock(runtime_root: Path):
+    """Shared read lock — allows concurrent readers, blocks writers."""
+    depth = int(getattr(_state_lock_local, "depth", 0) or 0)
+    if depth > 0:
+        _state_lock_local.depth = depth + 1
+        try:
+            yield
+        finally:
+            _state_lock_local.depth = depth
+        return
+
+    path = lock_path(runtime_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock_guard:
+        if not _state_flock_enabled():
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+            return
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            _state_lock_local.depth = 1
+            try:
+                yield
+            finally:
+                _state_lock_local.depth = 0
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def write_state(runtime_root: Path, state: dict[str, Any]) -> None:
+    path = state_path(runtime_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    persisted_state = dict(state)
+    if "_runtime_root" in persisted_state:
+        persisted_state["_runtime_root"] = str(persisted_state["_runtime_root"])
+    persisted_state.pop("sessions", None)
+    persisted_state.pop("talks", None)
+    # Session-scoped state is canonical under .aize-state/sessions/... .
+    persisted_state.pop("histories", None)
+    persisted_state.pop("pending_inputs", None)
+    persisted_state.pop("service_pending_inputs", None)
+    persisted_state.pop("codex_sessions", None)
+    persisted_state.pop("claude_sessions", None)
+    persisted_state.pop("conversation_sessions", None)
+    persisted_state.pop("agent_states", None)
+    fd, temp_path = tempfile.mkstemp(prefix="persistent.", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(persisted_state, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _atomic_write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _parse_session_index_ts(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(text).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _maybe_update_session_time_index(path: Path, payload: dict[str, Any]) -> None:
+    if path.name != "session.json" or not isinstance(payload, dict) or ".index" in path.parts:
+        return
+    session_dir_path = path.parent
+    user_dir = session_dir_path.parent
+    sessions_root = user_dir.parent
+    if not session_dir_path.name or not user_dir.name or sessions_root.name != "sessions":
+        return
+    username = normalize_username(user_dir.name)
+    session_id = str(payload.get("session_id") or session_dir_path.name).strip()
+    if not session_id:
+        return
+    created_at = str(payload.get("created_at") or payload.get("updated_at") or utc_ts()).strip()
+    updated_at_text = str(payload.get("updated_at") or created_at or utc_ts()).strip()
+    updated_at = _parse_session_index_ts(updated_at_text) or _parse_session_index_ts(created_at) or datetime.now(UTC)
+    bucket = updated_at.strftime("%Y/%m/%d")
+    index_root = sessions_root / ".index"
+    pointer_path = index_root / "by-session" / username / f"{Path(session_id).name}.json"
+    target_path = index_root / "updated" / bucket / f"{username}@@{Path(session_id).name}.json"
+    previous = read_json_file(pointer_path)
+    previous_path_text = str((previous or {}).get("index_path") or "")
+    if previous_path_text:
+        previous_path = Path(previous_path_text)
+        if previous_path != target_path and previous_path.exists():
+            try:
+                previous_path.unlink()
+            except OSError:
+                pass
+    entry = {
+        "username": username,
+        "session_id": session_id,
+        "created_at": created_at,
+        "updated_at": updated_at_text,
+    }
+    _atomic_write_json_file(target_path, entry)
+    _atomic_write_json_file(pointer_path, {**entry, "bucket": bucket, "index_path": str(target_path)})
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_json_file(path, payload)
+    _maybe_update_session_time_index(path, payload)
+
+
+def read_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def write_session_skills(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    skills: list[dict[str, Any]],
+) -> None:
+    normalized_username = normalize_username(username)
+    normalized_session_id = str(session_id or "").strip()
+    normalized_skills = normalize_session_skills(skills)
+    skills_dir = session_skills_dir(
+        runtime_root,
+        username=normalized_username,
+        session_id=normalized_session_id,
+    )
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    manifest_payload = {"skills": normalized_skills}
+    write_json_file(
+        session_skills_manifest_path(
+            runtime_root,
+            username=normalized_username,
+            session_id=normalized_session_id,
+        ),
+        manifest_payload,
+    )
+    for skill in normalized_skills:
+        for file_entry in skill.get("files", []):
+            if not isinstance(file_entry, dict):
+                continue
+            path = str(file_entry.get("path") or "").strip()
+            if not path or "content" not in file_entry:
+                continue
+            target_path = session_skill_file_path(
+                runtime_root,
+                username=normalized_username,
+                session_id=normalized_session_id,
+                relative_path=path,
+            )
+            if bool(file_entry.get("preserve_existing")) and target_path.exists():
+                continue
+            _write_text_file(target_path, str(file_entry.get("content") or ""))
+
+
+def load_session_skills(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    manifest = read_json_file(
+        session_skills_manifest_path(
+            runtime_root,
+            username=normalize_username(username),
+            session_id=str(session_id or "").strip(),
+        )
+    ) or {}
+    return normalize_session_skills(manifest.get("skills"))
+
+
+def ensure_session_template_workspace(
+    runtime_root: Path,
+    *,
+    username: str,
+    template_id: str,
+    display_name: str = "",
+    plugin_id: str = "",
+    session_id: str = "",
+) -> Path:
+    normalized_username = normalize_username(username)
+    normalized_template_id = str(template_id or "").strip()
+    target_dir = unit_workspace_dir(runtime_root, username=normalized_username, unit_id=normalized_template_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = unit_metadata_path(runtime_root, username=normalized_username, unit_id=normalized_template_id)
+    current = read_json_file(metadata_path) or {}
+    created_at = str(current.get("created_at") or utc_ts())
+    payload = dict(current)
+    payload.update(
+        {
+            "unit_id": normalized_template_id,
+            "template_id": normalized_template_id,
+            "username": normalized_username,
+            "display_name": str(display_name or normalized_template_id).strip(),
+            "plugin_id": str(plugin_id or "").strip(),
+            "workspace_path": str(target_dir),
+            "created_at": created_at,
+            "updated_at": utc_ts(),
+            "last_session_id": str(session_id or "").strip(),
+        }
+    )
+    write_json_file(
+        metadata_path,
+        payload,
+    )
+    return target_dir
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+def write_jsonl(path: Path, entries: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def remove_file_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def ensure_session_storage_unlocked(
+    runtime_root: Path,
+    *,
+    username: str,
+    session: dict[str, Any],
+) -> Path:
+    normalized = normalize_username(username)
+    session_id = str(session.get("session_id") or "").strip()
+    directory = session_dir(runtime_root, username=normalized, session_id=session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    session_pending_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
+    (session_pending_dir(runtime_root, username=normalized, session_id=session_id) / "services").mkdir(
+        parents=True, exist_ok=True
+    )
+    session_services_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
+    session_goal_manager_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
+    session_dag_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
+    session_skills_dir(runtime_root, username=normalized, session_id=session_id).mkdir(parents=True, exist_ok=True)
+    session_payload = dict(session)
+    if not str(session_payload.get("created_by_username") or "").strip():
+        session_payload["created_by_username"] = normalized
+    if not str(session_payload.get("created_by_type") or "").strip():
+        session_payload["created_by_type"] = "user"
+    if session_id == "default" and str(session_payload.get("label") or "").strip() in {"", "Default"}:
+        session_payload["label"] = "Root"
+    session_payload["_runtime_root"] = str(runtime_root)
+    session_payload["session_skills"] = normalize_session_skills(session_payload.get("session_skills"))
+    write_json_file(session_metadata_path(runtime_root, username=normalized, session_id=session_id), session_payload)
+    write_session_skills(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        skills=session_payload.get("session_skills", []),
+    )
+    goal_manager_state_path = session_goal_manager_state_path(runtime_root, username=normalized, session_id=session_id)
+    if not goal_manager_state_path.exists():
+        write_json_file(
+            goal_manager_state_path,
+            {
+                "state": "idle",
+                "last_reviewed_turn_completed_at": str(session.get("goal_manager_last_reviewed_turn_completed_at") or ""),
+                "updated_at": str(session.get("updated_at") or utc_ts()),
+            },
+        )
+    reviews_path = session_goal_manager_reviews_path(runtime_root, username=normalized, session_id=session_id)
+    reviews_path.touch(exist_ok=True)
+    parents_path = session_dag_parents_path(runtime_root, username=normalized, session_id=session_id)
+    if not parents_path.exists():
+        write_json_file(parents_path, {"parents": []})
+    children_path = session_dag_children_path(runtime_root, username=normalized, session_id=session_id)
+    if not children_path.exists():
+        write_json_file(children_path, {"children": []})
+    return directory
+
+
+def _load_session_records_for_user_unlocked(runtime_root: Path, username: str) -> list[dict[str, Any]]:
+    """Load conversation sessions for one user directly from session files."""
+    normalized = normalize_username(username)
+    user_dir = session_user_dir(runtime_root, username=normalized)
+    if not user_dir.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for talk_dir in sorted(path for path in user_dir.iterdir() if path.is_dir()):
+        session = read_json_file(session_metadata_path(runtime_root, username=normalized, session_id=talk_dir.name))
+        if not isinstance(session, dict):
+            continue
+        if str(session.get("_runtime_root") or "") != str(runtime_root):
+            continue
+        _ensure_session_defaults_unlocked(session)
+        records.append(dict(session))
+    return records
+
+
+def _ensure_user_sessions_cache_unlocked(runtime_root: Path, state: dict[str, Any], username: str) -> list[dict[str, Any]]:
+    normalized = normalize_username(username)
+    sessions = _conversation_sessions(state).setdefault(normalized, [])
+    if not isinstance(sessions, list):
+        sessions = []
+        _conversation_sessions(state)[normalized] = sessions
+    seen: set[str] = set()
+    for item in list(sessions):
+        if isinstance(item, dict):
+            session_id = str(item.get("session_id") or "").strip()
+            if session_id:
+                seen.add(session_id)
+    for session in _load_session_records_for_user_unlocked(runtime_root, normalized):
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        sessions.append(session)
+    return sessions
+
+
+def _auth_sessions(state: dict[str, Any]) -> dict[str, Any]:
+    return state.setdefault("auth_sessions", {})
+
+
+def _conversation_sessions(state: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    return state.setdefault("conversation_sessions", {})
+
+
+def _normalize_goal_revision_unlocked(revision: dict[str, Any], *, fallback_ts: str) -> dict[str, Any]:
+    goal_text = str(revision.get("goal_text", "") or "").strip()
+    goal_active = bool(revision.get("goal_active", bool(goal_text)))
+    progress_state = str(
+        revision.get(
+            "goal_progress_state",
+            "complete" if bool(revision.get("goal_completed", False)) else "in_progress",
+        )
+    ).strip().lower()
+    progress_state = progress_state if progress_state in {"complete", "in_progress"} else "in_progress"
+    updated_at = str(revision.get("updated_at") or revision.get("created_at") or fallback_ts)
+    return {
+        "goal_id": str(revision.get("goal_id") or secrets.token_hex(8)),
+        "previous_goal_id": (
+            str(revision.get("previous_goal_id") or "").strip() or None
+        ),
+        "goal_text": goal_text,
+        "goal_active": goal_active,
+        "goal_completed": progress_state == "complete",
+        "goal_progress_state": progress_state,
+        "created_at": str(revision.get("created_at") or updated_at),
+        "updated_at": updated_at,
+        "updated_by_username": str(revision.get("updated_by_username") or "").strip(),
+        "updated_by_type": str(revision.get("updated_by_type") or "").strip().lower() or "user",
+        "origin_session_id": str(revision.get("origin_session_id") or "").strip(),
+        "origin_goal_id": str(revision.get("origin_goal_id") or "").strip(),
+        "origin_goal_text": str(revision.get("origin_goal_text") or ""),
+    }
+
+
+def _active_goal_revision_unlocked(session: dict[str, Any]) -> dict[str, Any] | None:
+    active_goal_id = str(session.get("active_goal_id") or "").strip()
+    history = session.get("goal_history")
+    if not isinstance(history, list):
+        return None
+    for revision in history:
+        if isinstance(revision, dict) and str(revision.get("goal_id") or "").strip() == active_goal_id:
+            return revision
+    return None
+
+
+def _apply_active_goal_snapshot_unlocked(session: dict[str, Any]) -> None:
+    active_revision = _active_goal_revision_unlocked(session)
+    if active_revision is None:
+        session["goal_id"] = ""
+        session["goal_text"] = ""
+        session["goal_mode"] = "no_goal"
+        session["goal_active"] = False
+        session["goal_completed"] = True
+        session["goal_progress_state"] = "complete"
+        session["goal_updated_at"] = session.get("updated_at", utc_ts())
+        return
+    session["goal_id"] = str(active_revision.get("goal_id") or "")
+    session["goal_text"] = str(active_revision.get("goal_text", ""))
+    session["goal_active"] = bool(active_revision.get("goal_active", False))
+    session["goal_completed"] = bool(active_revision.get("goal_completed", False))
+    session["goal_progress_state"] = str(active_revision.get("goal_progress_state", "in_progress"))
+    session["goal_updated_at"] = str(active_revision.get("updated_at") or session.get("updated_at", utc_ts()))
+    _normalize_goal_mode_unlocked(session)
+
+
+def _ensure_goal_history_unlocked(session: dict[str, Any]) -> None:
+    raw_history = session.get("goal_history")
+    history: list[dict[str, Any]] = []
+    if isinstance(raw_history, list):
+        fallback_ts = str(session.get("goal_updated_at") or session.get("updated_at") or utc_ts())
+        for raw_revision in raw_history:
+            if isinstance(raw_revision, dict):
+                history.append(_normalize_goal_revision_unlocked(raw_revision, fallback_ts=fallback_ts))
+    session["goal_history"] = history
+    active_goal_id = str(session.get("active_goal_id") or session.get("goal_id") or "").strip()
+    if history:
+        history_ids = {str(revision.get("goal_id") or "") for revision in history}
+        if active_goal_id not in history_ids:
+            active_goal_id = str(history[-1].get("goal_id") or "")
+    else:
+        active_goal_id = ""
+    session["active_goal_id"] = active_goal_id
+    _apply_active_goal_snapshot_unlocked(session)
+
+
+def _normalize_goal_mode_unlocked(session: dict[str, Any]) -> None:
+    goal_text = str(session.get("goal_text", "") or "").strip()
+    if not goal_text:
+        session["goal_text"] = ""
+        session["goal_mode"] = "no_goal"
+        session["goal_active"] = False
+        session["goal_completed"] = True
+        session["goal_progress_state"] = "complete"
+        return
+    goal_active = bool(session.get("goal_active", True))
+    session["goal_mode"] = "active" if goal_active else "inactive"
+    session["goal_active"] = goal_active
+    progress_state = str(session.get("goal_progress_state", "complete" if bool(session.get("goal_completed", False)) else "in_progress")).strip().lower()
+    session["goal_progress_state"] = progress_state if progress_state in {"complete", "in_progress"} else "in_progress"
+    session["goal_completed"] = session["goal_progress_state"] == "complete"
+
+
+def _ensure_session_defaults_unlocked(session: dict[str, Any]) -> None:
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        session_id = secrets.token_hex(8)
+    session["session_id"] = session_id
+    session["auto_compact_threshold_left_percent"] = normalize_auto_compact_threshold_left_percent(
+        session.get("auto_compact_threshold_left_percent", DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT)
+    )
+    session.setdefault("goal_text", "")
+    has_goal_text = bool(str(session.get("goal_text") or "").strip())
+    session.setdefault("goal_active", has_goal_text)
+    session.setdefault("goal_mode", "active" if has_goal_text else "no_goal")
+    session.setdefault("goal_completed", not has_goal_text)
+    session.setdefault("goal_progress_state", "complete" if bool(session.get("goal_completed", False)) else "in_progress")
+    session.setdefault("goal_reset_completed_on_prompt", True)
+    session.setdefault("goal_auto_compact_enabled", True)
+    session.setdefault("agent_welcome_enabled", False)
+    session.setdefault("preferred_provider", "codex")
+    session["goal_context_root_limit"] = max(1, int(session.get("goal_context_root_limit", 2) or 2))
+    session["goal_context_recent_limit"] = max(1, int(session.get("goal_context_recent_limit", 2) or 2))
+    # agent_priority: ordered list with an optional border marker that disables entries below it
+    session["agent_priority"] = normalize_agent_priority(session.get("agent_priority"))
+    session["agent_profile_priority"] = normalize_agent_profile_priority(
+        session.get("agent_profile_priority") or session.get("agent_priority")
+    )
+    # goal_manager_priority is role-scoped. External providers are supported when
+    # explicitly placed above the divider, but the default runnable set is native only.
+    session["goal_manager_priority"] = normalize_goal_manager_priority(session.get("goal_manager_priority"))
+    session["goal_manager_profile_priority"] = normalize_agent_profile_priority(
+        session.get("goal_manager_profile_priority") or session.get("goal_manager_priority"),
+        default_priority=DEFAULT_GOAL_MANAGER_PRIORITY,
+    )
+    # session_priority: 0–100, higher means more important (default 50)
+    try:
+        session["session_priority"] = max(0, min(100, int(session.get("session_priority", 50))))
+    except (TypeError, ValueError):
+        session["session_priority"] = 50
+    session.setdefault("goal_updated_at", session.get("updated_at", utc_ts()))
+    session.setdefault("last_context_status", None)
+    session.setdefault("last_context_status_updated_at", session.get("updated_at", utc_ts()))
+    activity_index = session.get("activity_index")
+    session["activity_index"] = dict(activity_index) if isinstance(activity_index, dict) else {
+        "history_entry_count": 0,
+        "last_ts": "",
+        "last_user_ts": "",
+        "last_agent_ts": "",
+        "last_event_ts": "",
+        "service_ids": [],
+        "event_types": [],
+    }
+    runtime_journal_summary = session.get("runtime_journal_summary")
+    session["runtime_journal_summary"] = (
+        dict(runtime_journal_summary)
+        if isinstance(runtime_journal_summary, dict)
+        else {
+            "entry_count": 0,
+            "first_ts": "",
+            "last_ts": "",
+            "service_ids": [],
+            "event_types": [],
+        }
+    )
+    session.setdefault("created_by_username", "")
+    session.setdefault("created_by_type", "user")
+    session.setdefault("origin_session_id", str(session.get("parent_session_id") or "").strip())
+    session.setdefault("origin_goal_id", "")
+    session.setdefault("origin_goal_text", "")
+    requested_group = str(session.get("session_group") or DEFAULT_SESSION_GROUP).strip().lower()
+    if str(session.get("session_id") or "").strip() == "default":
+        group = "root"
+    elif requested_group in SESSION_GROUP_DEFAULT_PERMISSIONS:
+        group = requested_group
+    else:
+        group = DEFAULT_SESSION_GROUP
+    session["session_group"] = group
+    permissions = session.get("session_permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+    defaults = SESSION_GROUP_DEFAULT_PERMISSIONS.get(group, SESSION_GROUP_DEFAULT_PERMISSIONS[DEFAULT_SESSION_GROUP])
+    normalized_permissions: dict[str, bool] = {}
+    for operation_name, default_value in defaults.items():
+        if operation_name in permissions:
+            normalized_permissions[operation_name] = bool(permissions.get(operation_name))
+        else:
+            normalized_permissions[operation_name] = bool(default_value)
+    session["session_permissions"] = normalized_permissions
+    session["child_session_sharing"] = normalize_child_session_sharing_policy(
+        session.get("child_session_sharing")
+    )
+    session["session_skills"] = normalize_session_skills(session.get("session_skills"))
+    requested_ui_mode = str(session.get("session_ui_mode") or "").strip().lower()
+    is_recovery_session = bool(str(session.get("recovery_source_session_id") or "").strip()) or (
+        group == "error"
+        and str(session.get("label") or "").strip().lower().startswith("recovery:")
+    )
+    if requested_ui_mode in SESSION_UI_MODES:
+        session["session_ui_mode"] = DEFAULT_SESSION_UI_MODE if is_recovery_session and requested_ui_mode == "map_only" else requested_ui_mode
+    elif group == "root" or (
+        not bool(normalized_permissions.get("update_goal", True))
+        and not bool(normalized_permissions.get("send_prompt", True))
+        and not is_recovery_session
+    ):
+        session["session_ui_mode"] = "map_only"
+    else:
+        session["session_ui_mode"] = DEFAULT_SESSION_UI_MODE
+    session.setdefault("auto_resume_enabled", False)
+    try:
+        auto_resume_interval_seconds = int(session.get("auto_resume_interval_seconds", DEFAULT_AUTO_RESUME_INTERVAL_SECONDS))
+    except (TypeError, ValueError):
+        auto_resume_interval_seconds = DEFAULT_AUTO_RESUME_INTERVAL_SECONDS
+    session["auto_resume_interval_seconds"] = max(300, auto_resume_interval_seconds)
+    session.setdefault("auto_resume_next_at", "")
+    session.setdefault("auto_resume_reason", "")
+    session.setdefault("auto_resume_last_scheduled_at", "")
+    session.setdefault("auto_resume_last_started_at", "")
+    session.setdefault("auto_resume_last_error", "")
+    session.setdefault("user_response_wait_active", False)
+    try:
+        user_response_wait_requested_timeout_seconds = int(
+            session.get("user_response_wait_timeout_seconds", DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS)
+        )
+    except (TypeError, ValueError):
+        user_response_wait_requested_timeout_seconds = DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS
+    session["user_response_wait_timeout_seconds"] = user_response_wait_requested_timeout_seconds
+    try:
+        user_response_wait_effective_timeout_seconds = int(
+            session.get("user_response_wait_effective_timeout_seconds", DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS)
+        )
+    except (TypeError, ValueError):
+        user_response_wait_effective_timeout_seconds = DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS
+    session["user_response_wait_effective_timeout_seconds"] = max(
+        60,
+        min(DEFAULT_USER_RESPONSE_WAIT_TIMEOUT_SECONDS, user_response_wait_effective_timeout_seconds),
+    )
+    session.setdefault("user_response_wait_started_at", "")
+    session.setdefault("user_response_wait_until_at", "")
+    session.setdefault("user_response_wait_request_id", "")
+    session.setdefault("user_response_wait_generated_at", "")
+    session.setdefault("user_response_wait_prompt_text", "")
+    session.setdefault("user_response_wait_reason", "")
+    session.setdefault("user_response_wait_source_service_id", "")
+    session.setdefault("user_response_wait_requested_by_role", "")
+    session.setdefault("user_response_wait_last_cleared_at", "")
+    session.setdefault("user_response_wait_last_timeout_at", "")
+    if not isinstance(session.get("user_response_wait_requests"), list):
+        session["user_response_wait_requests"] = []
+    session.setdefault("launcher_unit_id", str(session.get("launcher_template_id") or "").strip())
+    session.setdefault("launcher_template_id", str(session.get("launcher_unit_id") or "").strip())
+    session.setdefault("launcher_display_name", "")
+    session.setdefault("launcher_preferred_provider", "")
+    session.setdefault("launcher_workspace_scope", "none")
+    session.setdefault("launcher_workspace_path", "")
+    requested_completion_policy = str(session.get("goal_completion_policy") or "").strip().lower()
+    session_ui_mode = str(session.get("session_ui_mode") or "standard").strip().lower() or "standard"
+    requested_session_interactive = bool(
+        session.get("session_interactive", session_ui_mode == "communication")
+    )
+    requested_communication_agent_enabled = bool(
+        session.get("communication_agent_enabled", requested_session_interactive)
+    )
+    launcher_template_id = str(session.get("launcher_template_id") or "").strip()
+    if requested_completion_policy in GOAL_COMPLETION_POLICIES:
+        session["goal_completion_policy"] = requested_completion_policy
+    elif launcher_template_id in CONTINUOUS_GOAL_TEMPLATE_IDS:
+        session["goal_completion_policy"] = "continuous"
+    else:
+        session["goal_completion_policy"] = "standard"
+    if "session_interactive" in session:
+        session["session_interactive"] = bool(session.get("session_interactive", False))
+    else:
+        session["session_interactive"] = session_ui_mode == "communication"
+    if "communication_agent_enabled" in session:
+        session["communication_agent_enabled"] = bool(session.get("communication_agent_enabled", False))
+    else:
+        session["communication_agent_enabled"] = bool(session.get("session_interactive", False))
+    communication_agent_priority = session.get("communication_agent_priority")
+    if communication_agent_priority == ["codex"]:
+        communication_agent_priority = DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY
+    session["communication_agent_priority"] = normalize_agent_profile_priority(
+        communication_agent_priority,
+        default_priority=DEFAULT_INTERACTIVE_AGENT_PROFILE_PRIORITY,
+    )
+    for item in session["communication_agent_priority"]:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("provider") or "").strip().lower() != AGENT_PRIORITY_BORDER and not str(
+            item.get("session_slot") or ""
+        ).strip():
+            item["session_slot"] = "interactive_agent"
+        config = item.get("config")
+        if isinstance(config, dict) and config.get("model_reasoning_effort") == "minimal":
+            config["model_reasoning_effort"] = "low"
+    welcomed_agents = session.get("welcomed_agents")
+    if not isinstance(welcomed_agents, list):
+        welcomed_agents = []
+    session["welcomed_agents"] = [dict(item) for item in welcomed_agents if isinstance(item, dict)]
+    session.setdefault("goal_manager_last_reviewed_turn_completed_at", "")
+    _ensure_goal_history_unlocked(session)
+    if session["goal_completion_policy"] == "continuous" and str(session.get("goal_text") or "").strip():
+        active_revision = _active_goal_revision_unlocked(session)
+        if active_revision is not None:
+            if (
+                not bool(active_revision.get("goal_active", False))
+                or bool(active_revision.get("goal_completed", False))
+                or str(active_revision.get("goal_progress_state") or "").strip().lower() != "in_progress"
+            ):
+                active_revision["goal_active"] = True
+                active_revision["goal_completed"] = False
+                active_revision["goal_progress_state"] = "in_progress"
+                active_revision["updated_at"] = utc_ts()
+                _apply_active_goal_snapshot_unlocked(session)
+
+
+def _ensure_default_session_unlocked(state: dict[str, Any], username: str) -> str:
+    normalized = normalize_username(username)
+    sessions = _ensure_user_sessions_cache_unlocked(state["_runtime_root"], state, normalized) if "_runtime_root" in state else _conversation_sessions(state).setdefault(normalized, [])
+    if sessions:
+        preferred_index: int | None = None
+        fallback_session_id = ""
+        root_group_index: int | None = None
+        for session in sessions:
+            if isinstance(session, dict):
+                _ensure_session_defaults_unlocked(session)
+        for index, session in enumerate(sessions):
+            if not isinstance(session, dict):
+                continue
+            session_id = str(session.get("session_id") or "").strip()
+            if session_id and not fallback_session_id:
+                fallback_session_id = session_id
+            if session_id == "default":
+                preferred_index = index
+                break
+            if normalized == "root" and root_group_index is None and str(session.get("session_group") or "").strip() == "root":
+                root_group_index = index
+        if preferred_index is None:
+            preferred_index = root_group_index
+        if preferred_index not in (None, 0):
+            sessions.insert(0, sessions.pop(preferred_index))
+        if preferred_index is not None and isinstance(sessions[0], dict):
+            session_id = str(sessions[0].get("session_id") or "").strip()
+            if session_id:
+                return session_id
+        if fallback_session_id:
+            return fallback_session_id
+    runtime_root = state["_runtime_root"]
+    if not isinstance(runtime_root, Path):
+        return "default"
+    session = {
+        "session_id": "default",
+        "label": "Root",
+        "session_group": "root",
+        "auto_compact_threshold_left_percent": DEFAULT_AUTO_COMPACT_THRESHOLD_LEFT_PERCENT,
+        "created_at": utc_ts(),
+        "updated_at": utc_ts(),
+        "created_by_username": normalized,
+        "created_by_type": "user",
+        "origin_session_id": "",
+        "origin_goal_id": "",
+        "origin_goal_text": "",
+    }
+    ensure_session_storage_unlocked(runtime_root, username=normalized, session=session)
+    if "conversation_sessions" not in state:
+        state["conversation_sessions"] = {}
+    _conversation_sessions(state).setdefault(normalized, []).append(session)
+    sessions.append(session)
+    return str(session["session_id"])
+
+
+def _ensure_session_exists_unlocked(state: dict[str, Any], username: str, session_id: str) -> bool:
+    normalized = normalize_username(username)
+    sessions = _ensure_user_sessions_cache_unlocked(state["_runtime_root"], state, normalized) if "_runtime_root" in state else _conversation_sessions(state).setdefault(normalized, [])
+    if any(isinstance(session, dict) and str(session.get("session_id") or "") == session_id for session in sessions):
+        return True
+    # Fallback to on-disk session metadata if the in-memory cache is stale.
+    for session in _load_session_records_for_user_unlocked(state["_runtime_root"], normalized):
+        if str(session.get("session_id") or "") == session_id:
+            sessions.append(session)
+            return True
+    if session_id == "default":
+        _ensure_default_session_unlocked(state, normalized)
+        return True
+    return False
+
+
+def _load_state_unlocked(runtime_root: Path) -> dict[str, Any]:
+    state = {
+        "users": {},
+        "auth_sessions": {},
+        "conversation_sessions": {},
+        "_runtime_root": str(runtime_root),
+    }
+    path = state_path(runtime_root)
+    if not path.exists():
+        return state
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state.setdefault("users", {})
+    state.setdefault("auth_sessions", {})
+    state.setdefault("conversation_sessions", {})
+    state.pop("histories", None)
+    state.pop("pending_inputs", None)
+    state.pop("service_pending_inputs", None)
+    state.pop("codex_sessions", None)
+    state.pop("claude_sessions", None)
+    state.pop("agent_states", None)
+    state["_runtime_root"] = runtime_root
+    return state
+
+
+def _guess_attachment_content_type(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+        "svg": "image/svg+xml",
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "m4a": "audio/mp4",
+        "ogg": "audio/ogg",
+        "flac": "audio/flac",
+        "aac": "audio/aac",
+        "webm": "video/webm",
+        "mp4": "video/mp4",
+        "mov": "video/quicktime",
+        "mkv": "video/x-matroska",
+        "pdf": "application/pdf",
+    }.get(ext, "application/octet-stream")
+
+
+def write_goal_dir(runtime_root: Path, *, username: str, session_id: str, revision: dict[str, Any]) -> None:
+    """Write goal directory structure (meta.json + goal.md) for a goal revision."""
+    goal_id = str(revision.get("goal_id") or "").strip()
+    if not goal_id:
+        return
+    normalized = normalize_username(username)
+    goal_dir = session_goal_dir(runtime_root, username=normalized, session_id=session_id, goal_id=goal_id)
+    goal_dir.mkdir(parents=True, exist_ok=True)
+    meta = {k: v for k, v in revision.items() if k != "goal_text"}
+    write_json_file(goal_dir / "meta.json", meta)
+    goal_text = str(revision.get("goal_text", "") or "")
+    (goal_dir / "goal.md").write_text(goal_text, encoding="utf-8")
+
+
+def list_goal_attachments(runtime_root: Path, *, username: str, session_id: str, goal_id: str) -> list[dict[str, Any]]:
+    """List attachment metadata for a goal directory."""
+    normalized = normalize_username(username)
+    attachments_dir = session_goal_attachments_dir(
+        runtime_root, username=normalized, session_id=session_id, goal_id=goal_id
+    )
+    if not attachments_dir.exists():
+        return []
+    files: list[dict[str, Any]] = []
+    for f in sorted(attachments_dir.iterdir()):
+        if f.is_file() and not f.name.startswith("."):
+            files.append({
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "content_type": _guess_attachment_content_type(f.name),
+            })
+    return files
+
+
+def save_goal_attachment(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    goal_id: str,
+    filename: str,
+    data: bytes,
+) -> str:
+    """Save an attachment file to the goal directory. Returns the stored filename."""
+    import re
+    normalized = normalize_username(username)
+    attachments_dir = session_goal_attachments_dir(
+        runtime_root, username=normalized, session_id=session_id, goal_id=goal_id
+    )
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^\w.\-]", "_", filename)[:120] or "attachment"
+    target = attachments_dir / safe_name
+    # Avoid overwrite collision
+    if target.exists():
+        stem = safe_name.rsplit(".", 1)
+        counter = 1
+        while target.exists():
+            candidate = f"{stem[0]}_{counter}.{stem[1]}" if len(stem) == 2 else f"{safe_name}_{counter}"
+            target = attachments_dir / candidate
+            counter += 1
+    target.write_bytes(data)
+    return target.name
+
+
+def save_session_message_artifacts(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    text: str,
+    attachments: list[dict[str, Any]] | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist a user message body and any uploaded attachments under a message directory."""
+    normalized = normalize_username(username)
+    resolved_message_id = str(message_id or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
+    message_dir = session_message_dir(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        message_id=resolved_message_id,
+    )
+    message_dir.mkdir(parents=True, exist_ok=True)
+    body_path = session_message_body_path(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        message_id=resolved_message_id,
+    )
+    body_text = str(text or "")
+    body_path.write_text(body_text, encoding="utf-8")
+    body_relpath = body_path.relative_to(session_dir(runtime_root, username=normalized, session_id=session_id)).as_posix()
+    saved_attachments: list[dict[str, Any]] = []
+    attachments_dir = session_message_attachments_dir(
+        runtime_root,
+        username=normalized,
+        session_id=session_id,
+        message_id=resolved_message_id,
+    )
+    if attachments:
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+    for raw_item in attachments or []:
+        filename = str(raw_item.get("filename") or "attachment").strip() or "attachment"
+        data = raw_item.get("data") or b""
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            continue
+        safe_name = re.sub(r"[^\w.\-]", "_", filename)[:120] or "attachment"
+        target = attachments_dir / safe_name
+        if target.exists():
+            stem = safe_name.rsplit(".", 1)
+            counter = 1
+            while target.exists():
+                candidate = f"{stem[0]}_{counter}.{stem[1]}" if len(stem) == 2 else f"{safe_name}_{counter}"
+                target = attachments_dir / candidate
+                counter += 1
+        target.write_bytes(bytes(data))
+        relpath = target.relative_to(session_dir(runtime_root, username=normalized, session_id=session_id)).as_posix()
+        saved_attachments.append(
+            {
+                "filename": target.name,
+                "original_filename": filename,
+                "size": target.stat().st_size,
+                "content_type": str(raw_item.get("content_type") or _guess_attachment_content_type(target.name)),
+                "relpath": relpath,
+            }
+        )
+    meta = {
+        "message_id": resolved_message_id,
+        "created_at": utc_ts(),
+        "text_relpath": body_relpath,
+        "text_size": len(body_text.encode("utf-8")),
+        "attachments": saved_attachments,
+    }
+    write_json_file(
+        session_message_meta_path(
+            runtime_root,
+            username=normalized,
+            session_id=session_id,
+            message_id=resolved_message_id,
+        ),
+        meta,
+    )
+    return meta
+
+
+def ensure_state(runtime_root: Path) -> dict[str, Any]:
+    with state_lock(runtime_root):
+        path = state_path(runtime_root)
+        if path.exists():
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                state = {}
+        else:
+            state = {}
+    state.setdefault("users", {})
+    state.setdefault("auth_sessions", {})
+    state.setdefault("conversation_sessions", {})
+    state.pop("histories", None)
+    state.pop("pending_inputs", None)
+    state.pop("service_pending_inputs", None)
+    state.pop("codex_sessions", None)
+    state.pop("claude_sessions", None)
+    state.pop("agent_states", None)
+    state.pop("sessions", None)
+    state.pop("talks", None)
+    write_state(runtime_root, state)
+    return state

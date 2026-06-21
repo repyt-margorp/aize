@@ -2,9 +2,9 @@
 
 ## User-visible behavior
 
-- Opening `new_aize.cli console` now checks for queued Active/Incomplete SessionGoals.
+- Opening `cli console` now checks for queued Active/Incomplete SessionGoals.
 - If queued work exists and no dispatch lease is currently acquired, the console starts a detached background `dispatch-worker`.
-- The startup worker polls the global dispatch queue briefly and dispatches queued work until the queue becomes idle.
+- The startup worker polls the global dispatch index briefly and dispatches pending work until the index becomes idle.
 - User `send` still starts a session-scoped background dispatch worker for the current Session.
 
 ## Recovery context
@@ -18,11 +18,11 @@
 
 ## Files touched
 
-- `src/new_aize/cli.py`
+- `src/cli.py`
   - added startup dispatch bootstrap;
   - added `--recovery-context` plumbing for dispatch commands;
   - made background dispatch startup support global queue workers.
-- `src/new_aize/store.py`
+- `src/store.py`
   - threads recovery context through dispatch lease metadata;
   - renders recovery context into GoalManager and WorkerAgent prompts;
   - keeps recovery context out of MessageLog.
@@ -34,7 +34,7 @@
 ## Verification
 
 ```bash
-python3 -m py_compile src/new_aize/*.py
+python3 -m py_compile src/*.py
 python3 -m unittest discover -s tests -q
 ```
 

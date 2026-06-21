@@ -58,8 +58,8 @@ Implemented:
 - GoalManager Worker requests are Session Messages with `worker_request: true`; Session dispatch turns those Messages into WorkerAgent work items.
 - GoalManager/Worker prompts receive Session MessageLog context.
 - Completion authority remains with GoalManager dispatch commit.
-- Dispatch queue entries are role-specific work items.
-- Dispatch queue entries are lightweight pointers into the Session MessageLog, usually via `trigger_message_id`.
+- Dispatch index entries are role-specific work items.
+- Dispatch index entries are lightweight pointers into the Session MessageLog, usually via `trigger_message_id`.
 - Agent prompts receive both the full `session-messages` log and the role-specific `dispatch-feed`.
 - `GoalManager` runs `GoalManagerReview`.
 - `WorkerAgent` runs `WorkerWork`.

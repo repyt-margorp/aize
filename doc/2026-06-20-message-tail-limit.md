@@ -9,13 +9,13 @@
 
 ## Files touched
 
-- `src/new_aize/cli.py`
+- `src/cli.py`
 - `tests/test_cli.py`
 
 ## Verification
 
 ```bash
-python3 -m py_compile src/new_aize/*.py
+python3 -m py_compile src/*.py
 python3 -m unittest discover -s tests -q
 ```
 

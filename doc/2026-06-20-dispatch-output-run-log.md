@@ -9,12 +9,12 @@
 
 ## Files touched
 
-- `src/new_aize/store.py`
+- `src/store.py`
 - `tests/test_cli.py`
 
 ## Verification
 
-- `python3 -m py_compile src/new_aize/*.py`
+- `python3 -m py_compile src/*.py`
 - `python3 -m unittest discover -s tests -q`
 
 ## Remaining risk

@@ -10,12 +10,12 @@
 
 ## Files touched
 
-- `src/new_aize/cli.py`
+- `src/cli.py`
 - `tests/test_cli.py`
 
 ## Verification
 
-- `python3 -m py_compile src/new_aize/*.py`
+- `python3 -m py_compile src/*.py`
 - `python3 -m unittest discover -s tests -q`
-- `PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state agent-pool`
+- `PYTHONPATH=src python3 -m cli --root .aize-state agent-pool`
 - Console `graph` shows `G:0,W:0` for queued but idle Sessions.

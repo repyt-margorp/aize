@@ -1,0 +1,51 @@
+{
+  "unit_id": "aize-development.system-monitor",
+  "unit_kind": "session",
+  "unit_class": "template",
+  "instance_policy": "multi",
+  "lifecycle": "auto",
+  "restart_policy": "schedule",
+  "display_name": "AIze System Monitor",
+  "description": "Root-lineage monitoring unit that scans AIze sessions for unresolved user input, unfinished goals, stalled work, and runtime problems.",
+  "enabled": true,
+  "launcher": {
+    "create_as_child": true,
+    "default_label": "AIze System Monitor",
+    "goal_text": "Scan AIze for unresolved user input, unfinished goals, apparently stalled sessions, and system-level runtime problems. Report concrete findings with exact session IDs and evidence.",
+    "initial_prompt": "Operate as the AIze system monitoring Unit under Root. First run `PYTHONPATH=./src python3 -m runtime.system_monitor --runtime-root ./.aize-runtime --json` from the repo root. Inspect any findings before reporting. For unresolved user input, unfinished goals, stalled agent turns, stale service bindings, or schedule/restart problems, identify the affected username, session_id, evidence, and the smallest recommended follow-up. Use existing diagnostics when relevant, including `python3 scripts/diagnostics/probe_restart.py` for restart-health suspicions. Do not request direct user feedback; only report detected problems and evidence.",
+    "preferred_provider": "codex",
+    "selected_agents": [
+      "codex_pool"
+    ],
+    "session_group": "root",
+    "session_ui_mode": "standard",
+    "goal_completion_policy": "standard",
+    "workspace_scope": "unit",
+    "auto_select_session": false,
+    "auto_send_initial_prompt": true,
+    "schedule": {
+      "enabled": true,
+      "kind": "interval",
+      "every_hours": 1,
+      "timezone": "UTC"
+    },
+    "skills": [
+      {
+        "skill_id": "aize-system-monitor",
+        "kind": "monitoring",
+        "title": "AIze System Monitor",
+        "description": "Hourly Root-lineage monitoring guidance for session and runtime problem detection.",
+        "canonical_session_key": "aize.system-monitor",
+        "prompt": "Use the system monitor scanner as the first evidence source, then inspect session files or runtime logs only where findings point. Keep reports concise and evidence-backed.",
+        "files": [
+          {
+            "path": "monitor-record.md",
+            "description": "Durable record of monitoring runs and recurring findings.",
+            "preserve_existing": true,
+            "content": "# AIze System Monitor\n\nAppend one entry per scheduled run:\n\n- Date/time:\n- Scanner summary:\n- Sessions with unresolved user input:\n- Unfinished goals:\n- Stalled sessions:\n- System problems:\n- Follow-up recommended:\n"
+          }
+        ]
+      }
+    ]
+  }
+}

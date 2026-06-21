@@ -9,7 +9,7 @@ When a `UserInput` Message is appended:
 - the latest Goal in the Session is marked `incomplete`;
 - if the Session has no Goal, a default reply Goal is created;
 - a `GoalCompletionState` Message records the transition and reason;
-- a priority `dispatch_queue` entry is created with user-input priority;
+- a priority dispatch index entry is created with user-input priority;
 - in the interactive console, `send` starts a one-shot background dispatch
   worker for the current Session and returns the prompt immediately.
 
@@ -27,7 +27,7 @@ queued dispatch work.
 
 ## Files touched
 
-- `src/new_aize/store.py`
+- `src/store.py`
   - Added persistent `dispatch_queue` state.
   - Added centralized Goal completion-state changes with reason Messages.
   - Added queued UserInput reconciliation for older state.
@@ -41,8 +41,8 @@ queued dispatch work.
   - Stopped stable read commands from rewriting state during queue
     reconciliation.
   - Changed state saves to use per-process unique temporary files.
-- `src/new_aize/cli.py`
-  - Added `dispatch-queue`.
+- `src/cli.py`
+  - Added `dispatch-index`.
   - Added `dispatch-worker` for foreground automatic queue processing.
   - Made interactive console `send` start a scoped background dispatch worker
     after recording input, instead of running Agent dispatch synchronously.
@@ -50,7 +50,7 @@ queued dispatch work.
     prompt can return immediately while Agent dispatch continues.
   - Added a console poller that prints new `UserConsole` Messages for the
     selected Session while the prompt remains open.
-- `src/new_aize/agents.py`
+- `src/agents.py`
   - Added `AIZE_GOAL_REASON` output in local and disabled external-provider
     GoalManager paths.
 - `tests/test_cli.py`
@@ -60,7 +60,7 @@ queued dispatch work.
 
 ## Verification
 
-- `python3 -m py_compile src/new_aize/*.py`
+- `python3 -m py_compile src/*.py`
 - `python3 -m unittest discover -s tests -q`
 - Unit coverage starts `dispatch-worker` first, then appends UserInput from a
   separate CLI process and verifies the worker dispatches that new queue entry.
@@ -72,16 +72,16 @@ queued dispatch work.
   is running.
 - Smoke coverage verified `send` is followed by another console command without
   blocking, while the background worker resolves the queued Session Goal.
-- Existing `.new-aize-state` `time` queue was dispatched with the real Codex
+- Existing `.aize-state` `time` queue was dispatched with the real Codex
   provider and the Goal is now complete.
 - Unit coverage verifies that a GoalManager incomplete result leaves a delayed
   retry queue entry and a reason-bearing `GoalCompletionState` Message.
 - CLI smoke test with external Agent execution disabled:
   create `time`, complete `reply to the user`, send another UserInput, confirm
   the Goal transitions complete -> incomplete -> complete and dispatches again.
-- Existing `.new-aize-state` inspection:
-  `dispatch-queue time` showed the queued `UserInput` reconciled into a
-  priority 100 queue entry.
+- Existing `.aize-state` inspection:
+  `dispatch-index time` showed the queued `UserInput` reconciled into a
+  priority 100 scheduling entry.
 
 ## Remaining risk
 

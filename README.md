@@ -18,32 +18,35 @@ Minimal AIze rebuild focused on a small MINIX-style core:
 - CLI-only status inspection
 - no UI
 
+The previous runtime source is preserved under `2026-06-20-old-aize/` for
+reference. The active CLI runtime lives directly under `src/`.
+
 ## Quick Start
 
 Run directly from the repo without installing:
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state init
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state create-session notes
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state send root user kernel "hello"
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state send-file root user kernel ./README.md --body "readme snapshot"
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state recv kernel
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state status
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state accounts
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state agents
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state auth root root
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state sessions
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state session-graph
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state dispatch-once
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state units
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state messages root
+PYTHONPATH=src python3 -m cli --root .aize-state init
+PYTHONPATH=src python3 -m cli --root .aize-state create-session notes
+PYTHONPATH=src python3 -m cli --root .aize-state send root user kernel "hello"
+PYTHONPATH=src python3 -m cli --root .aize-state send-file root user kernel ./README.md --body "readme snapshot"
+PYTHONPATH=src python3 -m cli --root .aize-state recv kernel
+PYTHONPATH=src python3 -m cli --root .aize-state status
+PYTHONPATH=src python3 -m cli --root .aize-state accounts
+PYTHONPATH=src python3 -m cli --root .aize-state agents
+PYTHONPATH=src python3 -m cli --root .aize-state auth root root
+PYTHONPATH=src python3 -m cli --root .aize-state sessions
+PYTHONPATH=src python3 -m cli --root .aize-state session-graph
+PYTHONPATH=src python3 -m cli --root .aize-state dispatch-once
+PYTHONPATH=src python3 -m cli --root .aize-state units
+PYTHONPATH=src python3 -m cli --root .aize-state messages root
 ```
 
 Or install the CLI command:
 
 ```bash
 python3 -m pip install -e .
-aize --root .new-aize-state status
+aize --root .aize-state status
 ```
 
 `init` always creates the default `root` Unit and the singleton `root` Session.
@@ -53,16 +56,37 @@ does not need a Unit. A Session can also have multiple parents by passing
 `--parent` more than once:
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state create-session task --parent root --parent notes
+PYTHONPATH=src python3 -m cli --root .aize-state create-session task --parent root --parent notes
 ```
+
+## Units / Session Templates
+
+In this CLI runtime, a Unit is the durable SessionTemplate-like record used to
+start Sessions. It can carry the default SessionGoal body, an initial prompt,
+and an interval schedule.
+
+```bash
+PYTHONPATH=src python3 -m cli --root .aize-state create-unit monitor \
+  --display-name "System Monitor" \
+  --goal-text "Inspect system state and report findings." \
+  --initial-prompt "Run diagnostics now." \
+  --schedule-every-hours 1
+
+PYTHONPATH=src python3 -m cli --root .aize-state run-scheduled-units
+```
+
+`run-scheduled-units` starts due scheduled Unit Sessions under `root` by
+default. The created Session receives the Unit `goal_text` as its SessionGoal.
+If `initial_prompt` is set, it is recorded as User input on that Session so
+normal Session dispatch can process it.
 
 Sessions have a user-controlled `active` flag. Goals have a GoalManager-owned
 `completion_state` of `incomplete` or `complete`. Dispatch only selects Goals
 that are both in an active Session and still incomplete.
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state deactivate-session task
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state activate-session task
+PYTHONPATH=src python3 -m cli --root .aize-state deactivate-session task
+PYTHONPATH=src python3 -m cli --root .aize-state activate-session task
 ```
 
 ## Login Console
@@ -70,7 +94,7 @@ PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state activate-session t
 Start the login console:
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state console
+PYTHONPATH=src python3 -m cli --root .aize-state console
 ```
 
 For the default local account, log in as `root` with password `root`.
@@ -106,10 +130,11 @@ and `WorkerAgent` in an XML-style `<aize-message-bundle>`.
 `send-file SESSION SENDER RECIPIENT PATH` reads a local text file and carries
 its contents as a Message `payload.files` entry. It does not copy files through a
 side channel or require shared filesystem access.
-`dispatch` runs one active Goal through a per-Session `GoalManager` precheck,
-`WorkerAgent` work step, and `GoalManager` completion check. Each Session keeps
-durable agent threads with resume tokens so later dispatches can continue the
-same role-specific context.
+`dispatch` runs one role-specific work item. `GoalManager` runs
+`GoalManagerReview`; `WorkerAgent` runs `WorkerWork` only after a Session
+Message carries `payload.worker_request: true`. Each Session keeps durable agent
+threads with resume tokens so later dispatches can continue the same
+role-specific context.
 Dispatch occupancy is recorded as a dispatch-run lease history (`lease_state`,
 `lease_acquired_at`, `lease_released_at`) rather than as a durable Goal or
 Session progress flag.
@@ -124,8 +149,8 @@ WorkerAgent  -> codex
 To assign another provider:
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state set-agent GoalManager claude
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state set-agent WorkerAgent local
+PYTHONPATH=src python3 -m cli --root .aize-state set-agent GoalManager claude
+PYTHONPATH=src python3 -m cli --root .aize-state set-agent WorkerAgent local
 ```
 
 External provider subprocess execution is enabled by default. Set
@@ -141,7 +166,7 @@ with full local permissions.
 another AIZE system through message passing:
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state set-agent WorkerAgent remote-aize
+PYTHONPATH=src python3 -m cli --root .aize-state set-agent WorkerAgent remote-aize
 ```
 
 When `WorkerAgent` uses `remote-aize`, dispatch records both the WorkerAgent
@@ -175,11 +200,12 @@ For automatic queue processing, run a foreground dispatch worker in another
 shell:
 
 ```bash
-PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state dispatch-worker
+PYTHONPATH=src python3 -m cli --root .aize-state dispatch-worker
 ```
 
-The worker polls the priority `dispatch_queue` and dispatches new active,
-incomplete Session Goals as they appear.
+The worker polls the dispatch scheduling index and dispatches new active,
+incomplete Session Goals as they appear. Triggered entries point back to Session
+Messages, so the Session MessageLog remains the main work stream.
 
 ## Scope
 

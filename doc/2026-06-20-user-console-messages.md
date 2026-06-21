@@ -11,7 +11,7 @@ GoalManager completion.
 
 ## Files touched
 
-- `src/new_aize/store.py`
+- `src/store.py`
   - Added the `UserConsole` recipient.
   - Added `send_user_console_message` to the default Session capabilities for
     `GoalManager` and `WorkerAgent`.
@@ -26,7 +26,7 @@ GoalManager completion.
 
 ## Verification
 
-- `python3 -m py_compile src/new_aize/*.py`
+- `python3 -m py_compile src/*.py`
 - `python3 -m unittest discover -s tests -q`
 - CLI smoke test with external Agent execution disabled:
   `session console-check`, `update-goal Reply`, `send hello`, `dispatch`,

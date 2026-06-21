@@ -20,5 +20,5 @@ SessionGoal `complete` / `incomplete` state is written only by Store dispatch/se
 
 ## Verification
 
-- `PYTHONPATH=src python3 -m py_compile src/new_aize/*.py`
+- `PYTHONPATH=src python3 -m py_compile src/*.py`
 - `PYTHONPATH=src python3 -m unittest discover -s tests -q`

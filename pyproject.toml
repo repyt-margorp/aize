@@ -10,8 +10,26 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-aize = "new_aize.cli:main"
-new-aize = "new_aize.cli:main"
+aize = "cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "agent_api",
+  "agents",
+  "cli",
+  "cli_console",
+  "cli_render",
+  "cli_workers",
+  "envelope",
+  "model",
+  "store",
+  "store_auth",
+  "store_defs",
+  "store_dispatch",
+  "store_dispatch_queue",
+  "store_message",
+  "store_prompts",
+  "store_query",
+  "store_session",
+]

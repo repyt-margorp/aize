@@ -17,7 +17,7 @@ ENV = {"PYTHONPATH": str(ROOT / "src"), "AIZE_ENABLE_EXTERNAL_AGENTS": "false"}
 
 def run_cli(state_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "new_aize.cli", "--root", str(state_root), *args],
+        [sys.executable, "-m", "cli", "--root", str(state_root), *args],
         cwd=ROOT,
         env=ENV,
         text=True,
@@ -28,7 +28,7 @@ def run_cli(state_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 def run_cli_with_input(state_root: Path, input_text: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "new_aize.cli", "--root", str(state_root), *args],
+        [sys.executable, "-m", "cli", "--root", str(state_root), *args],
         cwd=ROOT,
         env=ENV,
         text=True,
@@ -40,7 +40,7 @@ def run_cli_with_input(state_root: Path, input_text: str, *args: str) -> subproc
 
 def run_cli_with_env(state_root: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "new_aize.cli", "--root", str(state_root), *args],
+        [sys.executable, "-m", "cli", "--root", str(state_root), *args],
         cwd=ROOT,
         env=env,
         text=True,
@@ -73,8 +73,8 @@ def wait_for_goal_state(state_root: Path, session_id: str, expected_state: str, 
 
 class CliTests(unittest.TestCase):
     def test_agent_allocation_counts_follow_current_dispatch_phase(self) -> None:
-        from new_aize.cli_render import agent_allocations_by_session, agent_pool_snapshot
-        from new_aize.store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
+        from cli_render import agent_allocations_by_session, agent_pool_snapshot
+        from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
 
         runs = [
             {
@@ -108,7 +108,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual([run["current_phase"] for run in pool["active_runs"]], ["GoalManager", "WorkerAgent"])
 
     def test_goal_manager_status_and_reason_can_be_embedded_in_xml_body(self) -> None:
-        from new_aize.store import Store
+        from store import Store
 
         store = Store(Path("/unused"))
         output = (
@@ -129,7 +129,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(store._extract_goal_manager_reason(tagged_output), "answered through explicit XML tags")
 
     def test_console_body_prefers_agent_output_before_embedded_prompt(self) -> None:
-        from new_aize.cli_render import console_body
+        from cli_render import console_body
 
         output = (
             "<aize-output>\n"
@@ -234,6 +234,74 @@ class CliTests(unittest.TestCase):
             failed_auth = run_cli(state_root, "auth", "root", "wrong")
             self.assertEqual(failed_auth.returncode, 2)
             self.assertIn("authentication failed", failed_auth.stderr)
+
+    def test_unit_goal_prompt_and_interval_schedule_start_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "monitor",
+                "--display-name",
+                "Monitor",
+                "--description",
+                "scheduled monitor",
+                "--goal-text",
+                "Inspect system state and report findings.",
+                "--initial-prompt",
+                "Run diagnostics now.",
+                "--schedule-every-hours",
+                "1",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            unit = json.loads(created.stdout)
+            self.assertEqual(unit["goal_text"], "Inspect system state and report findings.")
+            self.assertEqual(unit["initial_prompt"], "Run diagnostics now.")
+            self.assertEqual(unit["schedule"]["every_hours"], 1)
+
+            started = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T00:00:00Z",
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            payload = json.loads(started.stdout)
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["session"]["unit_id"], "monitor")
+            self.assertEqual(payload[0]["goal"]["body"], "Inspect system state and report findings.")
+            self.assertEqual(payload[0]["initial_message"]["payload"]["body"], "Run diagnostics now.")
+            self.assertTrue(payload[0]["initial_message"]["payload"]["user_input"])
+
+            messages = json.loads(
+                run_cli(
+                    state_root,
+                    "messages",
+                    payload[0]["session"]["session_id"],
+                    "--limit",
+                    "0",
+                ).stdout
+            )
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]["payload"]["scheduled_unit_id"], "monitor")
+
+            not_due = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T00:30:00Z",
+            )
+            self.assertEqual(json.loads(not_due.stdout), [])
+
+            due_again = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T01:00:00Z",
+            )
+            self.assertEqual(len(json.loads(due_again.stdout)), 1)
 
     def test_session_graph_rejects_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,7 +438,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(followup.returncode, 0, followup.stderr)
             goals = json.loads(run_cli(state_root, "goals", "build-cli").stdout)
             self.assertEqual(goals[0]["completion_state"], "incomplete")
-            queue = json.loads(run_cli(state_root, "dispatch-queue", "build-cli").stdout)
+            queue = json.loads(run_cli(state_root, "dispatch-index", "build-cli").stdout)
             self.assertEqual(queue[0]["status"], "queued")
             self.assertEqual(queue[0]["priority"], 100)
 
@@ -415,14 +483,14 @@ class CliTests(unittest.TestCase):
 
     def test_agent_api_sends_to_reply_console_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from new_aize.agent_api import (
+            from agent_api import (
                 send_message,
                 send_session_message,
                 send_user_console_message,
                 send_worker_request,
             )
-            from new_aize.store import Store
-            from new_aize.store_defs import StoreError
+            from store import Store
+            from store_defs import StoreError
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -478,8 +546,8 @@ class CliTests(unittest.TestCase):
 
     def test_user_input_fans_out_to_active_worker_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from new_aize.store import Store
-            from new_aize.model import utc_now
+            from store import Store
+            from model import utc_now
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -521,7 +589,7 @@ class CliTests(unittest.TestCase):
 
     def test_worker_session_report_enqueues_goal_manager_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from new_aize.store import Store
+            from store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -561,7 +629,7 @@ class CliTests(unittest.TestCase):
 
     def test_triggered_dispatch_entries_are_not_coalesced_across_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from new_aize.store import Store
+            from store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -710,7 +778,7 @@ class CliTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "new_aize.cli",
+                    "cli",
                     "--root",
                     str(state_root),
                     "dispatch-worker",
@@ -793,7 +861,7 @@ class CliTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "new_aize.cli",
+                    "cli",
                     "--root",
                     str(state_root),
                     "dispatch-worker",
@@ -845,7 +913,7 @@ class CliTests(unittest.TestCase):
 
             before = (state_root / "state.json").read_text(encoding="utf-8")
             self.assertEqual(run_cli(state_root, "status").returncode, 0)
-            self.assertEqual(run_cli(state_root, "dispatch-queue", "time").returncode, 0)
+            self.assertEqual(run_cli(state_root, "dispatch-index", "time").returncode, 0)
             after = (state_root / "state.json").read_text(encoding="utf-8")
             self.assertEqual(after, before)
 
@@ -899,7 +967,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["goal"]["completion_state"], "incomplete")
             self.assertEqual(payload["run"]["completion_state"], "incomplete")
 
-            queue = json.loads(run_cli_with_env(state_root, env, "dispatch-queue", "retry-session").stdout)
+            queue = json.loads(run_cli_with_env(state_root, env, "dispatch-index", "retry-session").stdout)
             retry_entries = [entry for entry in queue if entry.get("status") == "queued"]
             self.assertEqual(len(retry_entries), 1)
             self.assertEqual(retry_entries[0]["priority"], 25)
@@ -1045,7 +1113,7 @@ class CliTests(unittest.TestCase):
 
     def test_codex_external_execution_uses_full_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from new_aize.agents import AgentRunner
+            from agents import AgentRunner
 
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -1151,7 +1219,7 @@ class CliTests(unittest.TestCase):
                         "prompt = sys.argv[-1]",
                         "role = os.environ.get('AIZE_AGENT_ROLE')",
                         "if role == 'GoalManager' and 'phase=\"review\"' in prompt:",
-                        "    from new_aize.agent_api import send_worker_request",
+                        "    from agent_api import send_worker_request",
                         "    send_worker_request('Please handle the implementation requested by the user.')",
                         "    print('<aize-output role=\"GoalManager\" provider=\"codex\">')",
                         "    print('AIZE_GOAL_STATUS: incomplete')",

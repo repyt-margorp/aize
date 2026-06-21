@@ -12,15 +12,15 @@
 
 ## Files touched
 
-- `src/new_aize/store.py`
-- `src/new_aize/cli.py`
+- `src/store.py`
+- `src/cli.py`
 - `tests/test_cli.py`
 
 ## Verification
 
-- `python3 -m py_compile src/new_aize/*.py`
+- `python3 -m py_compile src/*.py`
 - `python3 -m unittest discover -s tests -q`
-- `PYTHONPATH=src python3 -m new_aize.cli --root .new-aize-state console --username root --password root` with `graph`
+- `PYTHONPATH=src python3 -m cli --root .aize-state console --username root --password root` with `graph`
 
 ## Remaining risk
 

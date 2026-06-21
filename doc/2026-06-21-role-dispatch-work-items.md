@@ -16,21 +16,21 @@ The old `GoalManagerPrecheck -> WorkerAgent -> GoalManagerCompletion` single-run
 
 ## Files touched
 
-- `src/new_aize/store_dispatch.py`
-- `src/new_aize/store_dispatch_queue.py`
-- `src/new_aize/store_message.py`
-- `src/new_aize/store_defs.py`
-- `src/new_aize/store_prompts.py`
-- `src/new_aize/agents.py`
-- `src/new_aize/cli_render.py`
-- `src/new_aize/agent_api.py`
+- `src/store_dispatch.py`
+- `src/store_dispatch_queue.py`
+- `src/store_message.py`
+- `src/store_defs.py`
+- `src/store_prompts.py`
+- `src/agents.py`
+- `src/cli_render.py`
+- `src/agent_api.py`
 - `tests/test_cli.py`
 
 ## Verification
 
-- `PYTHONPATH=src python3 -m py_compile src/new_aize/*.py`
+- `PYTHONPATH=src python3 -m py_compile src/*.py`
 - `PYTHONPATH=src python3 -m unittest discover -s tests -q`
-- Confirmed no old dispatch phase names or old Worker request API names remain in `src/new_aize` or `tests`.
+- Confirmed no old dispatch phase names or old Worker request API names remain in `src` or `tests`.
 - Confirmed triggered dispatch entries are not coalesced across different Session Messages.
 
 ## Remaining risk

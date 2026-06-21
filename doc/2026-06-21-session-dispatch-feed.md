@@ -4,7 +4,7 @@
 
 Dispatch now treats Session MessageLog as the authoritative work stream.
 
-The dispatch queue is only a scheduling index. A queued item records:
+The dispatch index is only a scheduling index. A pending item records:
 
 - `session_id`
 - `goal_id`
@@ -25,5 +25,5 @@ This makes the Session more than passive history: incoming Messages can enqueue 
 
 ## Verification
 
-- `PYTHONPATH=src python3 -m py_compile src/new_aize/*.py`
+- `PYTHONPATH=src python3 -m py_compile src/*.py`
 - `PYTHONPATH=src python3 -m unittest discover -s tests -q`
