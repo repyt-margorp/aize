@@ -1014,7 +1014,7 @@ class CliTests(unittest.TestCase):
             after = (state_root / "state.json").read_text(encoding="utf-8")
             self.assertEqual(after, before)
 
-    def test_goal_manager_incomplete_schedules_retry_queue_entry(self) -> None:
+    def test_goal_manager_incomplete_creates_implicit_worker_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
             bin_dir = Path(tmp) / "bin"
@@ -1065,15 +1065,28 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["run"]["completion_state"], "incomplete")
 
             queue = json.loads(run_cli_with_env(state_root, env, "dispatch-index", "retry-session").stdout)
-            retry_entries = [entry for entry in queue if entry.get("status") == "queued"]
-            self.assertEqual(len(retry_entries), 1)
-            self.assertEqual(retry_entries[0]["priority"], 25)
-            self.assertIn("available_after", retry_entries[0])
-            self.assertIn("waiting for more work", retry_entries[0]["reason"])
+            worker_entries = [
+                entry
+                for entry in queue
+                if entry.get("status") == "queued" and entry.get("role") == "WorkerAgent"
+            ]
+            self.assertEqual(len(worker_entries), 1)
+            self.assertEqual(worker_entries[0]["priority"], 150)
+            self.assertNotIn("available_after", worker_entries[0])
+            self.assertIn("requires WorkerAgent work", worker_entries[0]["reason"])
 
             goals = json.loads(run_cli_with_env(state_root, env, "goals", "retry-session").stdout)
             self.assertIn("waiting for more work", goals[0]["completion_reason"])
-            self.assertFalse(json.loads(run_cli_with_env(state_root, env, "messages", "retry-session").stdout))
+            messages = json.loads(run_cli_with_env(state_root, env, "messages", "retry-session").stdout)
+            worker_requests = [
+                message
+                for message in messages
+                if message.get("to") == "session:retry-session"
+                and message.get("payload", {}).get("worker_request") is True
+            ]
+            self.assertEqual(len(worker_requests), 1)
+            self.assertTrue(worker_requests[0]["payload"]["implicit_worker_request"])
+            self.assertIn("waiting for more work", worker_requests[0]["payload"]["body"])
 
     def test_goal_manager_review_prompt_includes_session_message_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

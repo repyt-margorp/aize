@@ -7,8 +7,10 @@ from model import new_id, utc_now
 from store_defs import (
     DEFAULT_AGENT_PROVIDER,
     DISPATCH_PRIORITY_RETRY,
+    DISPATCH_PRIORITY_WORKER_REQUEST,
     GOAL_MANAGER_ROLE,
     ROOT_USERNAME,
+    SESSION_RECIPIENT,
     WORKER_AGENT_ROLE,
     StoreError,
     normalize_endpoint,
@@ -218,6 +220,7 @@ class DispatchMixin:
 
         completed_at = utc_now()
         worker_requested = self._has_live_worker_queue_for_goal(state, str(goal.get("goal_id") or ""))
+        implicit_worker_message = None
         if result["goal_status"] == "completed":
             transition = self._set_goal_completion_state(
                 state,
@@ -237,9 +240,19 @@ class DispatchMixin:
                 actor=GOAL_MANAGER_ROLE,
                 run_id=run["run_id"],
                 priority=DISPATCH_PRIORITY_RETRY,
-                enqueue_on_incomplete=not worker_requested,
-                available_after=None if worker_requested else self._retry_available_after(),
+                enqueue_on_incomplete=False,
             )
+            if not worker_requested:
+                implicit_worker_message = self._append_implicit_worker_request_for_incomplete_goal(
+                    state,
+                    goal=goal,
+                    session=session,
+                    run=run,
+                    reason=result["goal_reason"],
+                    output=result["agent_result"].output,
+                    created_at=completed_at,
+                )
+                worker_requested = True
             if worker_requested:
                 self._resolve_goal_manager_queue_entries_for_goal(
                     state,
@@ -273,7 +286,7 @@ class DispatchMixin:
             "unit": dict(lease["unit"]) if lease["unit"] else None,
             "run": dict(run),
             "state_transition": transition,
-            "message": None,
+            "message": dict(implicit_worker_message) if implicit_worker_message else None,
         }
 
     def _commit_worker_run_locked(self, lease: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -449,6 +462,58 @@ class DispatchMixin:
                 continue
             messages.append(dict(message))
         return messages
+
+    def _append_implicit_worker_request_for_incomplete_goal(
+        self,
+        state: dict[str, Any],
+        *,
+        goal: dict[str, Any],
+        session: dict[str, Any],
+        run: dict[str, Any],
+        reason: str,
+        output: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        body = self._implicit_worker_request_body(goal=goal, reason=reason, output=output)
+        payload: dict[str, Any] = {
+            "body": body,
+            "worker_request": True,
+            "worker_role": WORKER_AGENT_ROLE,
+            "run_id": run["run_id"],
+            "implicit_worker_request": True,
+        }
+        message = self._message(
+            from_endpoint=normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session["session_id"]),
+            to_endpoint=normalize_endpoint(SESSION_RECIPIENT, session_id=session["session_id"]),
+            payload=payload,
+            created_at=created_at,
+        )
+        state["messages"].append(message)
+        self._index_message_for_session(state, message, session["session_id"])
+        self._enqueue_dispatch(
+            state,
+            goal,
+            priority=DISPATCH_PRIORITY_WORKER_REQUEST,
+            reason=f"GoalManager incomplete result {message['message_id']} requires WorkerAgent work.",
+            role=WORKER_AGENT_ROLE,
+            trigger_message_id=message["message_id"],
+        )
+        return message
+
+    def _implicit_worker_request_body(self, *, goal: dict[str, Any], reason: str, output: str) -> str:
+        normalized_reason = str(reason or "").strip() or "Work toward the incomplete SessionGoal."
+        normalized_output = str(output or "").strip()
+        if len(normalized_output) > 4000:
+            normalized_output = f"{normalized_output[:4000]}\n...[truncated]"
+        return "\n\n".join(
+            [
+                "GoalManager marked the SessionGoal incomplete. Treat this incomplete result as WorkerAgent work.",
+                f"SessionGoal:\n{str(goal.get('body') or '').strip()}",
+                f"GoalManager incomplete reason:\n{normalized_reason}",
+                f"GoalManager output:\n{normalized_output}",
+                "Work toward the SessionGoal, report progress/results to Session, and do not decide goal completion.",
+            ]
+        )
 
     def _has_live_worker_queue_for_goal(self, state: dict[str, Any], goal_id: str) -> bool:
         return any(
