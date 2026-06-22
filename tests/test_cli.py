@@ -342,6 +342,164 @@ class CliTests(unittest.TestCase):
             monitor = next(unit for unit in units if unit["unit_id"] == "monitor")
             self.assertEqual(monitor["schedule"]["next_run_at"], "2026-06-22T03:00:00Z")
 
+    def test_scheduled_unit_supports_second_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "watchdog",
+                "--goal-text",
+                "Poll an external health check.",
+                "--schedule-every-seconds",
+                "15",
+                "--schedule-next-run-at",
+                "2026-06-22T00:00:00Z",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            unit = json.loads(created.stdout)
+            self.assertEqual(unit["schedule"]["every_seconds"], 15)
+
+            first = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T00:00:00Z",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(len(json.loads(first.stdout)), 1)
+            not_due = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T00:00:10Z",
+            )
+            self.assertEqual(json.loads(not_due.stdout), [])
+            due_again = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T00:00:15Z",
+            )
+            self.assertEqual(len(json.loads(due_again.stdout)), 1)
+            units = json.loads(run_cli(state_root, "units").stdout)
+            watchdog = next(unit for unit in units if unit["unit_id"] == "watchdog")
+            self.assertEqual(watchdog["schedule"]["next_run_at"], "2026-06-22T00:00:30Z")
+
+    def test_scheduled_unit_runs_automation_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            marker_path = Path(tmp) / "marker.txt"
+            script_path = Path(tmp) / "automation.py"
+            script_path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker_path)!r}).write_text('ran', encoding='utf-8')\n"
+                "print('automation complete')\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "automation",
+                "--goal-text",
+                "Run automation.",
+                "--schedule-every-hours",
+                "1",
+                "--schedule-next-run-at",
+                "2026-06-22T00:00:00Z",
+                "--automation-command",
+                sys.executable,
+                "--automation-command",
+                str(script_path),
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            unit = json.loads(created.stdout)
+            self.assertEqual(unit["automation"]["command"], [sys.executable, str(script_path)])
+
+            started = run_cli(
+                state_root,
+                "run-scheduled-units",
+                "--now",
+                "2026-06-22T00:00:00Z",
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            payload = json.loads(started.stdout)
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(marker_path.read_text(encoding="utf-8"), "ran")
+            result = payload[0]["automation_message"]["payload"]["automation_result"]
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("automation complete", result["stdout"])
+            self.assertEqual(payload[0]["goal"]["completion_state"], "complete")
+            self.assertEqual(payload[0]["goal"]["completion_reason"], "Unit automation exited with code 0: " + sys.executable + " " + str(script_path))
+
+            goals = json.loads(run_cli(state_root, "goals", payload[0]["session"]["session_id"]).stdout)
+            self.assertEqual(goals[0]["completion_state"], "complete")
+
+    def test_sync_app_units_creates_launcher_unit_and_preserves_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            plugins_dir = Path(tmp) / "plugins"
+            app_dir = plugins_dir / "automeet_launcher" / "apps" / "automeet_control"
+            app_dir.mkdir(parents=True)
+            app_path = app_dir / "app.json"
+            app_payload = {
+                "app_id": "automeet-control",
+                "display_name": "AutoMeet Control",
+                "description": "Launch AutoMeet.",
+                "enabled": True,
+                "launcher": {
+                    "goal_text": "Open the Meet room.",
+                    "initial_prompt": "Run AutoMeet now.",
+                    "schedule": {
+                        "startup": {"enabled": True},
+                        "interval": {"enabled": True, "seconds": 15},
+                    },
+                    "automation": {
+                        "enabled": True,
+                        "command": ["bash", "scripts/run-open-meet-cdp.sh"],
+                        "cwd": "../auto-meet",
+                        "timeout_seconds": 900,
+                    },
+                },
+            }
+            app_path.write_text(json.dumps(app_payload), encoding="utf-8")
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            synced = run_cli(
+                state_root,
+                "sync-app-units",
+                "--plugins-dir",
+                str(plugins_dir),
+                "--app-id",
+                "automeet-control",
+            )
+            self.assertEqual(synced.returncode, 0, synced.stderr)
+            payload = json.loads(synced.stdout)
+            unit = payload[0]["unit"]
+            self.assertEqual(unit["unit_id"], "automeet-control")
+            self.assertEqual(unit["schedule"]["every_seconds"], 15)
+            self.assertEqual(unit["automation"]["cwd"], "../auto-meet")
+            first_next_run_at = unit["schedule"]["next_run_at"]
+
+            app_payload["launcher"]["initial_prompt"] = "Run AutoMeet again."
+            app_path.write_text(json.dumps(app_payload), encoding="utf-8")
+            synced_again = run_cli(
+                state_root,
+                "sync-app-units",
+                "--plugins-dir",
+                str(plugins_dir),
+                "--app-id",
+                "automeet-control",
+            )
+            self.assertEqual(synced_again.returncode, 0, synced_again.stderr)
+            unit_again = json.loads(synced_again.stdout)[0]["unit"]
+            self.assertEqual(unit_again["initial_prompt"], "Run AutoMeet again.")
+            self.assertEqual(unit_again["schedule"]["next_run_at"], first_next_run_at)
+
     def test_daemon_starts_due_scheduled_units_and_dispatches_them(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
@@ -380,6 +538,45 @@ class CliTests(unittest.TestCase):
             self.assertTrue(any(session["session_id"] == session_id for session in sessions))
             runs = json.loads(run_cli(state_root, "dispatch-runs", session_id).stdout)
             self.assertTrue(runs)
+
+    def test_daemon_can_run_scheduled_units_without_dispatching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "monitor",
+                "--goal-text",
+                "Inspect system state and report findings.",
+                "--initial-prompt",
+                "Run diagnostics now.",
+                "--schedule-every-seconds",
+                "1",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+
+            daemon = run_cli(
+                state_root,
+                "daemon",
+                "--max-cycles",
+                "1",
+                "--schedule-interval",
+                "0.01",
+                "--dispatch-interval",
+                "0.01",
+                "--no-dispatch",
+            )
+            self.assertEqual(daemon.returncode, 0, daemon.stderr)
+            payload = json.loads(daemon.stdout)
+            self.assertEqual(payload["scheduled_count"], 1)
+            self.assertEqual(payload["dispatched_count"], 0)
+            self.assertFalse(payload["dispatch_enabled"])
+            session_id = payload["scheduled"][0]["session"]["session_id"]
+
+            runs = json.loads(run_cli(state_root, "dispatch-runs", session_id).stdout)
+            self.assertEqual(runs, [])
 
     def test_session_graph_rejects_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

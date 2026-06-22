@@ -89,6 +89,7 @@ def run_daemon(
     created_by: str,
     schedule_interval: float,
     dispatch_interval: float,
+    dispatch_enabled: bool = True,
     max_cycles: int | None = None,
     idle_timeout: float | None = None,
     recovery_context: str | None = None,
@@ -124,6 +125,14 @@ def run_daemon(
                 last_activity = time.monotonic()
             next_schedule_poll = now + schedule_interval
 
+        if not dispatch_enabled:
+            idle_polls += 1
+            if idle_timeout is not None and time.monotonic() - last_activity >= idle_timeout:
+                break
+            if schedule_interval:
+                time.sleep(schedule_interval)
+            continue
+
         result = store.dispatch_once(recovery_context=recovery_context)
         if result is None:
             idle_polls += 1
@@ -141,9 +150,9 @@ def run_daemon(
         "cycle_count": cycle_count,
         "scheduled_count": len(scheduled),
         "dispatched_count": len(dispatched),
+        "dispatch_enabled": dispatch_enabled,
         "idle_polls": idle_polls,
         "scheduled": scheduled,
         "results": dispatched,
         "daemon_elapsed_seconds": round(time.monotonic() - started, 3),
     }
-
