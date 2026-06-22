@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from cli_console import run_console
 from cli_render import (
@@ -53,7 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
     create_unit.add_argument("--goal-text", default="")
     create_unit.add_argument("--initial-prompt", default="")
     create_unit.add_argument("--schedule-every-hours", type=int)
+    create_unit.add_argument("--schedule-every-seconds", type=int)
     create_unit.add_argument("--schedule-next-run-at")
+    create_unit.add_argument("--automation-command", action="append", dest="automation_command")
+    create_unit.add_argument("--automation-cwd", default="")
+    create_unit.add_argument("--automation-timeout-seconds", type=int, default=900)
+
+    sync_app_units = sub.add_parser("sync-app-units", help="sync enabled plugin launcher apps into Units")
+    sync_app_units.add_argument("--plugins-dir", default="plugins/private")
+    sync_app_units.add_argument("--app-id", action="append", dest="app_ids")
 
     run_scheduled_units = sub.add_parser("run-scheduled-units", help="start due scheduled Unit sessions")
     run_scheduled_units.add_argument("--parent", default="root", dest="parent_session_id")
@@ -162,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--created-by", default="root", dest="created_by")
     daemon.add_argument("--schedule-interval", type=float, default=60.0)
     daemon.add_argument("--dispatch-interval", type=float, default=1.0)
+    daemon.add_argument("--no-dispatch", action="store_true", help="run scheduled Units without dispatching queued work")
     daemon.add_argument("--max-cycles", type=int)
     daemon.add_argument("--idle-timeout", type=float)
     daemon.add_argument("--recovery-context")
@@ -171,6 +182,71 @@ def build_parser() -> argparse.ArgumentParser:
     console.add_argument("--password")
 
     return parser
+
+
+def _launcher_schedule(launcher: dict[str, Any], existing_unit: dict[str, Any] | None = None) -> dict[str, Any]:
+    schedule_config = launcher.get("schedule")
+    if not isinstance(schedule_config, dict):
+        return {}
+    interval = schedule_config.get("interval")
+    if not isinstance(interval, dict) or interval.get("enabled") is not True:
+        return {}
+    every_hours = int(interval.get("hours") or 0)
+    every_seconds = int(interval.get("seconds") or interval.get("every_seconds") or 0)
+    if every_hours < 1 and every_seconds < 1:
+        return {}
+    existing_schedule = existing_unit.get("schedule") if isinstance(existing_unit, dict) else None
+    next_run_at = ""
+    if isinstance(existing_schedule, dict):
+        next_run_at = str(existing_schedule.get("next_run_at") or "").strip()
+    return {
+        "enabled": True,
+        "kind": "interval",
+        "every_hours": every_hours,
+        "every_seconds": every_seconds,
+        "next_run_at": next_run_at or None,
+        "timezone": "UTC",
+    }
+
+
+def _launcher_automation(launcher: dict[str, Any]) -> dict[str, Any]:
+    automation = launcher.get("automation")
+    if not isinstance(automation, dict) or automation.get("enabled") is not True:
+        return {}
+    return {
+        "enabled": True,
+        "command": automation.get("command") or [],
+        "cwd": automation.get("cwd") or "",
+        "timeout_seconds": int(automation.get("timeout_seconds") or 900),
+    }
+
+
+def sync_app_units(store: Store, plugins_dir: Path, app_ids: list[str] | None = None) -> list[dict[str, Any]]:
+    selected = set(app_ids or [])
+    synced: list[dict[str, Any]] = []
+    existing_units = {unit["unit_id"]: unit for unit in store.units()}
+    for app_path in sorted(plugins_dir.glob("*/apps/*/app.json")):
+        app = json.loads(app_path.read_text(encoding="utf-8"))
+        app_id = str(app.get("app_id") or "").strip()
+        if not app_id or (selected and app_id not in selected):
+            continue
+        if app.get("enabled") is not True:
+            continue
+        launcher = app.get("launcher")
+        if not isinstance(launcher, dict):
+            continue
+        unit = store.upsert_unit(
+            app_id,
+            instance_policy="multi",
+            display_name=str(app.get("display_name") or app_id),
+            description=str(app.get("description") or ""),
+            goal_text=str(launcher.get("goal_text") or app.get("description") or app_id),
+            initial_prompt=str(launcher.get("initial_prompt") or ""),
+            schedule=_launcher_schedule(launcher, existing_units.get(app_id)),
+            automation=_launcher_automation(launcher),
+        )
+        synced.append({"app_path": str(app_path), "unit": unit})
+    return synced
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -199,13 +275,22 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.create_account(args.username, password=args.password, roles=args.roles))
         elif args.command == "create-unit":
             schedule = {}
-            if args.schedule_every_hours is not None:
+            if args.schedule_every_hours is not None or args.schedule_every_seconds is not None:
                 schedule = {
                     "enabled": True,
                     "kind": "interval",
-                    "every_hours": args.schedule_every_hours,
+                    "every_hours": args.schedule_every_hours or 0,
+                    "every_seconds": args.schedule_every_seconds or 0,
                     "next_run_at": args.schedule_next_run_at,
                     "timezone": "UTC",
+                }
+            automation = {}
+            if args.automation_command:
+                automation = {
+                    "enabled": True,
+                    "command": args.automation_command,
+                    "cwd": args.automation_cwd,
+                    "timeout_seconds": args.automation_timeout_seconds,
                 }
             print_json(
                 store.create_unit(
@@ -216,8 +301,14 @@ def run(argv: list[str] | None = None) -> int:
                     goal_text=args.goal_text,
                     initial_prompt=args.initial_prompt,
                     schedule=schedule,
+                    automation=automation,
                 ).to_dict()
             )
+        elif args.command == "sync-app-units":
+            plugins_dir = Path(args.plugins_dir)
+            if not plugins_dir.is_absolute():
+                plugins_dir = Path.cwd() / plugins_dir
+            print_json(sync_app_units(store, plugins_dir, args.app_ids))
         elif args.command == "run-scheduled-units":
             print_json(
                 store.run_scheduled_units(
@@ -343,6 +434,7 @@ def run(argv: list[str] | None = None) -> int:
                     created_by=args.created_by,
                     schedule_interval=args.schedule_interval,
                     dispatch_interval=args.dispatch_interval,
+                    dispatch_enabled=not args.no_dispatch,
                     max_cycles=args.max_cycles,
                     idle_timeout=args.idle_timeout,
                     recovery_context=args.recovery_context,

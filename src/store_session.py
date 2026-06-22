@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -120,11 +121,13 @@ class SessionGoalMixin:
         goal_text: str = "",
         initial_prompt: str = "",
         schedule: dict[str, Any] | None = None,
+        automation: dict[str, Any] | None = None,
     ) -> Unit:
         state = self.load()
         if instance_policy not in {"multi", "singleton"}:
             raise StoreError(f"unsupported instance policy: {instance_policy}")
         normalized_schedule = self._normalize_unit_schedule(schedule)
+        normalized_automation = self._normalize_unit_automation(automation)
         units = state["units"]
         if unit_id in units:
             raise StoreError(f"unit already exists: {unit_id}")
@@ -137,12 +140,77 @@ class SessionGoalMixin:
             goal_text=str(goal_text or "").strip(),
             initial_prompt=str(initial_prompt or "").strip(),
             schedule=normalized_schedule,
+            automation=normalized_automation,
             workspace_path=self._unit_workspace_relpath(unit_id),
         )
         units[unit_id] = unit.to_dict()
         self._ensure_unit_workspace(units[unit_id])
         self.save(state)
         return unit
+
+    def upsert_unit(
+        self,
+        unit_id: str,
+        *,
+        instance_policy: str = "multi",
+        display_name: str = "",
+        description: str = "",
+        goal_text: str = "",
+        initial_prompt: str = "",
+        schedule: dict[str, Any] | None = None,
+        automation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self.load()
+        if instance_policy not in {"multi", "singleton"}:
+            raise StoreError(f"unsupported instance policy: {instance_policy}")
+        units = state["units"]
+        existing_unit = units.get(unit_id)
+        existing_schedule = (
+            existing_unit.get("schedule")
+            if isinstance(existing_unit, dict) and isinstance(existing_unit.get("schedule"), dict)
+            else {}
+        )
+        schedule_for_normalization = dict(schedule or {})
+        if (
+            schedule_for_normalization
+            and not str(schedule_for_normalization.get("next_run_at") or "").strip()
+            and existing_schedule.get("next_run_at")
+        ):
+            schedule_for_normalization["next_run_at"] = str(existing_schedule["next_run_at"])
+        normalized_schedule = self._normalize_unit_schedule(schedule_for_normalization)
+        normalized_automation = self._normalize_unit_automation(automation)
+        if unit_id not in units:
+            unit = Unit(
+                unit_id=unit_id,
+                created_at=utc_now(),
+                instance_policy=instance_policy,
+                display_name=str(display_name or "").strip(),
+                description=str(description or "").strip(),
+                goal_text=str(goal_text or "").strip(),
+                initial_prompt=str(initial_prompt or "").strip(),
+                schedule=normalized_schedule,
+                automation=normalized_automation,
+                workspace_path=self._unit_workspace_relpath(unit_id),
+            ).to_dict()
+            units[unit_id] = unit
+            self._ensure_unit_workspace(unit)
+            self.save(state)
+            return dict(unit)
+
+        unit = units[unit_id]
+        unit["instance_policy"] = instance_policy
+        unit["display_name"] = str(display_name or "").strip()
+        unit["description"] = str(description or "").strip()
+        unit["goal_text"] = str(goal_text or "").strip()
+        unit["initial_prompt"] = str(initial_prompt or "").strip()
+        unit["schedule"] = normalized_schedule
+        unit["automation"] = normalized_automation
+        unit["updated_at"] = utc_now()
+        if not str(unit.get("workspace_path") or "").strip():
+            unit["workspace_path"] = self._unit_workspace_relpath(unit_id)
+        self._ensure_unit_workspace(unit)
+        self.save(state)
+        return dict(unit)
 
     def run_scheduled_units(
         self,
@@ -208,6 +276,31 @@ class SessionGoalMixin:
                 message["payload"]["reprocess_recorded_at"] = now_text
                 payload["initial_message"] = dict(message)
                 payload["goal"] = dict(goal)
+            automation_result = self._run_unit_automation(unit)
+            if automation_result:
+                goal = state["goals"][payload["goal"]["goal_id"]]
+                message = self._message(
+                    from_endpoint="system",
+                    to_endpoint=session_endpoint(session_id),
+                    payload={
+                        "body": automation_result["summary"],
+                        "automation_result": automation_result,
+                        "scheduled_unit_id": unit_id,
+                    },
+                    created_at=utc_now(),
+                )
+                state["messages"].append(message)
+                self._index_message_for_session(state, message, session_id)
+                payload["automation_message"] = dict(message)
+                if int(automation_result["returncode"]) == 0:
+                    self._set_goal_completion_state(
+                        state,
+                        goal,
+                        "complete",
+                        reason=automation_result["summary"],
+                        actor="system",
+                    )
+                    payload["goal"] = dict(goal)
             unit["last_scheduled_at"] = now_text
             unit["updated_at"] = now_text
             unit["scheduled_run_count"] = int(unit.get("scheduled_run_count") or 0) + 1
@@ -218,6 +311,73 @@ class SessionGoalMixin:
             started.append(payload)
         self.save(state)
         return started
+
+    def _normalize_unit_automation(self, automation: dict[str, Any] | None) -> dict[str, Any]:
+        if not automation:
+            return {}
+        command = automation.get("command")
+        if isinstance(command, str):
+            command = [command]
+        if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+            raise StoreError("unit automation command must be a non-empty list of strings")
+        timeout_seconds = int(automation.get("timeout_seconds") or 900)
+        if timeout_seconds < 1:
+            raise StoreError("unit automation timeout_seconds must be positive")
+        cwd = str(automation.get("cwd") or "").strip()
+        return {
+            "enabled": bool(automation.get("enabled", True)),
+            "command": list(command),
+            "cwd": cwd,
+            "timeout_seconds": timeout_seconds,
+        }
+
+    def _run_unit_automation(self, unit: dict[str, Any]) -> dict[str, Any] | None:
+        automation = unit.get("automation")
+        if not isinstance(automation, dict) or automation.get("enabled") is not True:
+            return None
+        command = automation.get("command")
+        if not isinstance(command, list) or not command:
+            return None
+        cwd_text = str(automation.get("cwd") or "").strip()
+        cwd = (self.root.parent / cwd_text).resolve() if cwd_text else self.root.parent.resolve()
+        timeout_seconds = int(automation.get("timeout_seconds") or 900)
+        started_at = utc_now()
+        try:
+            completed = subprocess.run(
+                [str(item) for item in command],
+                cwd=str(cwd),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+            stdout = completed.stdout[-12000:]
+            stderr = completed.stderr[-12000:]
+            summary = (
+                f"Unit automation exited with code {completed.returncode}: "
+                f"{' '.join(str(item) for item in command)}"
+            )
+            return {
+                "command": list(command),
+                "cwd": str(cwd),
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "returncode": completed.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "summary": summary,
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "command": list(command),
+                "cwd": str(cwd),
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "returncode": 124,
+                "stdout": str(exc.stdout or "")[-12000:],
+                "stderr": str(exc.stderr or "")[-12000:],
+                "summary": f"Unit automation timed out after {timeout_seconds}s: {' '.join(str(item) for item in command)}",
+            }
 
     def set_agent_provider(self, role: str, *, provider: str) -> dict[str, Any]:
         normalized_role = self._normalize_agent_role(role)
@@ -431,12 +591,14 @@ class SessionGoalMixin:
         if kind != "interval":
             raise StoreError(f"unsupported unit schedule kind: {kind}")
         every_hours = int(schedule.get("every_hours") or 0)
-        if enabled and every_hours < 1:
-            raise StoreError("enabled interval schedules require every_hours >= 1")
+        every_seconds = int(schedule.get("every_seconds") or 0)
+        if enabled and every_hours < 1 and every_seconds < 1:
+            raise StoreError("enabled interval schedules require every_hours >= 1 or every_seconds >= 1")
         normalized = {
             "enabled": enabled,
             "kind": kind,
             "every_hours": every_hours,
+            "every_seconds": every_seconds,
             "next_run_at": str(schedule.get("next_run_at") or utc_now()).strip(),
             "timezone": str(schedule.get("timezone") or "UTC").strip() or "UTC",
         }
@@ -451,7 +613,8 @@ class SessionGoalMixin:
         if str(schedule.get("kind") or "interval") != "interval":
             return False
         every_hours = int(schedule.get("every_hours") or 0)
-        if every_hours < 1:
+        every_seconds = int(schedule.get("every_seconds") or 0)
+        if every_hours < 1 and every_seconds < 1:
             return False
         next_run_at = str(schedule.get("next_run_at") or "").strip()
         if not next_run_at:
@@ -460,9 +623,10 @@ class SessionGoalMixin:
 
     def _next_unit_run_at(self, schedule: dict[str, Any], *, now_dt: datetime) -> str:
         every_hours = int(schedule.get("every_hours") or 0)
-        if every_hours < 1:
-            raise StoreError("interval schedules require every_hours >= 1")
-        interval = timedelta(hours=every_hours)
+        every_seconds = int(schedule.get("every_seconds") or 0)
+        if every_hours < 1 and every_seconds < 1:
+            raise StoreError("interval schedules require every_hours >= 1 or every_seconds >= 1")
+        interval = timedelta(seconds=every_seconds) if every_seconds >= 1 else timedelta(hours=every_hours)
         next_run_at = str(schedule.get("next_run_at") or "").strip()
         next_dt = self._parse_utc(next_run_at) if next_run_at else now_dt
         while next_dt <= now_dt:

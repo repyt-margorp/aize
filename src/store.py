@@ -221,6 +221,7 @@ class Store(
                 "goal_text": "",
                 "initial_prompt": "",
                 "schedule": {},
+                "automation": {},
             }.items():
                 if key not in unit:
                     unit[key] = dict(default) if isinstance(default, dict) else default
