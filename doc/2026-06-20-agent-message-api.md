@@ -4,7 +4,7 @@
 
 - Console input now records a per-console reply endpoint on `UserInput` messages.
 - Agent stdout is no longer automatically mirrored to `UserConsole`.
-- Agents can send AIZE messages explicitly through `agent_api`.
+- Agents can send AIze messages explicitly through `agent_api`.
 - `UserConsole` messages require a valid reply endpoint; invalid routes are rejected by the Store layer.
 
 ## Files touched

@@ -4,7 +4,7 @@
 
 - Dispatch step stdout/stderr from GoalManager and WorkerAgent is no longer appended to the Session MessageLog.
 - Dispatch output is stored on `dispatch_runs[].steps[].output` as run history.
-- MessageLog remains for actual AIZE messages, such as user input, Session capability records, Goal completion state records, explicit user-console replies, and explicit remote handoff messages.
+- MessageLog remains for actual AIze messages, such as user input, Session capability records, Goal completion state records, explicit user-console replies, and explicit remote handoff messages.
 - Existing persisted MessageLog entries created before this change are left intact as history.
 
 ## Files touched

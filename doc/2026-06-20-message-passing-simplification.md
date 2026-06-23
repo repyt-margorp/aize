@@ -2,7 +2,7 @@
 
 ## User-visible behavior
 
-- AIZE messages now use a minimal envelope:
+- AIze messages now use a minimal envelope:
   - `message_id`
   - `from`
   - `to`

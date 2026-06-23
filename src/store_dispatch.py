@@ -619,13 +619,13 @@ class DispatchMixin:
         payload = {
             "goal_id": goal["goal_id"],
             "session_id": session_id,
-            "body": "WorkerAgent work item for remote AIZE. All exchange data is carried as message payload.",
+            "body": "WorkerAgent work item for remote AIze. All exchange data is carried as message payload.",
             "remote_aize_worker_handoff": {
                 "worker_prompt": worker_prompt,
             },
             "provider": "remote-aize",
             "run_id": run["run_id"],
-            "dispatch_step": "RemoteAizeWorkerHandoff",
+            "dispatch_step": "RemoteAIzeWorkerHandoff",
         }
         message = self._message(
             from_endpoint="dispatcher",
@@ -637,7 +637,7 @@ class DispatchMixin:
         self._index_message_for_session(state, message, session_id)
         run["steps"].append(
             {
-                "phase": "RemoteAizeWorkerHandoff",
+                "phase": "RemoteAIzeWorkerHandoff",
                 "provider": "remote-aize",
                 "message_id": message["message_id"],
                 "created_at": message["created_at"],

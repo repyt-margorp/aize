@@ -86,7 +86,7 @@ class PromptMixin:
             render_message_bundle(dispatch_messages or []),
             "  </dispatch-feed>",
             "  <python-message-api>",
-            "    Use Python functions from agent_api for AIZE message passing.",
+            "    Use Python functions from agent_api for AIze message passing.",
             "    Available functions: send_user_console_message(body), send_session_message(body), send_worker_request(body).",
             "    send_worker_request(body) records a Worker request as a Session Message; Session dispatch connects it to WorkerAgent.",
             "    GoalManager is the only role that may send user-facing console replies and request WorkerAgent work.",
@@ -151,7 +151,7 @@ class PromptMixin:
             render_message_bundle(dispatch_messages or []),
             "  </dispatch-feed>",
             "  <python-message-api>",
-            "    Use Python functions from agent_api for AIZE message passing.",
+            "    Use Python functions from agent_api for AIze message passing.",
             "    Available functions: send_session_message(body).",
             "    WorkerAgent must report execution progress and results to Session only.",
             "    WorkerAgent may not message GoalManager directly, decide SessionGoal completion, or send user-facing console replies.",
@@ -162,8 +162,8 @@ class PromptMixin:
             prompt.extend(["  <recovery-context>", xml_text(recovery_context), "  </recovery-context>"])
         prompt.extend(
             [
-                "  <instruction>Work toward the SessionGoal by using the Python AIZE message API and report the result.</instruction>",
-                "  <output-format>Return only a concise execution summary on stdout after sending AIZE messages through the Python API.</output-format>",
+                "  <instruction>Work toward the SessionGoal by using the Python AIze message API and report the result.</instruction>",
+                "  <output-format>Return only a concise execution summary on stdout after sending AIze messages through the Python API.</output-format>",
                 "</aize-agent-input>",
             ]
         )

@@ -16,7 +16,7 @@ from store import Store
 from store_defs import StoreError
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="aize")
+    parser = argparse.ArgumentParser(prog="AIze")
     parser.add_argument(
         "--root",
         default=".aize-state",

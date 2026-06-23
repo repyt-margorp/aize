@@ -6,7 +6,7 @@
 - Session capabilities are stored as `sessions[session_id].capabilities` metadata instead of a `SessionCapabilities` Message.
 - SessionGoal completion changes update the Goal record directly and append a `state_transitions` entry on that Goal instead of writing a `GoalCompletionState` Message.
 - Dispatch results return `state_transition` for Goal state changes and keep `message` as `null`.
-- Load-time migration removes old `SessionCapabilities`, `GoalCompletionState`, and dispatch stdout/stderr step messages from MessageLog. Explicit agent messages sent through the AIZE message API remain.
+- Load-time migration removes old `SessionCapabilities`, `GoalCompletionState`, and dispatch stdout/stderr step messages from MessageLog. Explicit agent messages sent through the AIze message API remain.
 
 ## Files touched
 

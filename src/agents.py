@@ -53,7 +53,7 @@ class AgentRunner:
                 provider=normalized,
                 output=(
                     '<aize-output role="WorkerAgent" provider="remote-aize">\n'
-                    "WorkerAgent handoff queued for remote AIZE via message passing. "
+                    "WorkerAgent handoff queued for remote AIze via message passing. "
                     "No local filesystem exchange was performed directly.\n\n"
                     f"{prompt}\n"
                     "</aize-output>"
@@ -123,7 +123,7 @@ class AgentRunner:
             raise AgentError(f"{provider} executable not found")
         resumed_prompt = prompt
         if resume_token:
-            resumed_prompt = f"Resume durable AIZE agent thread: {resume_token}\n\n{prompt}"
+            resumed_prompt = f"Resume durable AIze agent thread: {resume_token}\n\n{prompt}"
         if provider == "codex":
             command = [
                 executable,

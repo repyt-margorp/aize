@@ -14,7 +14,7 @@
   - persisted state may have changed;
   - agents should continue toward the current SessionGoal from current Session state.
 - This recovery context is stored on the `dispatch_runs` record.
-- It is not appended to the Session MessageLog, because it is runtime dispatch context rather than endpoint-to-endpoint AIZE IPC.
+- It is not appended to the Session MessageLog, because it is runtime dispatch context rather than endpoint-to-endpoint AIze IPC.
 
 ## Files touched
 

@@ -1525,7 +1525,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("--sandbox", argv)
             self.assertIn("danger-full-access", argv)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
-            self.assertIn("Resume durable AIZE agent thread: resume-1", argv[-1])
+            self.assertIn("Resume durable AIze agent thread: resume-1", argv[-1])
             self.assertEqual(payload["cwd"], str(cwd_path))
             self.assertEqual(payload["env"]["AIZE_STATE_ROOT"], "state-root")
             self.assertEqual(payload["env"]["AIZE_SESSION_ID"], "session-1")
@@ -1703,7 +1703,7 @@ class CliTests(unittest.TestCase):
             worker_payload = json.loads(worker_dispatched.stdout)
             self.assertEqual(
                 [step["phase"] for step in worker_payload["run"]["steps"]],
-                ["WorkerWork", "RemoteAizeWorkerHandoff"],
+                ["WorkerWork", "RemoteAIzeWorkerHandoff"],
             )
             self.assertEqual([step["provider"] for step in worker_payload["run"]["steps"]], ["remote-aize", "remote-aize"])
 

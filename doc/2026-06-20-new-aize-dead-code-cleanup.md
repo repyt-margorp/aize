@@ -6,7 +6,7 @@
 - The README now reflects the current MessageLog boundary:
   - Session capabilities are Session metadata, not Messages.
   - Agent stdout/stderr is dispatch-run step output, not Messages.
-  - Agent API calls create explicit AIZE Messages.
+  - Agent API calls create explicit AIze Messages.
   - Console startup can enqueue background dispatch for queued Active/Incomplete SessionGoals.
 
 ## Code cleanup
@@ -21,7 +21,7 @@
 
 - Non-interactive generic `send` / `recv` still exist for low-level message testing and scripting. They should only be removed after deciding whether the CLI should expose raw IPC.
 - Legacy state migration helpers still exist because live `.aize-state` may contain records from earlier same-day schema iterations.
-- Remote AIZE handoff is still represented as local durable messages; the transport is not implemented yet, but the provider path is covered by tests.
+- Remote AIze handoff is still represented as local durable messages; the transport is not implemented yet, but the provider path is covered by tests.
 
 ## Verification
 

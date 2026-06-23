@@ -1,4 +1,4 @@
-# aize
+# AIze
 
 Minimal AIze rebuild focused on a small MINIX-style core:
 
@@ -19,6 +19,10 @@ Minimal AIze rebuild focused on a small MINIX-style core:
 - console startup dispatch for queued Active/Incomplete Sessions
 - CLI-only status inspection
 - no UI
+
+Official display name is `AIze`. Lowercase identifiers such as the `aize`
+console command, `.aize-state`, `<aize-message>`, and `remote-aize` are stable
+CLI/protocol names rather than brand spelling.
 
 The previous runtime source is preserved under `2026-06-20-old-aize/` for
 reference. The active CLI runtime lives directly under `src/`.
@@ -221,14 +225,14 @@ with full local permissions.
 
 `GoalManager` must be evaluated on this PC. `remote-aize` is rejected for
 `GoalManager`, but can be assigned to `WorkerAgent` to represent work handed to
-another AIZE system through message passing:
+another AIze system through message passing:
 
 ```bash
 PYTHONPATH=src python3 -m cli --root .aize-state set-agent WorkerAgent remote-aize
 ```
 
 When `WorkerAgent` uses `remote-aize`, dispatch records both the WorkerAgent
-turn and a `RemoteAizeWorkerHandoff` Message addressed to `remote-aize`. The
+turn and a `RemoteAIzeWorkerHandoff` Message addressed to `remote-aize`. The
 handoff prompt is stored in a Message payload, so remote participation and
 future file exchange stay inside the message-passing model.
 
@@ -236,7 +240,7 @@ Each Session stores capability metadata on the Session record. Capabilities are
 included in Agent prompts, but they are not recorded as Session Messages.
 
 Agent stdout/stderr is recorded on dispatch-run steps, not as Session Messages.
-Only messages explicitly sent through the AIZE Agent API are appended to
+Only messages explicitly sent through the AIze Agent API are appended to
 MessageLog. `send_user_console_message(...)` sends user-visible text to the
 current console reply endpoint.
 

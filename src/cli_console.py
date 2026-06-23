@@ -31,7 +31,7 @@ from store import Store
 from store_defs import StoreError, payload_body
 
 CLI_STARTUP_RECOVERY_CONTEXT = (
-    "The AIZE CLI console started or restarted. Treat this as a runtime resume point: "
+    "The AIze CLI console started or restarted. Treat this as a runtime resume point: "
     "persisted state may have changed since the previous dispatch, so continue working "
     "toward the current SessionGoal using the current Session messages and goal state."
 )
@@ -74,12 +74,12 @@ def start_console_message_poller(
                         f"[{session_id}] {message.get('from')}: "
                         f"{console_body(payload_body(message))}"
                     )
-                    print(f"aize:{session_id}> ", end="", flush=True)
+                    print(f"AIze:{session_id}> ", end="", flush=True)
             except Exception:
                 pass
             stop_event.wait(0.5)
 
-    thread = threading.Thread(target=poll, name="aize-console-message-poller", daemon=True)
+    thread = threading.Thread(target=poll, name="AIze-console-message-poller", daemon=True)
     thread.start()
     return thread
 
@@ -169,7 +169,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
     try:
         while True:
             try:
-                line = input(f"aize:{current_session_id}> ")
+                line = input(f"AIze:{current_session_id}> ")
             except EOFError:
                 print()
                 return 0

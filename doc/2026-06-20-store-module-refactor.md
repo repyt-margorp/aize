@@ -43,7 +43,7 @@
   - GoalManager / WorkerAgent execution.
   - Agent thread turns.
   - Dispatch prompt rendering.
-  - Remote AIZE handoff message creation.
+  - Remote AIze handoff message creation.
 - `src/store_query.py`
   - Status and list/read views used by CLI.
 
