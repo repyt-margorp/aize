@@ -118,6 +118,26 @@ The daemon runs until stopped. For service managers or tests, `--max-cycles`,
 `--idle-timeout`, `--schedule-interval`, and `--dispatch-interval` can bound or
 tune the loop.
 
+Dispatch runs through interchangeable daemon Lots. Each Lot is only a worker
+thread used to start one `dispatch_once` call; Sessions are not pinned to a
+specific Lot. Start with a target Lot size:
+
+```bash
+PYTHONPATH=src python3 -m cli --root .aize-state daemon --dispatch-lots 10
+```
+
+The running daemon reads the target Lot size from state each cycle. Change it
+from another shell with:
+
+```bash
+PYTHONPATH=src python3 -m cli --root .aize-state set-dispatch-lots 4
+```
+
+If the target is lowered below the number of currently running Codex processes,
+the daemon lets those runs finish and only refills up to the new target. If the
+target is raised, free Lots are filled on later cycles. Use
+`--max-dispatch-lots` to cap how far a running daemon may grow.
+
 Sessions have a user-controlled `active` flag. Goals have a GoalManager-owned
 `completion_state` of `incomplete` or `complete`. Dispatch only selects Goals
 that are both in an active Session and still incomplete.

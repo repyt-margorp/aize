@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 
 
@@ -380,6 +381,123 @@ class CliTests(unittest.TestCase):
             self.assertTrue(any(session["session_id"] == session_id for session in sessions))
             runs = json.loads(run_cli(state_root, "dispatch-runs", session_id).stdout)
             self.assertTrue(runs)
+
+    def test_daemon_dispatch_lots_run_interchangeable_parallel_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            for session_id in ("alpha", "beta"):
+                self.assertEqual(run_cli(state_root, "create-session", session_id).returncode, 0)
+                self.assertEqual(
+                    run_cli(
+                        state_root,
+                        "update-goal",
+                        session_id,
+                        f"reply for {session_id}",
+                        "--created-by",
+                        "root",
+                    ).returncode,
+                    0,
+                )
+
+            daemon = run_cli(
+                state_root,
+                "daemon",
+                "--dispatch-lots",
+                "2",
+                "--max-cycles",
+                "1",
+                "--schedule-interval",
+                "60",
+                "--dispatch-interval",
+                "0.01",
+            )
+            self.assertEqual(daemon.returncode, 0, daemon.stderr)
+            payload = json.loads(daemon.stdout)
+            self.assertEqual(payload["dispatch_lot_size"], 2)
+            self.assertEqual(payload["dispatch_lot_cap"], 10)
+            self.assertEqual(payload["dispatched_count"], 2)
+            self.assertEqual(payload["peak_active_dispatch_lots"], 2)
+
+            runs = json.loads(run_cli(state_root, "dispatch-runs").stdout)
+            lot_ids = sorted(run.get("dispatch_lot_id") for run in runs)
+            self.assertEqual(lot_ids, [1, 2])
+            self.assertEqual({run["session_id"] for run in runs}, {"alpha", "beta"})
+
+    def test_dispatch_lot_size_can_change_after_daemon_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            first = run_cli(state_root, "set-dispatch-lots", "3")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["dispatch_lot_size"], 3)
+            status = json.loads(run_cli(state_root, "status").stdout)
+            self.assertEqual(status["dispatch_lot_size"], 3)
+
+            second = run_cli(state_root, "set-dispatch-lots", "1")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(json.loads(second.stdout)["dispatch_lot_size"], 1)
+            status = json.loads(run_cli(state_root, "status").stdout)
+            self.assertEqual(status["dispatch_lot_size"], 1)
+
+            rejected = run_cli(state_root, "set-dispatch-lots", "0")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("dispatch lot size must be positive", rejected.stderr)
+
+    def test_dispatch_lot_refill_respects_dynamic_target_without_pinning_sessions(self) -> None:
+        from cli_workers import _collect_completed_lots, _submit_available_lots
+
+        class FakeExecutor:
+            def __init__(self) -> None:
+                self.submitted: list[int] = []
+
+            def submit(self, func, **kwargs):
+                lot_id = int(kwargs["dispatch_lot_id"])
+                self.submitted.append(lot_id)
+                future: Future = Future()
+                future.set_result(None)
+                return future
+
+        class FakeStore:
+            def dispatch_once(self, **kwargs):
+                return None
+
+        active: dict[int, Future] = {}
+        for lot_id in (1, 2, 3):
+            future: Future = Future()
+            active[lot_id] = future
+
+        executor = FakeExecutor()
+        submitted = _submit_available_lots(
+            executor,
+            active,
+            target_lots=1,
+            recovery_context=None,
+            store=FakeStore(),
+        )
+        self.assertEqual(submitted, [])
+        self.assertEqual(set(active), {1, 2, 3})
+
+        active[1].set_result(None)
+        active[2].set_result(None)
+        dispatched: list[dict] = []
+        completed = _collect_completed_lots(active, dispatched)
+        self.assertEqual(completed, [1, 2])
+        self.assertEqual(set(active), {3})
+
+        active[3].set_result(None)
+        _collect_completed_lots(active, dispatched)
+        submitted = _submit_available_lots(
+            executor,
+            active,
+            target_lots=2,
+            recovery_context=None,
+            store=FakeStore(),
+        )
+        self.assertEqual(submitted, [1, 2])
+        self.assertEqual(executor.submitted, [1, 2])
 
     def test_session_graph_rejects_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

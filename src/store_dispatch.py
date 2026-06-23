@@ -24,11 +24,13 @@ class DispatchMixin:
         *,
         session_id: str | None = None,
         recovery_context: str | None = None,
+        dispatch_lot_id: int | None = None,
     ) -> dict[str, Any] | None:
         with self._state_lock():
             lease = self._acquire_dispatch_lease_locked(
                 session_id=session_id,
                 recovery_context=recovery_context,
+                dispatch_lot_id=dispatch_lot_id,
             )
         if lease is None:
             return None
@@ -124,6 +126,7 @@ class DispatchMixin:
         *,
         session_id: str | None = None,
         recovery_context: str | None = None,
+        dispatch_lot_id: int | None = None,
     ) -> dict[str, Any] | None:
         state = self.load()
         if session_id and session_id not in state["sessions"]:
@@ -177,6 +180,8 @@ class DispatchMixin:
             "session_message_ids": [message["message_id"] for message in session_messages],
             "current_phase": role,
         }
+        if dispatch_lot_id is not None:
+            run["dispatch_lot_id"] = int(dispatch_lot_id)
         if recovery_context:
             run["recovery_context"] = recovery_context
         state["dispatch_runs"][run_id] = run

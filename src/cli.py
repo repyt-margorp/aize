@@ -32,6 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("agents", help="list agent role provider assignments")
     sub.add_parser("agent-pool", help="show active agent pool allocations")
 
+    set_dispatch_lots = sub.add_parser("set-dispatch-lots", help="set daemon dispatch lot target size")
+    set_dispatch_lots.add_argument("size", type=int)
+
     set_agent = sub.add_parser("set-agent", help="assign a provider to an agent role")
     set_agent.add_argument("role")
     set_agent.add_argument("provider")
@@ -162,6 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--created-by", default="root", dest="created_by")
     daemon.add_argument("--schedule-interval", type=float, default=60.0)
     daemon.add_argument("--dispatch-interval", type=float, default=1.0)
+    daemon.add_argument("--dispatch-lots", type=int, default=1)
+    daemon.add_argument("--max-dispatch-lots", type=int)
     daemon.add_argument("--max-cycles", type=int)
     daemon.add_argument("--idle-timeout", type=float)
     daemon.add_argument("--recovery-context")
@@ -191,6 +196,8 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.agent_profiles())
         elif args.command == "agent-pool":
             print_json(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs()))
+        elif args.command == "set-dispatch-lots":
+            print_json(store.set_dispatch_lot_size(args.size))
         elif args.command == "set-agent":
             print_json(store.set_agent_provider(args.role, provider=args.provider))
         elif args.command == "auth":
@@ -343,6 +350,8 @@ def run(argv: list[str] | None = None) -> int:
                     created_by=args.created_by,
                     schedule_interval=args.schedule_interval,
                     dispatch_interval=args.dispatch_interval,
+                    dispatch_lots=args.dispatch_lots,
+                    max_dispatch_lots=args.max_dispatch_lots,
                     max_cycles=args.max_cycles,
                     idle_timeout=args.idle_timeout,
                     recovery_context=args.recovery_context,

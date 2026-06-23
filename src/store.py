@@ -78,6 +78,7 @@ class Store(
             "agent_threads": {},
             "dispatch_runs": {},
             "dispatch_queue": [],
+            "runtime_settings": {},
             "messages": [],
             "endpoint_cursors": {},
             "message_index": [],
@@ -104,6 +105,7 @@ class Store(
         state.setdefault("agent_threads", {})
         state.setdefault("dispatch_runs", {})
         state.setdefault("dispatch_queue", [])
+        state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
         state.setdefault("message_index", [])
@@ -195,9 +197,13 @@ class Store(
         agent_threads = state.setdefault("agent_threads", {})
         state.setdefault("dispatch_runs", {})
         state.setdefault("dispatch_queue", [])
+        runtime_settings = state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
         state.setdefault("message_index", [])
+        if "dispatch_lot_size" not in runtime_settings:
+            runtime_settings["dispatch_lot_size"] = 1
+            changed = True
         if ROOT_UNIT_ID not in units:
             units[ROOT_UNIT_ID] = Unit(
                 unit_id=ROOT_UNIT_ID,

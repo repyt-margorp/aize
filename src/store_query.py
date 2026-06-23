@@ -6,6 +6,20 @@ from store_defs import StoreError
 
 
 class QueryMixin:
+    def dispatch_lot_size(self) -> int:
+        state = self.load()
+        return max(1, int(state.setdefault("runtime_settings", {}).get("dispatch_lot_size") or 1))
+
+    def set_dispatch_lot_size(self, lot_size: int) -> dict[str, Any]:
+        normalized_size = int(lot_size)
+        if normalized_size < 1:
+            raise StoreError("dispatch lot size must be positive")
+        with self._state_lock():
+            state = self.load()
+            state.setdefault("runtime_settings", {})["dispatch_lot_size"] = normalized_size
+            self.save(state)
+        return {"dispatch_lot_size": normalized_size}
+
     def status(self) -> dict[str, Any]:
         state = self.load()
         messages = state["messages"]
@@ -46,6 +60,7 @@ class QueryMixin:
             "dispatch_queue_count": len(state.get("dispatch_queue", [])),
             "queued_dispatch_count": len(queued_dispatch_entries),
             "acquired_dispatch_count": len(acquired_dispatch_entries),
+            "dispatch_lot_size": max(1, int(state.setdefault("runtime_settings", {}).get("dispatch_lot_size") or 1)),
             "agent_profile_count": len(state["agent_profiles"]),
             "agent_thread_count": len(state["agent_threads"]),
             "message_count": len(messages),

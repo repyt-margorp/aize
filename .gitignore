@@ -1,4 +1,5 @@
 .new-aize-state*
+.aize-state/
 .temp/
 __pycache__/
 *.pyc
