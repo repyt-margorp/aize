@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from model import new_id, utc_now
 from store_defs import (
     DISPATCH_PRIORITY_GOAL,
-    DISPATCH_PRIORITY_RETRY,
-    DISPATCH_RETRY_DELAY_SECONDS,
     GOAL_MANAGER_ROLE,
     WORKER_AGENT_ROLE,
 )
@@ -174,13 +172,6 @@ class DispatchQueueMixin:
             return True
         return available_at <= datetime.now(UTC)
 
-    def _retry_available_after(self) -> str:
-        return (
-            datetime.now(UTC)
-            .replace(microsecond=0)
-            + timedelta(seconds=DISPATCH_RETRY_DELAY_SECONDS)
-        ).isoformat().replace("+00:00", "Z")
-
     def _has_acquired_role_run(self, state: dict[str, Any], *, session_id: str, role: str) -> bool:
         if role not in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE}:
             return False
@@ -206,37 +197,6 @@ class DispatchQueueMixin:
             and run.get("role") == WORKER_AGENT_ROLE
             and run.get("lease_state") == "acquired"
             for run in state.get("dispatch_runs", {}).values()
-        )
-
-    def _ensure_retry_dispatch_entry(
-        self,
-        state: dict[str, Any],
-        goal: dict[str, Any],
-        *,
-        reason: str,
-        available_after: str,
-    ) -> None:
-        goal_id = str(goal.get("goal_id") or "")
-        if any(
-            entry.get("goal_id") == goal_id
-            and entry.get("status") == "queued"
-            and entry.get("role", GOAL_MANAGER_ROLE) == GOAL_MANAGER_ROLE
-            and int(entry.get("priority") or 0) == DISPATCH_PRIORITY_RETRY
-            for entry in state.setdefault("dispatch_queue", [])
-        ):
-            return
-        state.setdefault("dispatch_queue", []).append(
-            {
-                "queue_id": new_id("dq"),
-                "session_id": str(goal.get("session_id") or ""),
-                "goal_id": goal_id,
-                "role": GOAL_MANAGER_ROLE,
-                "priority": DISPATCH_PRIORITY_RETRY,
-                "reason": reason,
-                "status": "queued",
-                "queued_at": utc_now(),
-                "available_after": available_after,
-            }
         )
 
     def _queue_entry_by_id(self, state: dict[str, Any], queue_id: str) -> dict[str, Any] | None:
