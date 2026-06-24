@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+from typing import Any
+
+from model import new_id, utc_now
+from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE, normalize_endpoint
+
+
+class SessionLogMixin:
+    def _ensure_session_log_defaults(self, state: dict[str, Any]) -> bool:
+        changed = False
+        session_logs = state.setdefault("session_logs", {})
+        for session_id, session in state.setdefault("sessions", {}).items():
+            if session_id not in session_logs:
+                session_logs[session_id] = []
+                changed = True
+            if self._ensure_role_cursors(session):
+                changed = True
+            if self._sync_session_current_state(state, session_id):
+                changed = True
+
+        indexed_message_ids = {
+            (str(item.get("session_id") or ""), str(item.get("message_id") or ""))
+            for item in state.setdefault("message_index", [])
+        }
+        logged_message_ids = {
+            (session_id, str(entry.get("message_id") or ""))
+            for session_id, entries in session_logs.items()
+            for entry in entries
+            if entry.get("kind") == "Message"
+        }
+        messages_by_id = {
+            str(message.get("message_id") or ""): message
+            for message in state.setdefault("messages", [])
+        }
+        for session_id, message_id in sorted(indexed_message_ids):
+            if not session_id or not message_id or (session_id, message_id) in logged_message_ids:
+                continue
+            message = messages_by_id.get(message_id, {})
+            self._append_session_log_entry(
+                state,
+                session_id,
+                kind="Message",
+                created_at=str(message.get("created_at") or utc_now()),
+                message_id=message_id,
+            )
+            changed = True
+
+        logged_event_keys = {
+            str(entry.get("event_key") or "")
+            for entries in session_logs.values()
+            for entry in entries
+            if entry.get("kind") == "GoalStateChanged"
+        }
+        for goal in state.setdefault("goals", {}).values():
+            session_id = str(goal.get("session_id") or "")
+            if not session_id:
+                continue
+            if not goal.setdefault("state_transitions", []):
+                imported_at = str(
+                    goal.get("completion_reason_updated_at")
+                    or goal.get("created_at")
+                    or utc_now()
+                )
+                goal_state = str(goal.get("completion_state") or "incomplete")
+                goal["state_transitions"].append(
+                    {
+                        "previous_state": goal_state,
+                        "completion_state": goal_state,
+                        "reason": "Imported current SessionGoal state.",
+                        "actor": normalize_endpoint("system", session_id=session_id),
+                        "run_id": None,
+                        "created_at": imported_at,
+                    }
+                )
+                changed = True
+            for transition in goal.setdefault("state_transitions", []):
+                event_key = self._goal_state_event_key(goal, transition)
+                if event_key in logged_event_keys:
+                    continue
+                self._append_session_log_entry(
+                    state,
+                    session_id,
+                    kind="GoalStateChanged",
+                    created_at=str(transition.get("created_at") or utc_now()),
+                    event=dict(transition),
+                    event_key=event_key,
+                )
+                logged_event_keys.add(event_key)
+                changed = True
+        return changed
+
+    def _ensure_role_cursors(self, session: dict[str, Any]) -> bool:
+        cursors = session.setdefault("role_cursors", {})
+        changed = False
+        for role in (GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE):
+            if role not in cursors:
+                cursors[role] = 0
+                changed = True
+        return changed
+
+    def _sync_session_current_state(self, state: dict[str, Any], session_id: str) -> bool:
+        session = state.setdefault("sessions", {}).get(session_id)
+        if not session:
+            return False
+        goal = self._current_goal_for_session(state, session_id)
+        current_state = {
+            "active": bool(session.get("active", True)),
+            "goal_id": str(goal.get("goal_id") or "") if goal else "",
+            "goal_completion_state": str(goal.get("completion_state") or "") if goal else "",
+        }
+        if session.get("current_state") == current_state:
+            return False
+        session["current_state"] = current_state
+        return True
+
+    def _append_session_log_entry(
+        self,
+        state: dict[str, Any],
+        session_id: str,
+        *,
+        kind: str,
+        created_at: str | None = None,
+        message_id: str | None = None,
+        event: dict[str, Any] | None = None,
+        event_key: str | None = None,
+    ) -> dict[str, Any]:
+        entries = state.setdefault("session_logs", {}).setdefault(session_id, [])
+        if message_id and any(
+            entry.get("kind") == "Message" and str(entry.get("message_id") or "") == message_id
+            for entry in entries
+        ):
+            return entries[-1] if entries else {}
+        if event_key and any(str(entry.get("event_key") or "") == event_key for entry in entries):
+            return entries[-1] if entries else {}
+        next_seq = int(entries[-1].get("seq") or 0) + 1 if entries else 1
+        entry = {
+            "log_id": new_id("log"),
+            "seq": next_seq,
+            "session_id": session_id,
+            "kind": kind,
+            "created_at": created_at or utc_now(),
+        }
+        if message_id:
+            entry["message_id"] = message_id
+        if event is not None:
+            entry["event"] = event
+        if event_key:
+            entry["event_key"] = event_key
+        entries.append(entry)
+        return entry
+
+    def _log_message_for_session(self, state: dict[str, Any], message: dict[str, Any], session_id: str) -> None:
+        self._append_session_log_entry(
+            state,
+            session_id,
+            kind="Message",
+            created_at=str(message.get("created_at") or utc_now()),
+            message_id=str(message.get("message_id") or ""),
+        )
+
+    def _log_goal_state_transition(
+        self,
+        state: dict[str, Any],
+        goal: dict[str, Any],
+        transition: dict[str, Any],
+    ) -> None:
+        session_id = str(goal.get("session_id") or "")
+        if not session_id:
+            return
+        self._append_session_log_entry(
+            state,
+            session_id,
+            kind="GoalStateChanged",
+            created_at=str(transition.get("created_at") or utc_now()),
+            event=dict(transition),
+            event_key=self._goal_state_event_key(goal, transition),
+        )
+        self._sync_session_current_state(state, session_id)
+
+    def _log_session_active_change(
+        self,
+        state: dict[str, Any],
+        session_id: str,
+        *,
+        previous_active: bool,
+        active: bool,
+        actor: str,
+        created_at: str,
+    ) -> None:
+        self._append_session_log_entry(
+            state,
+            session_id,
+            kind="SessionActiveChanged",
+            created_at=created_at,
+            event={
+                "previous_active": previous_active,
+                "active": active,
+                "actor": normalize_endpoint(actor, session_id=session_id),
+                "created_at": created_at,
+            },
+            event_key=f"session-active:{session_id}:{created_at}:{previous_active}->{active}",
+        )
+        self._sync_session_current_state(state, session_id)
+
+    def _log_system_signal(
+        self,
+        state: dict[str, Any],
+        session_id: str,
+        *,
+        signal_type: str,
+        body: str,
+        target_roles: list[str],
+        actor: str = "system",
+        run_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_roles = [role for role in target_roles if role in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE}]
+        if not normalized_roles:
+            normalized_roles = [GOAL_MANAGER_ROLE]
+        timestamp = created_at or utc_now()
+        signal = {
+            "signal_id": new_id("sig"),
+            "signal_type": str(signal_type or "system").strip() or "system",
+            "body": str(body or "").strip(),
+            "target_roles": normalized_roles,
+            "actor": normalize_endpoint(actor, session_id=session_id),
+            "run_id": str(run_id or ""),
+            "created_at": timestamp,
+            "data": dict(data or {}),
+        }
+        return self._append_session_log_entry(
+            state,
+            session_id,
+            kind="SystemSignal",
+            created_at=timestamp,
+            event=signal,
+            event_key=f"system-signal:{signal['signal_id']}",
+        )
+
+    def _goal_state_event_key(self, goal: dict[str, Any], transition: dict[str, Any]) -> str:
+        return ":".join(
+            [
+                "goal-state",
+                str(goal.get("goal_id") or ""),
+                str(transition.get("created_at") or ""),
+                str(transition.get("completion_state") or ""),
+                str(transition.get("run_id") or ""),
+                str(transition.get("actor") or ""),
+            ]
+        )
+
+    def _session_log_entries_after_cursor(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        role: str,
+    ) -> list[dict[str, Any]]:
+        session = state.setdefault("sessions", {}).get(session_id, {})
+        self._ensure_role_cursors(session)
+        cursor = int(session.setdefault("role_cursors", {}).get(role) or 0)
+        return [
+            dict(entry)
+            for entry in state.setdefault("session_logs", {}).setdefault(session_id, [])
+            if int(entry.get("seq") or 0) > cursor
+        ]
+
+    def _latest_session_log_seq(self, state: dict[str, Any], *, session_id: str) -> int:
+        entries = state.setdefault("session_logs", {}).setdefault(session_id, [])
+        return int(entries[-1].get("seq") or 0) if entries else 0
+
+    def _set_role_cursor(self, state: dict[str, Any], *, session_id: str, role: str, seq: int) -> None:
+        session = state.setdefault("sessions", {}).get(session_id)
+        if not session:
+            return
+        self._ensure_role_cursors(session)
+        session["role_cursors"][role] = max(int(session["role_cursors"].get(role) or 0), int(seq))
+
+    def _message_for_log_entry(self, state: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+        message_id = str(entry.get("message_id") or "")
+        if not message_id:
+            return None
+        for message in state.setdefault("messages", []):
+            if str(message.get("message_id") or "") == message_id:
+                return message
+        return None
+
+    def _system_signals_for_log_range(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        from_seq: int,
+        to_seq: int,
+        role: str | None = None,
+    ) -> list[dict[str, Any]]:
+        signals: list[dict[str, Any]] = []
+        for entry in state.setdefault("session_logs", {}).setdefault(session_id, []):
+            seq = int(entry.get("seq") or 0)
+            if seq < from_seq or seq > to_seq or entry.get("kind") != "SystemSignal":
+                continue
+            event = entry.get("event")
+            if not isinstance(event, dict):
+                continue
+            target_roles = event.get("target_roles")
+            if role and isinstance(target_roles, list) and role not in target_roles:
+                continue
+            signal = dict(event)
+            signal["log_id"] = entry.get("log_id")
+            signal["seq"] = seq
+            signals.append(signal)
+        return signals
+
+    def record_runtime_recovery_signals(self, context: str) -> list[dict[str, Any]]:
+        with self._state_lock():
+            state = self.load()
+            timestamp = utc_now()
+            signals: list[dict[str, Any]] = []
+            for goal in self._current_goals(state):
+                if goal.get("completion_state") != "incomplete" or goal.get("archived_at"):
+                    continue
+                session_id = str(goal.get("session_id") or "")
+                session = state.get("sessions", {}).get(session_id)
+                if not session or session.get("active") is not True:
+                    continue
+                interrupted_roles: list[str] = []
+                for run in state.get("dispatch_runs", {}).values():
+                    if str(run.get("session_id") or "") != session_id or run.get("lease_state") != "acquired":
+                        continue
+                    role = str(run.get("role") or run.get("current_phase") or "")
+                    if role in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE} and role not in interrupted_roles:
+                        interrupted_roles.append(role)
+                    run["lease_state"] = "interrupted"
+                    run["interrupted_at"] = timestamp
+                    run.pop("current_phase", None)
+                for request in state.setdefault("dispatch_requests", []):
+                    if str(request.get("session_id") or "") != session_id or request.get("status") != "acquired":
+                        continue
+                    request["status"] = "queued"
+                    request["recovered_at"] = timestamp
+                    request.pop("acquired_at", None)
+                target_roles = [GOAL_MANAGER_ROLE]
+                for role in interrupted_roles:
+                    if role not in target_roles:
+                        target_roles.append(role)
+                signal = self._log_system_signal(
+                    state,
+                    session_id,
+                    signal_type="RuntimeRecovered",
+                    body=(
+                        context
+                        or "AIze runtime started or restarted. Continue the active incomplete SessionGoal from persisted SessionLog state."
+                    ),
+                    target_roles=target_roles,
+                    actor="runtime",
+                    data={
+                        "goal_id": str(goal.get("goal_id") or ""),
+                        "interrupted_roles": interrupted_roles,
+                    },
+                    created_at=timestamp,
+                )
+                signals.append(dict(signal))
+            self.save(state)
+            return signals

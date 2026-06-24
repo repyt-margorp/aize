@@ -5,9 +5,7 @@ from typing import Any
 from model import Message, new_id, utc_now
 from store_defs import (
     AGENT_ROLES,
-    DISPATCH_PRIORITY_GOAL,
     DISPATCH_PRIORITY_USER_INPUT,
-    DISPATCH_PRIORITY_WORKER_REQUEST,
     GOAL_MANAGER_ROLE,
     ROLE_MESSAGE_RECIPIENTS,
     SESSION_RECIPIENT,
@@ -45,6 +43,7 @@ class MessageMixin:
                 "created_at": str(message.get("created_at") or utc_now()),
             }
         )
+        self._log_message_for_session(state, message, session_id)
         return True
 
     def _messages_after_cursor(self, state: dict[str, Any], endpoint: str) -> list[dict[str, Any]]:
@@ -192,32 +191,6 @@ class MessageMixin:
             )
             state["messages"].append(message)
             self._index_message_for_session(state, message, session_id)
-            if (
-                normalized_sender == GOAL_MANAGER_ROLE
-                and normalized_recipient == SESSION_RECIPIENT
-                and payload.get("worker_request") is True
-            ):
-                goal = self._current_goal_for_session(state, session_id)
-                if goal and goal.get("completion_state") == "incomplete":
-                    self._enqueue_dispatch(
-                        state,
-                        goal,
-                        priority=DISPATCH_PRIORITY_WORKER_REQUEST,
-                        reason=f"Session Worker request {message['message_id']} requires WorkerAgent work.",
-                        role=WORKER_AGENT_ROLE,
-                        trigger_message_id=message["message_id"],
-                    )
-            if normalized_sender == WORKER_AGENT_ROLE and normalized_recipient == SESSION_RECIPIENT:
-                goal = self._current_goal_for_session(state, session_id)
-                if goal and goal.get("completion_state") == "incomplete":
-                    self._enqueue_dispatch(
-                        state,
-                        goal,
-                        priority=DISPATCH_PRIORITY_GOAL,
-                        reason=f"WorkerAgent Session report {message['message_id']} requires GoalManager review.",
-                        role=GOAL_MANAGER_ROLE,
-                        trigger_message_id=message["message_id"],
-                    )
             sessions[session_id]["updated_at"] = now
             self.save(state)
             return message
@@ -285,7 +258,7 @@ class MessageMixin:
             priority=DISPATCH_PRIORITY_USER_INPUT,
             created_at=now,
             trigger_message_id=message["message_id"],
-            enqueue_on_incomplete=active_worker_run is None,
+            enqueue_on_incomplete=False,
         )
         message["payload"]["reprocess_goal_id"] = target_goal["goal_id"]
         message["payload"]["reprocess_recorded_at"] = now
@@ -309,15 +282,6 @@ class MessageMixin:
             )
             state["messages"].append(worker_message)
             self._index_message_for_session(state, worker_message, session_id)
-            if target_goal and target_goal.get("completion_state") == "incomplete":
-                self._enqueue_dispatch(
-                    state,
-                    target_goal,
-                    priority=DISPATCH_PRIORITY_WORKER_REQUEST,
-                    reason=f"UserInput message {message['message_id']} should be delivered to active WorkerAgent.",
-                    role=WORKER_AGENT_ROLE,
-                    trigger_message_id=worker_message["message_id"],
-                )
         sessions[session_id]["updated_at"] = now
         self.save(state)
         return message

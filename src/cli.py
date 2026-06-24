@@ -12,6 +12,7 @@ from cli_render import (
     tail_items,
 )
 from cli_workers import run_daemon, run_dispatch_loop, run_dispatch_worker
+from model import utc_now
 from store import Store
 from store_defs import StoreError
 
@@ -136,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     dispatch_index = sub.add_parser("dispatch-index", help="list dispatch scheduling index entries")
     dispatch_index.add_argument("session_id", nargs="?")
+    dispatch_requests = sub.add_parser("dispatch-requests", help="list dispatch requests")
+    dispatch_requests.add_argument("session_id", nargs="?")
 
     agent_threads = sub.add_parser("agent-threads", help="list durable session agent threads")
     agent_threads.add_argument("session_id", nargs="?")
@@ -206,14 +209,15 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.create_account(args.username, password=args.password, roles=args.roles))
         elif args.command == "create-unit":
             schedule = {}
-            if args.schedule_every_hours is not None:
+            if args.schedule_every_hours is not None or args.schedule_next_run_at is not None:
                 schedule = {
                     "enabled": True,
-                    "kind": "interval",
-                    "every_hours": args.schedule_every_hours,
-                    "next_run_at": args.schedule_next_run_at,
+                    "kind": "next-run",
+                    "next_run_at": args.schedule_next_run_at or utc_now(),
                     "timezone": "UTC",
                 }
+                if args.schedule_every_hours is not None:
+                    schedule["every_hours"] = args.schedule_every_hours
             print_json(
                 store.create_unit(
                     args.unit_id,
@@ -313,8 +317,8 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.goals(args.session_id))
         elif args.command == "dispatch-runs":
             print_json(store.dispatch_runs(args.session_id))
-        elif args.command == "dispatch-index":
-            print_json(store.dispatch_queue(args.session_id))
+        elif args.command in {"dispatch-index", "dispatch-requests"}:
+            print_json(store.dispatch_requests(args.session_id))
         elif args.command == "agent-threads":
             print_json(store.agent_threads(args.session_id))
         elif args.command == "dispatch-once":

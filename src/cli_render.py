@@ -303,14 +303,14 @@ def print_dispatch_runs(runs: list[dict[str, Any]]) -> None:
             print(f"  steps: {', '.join(phases)}")
 
 
-def print_dispatch_queue(entries: list[dict[str, Any]]) -> None:
+def print_dispatch_requests(entries: list[dict[str, Any]]) -> None:
     if not entries:
-        print("Dispatch index: empty")
+        print("Dispatch requests: empty")
         return
-    print(f"Dispatch index ({len(entries)})")
+    print(f"Dispatch requests ({len(entries)})")
     for entry in entries:
         print(
-            f"- {entry.get('queue_id')} [{entry.get('status')}] "
+            f"- {entry.get('request_id')} [{entry.get('status')}] "
             f"session={entry.get('session_id')} goal={entry.get('goal_id')} "
             f"role={entry.get('role') or GOAL_MANAGER_ROLE} priority={entry.get('priority')}"
         )

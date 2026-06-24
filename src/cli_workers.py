@@ -110,6 +110,10 @@ def run_daemon(
         raise StoreError("idle timeout must not be negative")
 
     store.init()
+    recovery_signals = store.record_runtime_recovery_signals(
+        recovery_context
+        or "AIze daemon started or restarted. Continue active incomplete SessionGoals from persisted SessionLog state."
+    )
     lot_cap = max_dispatch_lots or max(dispatch_lots, 10)
     if lot_cap < dispatch_lots:
         raise StoreError("max dispatch lots must be greater than or equal to dispatch lots")
@@ -177,6 +181,8 @@ def run_daemon(
         "idle_polls": idle_polls,
         "scheduled": scheduled,
         "results": dispatched,
+        "recovery_signal_count": len(recovery_signals),
+        "recovery_signals": recovery_signals,
         "daemon_elapsed_seconds": round(time.monotonic() - started, 3),
     }
 

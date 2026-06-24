@@ -67,6 +67,19 @@ def send_worker_request(body: str) -> dict[str, Any]:
     return send_message(SESSION_RECIPIENT, body, worker_request=True)
 
 
+def set_next_unit_run_at(next_run_at: str, *, note: str = "") -> dict[str, Any]:
+    context = runtime_context()
+    sender = context["agent_role"]
+    store = Store(Path(context["state_root"]))
+    return store.set_next_unit_run_at_from_session(
+        context["session_id"],
+        next_run_at=next_run_at,
+        note=note,
+        actor=sender,
+        run_id=context["run_id"] or None,
+    )
+
+
 def _required_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:

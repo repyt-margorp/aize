@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -214,7 +214,8 @@ class SessionGoalMixin:
             schedule = unit.get("schedule")
             if isinstance(schedule, dict):
                 schedule["last_run_at"] = now_text
-                schedule["next_run_at"] = self._next_unit_run_at(schedule, now_dt=now_dt)
+                schedule["next_run_at"] = ""
+                schedule["next_run_required_by_session_id"] = session_id
             started.append(payload)
         self.save(state)
         return started
@@ -253,23 +254,17 @@ class SessionGoalMixin:
         if not session:
             raise StoreError(f"unknown session: {session_id}")
         now = utc_now()
+        previous_active = bool(session.get("active", True))
         session["active"] = active
         session["updated_at"] = now
-        if active:
-            for goal in state["goals"].values():
-                if str(goal.get("session_id") or "") != session_id:
-                    continue
-                if goal.get("archived_at"):
-                    continue
-                if goal.get("completion_state") != "incomplete":
-                    continue
-                self._enqueue_dispatch(
-                    state,
-                    goal,
-                    priority=DISPATCH_PRIORITY_GOAL,
-                    reason="Session activated with incomplete Goal.",
-                    queued_at=now,
-                )
+        self._log_session_active_change(
+            state,
+            session_id,
+            previous_active=previous_active,
+            active=active,
+            actor="system",
+            created_at=now,
+        )
         self.save(state)
         return dict(session)
 
@@ -317,6 +312,7 @@ class SessionGoalMixin:
             title=session_id,
         )
         sessions[session_id] = session.to_dict()
+        self._ensure_role_cursors(sessions[session_id])
         self._ensure_session_workspace(sessions[session_id])
         self._ensure_session_unit_workspace_link(sessions[session_id], unit)
         if unit and unit.get("instance_policy") == "singleton":
@@ -398,6 +394,7 @@ class SessionGoalMixin:
             title=session_title,
         )
         state["sessions"][session_id] = session.to_dict()
+        self._ensure_role_cursors(state["sessions"][session_id])
         self._ensure_session_workspace(state["sessions"][session_id])
         self._ensure_session_unit_workspace_link(state["sessions"][session_id], unit)
         state["sessions"][session_id]["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
@@ -427,20 +424,30 @@ class SessionGoalMixin:
         if not schedule:
             return {}
         enabled = bool(schedule.get("enabled"))
-        kind = str(schedule.get("kind") or "interval").strip()
-        if kind != "interval":
+        kind = str(schedule.get("kind") or "next-run").strip()
+        if kind not in {"next-run", "interval"}:
             raise StoreError(f"unsupported unit schedule kind: {kind}")
-        every_hours = int(schedule.get("every_hours") or 0)
-        if enabled and every_hours < 1:
-            raise StoreError("enabled interval schedules require every_hours >= 1")
+        next_run_at = str(schedule.get("next_run_at") or "").strip()
         normalized = {
             "enabled": enabled,
-            "kind": kind,
-            "every_hours": every_hours,
-            "next_run_at": str(schedule.get("next_run_at") or utc_now()).strip(),
+            "kind": "next-run",
+            "next_run_at": next_run_at,
             "timezone": str(schedule.get("timezone") or "UTC").strip() or "UTC",
+            "note": str(schedule.get("note") or "").strip(),
         }
-        if enabled:
+        for key in (
+            "last_run_at",
+            "next_run_required_by_session_id",
+            "next_run_note",
+            "next_run_set_by_session_id",
+            "next_run_set_by_run_id",
+            "next_run_set_at",
+        ):
+            if key in schedule:
+                normalized[key] = schedule[key]
+        if schedule.get("every_hours"):
+            normalized["legacy_every_hours"] = int(schedule.get("every_hours") or 0)
+        if enabled and normalized["next_run_at"]:
             self._parse_utc(normalized["next_run_at"])
         return normalized
 
@@ -448,26 +455,12 @@ class SessionGoalMixin:
         schedule = unit.get("schedule")
         if not isinstance(schedule, dict) or schedule.get("enabled") is not True:
             return False
-        if str(schedule.get("kind") or "interval") != "interval":
-            return False
-        every_hours = int(schedule.get("every_hours") or 0)
-        if every_hours < 1:
+        if str(schedule.get("kind") or "next-run") != "next-run":
             return False
         next_run_at = str(schedule.get("next_run_at") or "").strip()
         if not next_run_at:
-            return True
+            return False
         return self._parse_utc(next_run_at) <= now_dt
-
-    def _next_unit_run_at(self, schedule: dict[str, Any], *, now_dt: datetime) -> str:
-        every_hours = int(schedule.get("every_hours") or 0)
-        if every_hours < 1:
-            raise StoreError("interval schedules require every_hours >= 1")
-        interval = timedelta(hours=every_hours)
-        next_run_at = str(schedule.get("next_run_at") or "").strip()
-        next_dt = self._parse_utc(next_run_at) if next_run_at else now_dt
-        while next_dt <= now_dt:
-            next_dt += interval
-        return next_dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     def _parse_utc(self, value: str) -> datetime:
         try:
@@ -475,6 +468,62 @@ class SessionGoalMixin:
         except ValueError as exc:
             raise StoreError(f"invalid UTC timestamp: {value}") from exc
         return parsed.astimezone(UTC)
+
+    def set_next_unit_run_at_from_session(
+        self,
+        session_id: str,
+        *,
+        next_run_at: str,
+        note: str = "",
+        actor: str,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        state = self.load()
+        session = state["sessions"].get(session_id)
+        if not session:
+            raise StoreError(f"unknown session: {session_id}")
+        if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
+            raise StoreError("only GoalManager may set a Scheduled Unit next run time")
+        unit_id = str(session.get("unit_id") or "")
+        if not unit_id:
+            raise StoreError("session is not owned by a Unit")
+        unit = state["units"].get(unit_id)
+        if not unit:
+            raise StoreError(f"session references unknown unit: {unit_id}")
+        schedule = unit.get("schedule")
+        if not isinstance(schedule, dict) or schedule.get("enabled") is not True:
+            raise StoreError(f"unit is not scheduled: {unit_id}")
+        parsed_next = self._parse_utc(next_run_at)
+        now = datetime.now(UTC).replace(microsecond=0)
+        if parsed_next <= now:
+            raise StoreError("next_run_at must be in the future")
+        normalized_next = parsed_next.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        schedule["kind"] = "next-run"
+        schedule["next_run_at"] = normalized_next
+        schedule["next_run_note"] = str(note or "").strip()
+        schedule["next_run_set_by_session_id"] = session_id
+        schedule["next_run_set_by_run_id"] = str(run_id or "")
+        schedule["next_run_set_at"] = utc_now()
+        schedule.pop("next_run_required_by_session_id", None)
+        unit["updated_at"] = schedule["next_run_set_at"]
+        message = self._message(
+            from_endpoint=normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session_id),
+            to_endpoint=session_endpoint(session_id),
+            payload={
+                "body": f"Scheduled Unit next_run_at set to {normalized_next}.",
+                "schedule_update": True,
+                "unit_id": unit_id,
+                "next_run_at": normalized_next,
+                "note": str(note or "").strip(),
+                "run_id": str(run_id or ""),
+            },
+            created_at=schedule["next_run_set_at"],
+        )
+        state["messages"].append(message)
+        self._index_message_for_session(state, message, session_id)
+        session["updated_at"] = schedule["next_run_set_at"]
+        self.save(state)
+        return {"unit": dict(unit), "message": dict(message)}
 
     def _scheduled_session_id(self, state: dict[str, Any], *, unit_id: str, now_text: str) -> str:
         safe_unit_id = "".join(char if char.isalnum() else "-" for char in unit_id.lower()).strip("-")
@@ -542,7 +591,7 @@ class SessionGoalMixin:
         actor: str,
         run_id: str | None = None,
         priority: int = DISPATCH_PRIORITY_GOAL,
-        enqueue_on_incomplete: bool = True,
+        enqueue_on_incomplete: bool = False,
         available_after: str | None = None,
         trigger_message_id: str | None = None,
     ) -> dict[str, Any]:
@@ -555,7 +604,7 @@ class SessionGoalMixin:
         goal["completion_reason_updated_at"] = now
         if completion_state == "complete":
             goal["completed_at"] = now
-            self._resolve_dispatch_queue_entries(state, str(goal.get("goal_id") or ""), resolved_at=now)
+            self._resolve_dispatch_request_entries(state, str(goal.get("goal_id") or ""), resolved_at=now)
         else:
             goal.pop("completed_at", None)
             goal["last_incomplete_at"] = now
@@ -583,6 +632,7 @@ class SessionGoalMixin:
         if run_id:
             transition["run_id"] = run_id
         goal.setdefault("state_transitions", []).append(transition)
+        self._log_goal_state_transition(state, goal, transition)
         return transition
 
     def _current_goal_for_session(self, state: dict[str, Any], session_id: str) -> dict[str, Any] | None:

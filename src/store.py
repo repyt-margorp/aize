@@ -13,8 +13,6 @@ from model import Session, Unit, new_id, utc_now
 from store_defs import (
     DEFAULT_AGENT_PROVIDER,
     DEFAULT_ROOT_PASSWORD,
-    DISPATCH_PRIORITY_GOAL,
-    DISPATCH_PRIORITY_USER_INPUT,
     GOAL_MANAGER_ROLE,
     ROOT_SESSION_ID,
     ROOT_UNIT_ID,
@@ -22,22 +20,23 @@ from store_defs import (
     STATE_VERSION,
     WORKER_AGENT_ROLE,
     StoreError,
-    session_endpoint,
 )
 from store_auth import AuthMixin
 from store_dispatch import DispatchMixin
-from store_dispatch_queue import DispatchQueueMixin
+from store_dispatch_requests import DispatchRequestMixin
 from store_message import MessageMixin
 from store_prompts import PromptMixin
 from store_query import QueryMixin
 from store_session import SessionGoalMixin
+from store_session_log import SessionLogMixin
 
 
 class Store(
     AuthMixin,
+    SessionLogMixin,
     SessionGoalMixin,
     MessageMixin,
-    DispatchQueueMixin,
+    DispatchRequestMixin,
     PromptMixin,
     DispatchMixin,
     QueryMixin,
@@ -77,11 +76,12 @@ class Store(
             "agent_profiles": {},
             "agent_threads": {},
             "dispatch_runs": {},
-            "dispatch_queue": [],
+            "dispatch_requests": [],
             "runtime_settings": {},
             "messages": [],
             "endpoint_cursors": {},
             "message_index": [],
+            "session_logs": {},
         }
         self.ensure_defaults(state, now=now)
         self.save(state)
@@ -104,86 +104,16 @@ class Store(
         state.setdefault("agent_profiles", {})
         state.setdefault("agent_threads", {})
         state.setdefault("dispatch_runs", {})
-        state.setdefault("dispatch_queue", [])
+        self._ensure_dispatch_requests_state(state)
         state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
         state.setdefault("message_index", [])
+        state.setdefault("session_logs", {})
         changed = self.ensure_defaults(state)
-        changed = self._reconcile_queued_user_inputs(state) or changed
-        changed = self._reconcile_incomplete_goal_queue(state) or changed
         if changed:
             self.save(state)
         return state
-
-    def _reconcile_queued_user_inputs(self, state: dict[str, Any]) -> bool:
-        changed = False
-        for session_id in state.get("sessions", {}):
-            for message in self._messages_after_cursor(state, session_endpoint(session_id)):
-                payload = message.get("payload")
-                if not isinstance(payload, dict) or not payload.get("user_input"):
-                    continue
-                reason = f"UserInput message {message.get('message_id')} requires Session processing."
-                if (
-                    payload.get("defer_goal_manager_until_worker_report") is True
-                    or payload.get("worker_request") is True
-                ):
-                    continue
-                if payload.get("reprocess_goal_id"):
-                    goal = state.get("goals", {}).get(str(payload.get("reprocess_goal_id") or ""))
-                    if goal:
-                        before_queue = json.dumps(state.setdefault("dispatch_queue", []), sort_keys=True)
-                        self._enqueue_dispatch(
-                            state,
-                            goal,
-                            priority=DISPATCH_PRIORITY_USER_INPUT,
-                            reason=reason,
-                            trigger_message_id=str(message.get("message_id") or ""),
-                        )
-                        after_queue = json.dumps(state.setdefault("dispatch_queue", []), sort_keys=True)
-                        if after_queue != before_queue:
-                            changed = True
-                    continue
-                actor = str(message.get("from") or "system")
-                goal = self._mark_session_reprocess_needed(
-                    state,
-                    session_id=session_id,
-                    actor=actor,
-                    reason=reason,
-                    priority=DISPATCH_PRIORITY_USER_INPUT,
-                    created_at=str(message.get("created_at") or utc_now()),
-                    trigger_message_id=str(message.get("message_id") or ""),
-                )
-                payload["reprocess_goal_id"] = goal["goal_id"]
-                payload["reprocess_recorded_at"] = utc_now()
-                changed = True
-        return changed
-
-    def _reconcile_incomplete_goal_queue(self, state: dict[str, Any]) -> bool:
-        changed = False
-        for goal in state.get("goals", {}).values():
-            if goal.get("archived_at"):
-                continue
-            if goal.get("completion_state") != "incomplete":
-                continue
-            goal_id = str(goal.get("goal_id") or "")
-            if self._has_live_worker_signal_for_goal(state, goal_id):
-                continue
-            has_live_entry = any(
-                entry.get("goal_id") == goal_id and entry.get("status") in {"queued", "acquired"}
-                for entry in state.setdefault("dispatch_queue", [])
-            )
-            if has_live_entry:
-                continue
-            entry = self._enqueue_dispatch(
-                state,
-                goal,
-                priority=DISPATCH_PRIORITY_GOAL,
-                reason="Active incomplete Goal discovered.",
-            )
-            if entry:
-                changed = True
-        return changed
 
     def ensure_defaults(self, state: dict[str, Any], *, now: str | None = None) -> bool:
         timestamp = now or utc_now()
@@ -196,11 +126,13 @@ class Store(
         agent_profiles = state.setdefault("agent_profiles", {})
         agent_threads = state.setdefault("agent_threads", {})
         state.setdefault("dispatch_runs", {})
-        state.setdefault("dispatch_queue", [])
+        if self._ensure_dispatch_requests_state(state):
+            changed = True
         runtime_settings = state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
         state.setdefault("message_index", [])
+        state.setdefault("session_logs", {})
         if "dispatch_lot_size" not in runtime_settings:
             runtime_settings["dispatch_lot_size"] = 1
             changed = True
@@ -230,6 +162,12 @@ class Store(
             }.items():
                 if key not in unit:
                     unit[key] = dict(default) if isinstance(default, dict) else default
+                    changed = True
+            schedule = unit.get("schedule")
+            if isinstance(schedule, dict) and schedule:
+                normalized_schedule = self._normalize_unit_schedule(schedule)
+                if schedule != normalized_schedule:
+                    unit["schedule"] = normalized_schedule
                     changed = True
 
         if ROOT_SESSION_ID not in sessions:
@@ -281,6 +219,8 @@ class Store(
                 changed = True
                 continue
         if self._ensure_session_metadata(state):
+            changed = True
+        if self._ensure_session_log_defaults(state):
             changed = True
         return changed
 

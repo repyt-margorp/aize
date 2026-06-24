@@ -16,7 +16,7 @@ from cli_render import (
     print_agent_threads,
     print_created_goal_session,
     print_created_session,
-    print_dispatch_queue,
+    print_dispatch_requests,
     print_dispatch_result,
     print_dispatch_runs,
     print_goals,
@@ -128,9 +128,9 @@ def start_background_dispatch(
 
 def start_startup_dispatch_if_needed(store: Store) -> subprocess.Popen[str] | None:
     status = store.status()
-    if int(status.get("queued_dispatch_count") or 0) < 1:
+    if int(status.get("queued_dispatch_request_count") or 0) < 1:
         return None
-    if int(status.get("acquired_dispatch_count") or 0) > 0:
+    if int(status.get("acquired_dispatch_request_count") or 0) > 0:
         return None
     if int(status.get("acquired_dispatch_lease_count") or 0) > 0:
         return None
@@ -187,7 +187,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 if command in {"exit", "quit"}:
                     return 0
                 if command == "help":
-                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-index, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
+                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-requests, dispatch-index, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
                 elif command == "units":
                     print_units(store.units())
                 elif command == "create-unit":
@@ -291,8 +291,8 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_agent_pool(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs()))
                 elif command == "dispatch-runs":
                     print_dispatch_runs(store.dispatch_runs(current_session_id))
-                elif command == "dispatch-index":
-                    print_dispatch_queue(store.dispatch_queue(current_session_id))
+                elif command in {"dispatch-requests", "dispatch-index"}:
+                    print_dispatch_requests(store.dispatch_requests(current_session_id))
                 elif command == "dispatch":
                     print_dispatch_result(store.dispatch_once())
                 elif command in {"goal", "start-goal"}:
@@ -324,7 +324,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_graph(
                         store.session_graph(),
                         goals=store.goals(),
-                        queue=store.dispatch_queue(),
+                        queue=store.dispatch_requests(),
                         runs=store.dispatch_runs(),
                     )
                 else:
