@@ -358,6 +358,151 @@ class CliTests(unittest.TestCase):
             self.assertEqual(monitor["schedule"]["next_run_at"], "")
             self.assertEqual(monitor["schedule"]["last_run_at"], "2026-06-22T02:30:00Z")
 
+    def test_unit_activation_triggers_are_independent_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "ops",
+                "--goal-text",
+                "Check ops.",
+                "--initial-prompt",
+                "Run startup check.",
+                "--schedule-next-run-at",
+                "2026-06-22T00:00:00Z",
+                "--startup",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            unit = json.loads(created.stdout)
+            self.assertEqual(
+                unit["activation_triggers"],
+                {"manual": True, "scheduled": True, "startup": True},
+            )
+
+            startup = json.loads(
+                run_cli(
+                    state_root,
+                    "run-startup-units",
+                    "--now",
+                    "2026-06-21T23:00:00Z",
+                ).stdout
+            )
+            self.assertEqual(len(startup), 1)
+            self.assertEqual(startup[0]["session"]["unit_id"], "ops")
+            self.assertIn("startup", startup[0]["session"]["session_id"])
+            self.assertEqual(startup[0]["initial_message"]["payload"]["startup_unit_id"], "ops")
+
+            scheduled = json.loads(
+                run_cli(
+                    state_root,
+                    "run-scheduled-units",
+                    "--now",
+                    "2026-06-22T00:00:00Z",
+                ).stdout
+            )
+            self.assertEqual(len(scheduled), 1)
+            self.assertEqual(scheduled[0]["session"]["unit_id"], "ops")
+            self.assertIn("scheduled", scheduled[0]["session"]["session_id"])
+
+    def test_unit_can_disable_manual_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "startup-only",
+                "--startup",
+                "--no-manual",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            unit = json.loads(created.stdout)
+            self.assertEqual(
+                unit["activation_triggers"],
+                {"manual": False, "scheduled": False, "startup": True},
+            )
+
+            manual_session = run_cli(
+                state_root,
+                "create-session",
+                "manual-session",
+                "--unit",
+                "startup-only",
+            )
+            self.assertEqual(manual_session.returncode, 2)
+            self.assertIn("does not allow manual activation", manual_session.stderr)
+
+            manual_goal = run_cli(
+                state_root,
+                "start-goal",
+                "manual-goal",
+                "--unit",
+                "startup-only",
+                "--label",
+                "Manual",
+                "--created-by",
+                "root",
+            )
+            self.assertEqual(manual_goal.returncode, 2)
+            self.assertIn("does not allow manual activation", manual_goal.stderr)
+
+            startup = json.loads(run_cli(state_root, "run-startup-units").stdout)
+            self.assertEqual(len(startup), 1)
+            self.assertEqual(startup[0]["session"]["unit_id"], "startup-only")
+
+    def test_startup_trigger_reuses_singleton_unit_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "resident",
+                "--instance-policy",
+                "singleton",
+                "--startup",
+                "--no-manual",
+                "--goal-text",
+                "Keep resident work active.",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+
+            first = json.loads(
+                run_cli(
+                    state_root,
+                    "run-startup-units",
+                    "--now",
+                    "2026-06-22T00:00:00Z",
+                ).stdout
+            )
+            second = json.loads(
+                run_cli(
+                    state_root,
+                    "run-startup-units",
+                    "--now",
+                    "2026-06-22T01:00:00Z",
+                ).stdout
+            )
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(second), 1)
+            self.assertEqual(first[0]["session"]["session_id"], second[0]["session"]["session_id"])
+
+            units = json.loads(run_cli(state_root, "units").stdout)
+            resident = next(unit for unit in units if unit["unit_id"] == "resident")
+            self.assertEqual(resident["startup_run_count"], 2)
+            self.assertEqual(resident["singleton_session_id"], first[0]["session"]["session_id"])
+
+            sessions = [
+                session for session in json.loads(run_cli(state_root, "sessions").stdout)
+                if session.get("unit_id") == "resident"
+            ]
+            self.assertEqual(len(sessions), 1)
+
     def test_scheduled_unit_completion_requires_future_next_run_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
@@ -502,6 +647,42 @@ class CliTests(unittest.TestCase):
             self.assertTrue(any(session["session_id"] == session_id for session in sessions))
             runs = json.loads(run_cli(state_root, "dispatch-runs", session_id).stdout)
             self.assertTrue(runs)
+
+    def test_daemon_runs_startup_units_once_on_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            created = run_cli(
+                state_root,
+                "create-unit",
+                "boot",
+                "--startup",
+                "--no-manual",
+                "--goal-text",
+                "Check boot state.",
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+
+            daemon = run_cli(
+                state_root,
+                "daemon",
+                "--max-cycles",
+                "2",
+                "--schedule-interval",
+                "60",
+                "--dispatch-interval",
+                "0.01",
+            )
+            self.assertEqual(daemon.returncode, 0, daemon.stderr)
+            payload = json.loads(daemon.stdout)
+            self.assertEqual(payload["startup_count"], 1)
+            self.assertEqual(payload["scheduled_count"], 0)
+            self.assertEqual(payload["startup"][0]["session"]["unit_id"], "boot")
+
+            units = json.loads(run_cli(state_root, "units").stdout)
+            boot = next(unit for unit in units if unit["unit_id"] == "boot")
+            self.assertEqual(boot["startup_run_count"], 1)
 
     def test_daemon_dispatch_lots_run_interchangeable_parallel_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

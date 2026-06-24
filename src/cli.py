@@ -58,11 +58,19 @@ def build_parser() -> argparse.ArgumentParser:
     create_unit.add_argument("--initial-prompt", default="")
     create_unit.add_argument("--schedule-every-hours", type=int)
     create_unit.add_argument("--schedule-next-run-at")
+    create_unit.add_argument("--manual", action="store_true", default=None, dest="manual")
+    create_unit.add_argument("--no-manual", action="store_false", dest="manual")
+    create_unit.add_argument("--startup", action="store_true", default=False)
 
     run_scheduled_units = sub.add_parser("run-scheduled-units", help="start due scheduled Unit sessions")
     run_scheduled_units.add_argument("--parent", default="root", dest="parent_session_id")
     run_scheduled_units.add_argument("--created-by", default="root", dest="created_by")
     run_scheduled_units.add_argument("--now")
+
+    run_startup_units = sub.add_parser("run-startup-units", help="start Unit sessions that run on daemon startup")
+    run_startup_units.add_argument("--parent", default="root", dest="parent_session_id")
+    run_startup_units.add_argument("--created-by", default="root", dest="created_by")
+    run_startup_units.add_argument("--now")
 
     create_session = sub.add_parser("create-session", help="create a session")
     create_session.add_argument("session_id")
@@ -218,6 +226,11 @@ def run(argv: list[str] | None = None) -> int:
                 }
                 if args.schedule_every_hours is not None:
                     schedule["every_hours"] = args.schedule_every_hours
+            activation_triggers = {
+                "manual": True if args.manual is None else bool(args.manual),
+                "scheduled": bool(schedule),
+                "startup": bool(args.startup),
+            }
             print_json(
                 store.create_unit(
                     args.unit_id,
@@ -227,11 +240,20 @@ def run(argv: list[str] | None = None) -> int:
                     goal_text=args.goal_text,
                     initial_prompt=args.initial_prompt,
                     schedule=schedule,
+                    activation_triggers=activation_triggers,
                 ).to_dict()
             )
         elif args.command == "run-scheduled-units":
             print_json(
                 store.run_scheduled_units(
+                    parent_session_id=args.parent_session_id,
+                    created_by=args.created_by,
+                    now=args.now,
+                )
+            )
+        elif args.command == "run-startup-units":
+            print_json(
+                store.run_startup_units(
                     parent_session_id=args.parent_session_id,
                     created_by=args.created_by,
                     now=args.now,

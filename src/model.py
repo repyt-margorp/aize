@@ -46,6 +46,7 @@ class Unit:
     goal_text: str = ""
     initial_prompt: str = ""
     schedule: dict[str, Any] | None = None
+    activation_triggers: dict[str, bool] | None = None
     workspace_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,6 +61,7 @@ class Unit:
             "goal_text": self.goal_text,
             "initial_prompt": self.initial_prompt,
             "schedule": dict(self.schedule or {}),
+            "activation_triggers": dict(self.activation_triggers or {}),
             "workspace_path": self.workspace_path,
         }
 

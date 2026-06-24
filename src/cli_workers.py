@@ -114,6 +114,7 @@ def run_daemon(
         recovery_context
         or "AIze daemon started or restarted. Continue active incomplete SessionGoals from persisted SessionLog state."
     )
+    startup_sessions = store.run_startup_units(parent_session_id=parent_session_id, created_by=created_by)
     lot_cap = max_dispatch_lots or max(dispatch_lots, 10)
     if lot_cap < dispatch_lots:
         raise StoreError("max dispatch lots must be greater than or equal to dispatch lots")
@@ -173,6 +174,7 @@ def run_daemon(
     return {
         "cycle_count": cycle_count,
         "scheduled_count": len(scheduled),
+        "startup_count": len(startup_sessions),
         "dispatched_count": len(dispatched),
         "dispatch_lot_size": store.dispatch_lot_size(),
         "dispatch_lot_cap": lot_cap,
@@ -180,6 +182,7 @@ def run_daemon(
         "peak_active_dispatch_lots": peak_active_lots,
         "idle_polls": idle_polls,
         "scheduled": scheduled,
+        "startup": startup_sessions,
         "results": dispatched,
         "recovery_signal_count": len(recovery_signals),
         "recovery_signals": recovery_signals,

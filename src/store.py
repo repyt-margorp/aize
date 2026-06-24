@@ -169,6 +169,14 @@ class Store(
                 if schedule != normalized_schedule:
                     unit["schedule"] = normalized_schedule
                     changed = True
+            triggers = unit.get("activation_triggers")
+            normalized_triggers = self._normalize_unit_activation_triggers(
+                triggers if isinstance(triggers, dict) and triggers else None,
+                schedule=unit.get("schedule"),
+            )
+            if triggers != normalized_triggers:
+                unit["activation_triggers"] = normalized_triggers
+                changed = True
 
         if ROOT_SESSION_ID not in sessions:
             sessions[ROOT_SESSION_ID] = Session(

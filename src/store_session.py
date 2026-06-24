@@ -23,6 +23,8 @@ from store_defs import (
     session_endpoint,
 )
 
+UNIT_ACTIVATION_TRIGGERS = ("manual", "scheduled", "startup")
+
 
 class SessionGoalMixin:
     def _safe_workspace_name(self, value: str, *, fallback: str) -> str:
@@ -120,11 +122,16 @@ class SessionGoalMixin:
         goal_text: str = "",
         initial_prompt: str = "",
         schedule: dict[str, Any] | None = None,
+        activation_triggers: dict[str, bool] | None = None,
     ) -> Unit:
         state = self.load()
         if instance_policy not in {"multi", "singleton"}:
             raise StoreError(f"unsupported instance policy: {instance_policy}")
         normalized_schedule = self._normalize_unit_schedule(schedule)
+        normalized_triggers = self._normalize_unit_activation_triggers(
+            activation_triggers,
+            schedule=normalized_schedule,
+        )
         units = state["units"]
         if unit_id in units:
             raise StoreError(f"unit already exists: {unit_id}")
@@ -137,6 +144,7 @@ class SessionGoalMixin:
             goal_text=str(goal_text or "").strip(),
             initial_prompt=str(initial_prompt or "").strip(),
             schedule=normalized_schedule,
+            activation_triggers=normalized_triggers,
             workspace_path=self._unit_workspace_relpath(unit_id),
         )
         units[unit_id] = unit.to_dict()
@@ -162,6 +170,8 @@ class SessionGoalMixin:
         for unit in sorted(state["units"].values(), key=lambda item: str(item.get("unit_id") or "")):
             if unit.get("status") != "active":
                 continue
+            if not self._unit_activation_trigger_enabled(unit, "scheduled"):
+                continue
             if not self._unit_schedule_due(unit, now_dt=now_dt):
                 continue
             unit_id = str(unit.get("unit_id") or "")
@@ -179,6 +189,7 @@ class SessionGoalMixin:
                 body=goal_body,
                 created_by=created_by,
                 created_at=now_text,
+                activation_trigger="scheduled",
             )
             initial_prompt = str(unit.get("initial_prompt") or "").strip()
             if initial_prompt:
@@ -216,6 +227,77 @@ class SessionGoalMixin:
                 schedule["last_run_at"] = now_text
                 schedule["next_run_at"] = ""
                 schedule["next_run_required_by_session_id"] = session_id
+            started.append(payload)
+        self.save(state)
+        return started
+
+    def run_startup_units(
+        self,
+        *,
+        parent_session_id: str = ROOT_SESSION_ID,
+        created_by: str = ROOT_USERNAME,
+        now: str | None = None,
+    ) -> list[dict[str, Any]]:
+        state = self.load()
+        if parent_session_id not in state["sessions"]:
+            raise StoreError(f"unknown parent session: {parent_session_id}")
+        if created_by not in state["accounts"]:
+            raise StoreError(f"unknown account: {created_by}")
+        now_text = now or utc_now()
+        started: list[dict[str, Any]] = []
+        for unit in sorted(state["units"].values(), key=lambda item: str(item.get("unit_id") or "")):
+            if unit.get("status") != "active":
+                continue
+            if not self._unit_activation_trigger_enabled(unit, "startup"):
+                continue
+            unit_id = str(unit.get("unit_id") or "")
+            if not unit_id:
+                continue
+            session_id = self._triggered_session_id(state, unit_id=unit_id, trigger="startup", now_text=now_text)
+            label = str(unit.get("display_name") or unit_id).strip()
+            goal_body = str(unit.get("goal_text") or label).strip()
+            payload = self._start_goal_session_in_state(
+                state,
+                session_id=session_id,
+                unit_id=unit_id,
+                parent_session_ids=[parent_session_id],
+                label=label,
+                body=goal_body,
+                created_by=created_by,
+                created_at=now_text,
+                activation_trigger="startup",
+            )
+            initial_prompt = str(unit.get("initial_prompt") or "").strip()
+            if initial_prompt:
+                message = self._message(
+                    from_endpoint=account_endpoint(created_by),
+                    to_endpoint=session_endpoint(payload["session"]["session_id"]),
+                    payload={
+                        "body": initial_prompt,
+                        "user_input": True,
+                        "startup_unit_id": unit_id,
+                    },
+                    created_at=now_text,
+                )
+                state["messages"].append(message)
+                self._index_message_for_session(state, message, payload["session"]["session_id"])
+                goal = state["goals"][payload["goal"]["goal_id"]]
+                self._set_goal_completion_state(
+                    state,
+                    goal,
+                    "incomplete",
+                    reason=f"Startup Unit initial prompt {message['message_id']} requires Session processing.",
+                    actor=created_by,
+                    priority=DISPATCH_PRIORITY_USER_INPUT,
+                    trigger_message_id=message["message_id"],
+                )
+                message["payload"]["reprocess_goal_id"] = goal["goal_id"]
+                message["payload"]["reprocess_recorded_at"] = now_text
+                payload["initial_message"] = dict(message)
+                payload["goal"] = dict(goal)
+            unit["last_startup_at"] = now_text
+            unit["updated_at"] = now_text
+            unit["startup_run_count"] = int(unit.get("startup_run_count") or 0) + 1
             started.append(payload)
         self.save(state)
         return started
@@ -290,6 +372,8 @@ class SessionGoalMixin:
         normalized_unit_id = str(unit_id or "").strip() or None
         if normalized_unit_id and normalized_unit_id not in state["units"]:
             raise StoreError(f"unknown unit: {normalized_unit_id}")
+        if normalized_unit_id and not self._unit_activation_trigger_enabled(state["units"][normalized_unit_id], "manual"):
+            raise StoreError(f"unit does not allow manual activation: {normalized_unit_id}")
         sessions = state["sessions"]
         if session_id in sessions:
             raise StoreError(f"session already exists: {session_id}")
@@ -351,6 +435,7 @@ class SessionGoalMixin:
             body=goal_body,
             created_by=created_by,
             created_at=utc_now(),
+            activation_trigger="manual",
         )
         self.save(state)
         return payload
@@ -366,6 +451,7 @@ class SessionGoalMixin:
         body: str,
         created_by: str,
         created_at: str,
+        activation_trigger: str = "manual",
     ) -> dict[str, Any]:
         session_title = label.strip()
         if not session_title:
@@ -374,13 +460,24 @@ class SessionGoalMixin:
         normalized_unit_id = str(unit_id or "").strip() or None
         if normalized_unit_id and normalized_unit_id not in state["units"]:
             raise StoreError(f"unknown unit: {normalized_unit_id}")
+        if normalized_unit_id and not self._unit_activation_trigger_enabled(state["units"][normalized_unit_id], activation_trigger):
+            raise StoreError(f"unit does not allow {activation_trigger} activation: {normalized_unit_id}")
         if session_id in state["sessions"]:
             raise StoreError(f"session already exists: {session_id}")
         unit = state["units"].get(normalized_unit_id) if normalized_unit_id else None
         if unit and unit.get("instance_policy") == "singleton":
             singleton_session_id = unit.get("singleton_session_id")
             if singleton_session_id and singleton_session_id in state["sessions"]:
-                raise StoreError(f"unit is singleton and already has session: {singleton_session_id}")
+                return self._activate_singleton_unit_session_in_state(
+                    state,
+                    unit=unit,
+                    parent_session_ids=parent_session_ids,
+                    label=session_title,
+                    body=goal_body,
+                    created_by=created_by,
+                    created_at=created_at,
+                    activation_trigger=activation_trigger,
+                )
         normalized_parent_ids = parent_session_ids or [ROOT_SESSION_ID]
         for parent_session_id in normalized_parent_ids:
             if parent_session_id not in state["sessions"]:
@@ -398,6 +495,9 @@ class SessionGoalMixin:
         self._ensure_session_workspace(state["sessions"][session_id])
         self._ensure_session_unit_workspace_link(state["sessions"][session_id], unit)
         state["sessions"][session_id]["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
+        if unit and unit.get("instance_policy") == "singleton":
+            unit["singleton_session_id"] = session_id
+            state["sessions"][session_id]["singleton"] = True
         for parent_session_id in normalized_parent_ids:
             self._link_sessions_in_state(state, parent_session_id, session_id)
 
@@ -419,6 +519,81 @@ class SessionGoalMixin:
             priority=DISPATCH_PRIORITY_GOAL,
         )
         return {"session": dict(state["sessions"][session_id]), "goal": goal_dict}
+
+    def _activate_singleton_unit_session_in_state(
+        self,
+        state: dict[str, Any],
+        *,
+        unit: dict[str, Any],
+        parent_session_ids: list[str],
+        label: str,
+        body: str,
+        created_by: str,
+        created_at: str,
+        activation_trigger: str,
+    ) -> dict[str, Any]:
+        unit_id = str(unit.get("unit_id") or "")
+        session_id = str(unit.get("singleton_session_id") or unit_id)
+        session = state["sessions"].get(session_id)
+        if not session:
+            session = Session(
+                session_id=session_id,
+                unit_id=unit_id,
+                created_at=created_at,
+                updated_at=created_at,
+                title=str(label or unit_id).strip() or unit_id,
+                singleton=True,
+            ).to_dict()
+            state["sessions"][session_id] = session
+            unit["singleton_session_id"] = session_id
+            self._ensure_role_cursors(session)
+            self._ensure_session_workspace(session)
+            self._ensure_session_unit_workspace_link(session, unit)
+            session["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
+        session["active"] = True
+        session["updated_at"] = created_at
+        normalized_parent_ids = parent_session_ids or [ROOT_SESSION_ID]
+        for parent_session_id in normalized_parent_ids:
+            if parent_session_id in state["sessions"] and parent_session_id != session_id:
+                self._link_sessions_in_state(state, parent_session_id, session_id)
+        goal = self._current_goal_for_session(state, session_id)
+        goal_body = str(body or "").strip() or str(unit.get("goal_text") or label or unit_id).strip()
+        if goal:
+            if goal_body:
+                goal["body"] = goal_body
+                goal["updated_at"] = created_at
+        else:
+            goal = Goal(
+                goal_id=new_id("goal"),
+                session_id=session_id,
+                body=goal_body or f"Run Unit {unit_id}.",
+                created_by=created_by,
+                created_at=created_at,
+            ).to_dict()
+            state["goals"][goal["goal_id"]] = goal
+        signal = self._log_system_signal(
+            state,
+            session_id,
+            signal_type="UnitActivated",
+            body=f"Unit {unit_id} activated by {activation_trigger} trigger.",
+            target_roles=[GOAL_MANAGER_ROLE],
+            actor="system",
+            data={
+                "unit_id": unit_id,
+                "activation_trigger": activation_trigger,
+            },
+            created_at=created_at,
+        )
+        self._set_goal_completion_state(
+            state,
+            goal,
+            "incomplete",
+            reason=f"Singleton Unit {unit_id} activated by {activation_trigger} trigger.",
+            actor="system",
+            priority=DISPATCH_PRIORITY_GOAL,
+            enqueue_on_incomplete=True,
+        )
+        return {"session": dict(session), "goal": goal, "startup_signal" if activation_trigger == "startup" else "activation_signal": dict(signal)}
 
     def _normalize_unit_schedule(self, schedule: dict[str, Any] | None) -> dict[str, Any]:
         if not schedule:
@@ -450,6 +625,39 @@ class SessionGoalMixin:
         if enabled and normalized["next_run_at"]:
             self._parse_utc(normalized["next_run_at"])
         return normalized
+
+    def _normalize_unit_activation_triggers(
+        self,
+        triggers: dict[str, Any] | None,
+        *,
+        schedule: dict[str, Any] | None,
+    ) -> dict[str, bool]:
+        schedule_enabled = isinstance(schedule, dict) and schedule.get("enabled") is True
+        if not triggers:
+            normalized = {
+                "manual": True,
+                "scheduled": bool(schedule_enabled),
+                "startup": False,
+            }
+        else:
+            normalized = {
+                key: bool(triggers.get(key))
+                for key in UNIT_ACTIVATION_TRIGGERS
+            }
+            if schedule_enabled and "scheduled" not in triggers:
+                normalized["scheduled"] = True
+        if not any(normalized.values()):
+            raise StoreError("unit must allow at least one activation trigger")
+        return normalized
+
+    def _unit_activation_trigger_enabled(self, unit: dict[str, Any], trigger: str) -> bool:
+        if trigger not in UNIT_ACTIVATION_TRIGGERS:
+            raise StoreError(f"unsupported unit activation trigger: {trigger}")
+        triggers = unit.get("activation_triggers")
+        if not isinstance(triggers, dict):
+            triggers = self._normalize_unit_activation_triggers(None, schedule=unit.get("schedule"))
+            unit["activation_triggers"] = triggers
+        return bool(triggers.get(trigger))
 
     def _unit_schedule_due(self, unit: dict[str, Any], *, now_dt: datetime) -> bool:
         schedule = unit.get("schedule")
@@ -526,9 +734,13 @@ class SessionGoalMixin:
         return {"unit": dict(unit), "message": dict(message)}
 
     def _scheduled_session_id(self, state: dict[str, Any], *, unit_id: str, now_text: str) -> str:
+        return self._triggered_session_id(state, unit_id=unit_id, trigger="scheduled", now_text=now_text)
+
+    def _triggered_session_id(self, state: dict[str, Any], *, unit_id: str, trigger: str, now_text: str) -> str:
         safe_unit_id = "".join(char if char.isalnum() else "-" for char in unit_id.lower()).strip("-")
         safe_time = "".join(char if char.isalnum() else "" for char in now_text.lower())
-        base = f"{safe_unit_id}-{safe_time or new_id('scheduled')}"
+        safe_trigger = "".join(char if char.isalnum() else "-" for char in trigger.lower()).strip("-") or "trigger"
+        base = f"{safe_unit_id}-{safe_trigger}-{safe_time or new_id(safe_trigger)}"
         candidate = base
         index = 2
         while candidate in state["sessions"]:
