@@ -318,7 +318,39 @@ class SessionLogMixin:
             state = self.load()
             timestamp = utc_now()
             signals: list[dict[str, Any]] = []
+            current_active_incomplete_goals: dict[str, dict[str, Any]] = {}
             for goal in self._current_goals(state):
+                session_id = str(goal.get("session_id") or "")
+                session = state.get("sessions", {}).get(session_id)
+                if (
+                    goal.get("completion_state") == "incomplete"
+                    and not goal.get("archived_at")
+                    and session
+                    and session.get("active") is True
+                ):
+                    current_active_incomplete_goals[str(goal.get("goal_id") or "")] = goal
+
+            for run in state.get("dispatch_runs", {}).values():
+                if run.get("lease_state") != "acquired":
+                    continue
+                if str(run.get("goal_id") or "") in current_active_incomplete_goals:
+                    continue
+                run["lease_state"] = "interrupted"
+                run["interrupted_at"] = timestamp
+                run["interrupted_reason"] = "runtime recovered stale acquired run for non-dispatchable goal"
+                run.pop("current_phase", None)
+
+            for request in state.setdefault("dispatch_requests", []):
+                if request.get("status") != "acquired":
+                    continue
+                if str(request.get("goal_id") or "") in current_active_incomplete_goals:
+                    continue
+                request["status"] = "stale"
+                request["stale_at"] = timestamp
+                request["stale_reason"] = "runtime recovered stale acquired request for non-dispatchable goal"
+                request.pop("acquired_at", None)
+
+            for goal in current_active_incomplete_goals.values():
                 if goal.get("completion_state") != "incomplete" or goal.get("archived_at"):
                     continue
                 session_id = str(goal.get("session_id") or "")

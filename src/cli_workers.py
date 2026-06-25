@@ -151,6 +151,8 @@ def run_daemon(
                 next_schedule_poll = now + schedule_interval
 
             target_lots = min(store.dispatch_lot_size(), lot_cap)
+            if not active_lots and idle_polls:
+                target_lots = 1
             _submit_available_lots(
                 executor,
                 active_lots,

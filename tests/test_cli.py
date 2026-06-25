@@ -609,6 +609,56 @@ class CliTests(unittest.TestCase):
             requests = store.dispatch_requests("recover-session")
             self.assertTrue(any(request.get("role") == "GoalManager" for request in requests))
 
+    def test_runtime_recovery_closes_stale_acquired_runs_for_completed_goals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from model import utc_now
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("done-session", parent_session_ids=["root"])
+            goal = store.update_goal("done-session", body="already done", created_by="root")
+            state = store.load()
+            state["goals"][goal["goal_id"]]["completion_state"] = "complete"
+            state["dispatch_runs"]["run-stale-acquired"] = {
+                "run_id": "run-stale-acquired",
+                "goal_id": goal["goal_id"],
+                "session_id": "done-session",
+                "role": "WorkerAgent",
+                "lease_state": "acquired",
+                "current_phase": "WorkerAgent",
+                "created_at": utc_now(),
+                "lease_acquired_at": utc_now(),
+                "steps": [],
+            }
+            state["dispatch_requests"].append(
+                {
+                    "request_id": "dr-stale-acquired",
+                    "session_id": "done-session",
+                    "goal_id": goal["goal_id"],
+                    "role": "WorkerAgent",
+                    "priority": 150,
+                    "reason": "stale worker",
+                    "status": "acquired",
+                    "queued_at": utc_now(),
+                    "acquired_at": utc_now(),
+                    "from_log_seq": 1,
+                    "to_log_seq": store._latest_session_log_seq(state, session_id="done-session"),
+                }
+            )
+            store.save(state)
+
+            signals = store.record_runtime_recovery_signals("system restarted")
+            self.assertEqual(signals, [])
+
+            state = store.load()
+            self.assertEqual(state["dispatch_runs"]["run-stale-acquired"]["lease_state"], "interrupted")
+            self.assertEqual(state["dispatch_requests"][0]["status"], "stale")
+            status = store.status()
+            self.assertEqual(status["active_incomplete_goal_count"], 0)
+            self.assertEqual(status["acquired_dispatch_lease_count"], 0)
+
     def test_daemon_starts_due_scheduled_units_and_dispatches_them(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
