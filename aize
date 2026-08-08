@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+has_root=false
+for argument in "$@"; do
+    if [[ "$argument" == "--root" ]]; then
+        has_root=true
+        break
+    fi
+done
+
+export PYTHONPATH="${repository_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ "$has_root" == false ]]; then
+    exec python3 -m cli --root "${repository_root}/.aize-state" "$@"
+fi
+exec python3 -m cli "$@"

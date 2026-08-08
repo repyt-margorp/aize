@@ -189,6 +189,12 @@ class DispatchRequestMixin:
             "from_log_seq": first_seq,
             "to_log_seq": to_seq,
         }
+        if trigger_entry.get("kind") == "SystemSignal":
+            event = trigger_entry.get("event")
+            data = event.get("data") if isinstance(event, dict) else None
+            available_after = str(data.get("available_after") or "").strip() if isinstance(data, dict) else ""
+            if available_after:
+                request["available_after"] = available_after
         if trigger_message:
             request["trigger_message_id"] = str(trigger_message.get("message_id") or "")
         return request

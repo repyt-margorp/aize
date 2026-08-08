@@ -76,11 +76,13 @@ def print_units(units: list[dict[str, Any]]) -> None:
     print(f"Units ({len(units)})")
     for unit in units:
         singleton = f" singleton={unit.get('singleton_session_id')}" if unit.get("singleton_session_id") else ""
+        owner = f" owner={unit.get('owner_account')}" if unit.get("owner_account") else ""
         triggers = unit.get("activation_triggers") if isinstance(unit.get("activation_triggers"), dict) else {}
         trigger_text = ",".join(key for key in ("manual", "scheduled", "startup") if triggers.get(key)) or "none"
         print(
             f"- {unit.get('unit_id')} policy={unit.get('instance_policy')} "
             f"triggers={trigger_text} status={unit.get('status')}{singleton}"
+            f"{owner}"
         )
 
 

@@ -23,6 +23,7 @@ py-modules = [
   "cli_workers",
   "envelope",
   "model",
+  "schedule_resolvers",
   "store",
   "store_auth",
   "store_defs",

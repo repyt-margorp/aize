@@ -20,7 +20,9 @@ from store_defs import (
     STATE_VERSION,
     WORKER_AGENT_ROLE,
     StoreError,
+    account_home_unit_id,
     account_home_session_id,
+    session_endpoint,
 )
 from store_auth import AuthMixin
 from store_dispatch import DispatchMixin
@@ -58,34 +60,33 @@ class Store(
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def init(self) -> dict[str, Any]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        if self.state_path.exists():
-            state = self.load()
-            changed = self.ensure_defaults(state)
-            if changed:
-                self.save(state)
+        with self._state_lock():
+            if self.state_path.exists():
+                state = self.load()
+                if self.ensure_defaults(state):
+                    self.save(state)
+                return state
+            now = utc_now()
+            state = {
+                "version": STATE_VERSION,
+                "created_at": now,
+                "units": {},
+                "sessions": {},
+                "session_edges": [],
+                "accounts": {},
+                "goals": {},
+                "agent_profiles": {},
+                "agent_threads": {},
+                "dispatch_runs": {},
+                "dispatch_requests": [],
+                "runtime_settings": {},
+                "messages": [],
+                "endpoint_cursors": {},
+                "session_logs": {},
+            }
+            self.ensure_defaults(state, now=now)
+            self.save(state)
             return state
-        now = utc_now()
-        state = {
-            "version": STATE_VERSION,
-            "created_at": now,
-            "units": {},
-            "sessions": {},
-            "session_edges": [],
-            "accounts": {},
-            "goals": {},
-            "agent_profiles": {},
-            "agent_threads": {},
-            "dispatch_runs": {},
-            "dispatch_requests": [],
-            "runtime_settings": {},
-            "messages": [],
-            "endpoint_cursors": {},
-            "session_logs": {},
-        }
-        self.ensure_defaults(state, now=now)
-        self.save(state)
-        return state
 
     def load(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -109,9 +110,7 @@ class Store(
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
         state.setdefault("session_logs", {})
-        changed = self.ensure_defaults(state)
-        if changed:
-            self.save(state)
+        self.ensure_defaults(state)
         return state
 
     def ensure_defaults(self, state: dict[str, Any], *, now: str | None = None) -> bool:
@@ -175,6 +174,9 @@ class Store(
             if triggers != normalized_triggers:
                 unit["activation_triggers"] = normalized_triggers
                 changed = True
+            if "owner_account" not in unit:
+                unit["owner_account"] = "" if unit.get("unit_id") == ROOT_UNIT_ID else ROOT_USERNAME
+                changed = True
 
         if ROOT_SESSION_ID not in sessions:
             sessions[ROOT_SESSION_ID] = Session(
@@ -202,6 +204,8 @@ class Store(
             ).to_dict()
             changed = True
         if self._ensure_account_home_sessions(state, now=timestamp):
+            changed = True
+        if self._ensure_unit_session_owner_parents(state):
             changed = True
         for session_id in list(sessions):
             if session_id == ROOT_SESSION_ID:
@@ -232,33 +236,120 @@ class Store(
             changed = True
         return changed
 
+    def _ensure_unit_session_owner_parents(self, state: dict[str, Any]) -> bool:
+        changed = False
+        units = state.setdefault("units", {})
+        sessions = state.setdefault("sessions", {})
+        accounts = state.setdefault("accounts", {})
+        edges = state.setdefault("session_edges", [])
+        for session_id, session in sessions.items():
+            unit_id = str(session.get("unit_id") or "").strip()
+            unit = units.get(unit_id)
+            owner_account = str(unit.get("owner_account") or "").strip() if unit else ""
+            account = accounts.get(owner_account)
+            if not account:
+                continue
+            home_session_id = str(account.get("home_session_id") or "").strip()
+            if not home_session_id or home_session_id == session_id:
+                continue
+            if home_session_id not in sessions:
+                raise StoreError(f"owner account has no home session: {owner_account}")
+            if not any(
+                edge.get("parent_session_id") == home_session_id
+                and edge.get("child_session_id") == session_id
+                for edge in edges
+            ):
+                self._link_sessions_in_state(state, home_session_id, session_id)
+                changed = True
+            retained_edges = [
+                edge
+                for edge in edges
+                if not (
+                    edge.get("parent_session_id") == ROOT_SESSION_ID
+                    and edge.get("child_session_id") == session_id
+                )
+            ]
+            if len(retained_edges) != len(edges):
+                edges[:] = retained_edges
+                changed = True
+        return changed
+
     def _ensure_account_home_sessions(self, state: dict[str, Any], *, now: str | None = None) -> bool:
         timestamp = now or utc_now()
         changed = False
+        units = state.setdefault("units", {})
         sessions = state.setdefault("sessions", {})
         accounts = state.setdefault("accounts", {})
         state.setdefault("session_edges", [])
         for username, account in sorted(accounts.items()):
-            home_session_id = str(account.get("home_session_id") or "").strip()
-            if not home_session_id:
-                home_session_id = account_home_session_id(username)
+            home_session_id = account_home_session_id(username)
+            previous_home_session_id = str(account.get("home_session_id") or "").strip()
+            if previous_home_session_id and previous_home_session_id != home_session_id:
+                if self._rename_session_id(state, previous_home_session_id, home_session_id):
+                    changed = True
+            if previous_home_session_id != home_session_id:
                 account["home_session_id"] = home_session_id
+                changed = True
+            home_unit_id = account_home_unit_id(username)
+            previous_home_unit_id = str(account.get("home_unit_id") or "").strip()
+            if previous_home_unit_id and previous_home_unit_id != home_unit_id:
+                previous_home_unit = units.pop(previous_home_unit_id, None)
+                if previous_home_unit is not None:
+                    if home_unit_id in units:
+                        raise StoreError(f"account home unit already exists: {home_unit_id}")
+                    previous_home_unit["unit_id"] = home_unit_id
+                    units[home_unit_id] = previous_home_unit
+                    changed = True
+            if previous_home_unit_id != home_unit_id:
+                account["home_unit_id"] = home_unit_id
                 changed = True
             if home_session_id == ROOT_SESSION_ID:
                 raise StoreError("account home session cannot be the system root session")
+            home_unit = units.get(home_unit_id)
+            if home_unit is None:
+                home_unit = Unit(
+                    unit_id=home_unit_id,
+                    created_at=timestamp,
+                    instance_policy="singleton",
+                    singleton_session_id=home_session_id,
+                    display_name=f"{username} account root",
+                    description="Account root singleton Unit.",
+                    activation_triggers={"manual": True, "scheduled": False, "startup": False},
+                    workspace_path=self._unit_workspace_relpath(home_unit_id),
+                    owner_account=username,
+                ).to_dict()
+                units[home_unit_id] = home_unit
+                changed = True
+            else:
+                if home_unit.get("instance_policy") != "singleton":
+                    home_unit["instance_policy"] = "singleton"
+                    changed = True
+                if home_unit.get("singleton_session_id") != home_session_id:
+                    home_unit["singleton_session_id"] = home_session_id
+                    changed = True
+                if home_unit.get("owner_account") != username:
+                    home_unit["owner_account"] = username
+                    changed = True
+            self._ensure_unit_workspace(home_unit)
             if home_session_id not in sessions:
                 sessions[home_session_id] = Session(
                     session_id=home_session_id,
-                    unit_id=None,
+                    unit_id=home_unit_id,
                     created_at=timestamp,
                     updated_at=timestamp,
                     title=f"{username} home",
                     active=True,
-                    singleton=False,
+                    singleton=True,
                 ).to_dict()
                 changed = True
             else:
                 session = sessions[home_session_id]
+                if session.get("unit_id") != home_unit_id:
+                    session["unit_id"] = home_unit_id
+                    changed = True
+                if session.get("singleton") is not True:
+                    session["singleton"] = True
+                    changed = True
                 if not str(session.get("title") or "").strip():
                     session["title"] = f"{username} home"
                     changed = True
@@ -268,6 +359,69 @@ class Store(
                 self._link_sessions_in_state(state, ROOT_SESSION_ID, home_session_id)
                 changed = True
         return changed
+
+    def _rename_session_id(self, state: dict[str, Any], previous_id: str, session_id: str) -> bool:
+        sessions = state.setdefault("sessions", {})
+        if previous_id == session_id or previous_id not in sessions:
+            return False
+        if session_id in sessions:
+            raise StoreError(f"account home session already exists: {session_id}")
+
+        session = sessions.pop(previous_id)
+        session["session_id"] = session_id
+        sessions[session_id] = session
+
+        for edge in state.setdefault("session_edges", []):
+            if edge.get("parent_session_id") == previous_id:
+                edge["parent_session_id"] = session_id
+            if edge.get("child_session_id") == previous_id:
+                edge["child_session_id"] = session_id
+        for goal in state.setdefault("goals", {}).values():
+            if goal.get("session_id") == previous_id:
+                goal["session_id"] = session_id
+        for request in state.setdefault("dispatch_requests", []):
+            if request.get("session_id") == previous_id:
+                request["session_id"] = session_id
+        for run in state.setdefault("dispatch_runs", {}).values():
+            if run.get("session_id") == previous_id:
+                run["session_id"] = session_id
+
+        previous_endpoint = session_endpoint(previous_id)
+        endpoint = session_endpoint(session_id)
+        for message in state.setdefault("messages", []):
+            if message.get("from") == previous_endpoint:
+                message["from"] = endpoint
+            if message.get("to") == previous_endpoint:
+                message["to"] = endpoint
+        endpoint_cursors = state.setdefault("endpoint_cursors", {})
+        if previous_endpoint in endpoint_cursors:
+            endpoint_cursors[endpoint] = endpoint_cursors.pop(previous_endpoint)
+
+        session_logs = state.setdefault("session_logs", {})
+        if previous_id in session_logs:
+            session_logs[session_id] = session_logs.pop(previous_id)
+
+        agent_threads = state.setdefault("agent_threads", {})
+        for thread_key, thread in list(agent_threads.items()):
+            if thread.get("session_id") != previous_id:
+                continue
+            role = str(thread.get("role") or "")
+            new_thread_key = f"{session_id}:{role}"
+            thread["session_id"] = session_id
+            thread["thread_id"] = new_thread_key
+            agent_threads.pop(thread_key)
+            agent_threads[new_thread_key] = thread
+
+        for unit in state.setdefault("units", {}).values():
+            if unit.get("singleton_session_id") == previous_id:
+                unit["singleton_session_id"] = session_id
+            schedule = unit.get("schedule")
+            if not isinstance(schedule, dict):
+                continue
+            for key in ("next_run_required_by_session_id", "next_run_set_by_session_id"):
+                if schedule.get(key) == previous_id:
+                    schedule[key] = session_id
+        return True
 
     def save(self, state: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

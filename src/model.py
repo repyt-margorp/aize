@@ -48,6 +48,7 @@ class Unit:
     schedule: dict[str, Any] | None = None
     activation_triggers: dict[str, bool] | None = None
     workspace_path: str = ""
+    owner_account: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +64,7 @@ class Unit:
             "schedule": dict(self.schedule or {}),
             "activation_triggers": dict(self.activation_triggers or {}),
             "workspace_path": self.workspace_path,
+            "owner_account": self.owner_account,
         }
 
 

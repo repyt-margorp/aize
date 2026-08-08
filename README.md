@@ -16,7 +16,7 @@ Minimal AIze rebuild focused on a small MINIX-style core:
 - per-session Agent workspaces
 - per-Unit shared workspaces linked from Unit-derived Sessions
 - CLI dispatch with durable run records
-- console startup dispatch for queued Active/Incomplete Sessions
+- Daemon-owned dispatch for queued Active/Incomplete Sessions
 - CLI-only status inspection
 - no UI
 
@@ -29,7 +29,27 @@ reference. The active CLI runtime lives directly under `src/`.
 
 ## Quick Start
 
-Run directly from the repo without installing:
+From this repository, use the included launcher. It supplies the source path
+and connects to this checkout's `.aize-state` by default:
+
+```bash
+./aize console
+./aize status
+```
+
+Pass `--root` when operating a different runtime state directory:
+
+```bash
+./aize --root .other-aize-state console
+```
+
+The equivalent direct Python invocation is:
+
+```bash
+PYTHONPATH=src python3 -m cli --root .aize-state console
+```
+
+Other commands can also run directly from the repo without installing:
 
 ```bash
 PYTHONPATH=src python3 -m cli --root .aize-state init
@@ -87,28 +107,39 @@ the absolute Unit workspace path as `AIZE_UNIT_WORKSPACE`.
 
 ## Units / Session Templates
 
-In this CLI runtime, a Unit is the durable SessionTemplate-like record used to
+In this CLI runtime, a Unit is the durable executable-like definition used to
 start Sessions. It can carry the default SessionGoal body, an initial prompt,
-and a schedule. Schedules are managed by each Unit's `schedule.next_run_at`.
-`--schedule-every-hours` defines how far to advance `next_run_at` after a run.
+and a schedule. The Scheduler only uses `schedule.next_run_at` to decide when a
+Unit is due.
 
 ```bash
 PYTHONPATH=src python3 -m cli --root .aize-state create-unit monitor \
   --display-name "System Monitor" \
   --goal-text "Inspect system state and report findings." \
   --initial-prompt "Run diagnostics now." \
-  --schedule-every-hours 1 \
+  --schedule-resolver next_interval_boundary \
+  --schedule-fixed-parameters '{"interval_seconds":21600,"anchor":"scheduled_for"}' \
   --schedule-next-run-at "2026-06-22T00:00:00Z"
 
 PYTHONPATH=src python3 -m cli --root .aize-state run-scheduled-units
 ```
 
-`run-scheduled-units` starts Unit Sessions whose `schedule.next_run_at` is due
-under `root` by default. The created Session receives the Unit `goal_text` as
-its SessionGoal. If `initial_prompt` is set, it is recorded as User input on
-that Session so normal Session dispatch can process it. After a due Unit starts
-a Session, `schedule.next_run_at` is advanced to the next future interval
-boundary.
+Update an existing Unit without recreating it:
+
+```bash
+./aize configure-unit-schedule monitor next_interval_boundary \
+  --fixed-parameters '{"interval_seconds":21600,"anchor":"scheduled_for"}'
+```
+
+`run-scheduled-units` starts Unit Sessions whose `schedule.next_run_at` is due.
+The created Session receives the Unit `goal_text` as its SessionGoal. If
+`initial_prompt` is set, it is recorded as User input on that Session so normal
+Session dispatch can process it. When GoalManager completes a scheduled
+Session, AIze invokes the Unit's schedule resolver with two separate inputs:
+the Unit's fixed parameters and runtime parameters derived by AIze. Runtime
+parameters include `scheduled_for`, `queued_at`, `started_at`, `completed_at`,
+and optional call parameters from GoalManager. The resolver result becomes the
+new `schedule.next_run_at`.
 
 For normal operation, run the daemon. It initializes state if needed, polls due
 Unit schedules, creates Sessions for due Units, and dispatches queued Session
@@ -247,21 +278,18 @@ current console reply endpoint.
 When user input is sent to a Session, the Session's latest Goal is marked
 `incomplete` again and queued with user-input priority. If the Session has no
 Goal yet, a default reply Goal is created. In the interactive console, `send`
-records the UserInput Message, starts a one-shot background dispatch worker for
-that Session, and returns the prompt without waiting for Agent execution.
-While the console stays open, it polls new `UserConsole` Messages for the
-current Session and prints Agent replies as they arrive.
+records the UserInput Message and returns immediately; the running Daemon owns
+dispatch. While the console stays open, it polls new `UserConsole` Messages for
+the current Session and prints Agent replies as they arrive.
 
 If a WorkerAgent run is already active for the Session, new UserInput is also
 recorded as a WorkerAgent follow-up Message. That follow-up waits until the
 current WorkerAgent run releases, then dispatch resumes the same WorkerAgent
 thread with the updated Session MessageLog.
 
-When the interactive console starts, it also checks for queued Active/Incomplete
-SessionGoals. If queued work exists and no dispatch lease is currently acquired,
-the console starts a detached background worker with a recovery context. That
-context is stored on the dispatch-run record and passed to GoalManager and
-WorkerAgent prompts; it is not appended to MessageLog.
+The interactive console never starts dispatch workers. Run the Daemon as the
+single dispatcher. `dispatch` remains available as an explicit diagnostic or
+manual operation when the Daemon is intentionally stopped.
 
 For dispatch-only queue processing without schedule polling, run a foreground
 dispatch worker in another shell:

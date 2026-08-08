@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 
@@ -61,8 +60,11 @@ def safe_id_part(value: str, *, fallback: str) -> str:
 
 def account_home_session_id(username: str) -> str:
     normalized = str(username or "").strip()
-    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
-    return f"account-{safe_id_part(normalized, fallback='user')}-{digest}"
+    return f"account-{safe_id_part(normalized, fallback='user')}"
+
+
+def account_home_unit_id(username: str) -> str:
+    return account_home_session_id(username)
 
 
 def session_endpoint(session_id: str) -> str:

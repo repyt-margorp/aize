@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import os
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,12 @@ class DispatchMixin:
         now = utc_now()
         request_entry["status"] = "acquired"
         request_entry["acquired_at"] = now
+        schedule_timing = session.get("schedule_timing")
+        if isinstance(schedule_timing, dict):
+            if not schedule_timing.get("queued_at"):
+                schedule_timing["queued_at"] = str(request_entry.get("queued_at") or now)
+            if not schedule_timing.get("started_at"):
+                schedule_timing["started_at"] = now
         role = str(request_entry.get("role") or GOAL_MANAGER_ROLE)
         if role not in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE}:
             raise StoreError(f"unsupported dispatch role: {role}")
@@ -218,7 +225,9 @@ class DispatchMixin:
 
     def _commit_goal_manager_run_locked(self, lease: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
         state = self.load()
-        run = state["dispatch_runs"][lease["run"]["run_id"]]
+        run = state["dispatch_runs"].get(lease["run"]["run_id"])
+        if run is None:
+            return self._recover_missing_lease_run_locked(state, lease)
         goal = state["goals"][lease["goal"]["goal_id"]]
         session = state["sessions"][lease["session"]["session_id"]]
         request_entry = self._request_entry_by_id(state, lease["request_id"])
@@ -236,9 +245,8 @@ class DispatchMixin:
         )
 
         completed_at = utc_now()
-        decision = self._goal_state_transition_for_run(
+        decision = self._declared_goal_outcome_for_run(
             state,
-            session_id=session["session_id"],
             run_id=run["run_id"],
         )
         if decision is None:
@@ -253,6 +261,31 @@ class DispatchMixin:
             )
             run["completion_state"] = "incomplete"
             run["goal_manager_status"] = "missing_completion_decision"
+            protocol_signal = self._log_system_signal(
+                state,
+                session["session_id"],
+                signal_type="GoalManagerTurnProtocolViolation",
+                body=(
+                    "GoalManager returned without declaring the SessionGoal complete or incomplete. "
+                    "Review the unchanged SessionGoal and produce the required completion decision."
+                ),
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor="dispatcher",
+                run_id=run["run_id"],
+                data={
+                    "required_output": "goal_completion_state",
+                    "available_after": self._role_turn_retry_at(),
+                },
+                created_at=completed_at,
+            )
+            self._record_role_turn_outcome(
+                state,
+                run,
+                session_id=session["session_id"],
+                role=GOAL_MANAGER_ROLE,
+                goal_decision=None,
+                protocol_signal=protocol_signal,
+            )
             run["lease_state"] = "released"
             run["lease_released_at"] = completed_at
             run.pop("current_phase", None)
@@ -273,7 +306,13 @@ class DispatchMixin:
         ) or self._has_worker_request_for_run(state, session_id=session["session_id"], run_id=run["run_id"])
         implicit_worker_message = None
         if decision["completion_state"] == "complete":
-            schedule_reason = self._scheduled_unit_completion_blocker(state, session=session, completed_at=completed_at)
+            schedule_reason = self._prepare_scheduled_unit_completion(
+                state,
+                session=session,
+                run=run,
+                decision=decision,
+                completed_at=completed_at,
+            )
             if schedule_reason:
                 self._log_system_signal(
                     state,
@@ -309,7 +348,9 @@ class DispatchMixin:
                     reason=str(decision.get("reason") or ""),
                     actor=GOAL_MANAGER_ROLE,
                     run_id=run["run_id"],
+                    occurred_at=completed_at,
                 )
+                session.setdefault("schedule_timing", {})["completed_at"] = completed_at
                 run["completion_state"] = "complete"
         else:
             transition = self._set_goal_completion_state(
@@ -340,6 +381,13 @@ class DispatchMixin:
                 )
             run["completion_state"] = "incomplete"
             run["goal_manager_status"] = "incomplete"
+        self._record_role_turn_outcome(
+            state,
+            run,
+            session_id=session["session_id"],
+            role=GOAL_MANAGER_ROLE,
+            goal_decision=decision,
+        )
         if request_entry and (
             run.get("completion_state") == "complete"
             or run.get("goal_manager_status") == "schedule_next_run_required"
@@ -386,8 +434,8 @@ class DispatchMixin:
         next_run_at = str(schedule.get("next_run_at") or "").strip()
         if not next_run_at:
             return (
-                "Scheduled Unit completion requires GoalManager to set the Unit next_run_at first. "
-                "Call agent_api.set_next_unit_run_at(next_run_at, note=...) with a future UTC timestamp, then complete."
+                "Scheduled Unit completion requires a future next_run_at. "
+                "Call set_goal_completion_state(..., schedule_parameters={...}) so the Unit schedule resolver can calculate it."
             )
         try:
             next_dt = self._parse_utc(next_run_at)
@@ -395,18 +443,58 @@ class DispatchMixin:
         except StoreError:
             return (
                 "Scheduled Unit completion requires a valid future Unit next_run_at. "
-                "Call agent_api.set_next_unit_run_at(next_run_at, note=...) with a future UTC timestamp, then complete."
+                "Call set_goal_completion_state(..., schedule_parameters={...}) so the Unit schedule resolver can calculate it."
             )
         if next_dt <= completed_dt:
             return (
                 f"Scheduled Unit next_run_at {next_run_at} is not in the future. "
-                "Call agent_api.set_next_unit_run_at(next_run_at, note=...) with a future UTC timestamp, then complete."
+                "Call set_goal_completion_state(..., schedule_parameters={...}) so the Unit schedule resolver can calculate it."
             )
         return ""
 
+    def _prepare_scheduled_unit_completion(
+        self,
+        state: dict[str, Any],
+        *,
+        session: dict[str, Any],
+        run: dict[str, Any],
+        decision: dict[str, Any],
+        completed_at: str,
+    ) -> str:
+        unit_id = str(session.get("unit_id") or "")
+        unit = state.get("units", {}).get(unit_id) if unit_id else None
+        schedule = unit.get("schedule") if unit else None
+        if not isinstance(schedule, dict) or schedule.get("enabled") is not True:
+            return ""
+        next_run_at = str(schedule.get("next_run_at") or "").strip()
+        resolver = str(schedule.get("resolver") or "explicit")
+        resolve_next = resolver != "explicit" or not next_run_at
+        if next_run_at and not resolve_next:
+            try:
+                resolve_next = self._parse_utc(next_run_at) <= self._parse_utc(completed_at)
+            except StoreError:
+                resolve_next = True
+        if resolve_next:
+            schedule_parameters = decision.get("schedule_parameters")
+            try:
+                self._schedule_next_unit_run_locked(
+                    state,
+                    session_id=str(session["session_id"]),
+                    call_parameters=dict(schedule_parameters) if isinstance(schedule_parameters, dict) else {},
+                    actor=GOAL_MANAGER_ROLE,
+                    run_id=str(run["run_id"]),
+                    completed_at=completed_at,
+                    completion_is_provisional=False,
+                )
+            except StoreError as exc:
+                return f"Scheduled Unit next run resolution failed: {exc}"
+        return self._scheduled_unit_completion_blocker(state, session=session, completed_at=completed_at)
+
     def _commit_worker_run_locked(self, lease: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
         state = self.load()
-        run = state["dispatch_runs"][lease["run"]["run_id"]]
+        run = state["dispatch_runs"].get(lease["run"]["run_id"])
+        if run is None:
+            return self._recover_missing_lease_run_locked(state, lease)
         goal = state["goals"][lease["goal"]["goal_id"]]
         session = state["sessions"][lease["session"]["session_id"]]
         request_entry = self._request_entry_by_id(state, lease["request_id"])
@@ -431,6 +519,38 @@ class DispatchMixin:
                 worker_prompt=result["prompt"],
             )
         completed_at = utc_now()
+        worker_reports = self._role_turn_session_messages(
+            state,
+            session_id=session["session_id"],
+            run_id=run["run_id"],
+            role=WORKER_AGENT_ROLE,
+        )
+        protocol_signal = None
+        if not worker_reports:
+            protocol_signal = self._log_system_signal(
+                state,
+                session["session_id"],
+                signal_type="WorkerTurnProtocolViolation",
+                body=(
+                    "WorkerAgent returned without reporting work results to Session. "
+                    "GoalManager must review the failed Worker turn and decide whether to request the work again."
+                ),
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor="dispatcher",
+                run_id=run["run_id"],
+                data={
+                    "required_output": "session_message",
+                    "available_after": self._role_turn_retry_at(),
+                },
+                created_at=completed_at,
+            )
+        self._record_role_turn_outcome(
+            state,
+            run,
+            session_id=session["session_id"],
+            role=WORKER_AGENT_ROLE,
+            protocol_signal=protocol_signal,
+        )
         if request_entry:
             request_entry["status"] = "resolved"
             request_entry["resolved_at"] = completed_at
@@ -457,7 +577,9 @@ class DispatchMixin:
 
     def _commit_dispatch_error_locked(self, lease: dict[str, Any], exc: AgentError) -> dict[str, Any]:
         state = self.load()
-        run = state["dispatch_runs"][lease["run"]["run_id"]]
+        run = state["dispatch_runs"].get(lease["run"]["run_id"])
+        if run is None:
+            return self._recover_missing_lease_run_locked(state, lease)
         goal = state["goals"][lease["goal"]["goal_id"]]
         session = state["sessions"][lease["session"]["session_id"]]
         request_entry = self._request_entry_by_id(state, lease["request_id"])
@@ -507,6 +629,40 @@ class DispatchMixin:
             "unit": dict(lease["unit"]) if lease["unit"] else None,
             "run": dict(run),
             "state_transition": transition,
+            "message": None,
+        }
+
+    def _recover_missing_lease_run_locked(self, state: dict[str, Any], lease: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(lease["run"]["run_id"])
+        session_id = str(lease["session"]["session_id"])
+        request_entry = self._request_entry_by_id(state, lease["request_id"])
+        recovered_at = utc_now()
+        if request_entry and request_entry.get("status") == "acquired":
+            request_entry["status"] = "queued"
+            request_entry["recovered_at"] = recovered_at
+            request_entry.pop("acquired_at", None)
+        if session_id in state.get("sessions", {}):
+            self._log_system_signal(
+                state,
+                session_id,
+                signal_type="DispatchRunRecovered",
+                body=(
+                    f"Dispatch run {run_id} was missing when its Agent result returned. "
+                    "The request was returned to the dispatch queue."
+                ),
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor="dispatcher",
+                run_id=run_id,
+                data={"request_id": lease["request_id"], "role": lease["role"]},
+                created_at=recovered_at,
+            )
+        self.save(state)
+        return {
+            "goal": dict(state.get("goals", {}).get(lease["goal"]["goal_id"], lease["goal"])),
+            "session": dict(state.get("sessions", {}).get(session_id, lease["session"])),
+            "unit": dict(lease["unit"]) if lease["unit"] else None,
+            "run": {**dict(lease["run"]), "lease_state": "lost"},
+            "state_transition": None,
             "message": None,
         }
 
@@ -677,23 +833,17 @@ class DispatchMixin:
             entry["status"] = "resolved"
             entry["resolved_at"] = resolved_at
 
-    def _goal_state_transition_for_run(
+    def _declared_goal_outcome_for_run(
         self,
         state: dict[str, Any],
         *,
-        session_id: str,
         run_id: str,
     ) -> dict[str, Any] | None:
-        for entry in reversed(state.setdefault("session_logs", {}).setdefault(session_id, [])):
-            if entry.get("kind") != "GoalStateChanged":
-                continue
-            event = entry.get("event")
-            if not isinstance(event, dict) or str(event.get("run_id") or "") != run_id:
-                continue
-            if str(event.get("actor") or "") != normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session_id):
-                continue
-            return dict(event)
-        return None
+        run = state.setdefault("dispatch_runs", {}).get(run_id)
+        if not isinstance(run, dict):
+            return None
+        declaration = run.get("declared_outcome")
+        return dict(declaration) if isinstance(declaration, dict) else None
 
     def _ensure_agent_thread(self, state: dict[str, Any], *, session_id: str, role: str) -> dict[str, Any]:
         thread_key = f"{session_id}:{role}"
@@ -770,6 +920,71 @@ class DispatchMixin:
         }
         run["steps"].append(step)
         return step
+
+    def _role_turn_session_messages(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        run_id: str,
+        role: str,
+    ) -> list[dict[str, Any]]:
+        sender = normalize_endpoint(role, session_id=session_id)
+        recipient = normalize_endpoint(SESSION_RECIPIENT, session_id=session_id)
+        reports: list[dict[str, Any]] = []
+        for message in self._session_messages(state, session_id):
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("run_id") or "") != run_id:
+                continue
+            if str(message.get("from") or "") != sender or str(message.get("to") or "") != recipient:
+                continue
+            reports.append(dict(message))
+        return reports
+
+    def _record_role_turn_outcome(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        *,
+        session_id: str,
+        role: str,
+        goal_decision: dict[str, Any] | None = None,
+        protocol_signal: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session_messages = self._role_turn_session_messages(
+            state,
+            session_id=session_id,
+            run_id=str(run.get("run_id") or ""),
+            role=role,
+        )
+        if role == GOAL_MANAGER_ROLE:
+            required_output = "goal_completion_state"
+            valid = goal_decision is not None
+        else:
+            required_output = "session_message"
+            valid = bool(session_messages)
+        outcome = {
+            "contract_version": 1,
+            "role": role,
+            "required_output": required_output,
+            "valid": valid,
+            "session_message_ids": [message["message_id"] for message in session_messages],
+        }
+        if goal_decision is not None:
+            outcome["goal_decision"] = dict(goal_decision)
+        if protocol_signal is not None:
+            event = protocol_signal.get("event")
+            if isinstance(event, dict):
+                outcome["protocol_signal_id"] = str(event.get("signal_id") or "")
+            outcome["protocol_signal_log_id"] = str(protocol_signal.get("log_id") or "")
+        run["outcome"] = outcome
+        return outcome
+
+    def _role_turn_retry_at(self, delay_seconds: int = 30) -> str:
+        retry_at = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+        return retry_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     def _append_remote_aize_handoff_message(
         self,

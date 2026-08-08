@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -58,9 +59,23 @@ def build_parser() -> argparse.ArgumentParser:
     create_unit.add_argument("--initial-prompt", default="")
     create_unit.add_argument("--schedule-every-hours", type=int)
     create_unit.add_argument("--schedule-next-run-at")
+    create_unit.add_argument(
+        "--schedule-resolver",
+        choices=["explicit", "next_interval_boundary"],
+    )
+    create_unit.add_argument("--schedule-fixed-parameters", default="{}")
+    create_unit.add_argument("--owner-account", default="root")
     create_unit.add_argument("--manual", action="store_true", default=None, dest="manual")
     create_unit.add_argument("--no-manual", action="store_false", dest="manual")
     create_unit.add_argument("--startup", action="store_true", default=False)
+
+    configure_schedule = sub.add_parser("configure-unit-schedule", help="set a Unit schedule resolver and fixed parameters")
+    configure_schedule.add_argument("unit_id")
+    configure_schedule.add_argument("resolver", choices=["explicit", "next_interval_boundary"])
+    configure_schedule.add_argument("--fixed-parameters", default="{}")
+    configure_schedule.add_argument("--next-run-at")
+    configure_schedule.add_argument("--note")
+    configure_schedule.add_argument("--disable", action="store_true")
 
     run_scheduled_units = sub.add_parser("run-scheduled-units", help="start due scheduled Unit sessions")
     run_scheduled_units.add_argument("--parent", default="root", dest="parent_session_id")
@@ -224,15 +239,31 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.create_account(args.username, password=args.password, roles=args.roles))
         elif args.command == "create-unit":
             schedule = {}
-            if args.schedule_every_hours is not None or args.schedule_next_run_at is not None:
+            if (
+                args.schedule_every_hours is not None
+                or args.schedule_next_run_at is not None
+                or args.schedule_resolver is not None
+            ):
+                try:
+                    fixed_parameters = json.loads(args.schedule_fixed_parameters)
+                except json.JSONDecodeError as exc:
+                    raise StoreError(f"invalid schedule fixed parameters JSON: {exc}") from exc
+                if not isinstance(fixed_parameters, dict):
+                    raise StoreError("schedule fixed parameters must be a JSON object")
+                resolver = args.schedule_resolver or "explicit"
+                if args.schedule_every_hours is not None:
+                    resolver = "next_interval_boundary"
+                    fixed_parameters = {
+                        **fixed_parameters,
+                        "interval_seconds": args.schedule_every_hours * 3600,
+                        "anchor": str(fixed_parameters.get("anchor") or "scheduled_for"),
+                    }
                 schedule = {
                     "enabled": True,
-                    "kind": "next-run",
                     "next_run_at": args.schedule_next_run_at or utc_now(),
-                    "timezone": "UTC",
+                    "resolver": resolver,
+                    "fixed_parameters": fixed_parameters,
                 }
-                if args.schedule_every_hours is not None:
-                    schedule["every_hours"] = args.schedule_every_hours
             activation_triggers = {
                 "manual": True if args.manual is None else bool(args.manual),
                 "scheduled": bool(schedule),
@@ -248,7 +279,25 @@ def run(argv: list[str] | None = None) -> int:
                     initial_prompt=args.initial_prompt,
                     schedule=schedule,
                     activation_triggers=activation_triggers,
+                    owner_account=args.owner_account,
                 ).to_dict()
+            )
+        elif args.command == "configure-unit-schedule":
+            try:
+                fixed_parameters = json.loads(args.fixed_parameters)
+            except json.JSONDecodeError as exc:
+                raise StoreError(f"invalid schedule fixed parameters JSON: {exc}") from exc
+            if not isinstance(fixed_parameters, dict):
+                raise StoreError("schedule fixed parameters must be a JSON object")
+            print_json(
+                store.configure_unit_schedule(
+                    args.unit_id,
+                    resolver=args.resolver,
+                    fixed_parameters=fixed_parameters,
+                    next_run_at=args.next_run_at,
+                    note=args.note,
+                    enabled=not args.disable,
+                )
             )
         elif args.command == "run-scheduled-units":
             print_json(

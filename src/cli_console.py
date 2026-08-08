@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import getpass
 import shlex
-import subprocess
-import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -29,13 +27,6 @@ from cli_render import (
 from model import new_id
 from store import Store
 from store_defs import StoreError, payload_body
-
-CLI_STARTUP_RECOVERY_CONTEXT = (
-    "The AIze CLI console started or restarted. Treat this as a runtime resume point: "
-    "persisted state may have changed since the previous dispatch, so continue working "
-    "toward the current SessionGoal using the current Session messages and goal state."
-)
-
 
 def start_console_message_poller(
     store: Store,
@@ -84,66 +75,6 @@ def start_console_message_poller(
     return thread
 
 
-def start_background_dispatch(
-    store: Store,
-    *,
-    session_id: str | None = None,
-    max_dispatches: int | None = 1,
-    idle_timeout: float | None = 5.0,
-    interval: float = 0.05,
-    recovery_context: str | None = None,
-) -> subprocess.Popen[str]:
-    log_dir = store.root / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "dispatch-worker.log"
-    log_file = log_path.open("a", encoding="utf-8")
-    command = [
-        sys.executable,
-        "-m",
-        "cli",
-        "--root",
-        str(store.root),
-        "dispatch-worker",
-    ]
-    if session_id:
-        command.extend(["--session", session_id])
-    if max_dispatches is not None:
-        command.extend(["--max-dispatches", str(max_dispatches)])
-    if idle_timeout is not None:
-        command.extend(["--idle-timeout", str(idle_timeout)])
-    command.extend(["--interval", str(interval)])
-    if recovery_context:
-        command.extend(["--recovery-context", recovery_context])
-    process = subprocess.Popen(
-        command,
-        stdout=log_file,
-        stderr=log_file,
-        text=True,
-        close_fds=True,
-        start_new_session=True,
-    )
-    log_file.close()
-    return process
-
-
-def start_startup_dispatch_if_needed(store: Store) -> subprocess.Popen[str] | None:
-    status = store.status()
-    if int(status.get("queued_dispatch_request_count") or 0) < 1:
-        return None
-    if int(status.get("acquired_dispatch_request_count") or 0) > 0:
-        return None
-    if int(status.get("acquired_dispatch_lease_count") or 0) > 0:
-        return None
-    return start_background_dispatch(
-        store,
-        session_id=None,
-        max_dispatches=None,
-        idle_timeout=0.5,
-        interval=0.05,
-        recovery_context=CLI_STARTUP_RECOVERY_CONTEXT,
-    )
-
-
 def run_console(store: Store, *, username: str | None, password: str | None) -> int:
     store.init()
     login_username = username or input("username: ")
@@ -162,9 +93,6 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
     print(f"logged in as {account['username']}")
     print(f"current session: {current_session_id}")
     print("type 'help' for commands")
-    startup_process = start_startup_dispatch_if_needed(store)
-    if startup_process:
-        print(f"startup dispatch worker queued: pid={startup_process.pid}")
 
     try:
         while True:
@@ -242,8 +170,6 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                             message
                         ]
                     )
-                    process = start_background_dispatch(store, session_id=current_session_id)
-                    print(f"dispatch queued in background: pid={process.pid}")
                 elif command == "send-file":
                     if len(args) < 2:
                         raise StoreError("usage: send-file RECIPIENT PATH [BODY]")

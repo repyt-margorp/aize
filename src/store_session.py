@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from model import Goal, Session, Unit, new_id, utc_now
+from schedule_resolvers import ScheduleResolverError, resolve_next_run_at
 from store_defs import (
     AGENT_ROLES,
     DEFAULT_SESSION_CAPABILITIES,
@@ -123,6 +124,7 @@ class SessionGoalMixin:
         initial_prompt: str = "",
         schedule: dict[str, Any] | None = None,
         activation_triggers: dict[str, bool] | None = None,
+        owner_account: str = ROOT_USERNAME,
     ) -> Unit:
         state = self.load()
         if instance_policy not in {"multi", "singleton"}:
@@ -135,6 +137,9 @@ class SessionGoalMixin:
         units = state["units"]
         if unit_id in units:
             raise StoreError(f"unit already exists: {unit_id}")
+        normalized_owner_account = str(owner_account or "").strip()
+        if normalized_owner_account and normalized_owner_account not in state["accounts"]:
+            raise StoreError(f"unknown owner account: {normalized_owner_account}")
         unit = Unit(
             unit_id=unit_id,
             created_at=utc_now(),
@@ -146,11 +151,87 @@ class SessionGoalMixin:
             schedule=normalized_schedule,
             activation_triggers=normalized_triggers,
             workspace_path=self._unit_workspace_relpath(unit_id),
+            owner_account=normalized_owner_account,
         )
         units[unit_id] = unit.to_dict()
         self._ensure_unit_workspace(units[unit_id])
         self.save(state)
         return unit
+
+    def configure_unit_schedule(
+        self,
+        unit_id: str,
+        *,
+        resolver: str,
+        fixed_parameters: dict[str, Any],
+        next_run_at: str | None = None,
+        note: str | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        with self._state_lock():
+            state = self.load()
+            unit = state["units"].get(unit_id)
+            if not unit:
+                raise StoreError(f"unknown unit: {unit_id}")
+            existing = unit.get("schedule")
+            schedule = dict(existing) if isinstance(existing, dict) else {}
+            schedule["enabled"] = bool(enabled)
+            schedule["resolver"] = str(resolver or "").strip()
+            schedule["fixed_parameters"] = dict(fixed_parameters)
+            schedule.pop("last_resolution", None)
+            if next_run_at is not None:
+                schedule["next_run_at"] = str(next_run_at).strip()
+            if note is not None:
+                schedule["note"] = str(note).strip()
+            unit["schedule"] = self._normalize_unit_schedule(schedule)
+            self._backfill_unit_schedule_timing(state, unit)
+            triggers = dict(unit.get("activation_triggers") or {})
+            triggers["scheduled"] = bool(enabled)
+            unit["activation_triggers"] = self._normalize_unit_activation_triggers(
+                triggers,
+                schedule=unit["schedule"],
+            )
+            unit["updated_at"] = utc_now()
+            self.save(state)
+            return dict(unit)
+
+    def _backfill_unit_schedule_timing(self, state: dict[str, Any], unit: dict[str, Any]) -> None:
+        schedule = unit.get("schedule")
+        if not isinstance(schedule, dict) or schedule.get("resolver") != "next_interval_boundary":
+            return
+        fixed_parameters = schedule.get("fixed_parameters")
+        if not isinstance(fixed_parameters, dict):
+            return
+        interval_seconds = int(fixed_parameters.get("interval_seconds") or 0)
+        next_run_at = str(schedule.get("next_run_at") or "").strip()
+        session_id = str(schedule.get("next_run_set_by_session_id") or "").strip()
+        session = state.get("sessions", {}).get(session_id)
+        if interval_seconds < 1 or not next_run_at or not session:
+            return
+        timing = session.setdefault("schedule_timing", {})
+        if timing.get("scheduled_for"):
+            return
+        previous_boundary = self._parse_utc(next_run_at).timestamp() - interval_seconds
+        timing["scheduled_for"] = datetime.fromtimestamp(previous_boundary, UTC).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+
+    def _unit_launch_identity(
+        self,
+        state: dict[str, Any],
+        *,
+        unit: dict[str, Any],
+        fallback_parent_session_id: str,
+        fallback_created_by: str,
+    ) -> tuple[str, str]:
+        owner_account = str(unit.get("owner_account") or "").strip()
+        account = state.get("accounts", {}).get(owner_account)
+        if not account:
+            return fallback_parent_session_id, fallback_created_by
+        home_session_id = str(account.get("home_session_id") or "").strip()
+        if home_session_id not in state.get("sessions", {}):
+            raise StoreError(f"owner account has no home session: {owner_account}")
+        return home_session_id, owner_account
 
     def run_scheduled_units(
         self,
@@ -177,26 +258,37 @@ class SessionGoalMixin:
             unit_id = str(unit.get("unit_id") or "")
             if not unit_id:
                 continue
+            unit_parent_session_id, unit_created_by = self._unit_launch_identity(
+                state,
+                unit=unit,
+                fallback_parent_session_id=parent_session_id,
+                fallback_created_by=created_by,
+            )
             session_id = self._scheduled_session_id(state, unit_id=unit_id, now_text=now_text)
+            scheduled_for = str(unit.get("schedule", {}).get("next_run_at") or "")
             label = str(unit.get("display_name") or unit_id).strip()
             goal_body = str(unit.get("goal_text") or label).strip()
             payload = self._start_goal_session_in_state(
                 state,
                 session_id=session_id,
                 unit_id=unit_id,
-                parent_session_ids=[parent_session_id],
+                parent_session_ids=[unit_parent_session_id],
                 label=label,
                 body=goal_body,
-                created_by=created_by,
+                created_by=unit_created_by,
                 created_at=now_text,
                 activation_trigger="scheduled",
             )
+            state["sessions"][session_id]["schedule_timing"] = {
+                "scheduled_for": scheduled_for,
+            }
+            payload["session"] = dict(state["sessions"][session_id])
             initial_prompt = str(unit.get("initial_prompt") or "").strip()
             if initial_prompt:
                 message = self._append_session_message_locked(
                     state,
                     session_id=session_id,
-                    from_endpoint=account_endpoint(created_by),
+                    from_endpoint=account_endpoint(unit_created_by),
                     to_endpoint=session_endpoint(session_id),
                     payload={
                         "body": initial_prompt,
@@ -211,7 +303,7 @@ class SessionGoalMixin:
                     goal,
                     "incomplete",
                     reason=f"Scheduled Unit initial prompt {message['message_id']} requires Session processing.",
-                    actor=created_by,
+                    actor=unit_created_by,
                     priority=DISPATCH_PRIORITY_USER_INPUT,
                     trigger_message_id=message["message_id"],
                 )
@@ -253,6 +345,12 @@ class SessionGoalMixin:
             unit_id = str(unit.get("unit_id") or "")
             if not unit_id:
                 continue
+            unit_parent_session_id, unit_created_by = self._unit_launch_identity(
+                state,
+                unit=unit,
+                fallback_parent_session_id=parent_session_id,
+                fallback_created_by=created_by,
+            )
             session_id = self._triggered_session_id(state, unit_id=unit_id, trigger="startup", now_text=now_text)
             label = str(unit.get("display_name") or unit_id).strip()
             goal_body = str(unit.get("goal_text") or label).strip()
@@ -260,10 +358,10 @@ class SessionGoalMixin:
                 state,
                 session_id=session_id,
                 unit_id=unit_id,
-                parent_session_ids=[parent_session_id],
+                parent_session_ids=[unit_parent_session_id],
                 label=label,
                 body=goal_body,
-                created_by=created_by,
+                created_by=unit_created_by,
                 created_at=now_text,
                 activation_trigger="startup",
             )
@@ -272,7 +370,7 @@ class SessionGoalMixin:
                 message = self._append_session_message_locked(
                     state,
                     session_id=payload["session"]["session_id"],
-                    from_endpoint=account_endpoint(created_by),
+                    from_endpoint=account_endpoint(unit_created_by),
                     to_endpoint=session_endpoint(payload["session"]["session_id"]),
                     payload={
                         "body": initial_prompt,
@@ -287,7 +385,7 @@ class SessionGoalMixin:
                     goal,
                     "incomplete",
                     reason=f"Startup Unit initial prompt {message['message_id']} requires Session processing.",
-                    actor=created_by,
+                    actor=unit_created_by,
                     priority=DISPATCH_PRIORITY_USER_INPUT,
                     trigger_message_id=message["message_id"],
                 )
@@ -599,16 +697,23 @@ class SessionGoalMixin:
         if not schedule:
             return {}
         enabled = bool(schedule.get("enabled"))
-        kind = str(schedule.get("kind") or "next-run").strip()
-        if kind not in {"next-run", "interval"}:
-            raise StoreError(f"unsupported unit schedule kind: {kind}")
         next_run_at = str(schedule.get("next_run_at") or "").strip()
+        resolver = str(schedule.get("resolver") or "explicit").strip()
+        fixed_parameters = schedule.get("fixed_parameters")
+        if not isinstance(fixed_parameters, dict):
+            fixed_parameters = {}
+        if schedule.get("every_hours") and resolver == "explicit":
+            resolver = "next_interval_boundary"
+            fixed_parameters = {
+                "interval_seconds": int(schedule.get("every_hours") or 0) * 3600,
+                "anchor": "scheduled_for",
+            }
         normalized = {
             "enabled": enabled,
-            "kind": "next-run",
             "next_run_at": next_run_at,
-            "timezone": str(schedule.get("timezone") or "UTC").strip() or "UTC",
             "note": str(schedule.get("note") or "").strip(),
+            "resolver": resolver,
+            "fixed_parameters": dict(fixed_parameters),
         }
         for key in (
             "last_run_at",
@@ -617,13 +722,18 @@ class SessionGoalMixin:
             "next_run_set_by_session_id",
             "next_run_set_by_run_id",
             "next_run_set_at",
+            "last_resolution",
         ):
             if key in schedule:
                 normalized[key] = schedule[key]
-        if schedule.get("every_hours"):
-            normalized["legacy_every_hours"] = int(schedule.get("every_hours") or 0)
         if enabled and normalized["next_run_at"]:
             self._parse_utc(normalized["next_run_at"])
+        try:
+            if resolver not in {"explicit", "next_interval_boundary"}:
+                resolve_next_run_at(resolver, {}, {})
+        except ScheduleResolverError as exc:
+            if "unknown schedule resolver" in str(exc):
+                raise StoreError(str(exc)) from exc
         return normalized
 
     def _normalize_unit_activation_triggers(
@@ -663,8 +773,6 @@ class SessionGoalMixin:
         schedule = unit.get("schedule")
         if not isinstance(schedule, dict) or schedule.get("enabled") is not True:
             return False
-        if str(schedule.get("kind") or "next-run") != "next-run":
-            return False
         next_run_at = str(schedule.get("next_run_at") or "").strip()
         if not next_run_at:
             return False
@@ -686,7 +794,46 @@ class SessionGoalMixin:
         actor: str,
         run_id: str | None = None,
     ) -> dict[str, Any]:
-        state = self.load()
+        return self.schedule_next_unit_run_from_session(
+            session_id,
+            call_parameters={"next_run_at": next_run_at, "note": note},
+            actor=actor,
+            run_id=run_id,
+        )
+
+    def schedule_next_unit_run_from_session(
+        self,
+        session_id: str,
+        *,
+        call_parameters: dict[str, Any],
+        actor: str,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._state_lock():
+            state = self.load()
+            result = self._schedule_next_unit_run_locked(
+                state,
+                session_id=session_id,
+                call_parameters=call_parameters,
+                actor=actor,
+                run_id=run_id,
+                completed_at=utc_now(),
+                completion_is_provisional=True,
+            )
+            self.save(state)
+            return result
+
+    def _schedule_next_unit_run_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        call_parameters: dict[str, Any],
+        actor: str,
+        run_id: str | None,
+        completed_at: str,
+        completion_is_provisional: bool = False,
+    ) -> dict[str, Any]:
         session = state["sessions"].get(session_id)
         if not session:
             raise StoreError(f"unknown session: {session_id}")
@@ -701,17 +848,37 @@ class SessionGoalMixin:
         schedule = unit.get("schedule")
         if not isinstance(schedule, dict) or schedule.get("enabled") is not True:
             raise StoreError(f"unit is not scheduled: {unit_id}")
-        parsed_next = self._parse_utc(next_run_at)
-        now = datetime.now(UTC).replace(microsecond=0)
-        if parsed_next <= now:
+        runtime_parameters = self._schedule_runtime_parameters(
+            state,
+            session=session,
+            completed_at=completed_at,
+            call_parameters=call_parameters,
+            completion_is_provisional=completion_is_provisional,
+        )
+        resolver = str(schedule.get("resolver") or "explicit")
+        fixed_parameters = schedule.get("fixed_parameters")
+        if not isinstance(fixed_parameters, dict):
+            fixed_parameters = {}
+        try:
+            normalized_next = resolve_next_run_at(resolver, fixed_parameters, runtime_parameters)
+        except ScheduleResolverError as exc:
+            raise StoreError(str(exc)) from exc
+        parsed_next = self._parse_utc(normalized_next)
+        resolved_at = utc_now()
+        comparison_time = self._parse_utc(completed_at or resolved_at)
+        if parsed_next <= comparison_time:
             raise StoreError("next_run_at must be in the future")
-        normalized_next = parsed_next.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        schedule["kind"] = "next-run"
         schedule["next_run_at"] = normalized_next
-        schedule["next_run_note"] = str(note or "").strip()
+        schedule["next_run_note"] = str(call_parameters.get("note") or "").strip()
         schedule["next_run_set_by_session_id"] = session_id
         schedule["next_run_set_by_run_id"] = str(run_id or "")
-        schedule["next_run_set_at"] = utc_now()
+        schedule["next_run_set_at"] = resolved_at
+        schedule["last_resolution"] = {
+            "resolver": resolver,
+            "unit_parameters": dict(fixed_parameters),
+            "runtime_parameters": dict(runtime_parameters),
+            "next_run_at": normalized_next,
+        }
         schedule.pop("next_run_required_by_session_id", None)
         unit["updated_at"] = schedule["next_run_set_at"]
         message = self._append_session_message_locked(
@@ -724,13 +891,47 @@ class SessionGoalMixin:
                 "schedule_update": True,
                 "unit_id": unit_id,
                 "next_run_at": normalized_next,
-                "note": str(note or "").strip(),
+                "note": str(call_parameters.get("note") or "").strip(),
+                "resolver": resolver,
+                "unit_parameters": dict(fixed_parameters),
+                "runtime_parameters": dict(runtime_parameters),
                 "run_id": str(run_id or ""),
             },
             created_at=schedule["next_run_set_at"],
         )
-        self.save(state)
-        return {"unit": dict(unit), "message": dict(message)}
+        return {"unit": dict(unit), "message": dict(message), "resolution": dict(schedule["last_resolution"])}
+
+    def _schedule_runtime_parameters(
+        self,
+        state: dict[str, Any],
+        *,
+        session: dict[str, Any],
+        completed_at: str,
+        call_parameters: dict[str, Any],
+        completion_is_provisional: bool,
+    ) -> dict[str, Any]:
+        session_id = str(session.get("session_id") or "")
+        timing = session.get("schedule_timing")
+        if not isinstance(timing, dict):
+            timing = {}
+        started_at = str(timing.get("started_at") or "")
+        if not started_at:
+            run_starts = sorted(
+                str(run.get("lease_acquired_at") or "")
+                for run in state.setdefault("dispatch_runs", {}).values()
+                if run.get("session_id") == session_id and run.get("lease_acquired_at")
+            )
+            started_at = run_starts[0] if run_starts else ""
+        return {
+            "session_id": session_id,
+            "unit_id": str(session.get("unit_id") or ""),
+            "scheduled_for": str(timing.get("scheduled_for") or ""),
+            "queued_at": str(timing.get("queued_at") or ""),
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "completion_is_provisional": completion_is_provisional,
+            "call_parameters": dict(call_parameters),
+        }
 
     def _scheduled_session_id(self, state: dict[str, Any], *, unit_id: str, now_text: str) -> str:
         return self._triggered_session_id(state, unit_id=unit_id, trigger="scheduled", now_text=now_text)
@@ -805,10 +1006,11 @@ class SessionGoalMixin:
         enqueue_on_incomplete: bool = False,
         available_after: str | None = None,
         trigger_message_id: str | None = None,
+        occurred_at: str | None = None,
     ) -> dict[str, Any]:
         if completion_state not in {"complete", "incomplete"}:
             raise StoreError(f"unsupported goal completion state: {completion_state}")
-        now = utc_now()
+        now = occurred_at or utc_now()
         previous_state = str(goal.get("completion_state") or "incomplete")
         goal["completion_state"] = completion_state
         goal["completion_reason"] = reason
@@ -853,9 +1055,12 @@ class SessionGoalMixin:
         reason: str,
         actor: str,
         run_id: str | None,
+        schedule_parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
             raise StoreError("only GoalManager may set a SessionGoal completion state")
+        if completion_state not in {"complete", "incomplete"}:
+            raise StoreError(f"unsupported goal completion state: {completion_state}")
         if not run_id:
             raise StoreError("GoalManager completion state requires an active dispatch run")
         with self._state_lock():
@@ -872,40 +1077,17 @@ class SessionGoalMixin:
             goal = self._current_goal_for_session(state, session_id)
             if not goal or str(goal.get("goal_id") or "") != str(run.get("goal_id") or ""):
                 raise StoreError("dispatch run no longer owns the current SessionGoal")
-            if completion_state == "complete":
-                blocker = self._scheduled_unit_completion_blocker(
-                    state,
-                    session=state["sessions"][session_id],
-                    completed_at=utc_now(),
-                )
-                if blocker:
-                    self._log_system_signal(
-                        state,
-                        session_id,
-                        signal_type="GoalCompletionRejected",
-                        body=blocker,
-                        target_roles=[GOAL_MANAGER_ROLE],
-                        actor="scheduler",
-                        run_id=run_id,
-                        data={
-                            "goal_id": goal["goal_id"],
-                            "unit_id": str(state["sessions"][session_id].get("unit_id") or ""),
-                            "rejected_completion_state": "complete",
-                        },
-                    )
-                    self.save(state)
-                    raise StoreError(blocker)
-            transition = self._set_goal_completion_state(
-                state,
-                goal,
-                completion_state,
-                reason=str(reason or "").strip() or "GoalManager recorded a completion decision.",
-                actor=GOAL_MANAGER_ROLE,
-                run_id=run_id,
-                enqueue_on_incomplete=False,
-            )
+            if isinstance(run.get("declared_outcome"), dict):
+                raise StoreError("GoalManager dispatch run already declared its completion outcome")
+            declaration = {
+                "completion_state": completion_state,
+                "reason": str(reason or "").strip() or "GoalManager recorded a completion decision.",
+                "schedule_parameters": dict(schedule_parameters or {}),
+                "declared_at": utc_now(),
+            }
+            run["declared_outcome"] = declaration
             self.save(state)
-            return transition
+            return dict(declaration)
 
     def _current_goal_for_session(self, state: dict[str, Any], session_id: str) -> dict[str, Any] | None:
         session_goals = sorted(

@@ -73,6 +73,46 @@ def wait_for_goal_state(state_root: Path, session_id: str, expected_state: str, 
 
 
 class CliTests(unittest.TestCase):
+    def test_schedule_resolver_combines_unit_and_runtime_parameters(self) -> None:
+        from schedule_resolvers import resolve_next_run_at
+
+        next_run_at = resolve_next_run_at(
+            "next_interval_boundary",
+            {"interval_seconds": 21600, "anchor": "scheduled_for"},
+            {
+                "scheduled_for": "2026-08-08T06:00:00Z",
+                "queued_at": "2026-08-08T06:01:00Z",
+                "started_at": "2026-08-08T06:12:00Z",
+                "completed_at": "2026-08-08T06:30:00Z",
+                "call_parameters": {},
+            },
+        )
+
+        self.assertEqual(next_run_at, "2026-08-08T12:00:00Z")
+
+    def test_existing_unit_schedule_can_be_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            self.assertEqual(run_cli(state_root, "create-unit", "monitor").returncode, 0)
+
+            configured = run_cli(
+                state_root,
+                "configure-unit-schedule",
+                "monitor",
+                "next_interval_boundary",
+                "--fixed-parameters",
+                '{"interval_seconds":21600,"anchor":"scheduled_for"}',
+                "--next-run-at",
+                "2099-01-01T00:00:00Z",
+            )
+
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            unit = json.loads(configured.stdout)
+            self.assertEqual(unit["schedule"]["resolver"], "next_interval_boundary")
+            self.assertEqual(unit["schedule"]["fixed_parameters"]["interval_seconds"], 21600)
+            self.assertTrue(unit["activation_triggers"]["scheduled"])
+
     def test_agent_allocation_counts_follow_current_dispatch_phase(self) -> None:
         from cli_render import agent_allocations_by_session, agent_pool_snapshot
         from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
@@ -166,7 +206,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(file_message["payload"]["files"][0]["content"], "payload body\n")
 
             status = json.loads(run_cli(state_root, "status").stdout)
-            self.assertEqual(status["unit_count"], 2)
+            self.assertEqual(status["unit_count"], 3)
             self.assertEqual(status["session_count"], 3)
             self.assertEqual(status["active_session_count"], 3)
             self.assertEqual(status["inactive_session_count"], 0)
@@ -190,17 +230,19 @@ class CliTests(unittest.TestCase):
             self.assertIn("root", session_ids)
 
             units = json.loads(run_cli(state_root, "units").stdout)
-            self.assertEqual(units[0]["unit_id"], "entrance")
-            self.assertEqual(units[1]["unit_id"], "root")
+            self.assertIn("entrance", [unit["unit_id"] for unit in units])
+            self.assertIn("root", [unit["unit_id"] for unit in units])
 
-            children = json.loads(run_cli(state_root, "children", "root").stdout)
+            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            children = json.loads(run_cli(state_root, "children", root_account["home_session_id"]).stdout)
             child_session_ids = [child["child_session_id"] for child in children]
             self.assertIn("entrance-main", child_session_ids)
 
             accounts = json.loads(run_cli(state_root, "accounts").stdout)
             self.assertEqual(accounts[0]["username"], "root")
             self.assertEqual(accounts[0]["roles"], ["root", "admin"])
-            self.assertTrue(accounts[0]["home_session_id"].startswith("account-root-"))
+            self.assertEqual(accounts[0]["home_session_id"], "account-root")
+            self.assertEqual(accounts[0]["home_unit_id"], accounts[0]["home_session_id"])
             self.assertNotIn("password_hash", accounts[0])
             self.assertNotIn("salt", accounts[0])
 
@@ -208,6 +250,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(auth.returncode, 0, auth.stderr)
             self.assertEqual(json.loads(auth.stdout)["username"], "root")
             self.assertEqual(json.loads(auth.stdout)["home_session_id"], accounts[0]["home_session_id"])
+            self.assertEqual(json.loads(auth.stdout)["home_unit_id"], accounts[0]["home_unit_id"])
 
             failed_auth = run_cli(state_root, "auth", "root", "wrong")
             self.assertEqual(failed_auth.returncode, 2)
@@ -222,10 +265,21 @@ class CliTests(unittest.TestCase):
             self.assertEqual(created.returncode, 0, created.stderr)
             account = json.loads(created.stdout)
             home_session_id = account["home_session_id"]
-            self.assertTrue(home_session_id.startswith("account-alice-"))
+            self.assertEqual(home_session_id, "account-alice")
+            home_unit_id = account["home_unit_id"]
 
             root_children = json.loads(run_cli(state_root, "children", "root").stdout)
             self.assertIn(home_session_id, [child["child_session_id"] for child in root_children])
+            units = json.loads(run_cli(state_root, "units").stdout)
+            home_unit = next(unit for unit in units if unit["unit_id"] == home_unit_id)
+            self.assertEqual(home_unit["instance_policy"], "singleton")
+            self.assertEqual(home_unit["singleton_session_id"], home_session_id)
+            home_session = next(
+                session for session in json.loads(run_cli(state_root, "sessions").stdout)
+                if session["session_id"] == home_session_id
+            )
+            self.assertTrue(home_session["singleton"])
+            self.assertEqual(home_session["unit_id"], home_unit_id)
 
             session = run_cli(state_root, "create-session", "alice-notes", "--created-by", "alice")
             self.assertEqual(session.returncode, 0, session.stderr)
@@ -262,8 +316,6 @@ class CliTests(unittest.TestCase):
                 "Inspect system state and report findings.",
                 "--initial-prompt",
                 "Run diagnostics now.",
-                "--schedule-every-hours",
-                "1",
                 "--schedule-next-run-at",
                 "2026-06-22T00:00:00Z",
             )
@@ -271,8 +323,8 @@ class CliTests(unittest.TestCase):
             unit = json.loads(created.stdout)
             self.assertEqual(unit["goal_text"], "Inspect system state and report findings.")
             self.assertEqual(unit["initial_prompt"], "Run diagnostics now.")
-            self.assertEqual(unit["schedule"]["legacy_every_hours"], 1)
-            self.assertEqual(unit["schedule"]["kind"], "next-run")
+            self.assertEqual(unit["schedule"]["resolver"], "explicit")
+            self.assertEqual(unit["schedule"]["fixed_parameters"], {})
             self.assertEqual(unit["schedule"]["next_run_at"], "2026-06-22T00:00:00Z")
 
             started = run_cli(
@@ -285,9 +337,17 @@ class CliTests(unittest.TestCase):
             payload = json.loads(started.stdout)
             self.assertEqual(len(payload), 1)
             self.assertEqual(payload[0]["session"]["unit_id"], "monitor")
+            self.assertEqual(payload[0]["session"]["schedule_timing"]["scheduled_for"], "2026-06-22T00:00:00Z")
+            self.assertNotIn("queued_at", payload[0]["session"]["schedule_timing"])
             self.assertEqual(payload[0]["goal"]["body"], "Inspect system state and report findings.")
             self.assertEqual(payload[0]["initial_message"]["payload"]["body"], "Run diagnostics now.")
             self.assertTrue(payload[0]["initial_message"]["payload"]["user_input"])
+            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            parents = json.loads(run_cli(state_root, "parents", payload[0]["session"]["session_id"]).stdout)
+            self.assertEqual(
+                [parent["parent_session_id"] for parent in parents],
+                [root_account["home_session_id"]],
+            )
 
             messages = json.loads(
                 run_cli(
@@ -515,10 +575,33 @@ class CliTests(unittest.TestCase):
     def test_scheduled_unit_completion_requires_future_next_run_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            codex_path = bin_dir / "codex"
+            codex_path.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import os",
+                        "from agent_api import set_goal_completion_state",
+                        "next_run_at = os.environ.get('AIZE_TEST_NEXT_RUN_AT', '')",
+                        "parameters = {'next_run_at': next_run_at, 'note': 'next explicit run'} if next_run_at else {}",
+                        "set_goal_completion_state('complete', 'scheduled work is done', schedule_parameters=parameters)",
+                        "print('completion declared')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            codex_path.chmod(0o755)
+            env = {
+                "PYTHONPATH": str(ROOT / "src"),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
 
-            self.assertEqual(run_cli(state_root, "init").returncode, 0)
-            created = run_cli(
+            self.assertEqual(run_cli_with_env(state_root, env, "init").returncode, 0)
+            created = run_cli_with_env(
                 state_root,
+                env,
                 "create-unit",
                 "monitor",
                 "--goal-text",
@@ -530,37 +613,22 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(created.returncode, 0, created.stderr)
             started = json.loads(
-                run_cli(
+                run_cli_with_env(
                     state_root,
+                    env,
                     "run-scheduled-units",
                     "--now",
                     "2026-06-22T00:00:00Z",
                 ).stdout
             )
             session_id = started[0]["session"]["session_id"]
-            from store import Store
-            from store_defs import StoreError
+            rejected = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
+            self.assertEqual(rejected["goal"]["completion_state"], "incomplete")
+            self.assertEqual(rejected["run"]["goal_manager_status"], "schedule_next_run_required")
 
-            store = Store(state_root)
-            state = store.load()
-            goal_id = started[0]["goal"]["goal_id"]
-            state["dispatch_runs"]["run-test"] = {
-                "run_id": "run-test",
-                "goal_id": goal_id,
-                "session_id": session_id,
-                "role": "GoalManager",
-                "lease_state": "acquired",
-            }
-            store.save(state)
-            with self.assertRaises(StoreError):
-                store.set_goal_completion_state_from_runtime(
-                    session_id,
-                    completion_state="complete",
-                    reason="scheduled work is done",
-                    actor="GoalManager",
-                    run_id="run-test",
-                )
-            state = store.load()
+            from store import Store
+
+            state = Store(state_root).load()
             signals = [
                 entry.get("event")
                 for entry in state["session_logs"][session_id]
@@ -570,21 +638,20 @@ class CliTests(unittest.TestCase):
             rejection = next(signal for signal in signals if signal.get("signal_type") == "GoalCompletionRejected")
             self.assertEqual(rejection["target_roles"], ["GoalManager"])
             self.assertIn("next_run_at", rejection["body"])
-            store.set_next_unit_run_at_from_session(
-                session_id,
-                next_run_at="2099-06-22T00:00:00Z",
-                note="next explicit run",
-                actor="GoalManager",
-                run_id="run-test",
+            completing_env = {**env, "AIZE_TEST_NEXT_RUN_AT": "2099-06-22T00:00:00Z"}
+            completed = json.loads(run_cli_with_env(state_root, completing_env, "dispatch-once").stdout)
+            self.assertEqual(completed["goal"]["completion_state"], "complete")
+            state = Store(state_root).load()
+            schedule = state["units"]["monitor"]["schedule"]
+            self.assertEqual(schedule["last_resolution"]["resolver"], "explicit")
+            self.assertEqual(
+                schedule["last_resolution"]["runtime_parameters"]["call_parameters"]["next_run_at"],
+                "2099-06-22T00:00:00Z",
             )
-            completed = store.set_goal_completion_state_from_runtime(
-                session_id,
-                completion_state="complete",
-                reason="scheduled work is done",
-                actor="GoalManager",
-                run_id="run-test",
+            self.assertEqual(
+                state["sessions"][session_id]["schedule_timing"]["completed_at"],
+                completed["state_transition"]["created_at"],
             )
-            self.assertEqual(completed["completion_state"], "complete")
 
     def test_runtime_recovery_signal_targets_interrupted_roles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -909,13 +976,15 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(graph["edges"]), 4)
 
             parents = json.loads(run_cli(state_root, "parents", "task").stdout)
-            self.assertEqual([parent["parent_session_id"] for parent in parents], ["dev", "root"])
+            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            self.assertEqual(
+                [parent["parent_session_id"] for parent in parents],
+                [root_account["home_session_id"], "dev"],
+            )
 
             children = json.loads(run_cli(state_root, "children", "root").stdout)
             root_children = [child["child_session_id"] for child in children]
-            self.assertIn("dev", root_children)
-            self.assertIn("task", root_children)
-            self.assertTrue(any(child.startswith("account-root-") for child in root_children))
+            self.assertEqual(root_children, [root_account["home_session_id"]])
 
             cycle = run_cli(state_root, "link-session", "task", "root")
             self.assertEqual(cycle.returncode, 2)
@@ -998,7 +1067,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(user_message["to"], "session:build-cli")
             self.assertTrue(user_message["payload"]["user_input"])
 
-            children = json.loads(run_cli(state_root, "children", "root").stdout)
+            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            children = json.loads(run_cli(state_root, "children", root_account["home_session_id"]).stdout)
             self.assertIn("build-cli", [child["child_session_id"] for child in children])
 
             dispatched = run_cli(state_root, "dispatch-once")
@@ -1137,13 +1207,15 @@ class CliTests(unittest.TestCase):
                 transition = set_goal_completion_state("incomplete", "delegate the work")
                 self.assertEqual(transition["completion_state"], "incomplete")
                 session_log = store.session_log("api-session", limit=0)
-                self.assertTrue(
+                self.assertFalse(
                     any(
                         entry.get("kind") == "GoalStateChanged"
                         and entry.get("event", {}).get("run_id") == "run-test"
                         for entry in session_log
                     )
                 )
+                declared_run = store.load()["dispatch_runs"]["run-test"]
+                self.assertEqual(declared_run["declared_outcome"]["completion_state"], "incomplete")
 
                 os.environ["AIZE_AGENT_ROLE"] = "WorkerAgent"
                 session_message = send_session_message("session note through API")
@@ -1697,6 +1769,8 @@ class CliTests(unittest.TestCase):
             dispatched = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
             self.assertEqual(dispatched["goal"]["completion_state"], "incomplete")
             self.assertEqual(dispatched["run"]["goal_manager_status"], "missing_completion_decision")
+            self.assertFalse(dispatched["run"]["outcome"]["valid"])
+            self.assertEqual(dispatched["run"]["outcome"]["required_output"], "goal_completion_state")
             log = json.loads(run_cli_with_env(state_root, env, "session-log", "stdout-only", "--limit", "0").stdout)
             self.assertFalse(
                 any(
@@ -1704,6 +1778,20 @@ class CliTests(unittest.TestCase):
                     and entry.get("event", {}).get("run_id") == dispatched["run"]["run_id"]
                     and entry.get("event", {}).get("actor") == "agent:GoalManager"
                     for entry in log
+                )
+            )
+            self.assertTrue(
+                any(
+                    entry.get("kind") == "SystemSignal"
+                    and entry.get("event", {}).get("signal_type") == "GoalManagerTurnProtocolViolation"
+                    for entry in log
+                )
+            )
+            requests = json.loads(run_cli_with_env(state_root, env, "dispatch-requests", "stdout-only").stdout)
+            self.assertTrue(
+                any(
+                    request.get("status") == "queued" and request.get("role") == "GoalManager"
+                    for request in requests
                 )
             )
 
@@ -1861,6 +1949,76 @@ class CliTests(unittest.TestCase):
             messages = json.loads(run_cli_with_env(state_root, env, "messages", "cycle-session", "--limit", "0").stdout)
             self.assertTrue(any(message.get("payload", {}).get("implicit_worker_request") for message in messages))
             self.assertTrue(any("WorkerAgent finished delegated work" in message.get("payload", {}).get("body", "") for message in messages))
+
+    def test_worker_stdout_without_session_report_returns_control_to_goal_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            codex_path = bin_dir / "codex"
+            codex_path.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import os",
+                        "if os.environ.get('AIZE_AGENT_ROLE') == 'GoalManager':",
+                        "    from agent_api import set_goal_completion_state",
+                        "    set_goal_completion_state('incomplete', 'delegate work')",
+                        "    print('decision recorded')",
+                        "else:",
+                        "    print('worker stdout is not a Session report')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            codex_path.chmod(0o755)
+            env = {
+                "PYTHONPATH": str(ROOT / "src"),
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
+
+            self.assertEqual(run_cli_with_env(state_root, env, "init").returncode, 0)
+            self.assertEqual(
+                run_cli_with_env(
+                    state_root,
+                    env,
+                    "start-goal",
+                    "missing-worker-report",
+                    "--label",
+                    "Missing worker report",
+                    "--created-by",
+                    "root",
+                ).returncode,
+                0,
+            )
+            first = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
+            self.assertEqual(first["run"]["role"], "GoalManager")
+            self.assertTrue(first["run"]["outcome"]["valid"])
+
+            second = json.loads(run_cli_with_env(state_root, env, "dispatch-once").stdout)
+            self.assertEqual(second["run"]["role"], "WorkerAgent")
+            self.assertFalse(second["run"]["outcome"]["valid"])
+            self.assertEqual(second["run"]["outcome"]["required_output"], "session_message")
+
+            log = json.loads(
+                run_cli_with_env(state_root, env, "session-log", "missing-worker-report", "--limit", "0").stdout
+            )
+            self.assertTrue(
+                any(
+                    entry.get("kind") == "SystemSignal"
+                    and entry.get("event", {}).get("signal_type") == "WorkerTurnProtocolViolation"
+                    for entry in log
+                )
+            )
+            requests = json.loads(
+                run_cli_with_env(state_root, env, "dispatch-requests", "missing-worker-report").stdout
+            )
+            self.assertTrue(
+                any(
+                    request.get("status") == "queued" and request.get("role") == "GoalManager"
+                    for request in requests
+                )
+            )
 
     def test_goal_manager_review_prompt_includes_session_message_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2289,7 +2447,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("session: child-session unit=none", result.stdout)
             self.assertIn("hello from console", result.stdout)
             self.assertIn("account:root -> session:root", result.stdout)
-            self.assertIn("dispatch queued in background", result.stdout)
+            self.assertNotIn("dispatch queued in background", result.stdout)
             self.assertIn("goal: child body [incomplete]", result.stdout)
             self.assertIn("No messages.", result.stdout)
             self.assertNotIn("agent:GoalManager -> agent:WorkerAgent", result.stdout)
@@ -2326,13 +2484,13 @@ class CliTests(unittest.TestCase):
                 "root",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("current session: account-root-", result.stdout)
-            self.assertIn("Session account-root-", result.stdout)
+            self.assertIn("current session: account-root", result.stdout)
+            self.assertIn("Session account-root", result.stdout)
             self.assertIn("session: home-child unit=none", result.stdout)
-            self.assertIn("root -> account-root-", result.stdout)
-            self.assertIn("account-root-dc76e9f0 -> home-child", result.stdout)
+            self.assertIn("root -> account-root", result.stdout)
+            self.assertIn("account-root -> home-child", result.stdout)
 
-    def test_console_send_dispatches_current_session_before_other_queued_sessions(self) -> None:
+    def test_console_send_queues_current_session_without_starting_a_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
 
@@ -2381,12 +2539,9 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("session: time", result.stdout)
-            self.assertIn("dispatch queued in background", result.stdout)
-
-            time_goal = wait_for_goal_state(state_root, "time", "incomplete")
-            other_goal = wait_for_goal_state(state_root, "other", "incomplete")
-            self.assertEqual(time_goal["completion_state"], "incomplete")
-            self.assertEqual(other_goal["completion_state"], "incomplete")
+            self.assertNotIn("dispatch queued in background", result.stdout)
+            requests = json.loads(run_cli(state_root, "dispatch-requests", "time").stdout)
+            self.assertTrue(any(request["status"] == "queued" for request in requests))
 
     def test_console_update_goal_uses_body_without_title(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2419,7 +2574,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(goals[0]["body"], "reply to the user without a separate title")
             self.assertEqual(goals[0]["completion_state"], "incomplete")
 
-    def test_console_startup_dispatches_queued_active_incomplete_sessions(self) -> None:
+    def test_console_startup_does_not_start_a_dispatch_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
 
@@ -2447,12 +2602,9 @@ class CliTests(unittest.TestCase):
                 "root",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("startup dispatch worker queued", result.stdout)
-
-            goal = wait_for_goal_state(state_root, "resume-me", "incomplete")
-            self.assertEqual(goal["completion_state"], "incomplete")
+            self.assertNotIn("startup dispatch worker queued", result.stdout)
             runs = json.loads(run_cli(state_root, "dispatch-runs", "resume-me").stdout)
-            self.assertTrue(any("CLI console started or restarted" in run.get("recovery_context", "") for run in runs))
+            self.assertEqual(runs, [])
 
 
 if __name__ == "__main__":

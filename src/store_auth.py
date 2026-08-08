@@ -42,6 +42,7 @@ class AuthMixin:
             "roles": list(account.get("roles", [])),
             "created_at": account["created_at"],
             "status": account.get("status", "active"),
+            "home_unit_id": account.get("home_unit_id"),
             "home_session_id": account.get("home_session_id"),
         }
 
