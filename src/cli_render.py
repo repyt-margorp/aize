@@ -45,13 +45,10 @@ def console_body(value: Any, *, limit: int = 500) -> str:
             if value.strip()
         )
     if tagged_values:
-        text = tagged_values[-1]
-        if "AIZE_GOAL_REASON:" in text:
-            text = text.split("AIZE_GOAL_REASON:", 1)[1].splitlines()[0].strip()
-        return short_text(text, limit=limit)
+        return short_text(tagged_values[-1], limit=limit)
     for line in output_part.splitlines():
         line = line.strip()
-        if not line or line.startswith("<") or line.startswith("AIZE_GOAL_STATUS:"):
+        if not line or line.startswith("<"):
             continue
         return short_text(line, limit=limit)
     tagged_values = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -51,6 +52,17 @@ DEFAULT_SESSION_CAPABILITIES = {
 
 class StoreError(RuntimeError):
     pass
+
+
+def safe_id_part(value: str, *, fallback: str) -> str:
+    safe_value = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
+    return safe_value.strip("-_") or fallback
+
+
+def account_home_session_id(username: str) -> str:
+    normalized = str(username or "").strip()
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"account-{safe_id_part(normalized, fallback='user')}-{digest}"
 
 
 def session_endpoint(session_id: str) -> str:

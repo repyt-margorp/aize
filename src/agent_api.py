@@ -67,6 +67,17 @@ def send_worker_request(body: str) -> dict[str, Any]:
     return send_message(SESSION_RECIPIENT, body, worker_request=True)
 
 
+def set_goal_completion_state(completion_state: str, reason: str) -> dict[str, Any]:
+    context = runtime_context()
+    return Store(Path(context["state_root"])).set_goal_completion_state_from_runtime(
+        context["session_id"],
+        completion_state=completion_state,
+        reason=reason,
+        actor=context["agent_role"],
+        run_id=context["run_id"] or None,
+    )
+
+
 def set_next_unit_run_at(next_run_at: str, *, note: str = "") -> dict[str, Any]:
     context = runtime_context()
     sender = context["agent_role"]

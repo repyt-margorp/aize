@@ -149,7 +149,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
     login_username = username or input("username: ")
     login_password = password or getpass.getpass("password: ")
     account = store.authenticate(login_username, password=login_password)
-    current_session_id = "root"
+    current_session_id = str(account.get("home_session_id") or "root")
     current_session = {"session_id": current_session_id}
     console_endpoint_id = new_id("console")
     stop_event = threading.Event()
@@ -187,7 +187,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 if command in {"exit", "quit"}:
                     return 0
                 if command == "help":
-                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-requests, dispatch-index, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
+                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-requests, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
                 elif command == "units":
                     print_units(store.units())
                 elif command == "create-unit":
@@ -291,7 +291,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_agent_pool(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs()))
                 elif command == "dispatch-runs":
                     print_dispatch_runs(store.dispatch_runs(current_session_id))
-                elif command in {"dispatch-requests", "dispatch-index"}:
+                elif command == "dispatch-requests":
                     print_dispatch_requests(store.dispatch_requests(current_session_id))
                 elif command == "dispatch":
                     print_dispatch_result(store.dispatch_once())

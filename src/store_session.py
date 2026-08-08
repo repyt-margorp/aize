@@ -193,7 +193,9 @@ class SessionGoalMixin:
             )
             initial_prompt = str(unit.get("initial_prompt") or "").strip()
             if initial_prompt:
-                message = self._message(
+                message = self._append_session_message_locked(
+                    state,
+                    session_id=session_id,
                     from_endpoint=account_endpoint(created_by),
                     to_endpoint=session_endpoint(session_id),
                     payload={
@@ -203,8 +205,6 @@ class SessionGoalMixin:
                     },
                     created_at=now_text,
                 )
-                state["messages"].append(message)
-                self._index_message_for_session(state, message, session_id)
                 goal = state["goals"][payload["goal"]["goal_id"]]
                 self._set_goal_completion_state(
                     state,
@@ -269,7 +269,9 @@ class SessionGoalMixin:
             )
             initial_prompt = str(unit.get("initial_prompt") or "").strip()
             if initial_prompt:
-                message = self._message(
+                message = self._append_session_message_locked(
+                    state,
+                    session_id=payload["session"]["session_id"],
                     from_endpoint=account_endpoint(created_by),
                     to_endpoint=session_endpoint(payload["session"]["session_id"]),
                     payload={
@@ -279,8 +281,6 @@ class SessionGoalMixin:
                     },
                     created_at=now_text,
                 )
-                state["messages"].append(message)
-                self._index_message_for_session(state, message, payload["session"]["session_id"])
                 goal = state["goals"][payload["goal"]["goal_id"]]
                 self._set_goal_completion_state(
                     state,
@@ -714,7 +714,9 @@ class SessionGoalMixin:
         schedule["next_run_set_at"] = utc_now()
         schedule.pop("next_run_required_by_session_id", None)
         unit["updated_at"] = schedule["next_run_set_at"]
-        message = self._message(
+        message = self._append_session_message_locked(
+            state,
+            session_id=session_id,
             from_endpoint=normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session_id),
             to_endpoint=session_endpoint(session_id),
             payload={
@@ -727,9 +729,6 @@ class SessionGoalMixin:
             },
             created_at=schedule["next_run_set_at"],
         )
-        state["messages"].append(message)
-        self._index_message_for_session(state, message, session_id)
-        session["updated_at"] = schedule["next_run_set_at"]
         self.save(state)
         return {"unit": dict(unit), "message": dict(message)}
 
@@ -843,9 +842,70 @@ class SessionGoalMixin:
         }
         if run_id:
             transition["run_id"] = run_id
-        goal.setdefault("state_transitions", []).append(transition)
         self._log_goal_state_transition(state, goal, transition)
         return transition
+
+    def set_goal_completion_state_from_runtime(
+        self,
+        session_id: str,
+        *,
+        completion_state: str,
+        reason: str,
+        actor: str,
+        run_id: str | None,
+    ) -> dict[str, Any]:
+        if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
+            raise StoreError("only GoalManager may set a SessionGoal completion state")
+        if not run_id:
+            raise StoreError("GoalManager completion state requires an active dispatch run")
+        with self._state_lock():
+            state = self.load()
+            run = state.setdefault("dispatch_runs", {}).get(run_id)
+            if not run:
+                raise StoreError(f"unknown dispatch run: {run_id}")
+            if (
+                str(run.get("session_id") or "") != session_id
+                or str(run.get("role") or "") != GOAL_MANAGER_ROLE
+                or run.get("lease_state") != "acquired"
+            ):
+                raise StoreError("GoalManager completion state requires its acquired dispatch lease")
+            goal = self._current_goal_for_session(state, session_id)
+            if not goal or str(goal.get("goal_id") or "") != str(run.get("goal_id") or ""):
+                raise StoreError("dispatch run no longer owns the current SessionGoal")
+            if completion_state == "complete":
+                blocker = self._scheduled_unit_completion_blocker(
+                    state,
+                    session=state["sessions"][session_id],
+                    completed_at=utc_now(),
+                )
+                if blocker:
+                    self._log_system_signal(
+                        state,
+                        session_id,
+                        signal_type="GoalCompletionRejected",
+                        body=blocker,
+                        target_roles=[GOAL_MANAGER_ROLE],
+                        actor="scheduler",
+                        run_id=run_id,
+                        data={
+                            "goal_id": goal["goal_id"],
+                            "unit_id": str(state["sessions"][session_id].get("unit_id") or ""),
+                            "rejected_completion_state": "complete",
+                        },
+                    )
+                    self.save(state)
+                    raise StoreError(blocker)
+            transition = self._set_goal_completion_state(
+                state,
+                goal,
+                completion_state,
+                reason=str(reason or "").strip() or "GoalManager recorded a completion decision.",
+                actor=GOAL_MANAGER_ROLE,
+                run_id=run_id,
+                enqueue_on_incomplete=False,
+            )
+            self.save(state)
+            return transition
 
     def _current_goal_for_session(self, state: dict[str, Any], session_id: str) -> dict[str, Any] | None:
         session_goals = sorted(

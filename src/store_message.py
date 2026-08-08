@@ -29,22 +29,40 @@ class MessageMixin:
             created_at=created_at or utc_now(),
         ).to_dict()
 
-    def _index_message_for_session(self, state: dict[str, Any], message: dict[str, Any], session_id: str) -> bool:
-        if not session_id:
-            return False
-        message_id = str(message.get("message_id") or "")
-        index = state.setdefault("message_index", [])
-        if any(item.get("message_id") == message_id and item.get("session_id") == session_id for item in index):
-            return False
-        index.append(
-            {
-                "message_id": message_id,
-                "session_id": session_id,
-                "created_at": str(message.get("created_at") or utc_now()),
-            }
+    def _append_session_message_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        from_endpoint: str,
+        to_endpoint: str,
+        payload: dict[str, Any],
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        if session_id not in state.setdefault("sessions", {}):
+            raise StoreError(f"unknown session: {session_id}")
+        message = self._message(
+            from_endpoint=from_endpoint,
+            to_endpoint=to_endpoint,
+            payload=dict(payload),
+            created_at=created_at,
         )
+        state.setdefault("messages", []).append(message)
         self._log_message_for_session(state, message, session_id)
-        return True
+        state["sessions"][session_id]["updated_at"] = str(message["created_at"])
+        return message
+
+    def _session_messages(self, state: dict[str, Any], session_id: str) -> list[dict[str, Any]]:
+        message_ids = {
+            str(entry.get("message_id") or "")
+            for entry in state.setdefault("session_logs", {}).setdefault(session_id, [])
+            if entry.get("kind") == "Message"
+        }
+        return [
+            dict(message)
+            for message in state.setdefault("messages", [])
+            if str(message.get("message_id") or "") in message_ids
+        ]
 
     def _messages_after_cursor(self, state: dict[str, Any], endpoint: str) -> list[dict[str, Any]]:
         messages = state.get("messages", [])
@@ -68,7 +86,7 @@ class MessageMixin:
                 return
 
     def _latest_reply_endpoint_for_session(self, state: dict[str, Any], *, session_id: str) -> str:
-        for message in reversed(state.get("messages", [])):
+        for message in reversed(self._session_messages(state, session_id)):
             if str(message.get("to") or "") != session_endpoint(session_id):
                 continue
             payload = message.get("payload")
@@ -89,23 +107,23 @@ class MessageMixin:
         files: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         state = self.load()
-        sessions = state["sessions"]
-        if session_id not in sessions:
+        if session_id not in state["sessions"]:
             raise StoreError(f"unknown session: {session_id}")
         normalized_files = self._normalize_message_files(files)
-        now = utc_now()
         payload: dict[str, Any] = {"body": body}
         if normalized_files:
             payload["files"] = normalized_files
-        message = self._message(
-            from_endpoint=normalize_endpoint(sender, session_id=session_id),
-            to_endpoint=normalize_endpoint(recipient, session_id=session_id),
+        from_endpoint = normalize_endpoint(sender, session_id=session_id)
+        to_endpoint = normalize_endpoint(recipient, session_id=session_id)
+        if from_endpoint.startswith("agent:") or to_endpoint.startswith("agent:"):
+            raise StoreError("generic messages may not use agent endpoints")
+        message = self._append_session_message_locked(
+            state,
+            session_id=session_id,
+            from_endpoint=from_endpoint,
+            to_endpoint=to_endpoint,
             payload=payload,
-            created_at=now,
         )
-        state["messages"].append(message)
-        self._index_message_for_session(state, message, session_id)
-        sessions[session_id]["updated_at"] = now
         self.save(state)
         return message
 
@@ -160,7 +178,6 @@ class MessageMixin:
                 raise StoreError(
                     f"agent runtime recipient is not allowed: {normalized_sender} -> {normalized_recipient}"
                 )
-            now = utc_now()
             payload: dict[str, Any] = {"body": body}
             normalized_files = self._normalize_message_files(files)
             if normalized_files:
@@ -183,15 +200,13 @@ class MessageMixin:
                 to_endpoint = console_endpoint(endpoint)
             else:
                 to_endpoint = normalize_endpoint(normalized_recipient, session_id=session_id)
-            message = self._message(
+            message = self._append_session_message_locked(
+                state,
+                session_id=session_id,
                 from_endpoint=normalize_endpoint(normalized_sender, session_id=session_id),
                 to_endpoint=to_endpoint,
                 payload=payload,
-                created_at=now,
             )
-            state["messages"].append(message)
-            self._index_message_for_session(state, message, session_id)
-            sessions[session_id]["updated_at"] = now
             self.save(state)
             return message
 
@@ -242,14 +257,14 @@ class MessageMixin:
             payload["defer_goal_manager_until_worker_report"] = True
         if normalized_reply_to:
             payload["reply_to"] = normalized_reply_to
-        message = self._message(
+        message = self._append_session_message_locked(
+            state,
+            session_id=session_id,
             from_endpoint=account_endpoint(sender),
             to_endpoint=session_endpoint(session_id),
             payload=payload,
             created_at=now,
         )
-        state["messages"].append(message)
-        self._index_message_for_session(state, message, session_id)
         target_goal = self._mark_session_reprocess_needed(
             state,
             session_id=session_id,
@@ -274,15 +289,14 @@ class MessageMixin:
             }
             if normalized_reply_to:
                 worker_payload["reply_to"] = normalized_reply_to
-            worker_message = self._message(
+            self._append_session_message_locked(
+                state,
+                session_id=session_id,
                 from_endpoint=account_endpoint(sender),
                 to_endpoint=session_endpoint(session_id),
                 payload=worker_payload,
                 created_at=now,
             )
-            state["messages"].append(worker_message)
-            self._index_message_for_session(state, worker_message, session_id)
-        sessions[session_id]["updated_at"] = now
         self.save(state)
         return message
 

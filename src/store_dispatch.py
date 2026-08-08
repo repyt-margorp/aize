@@ -62,6 +62,7 @@ class DispatchMixin:
                     dispatch_messages=lease["dispatch_messages"],
                     dispatch_signals=lease["dispatch_signals"],
                     run_messages=run_messages,
+                    log_window=run,
                     recovery_context=lease.get("recovery_context") or "",
                 )
                 agent_result = runner.run(
@@ -81,8 +82,6 @@ class DispatchMixin:
                 result = {
                     "prompt": prompt,
                     "agent_result": agent_result,
-                    "goal_status": self._extract_goal_manager_status(agent_result.output),
-                    "goal_reason": self._extract_goal_manager_reason(agent_result.output),
                 }
                 with self._state_lock():
                     return self._commit_goal_manager_run_locked(lease, result)
@@ -95,6 +94,7 @@ class DispatchMixin:
                     session_messages=session_messages,
                     dispatch_messages=lease["dispatch_messages"],
                     dispatch_signals=lease["dispatch_signals"],
+                    log_window=run,
                     recovery_context=lease.get("recovery_context") or "",
                 )
                 agent_result = runner.run(
@@ -236,12 +236,43 @@ class DispatchMixin:
         )
 
         completed_at = utc_now()
+        decision = self._goal_state_transition_for_run(
+            state,
+            session_id=session["session_id"],
+            run_id=run["run_id"],
+        )
+        if decision is None:
+            if request_entry:
+                request_entry["status"] = "resolved"
+                request_entry["resolved_at"] = completed_at
+            self._set_role_cursor(
+                state,
+                session_id=session["session_id"],
+                role=GOAL_MANAGER_ROLE,
+                seq=int(run.get("to_log_seq") or 0),
+            )
+            run["completion_state"] = "incomplete"
+            run["goal_manager_status"] = "missing_completion_decision"
+            run["lease_state"] = "released"
+            run["lease_released_at"] = completed_at
+            run.pop("current_phase", None)
+            self._mark_session_messages_delivered(state, lease["session_messages"], delivered_at=completed_at)
+            session["updated_at"] = completed_at
+            self.save(state)
+            return {
+                "goal": dict(goal),
+                "session": dict(session),
+                "unit": dict(lease["unit"]) if lease["unit"] else None,
+                "run": dict(run),
+                "state_transition": None,
+                "message": None,
+            }
         worker_requested = self._has_live_worker_request_for_goal(
             state,
             str(goal.get("goal_id") or ""),
         ) or self._has_worker_request_for_run(state, session_id=session["session_id"], run_id=run["run_id"])
         implicit_worker_message = None
-        if result["goal_status"] == "completed":
+        if decision["completion_state"] == "complete":
             schedule_reason = self._scheduled_unit_completion_blocker(state, session=session, completed_at=completed_at)
             if schedule_reason:
                 self._log_system_signal(
@@ -275,7 +306,7 @@ class DispatchMixin:
                     state,
                     goal,
                     "complete",
-                    reason=result["goal_reason"],
+                    reason=str(decision.get("reason") or ""),
                     actor=GOAL_MANAGER_ROLE,
                     run_id=run["run_id"],
                 )
@@ -285,7 +316,7 @@ class DispatchMixin:
                 state,
                 goal,
                 "incomplete",
-                reason=result["goal_reason"],
+                reason=str(decision.get("reason") or ""),
                 actor=GOAL_MANAGER_ROLE,
                 run_id=run["run_id"],
                 priority=DISPATCH_PRIORITY_RETRY,
@@ -297,8 +328,7 @@ class DispatchMixin:
                     goal=goal,
                     session=session,
                     run=run,
-                    reason=result["goal_reason"],
-                    output=result["agent_result"].output,
+                    reason=str(decision.get("reason") or ""),
                     created_at=completed_at,
                 )
                 worker_requested = True
@@ -309,7 +339,7 @@ class DispatchMixin:
                     resolved_at=completed_at,
                 )
             run["completion_state"] = "incomplete"
-            run["goal_manager_status"] = result["goal_status"]
+            run["goal_manager_status"] = "incomplete"
         if request_entry and (
             run.get("completion_state") == "complete"
             or run.get("goal_manager_status") == "schedule_next_run_required"
@@ -481,16 +511,7 @@ class DispatchMixin:
         }
 
     def _session_messages_for_dispatch(self, state: dict[str, Any], *, session_id: str) -> list[dict[str, Any]]:
-        indexed_ids = {
-            str(item.get("message_id") or "")
-            for item in state.setdefault("message_index", [])
-            if item.get("session_id") == session_id
-        }
-        return [
-            dict(message)
-            for message in state.get("messages", [])
-            if str(message.get("message_id") or "") in indexed_ids
-        ]
+        return self._session_messages(state, session_id)
 
     def _mark_session_messages_delivered(
         self,
@@ -513,16 +534,11 @@ class DispatchMixin:
         run_id: str,
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
-        for message in state.get("messages", []):
+        for message in self._session_messages(state, session_id):
             payload = message.get("payload")
             if not isinstance(payload, dict):
                 continue
             if str(payload.get("run_id") or "") != run_id:
-                continue
-            if not any(
-                item.get("message_id") == message.get("message_id") and item.get("session_id") == session_id
-                for item in state.setdefault("message_index", [])
-            ):
                 continue
             messages.append(dict(message))
         return messages
@@ -548,7 +564,7 @@ class DispatchMixin:
             return messages
         trigger_message_id = str(request_entry.get("trigger_message_id") or "").strip()
         messages: list[dict[str, Any]] = []
-        for message in state.get("messages", []):
+        for message in self._session_messages(state, session_id):
             if trigger_message_id:
                 if str(message.get("message_id") or "") != trigger_message_id:
                     continue
@@ -564,11 +580,6 @@ class DispatchMixin:
                     or message.get("from") == normalize_endpoint(WORKER_AGENT_ROLE, session_id=session_id)
                 ):
                     continue
-            if not any(
-                item.get("message_id") == message.get("message_id") and item.get("session_id") == session_id
-                for item in state.setdefault("message_index", [])
-            ):
-                continue
             messages.append(dict(message))
         return messages
 
@@ -600,11 +611,12 @@ class DispatchMixin:
         session: dict[str, Any],
         run: dict[str, Any],
         reason: str,
-        output: str,
         created_at: str,
     ) -> dict[str, Any]:
-        body = self._implicit_worker_request_body(goal=goal, reason=reason, output=output)
-        message = self._message(
+        body = self._implicit_worker_request_body(goal=goal, reason=reason)
+        return self._append_session_message_locked(
+            state,
+            session_id=session["session_id"],
             from_endpoint=normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session["session_id"]),
             to_endpoint=normalize_endpoint(SESSION_RECIPIENT, session_id=session["session_id"]),
             payload={
@@ -616,21 +628,14 @@ class DispatchMixin:
             },
             created_at=created_at,
         )
-        state["messages"].append(message)
-        self._index_message_for_session(state, message, session["session_id"])
-        return message
 
-    def _implicit_worker_request_body(self, *, goal: dict[str, Any], reason: str, output: str) -> str:
+    def _implicit_worker_request_body(self, *, goal: dict[str, Any], reason: str) -> str:
         normalized_reason = str(reason or "").strip() or "Work toward the incomplete SessionGoal."
-        normalized_output = str(output or "").strip()
-        if len(normalized_output) > 4000:
-            normalized_output = f"{normalized_output[:4000]}\n...[truncated]"
         return "\n\n".join(
             [
                 "GoalManager marked the SessionGoal incomplete. Treat this as WorkerAgent work.",
                 f"SessionGoal:\n{str(goal.get('body') or '').strip()}",
                 f"GoalManager incomplete instruction:\n{normalized_reason}",
-                f"GoalManager output:\n{normalized_output}",
                 "Work toward the SessionGoal, report progress/results to Session, and do not decide goal completion.",
             ]
         )
@@ -644,18 +649,13 @@ class DispatchMixin:
         )
 
     def _has_worker_request_for_run(self, state: dict[str, Any], *, session_id: str, run_id: str) -> bool:
-        for message in state.get("messages", []):
+        for message in self._session_messages(state, session_id):
             payload = message.get("payload")
             if not isinstance(payload, dict):
                 continue
             if str(payload.get("run_id") or "") != run_id:
                 continue
             if payload.get("worker_request") is not True:
-                continue
-            if not any(
-                item.get("message_id") == message.get("message_id") and item.get("session_id") == session_id
-                for item in state.setdefault("message_index", [])
-            ):
                 continue
             return True
         return False
@@ -676,6 +676,24 @@ class DispatchMixin:
                 continue
             entry["status"] = "resolved"
             entry["resolved_at"] = resolved_at
+
+    def _goal_state_transition_for_run(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        for entry in reversed(state.setdefault("session_logs", {}).setdefault(session_id, [])):
+            if entry.get("kind") != "GoalStateChanged":
+                continue
+            event = entry.get("event")
+            if not isinstance(event, dict) or str(event.get("run_id") or "") != run_id:
+                continue
+            if str(event.get("actor") or "") != normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session_id):
+                continue
+            return dict(event)
+        return None
 
     def _ensure_agent_thread(self, state: dict[str, Any], *, session_id: str, role: str) -> dict[str, Any]:
         thread_key = f"{session_id}:{role}"
@@ -773,14 +791,14 @@ class DispatchMixin:
             "run_id": run["run_id"],
             "dispatch_step": "RemoteAIzeWorkerHandoff",
         }
-        message = self._message(
+        message = self._append_session_message_locked(
+            state,
+            session_id=session_id,
             from_endpoint="dispatcher",
             to_endpoint=node_endpoint("remote-aize"),
             payload=payload,
             created_at=utc_now(),
         )
-        state["messages"].append(message)
-        self._index_message_for_session(state, message, session_id)
         run["steps"].append(
             {
                 "phase": "RemoteAIzeWorkerHandoff",

@@ -157,14 +157,42 @@ class QueryMixin:
         state = self.load()
         messages = state["messages"]
         if session_id:
-            indexed_ids = {
-                str(item.get("message_id") or "")
-                for item in state.setdefault("message_index", [])
-                if item.get("session_id") == session_id
-            }
-            messages = [
-                msg
-                for msg in messages
-                if str(msg.get("message_id") or "") in indexed_ids
-            ]
+            messages = self._session_messages(state, session_id)
         return list(messages)
+
+    def session_log(
+        self,
+        session_id: str,
+        *,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+        limit: int = 10,
+        role: str | None = None,
+        after_cursor: bool = False,
+    ) -> list[dict[str, Any]]:
+        state = self.load()
+        session = state["sessions"].get(session_id)
+        if not session:
+            raise StoreError(f"unknown session: {session_id}")
+        if after_cursor:
+            if not role:
+                raise StoreError("--after-cursor requires --role")
+            self._ensure_role_cursors(session)
+            cursor = int(session.setdefault("role_cursors", {}).get(role) or 0)
+            from_seq = max(int(from_seq or 0), cursor + 1)
+
+        entries = []
+        for entry in state.setdefault("session_logs", {}).setdefault(session_id, []):
+            seq = int(entry.get("seq") or 0)
+            if from_seq is not None and seq < int(from_seq):
+                continue
+            if to_seq is not None and seq > int(to_seq):
+                continue
+            rendered = dict(entry)
+            message = self._message_for_log_entry(state, entry)
+            if message:
+                rendered["message"] = dict(message)
+            entries.append(rendered)
+        if limit and limit > 0:
+            entries = entries[-limit:]
+        return entries

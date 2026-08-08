@@ -42,6 +42,7 @@ class AuthMixin:
             "roles": list(account.get("roles", [])),
             "created_at": account["created_at"],
             "status": account.get("status", "active"),
+            "home_session_id": account.get("home_session_id"),
         }
 
     def create_account(self, username: str, *, password: str, roles: list[str] | None = None) -> dict[str, Any]:
@@ -54,15 +55,17 @@ class AuthMixin:
         accounts = state["accounts"]
         if normalized_username in accounts:
             raise StoreError(f"account already exists: {normalized_username}")
+        now = utc_now()
         account = self._build_account(
             normalized_username,
             password,
             roles=roles or ["user"],
-            created_at=utc_now(),
+            created_at=now,
         )
         accounts[normalized_username] = account.to_dict()
+        self._ensure_account_home_sessions(state, now=now)
         self.save(state)
-        return self._public_account(account.to_dict())
+        return self._public_account(accounts[normalized_username])
 
     def authenticate(self, username: str, *, password: str) -> dict[str, Any]:
         state = self.load()
@@ -77,11 +80,21 @@ class AuthMixin:
             raise StoreError("authentication failed")
         return self._public_account(account)
 
+    def account_home_session(self, username: str) -> str:
+        state = self.load()
+        account = state["accounts"].get(username)
+        if not account:
+            raise StoreError(f"unknown account: {username}")
+        home_session_id = str(account.get("home_session_id") or "").strip()
+        if not home_session_id:
+            raise StoreError(f"account has no home session: {username}")
+        if home_session_id not in state["sessions"]:
+            raise StoreError(f"unknown account home session: {home_session_id}")
+        return home_session_id
+
     def accounts(self) -> list[dict[str, Any]]:
         state = self.load()
         return sorted(
             [self._public_account(account) for account in state["accounts"].values()],
             key=lambda item: item["username"],
         )
-
-

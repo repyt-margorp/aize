@@ -20,6 +20,7 @@ from store_defs import (
     STATE_VERSION,
     WORKER_AGENT_ROLE,
     StoreError,
+    account_home_session_id,
 )
 from store_auth import AuthMixin
 from store_dispatch import DispatchMixin
@@ -80,7 +81,6 @@ class Store(
             "runtime_settings": {},
             "messages": [],
             "endpoint_cursors": {},
-            "message_index": [],
             "session_logs": {},
         }
         self.ensure_defaults(state, now=now)
@@ -108,7 +108,6 @@ class Store(
         state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
-        state.setdefault("message_index", [])
         state.setdefault("session_logs", {})
         changed = self.ensure_defaults(state)
         if changed:
@@ -131,7 +130,6 @@ class Store(
         runtime_settings = state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
-        state.setdefault("message_index", [])
         state.setdefault("session_logs", {})
         if "dispatch_lot_size" not in runtime_settings:
             runtime_settings["dispatch_lot_size"] = 1
@@ -195,6 +193,16 @@ class Store(
             if root_session.get("singleton") is not True:
                 root_session["singleton"] = True
                 changed = True
+        if ROOT_USERNAME not in accounts:
+            accounts[ROOT_USERNAME] = self._build_account(
+                ROOT_USERNAME,
+                DEFAULT_ROOT_PASSWORD,
+                roles=["root", "admin"],
+                created_at=timestamp,
+            ).to_dict()
+            changed = True
+        if self._ensure_account_home_sessions(state, now=timestamp):
+            changed = True
         for session_id in list(sessions):
             if session_id == ROOT_SESSION_ID:
                 continue
@@ -207,14 +215,6 @@ class Store(
                     }
                 )
                 changed = True
-        if ROOT_USERNAME not in accounts:
-            accounts[ROOT_USERNAME] = self._build_account(
-                ROOT_USERNAME,
-                DEFAULT_ROOT_PASSWORD,
-                roles=["root", "admin"],
-                created_at=timestamp,
-            ).to_dict()
-            changed = True
         for role in (GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE):
             if role not in agent_profiles:
                 agent_profiles[role] = {
@@ -230,6 +230,43 @@ class Store(
             changed = True
         if self._ensure_session_log_defaults(state):
             changed = True
+        return changed
+
+    def _ensure_account_home_sessions(self, state: dict[str, Any], *, now: str | None = None) -> bool:
+        timestamp = now or utc_now()
+        changed = False
+        sessions = state.setdefault("sessions", {})
+        accounts = state.setdefault("accounts", {})
+        state.setdefault("session_edges", [])
+        for username, account in sorted(accounts.items()):
+            home_session_id = str(account.get("home_session_id") or "").strip()
+            if not home_session_id:
+                home_session_id = account_home_session_id(username)
+                account["home_session_id"] = home_session_id
+                changed = True
+            if home_session_id == ROOT_SESSION_ID:
+                raise StoreError("account home session cannot be the system root session")
+            if home_session_id not in sessions:
+                sessions[home_session_id] = Session(
+                    session_id=home_session_id,
+                    unit_id=None,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    title=f"{username} home",
+                    active=True,
+                    singleton=False,
+                ).to_dict()
+                changed = True
+            else:
+                session = sessions[home_session_id]
+                if not str(session.get("title") or "").strip():
+                    session["title"] = f"{username} home"
+                    changed = True
+            self._ensure_role_cursors(sessions[home_session_id])
+            self._ensure_session_workspace(sessions[home_session_id])
+            if not self._has_path(state["session_edges"], ROOT_SESSION_ID, home_session_id):
+                self._link_sessions_in_state(state, ROOT_SESSION_ID, home_session_id)
+                changed = True
         return changed
 
     def save(self, state: dict[str, Any]) -> None:

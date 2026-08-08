@@ -62,16 +62,13 @@ class AgentRunner:
             )
         if normalized in {"codex", "claude"}:
             if not self.external_enabled:
-                status_line = ""
-                if role == "GoalManager" and self._prompt_has_phase(prompt, "review"):
-                    status_line = "\nAIZE_GOAL_STATUS: completed\nAIZE_GOAL_REASON: local disabled-provider review finished"
                 return AgentResult(
                     provider=normalized,
                     output=(
                         f'<aize-output role="{role}" provider="{normalized}">\n'
                         f"{normalized} provider is assigned but external execution is disabled. "
                         "The session agent thread was still resumed in durable state."
-                        f"{status_line}\n\n{prompt}\n"
+                        f"\n\n{prompt}\n"
                         "</aize-output>"
                     ),
                     resume_token=resume_token,
@@ -91,23 +88,11 @@ class AgentRunner:
 
     def _run_local(self, *, role: str, prompt: str, resume_token: str | None) -> str:
         thread = f"\nThread: {resume_token}" if resume_token else ""
-        if role == "GoalManager" and self._prompt_has_phase(prompt, "review"):
-            return (
-                f'<aize-output role="{role}" provider="local">\n'
-                f"{role} handled prompt locally.{thread}\n"
-                "AIZE_GOAL_STATUS: completed\n"
-                "AIZE_GOAL_REASON: local review finished\n\n"
-                f"{prompt}\n"
-                "</aize-output>"
-            )
         return (
             f'<aize-output role="{role}" provider="local">\n'
             f"{role} handled prompt locally.{thread}\n\n{prompt}\n"
             "</aize-output>"
         )
-
-    def _prompt_has_phase(self, prompt: str, phase: str) -> bool:
-        return f"Phase: {phase}" in prompt or f'phase="{phase}"' in prompt
 
     def _run_external(
         self,

@@ -17,18 +17,10 @@ from store_defs import (
 
 class DispatchRequestMixin:
     def _ensure_dispatch_requests_state(self, state: dict[str, Any]) -> bool:
-        changed = False
-        if "dispatch_requests" not in state:
-            state["dispatch_requests"] = list(state.get("dispatch_queue") or [])
-            changed = True
-        if "dispatch_queue" in state:
-            state.pop("dispatch_queue", None)
-            changed = True
-        for request in state.setdefault("dispatch_requests", []):
-            if "request_id" not in request and request.get("queue_id"):
-                request["request_id"] = request.pop("queue_id")
-                changed = True
-        return changed
+        if "dispatch_requests" in state:
+            return False
+        state["dispatch_requests"] = []
+        return True
 
     def _enqueue_dispatch(
         self,

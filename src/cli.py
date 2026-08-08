@@ -76,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_session.add_argument("session_id")
     create_session.add_argument("--unit", dest="unit_id")
     create_session.add_argument("--parent", action="append", dest="parent_session_ids")
+    create_session.add_argument("--created-by", dest="created_by")
 
     activate_session = sub.add_parser("activate-session", help="set a session active")
     activate_session.add_argument("session_id")
@@ -137,14 +138,20 @@ def build_parser() -> argparse.ArgumentParser:
     messages.add_argument("session_id", nargs="?")
     messages.add_argument("-n", "--limit", type=int, default=DEFAULT_MESSAGE_LIMIT, help="number of trailing messages to show, 0 for all")
 
+    session_log = sub.add_parser("session-log", help="list session log entries")
+    session_log.add_argument("session_id")
+    session_log.add_argument("--from", dest="from_seq", type=int)
+    session_log.add_argument("--to", dest="to_seq", type=int)
+    session_log.add_argument("-n", "--limit", type=int, default=DEFAULT_MESSAGE_LIMIT, help="number of trailing log entries to show, 0 for all")
+    session_log.add_argument("--role", choices=["GoalManager", "WorkerAgent"])
+    session_log.add_argument("--after-cursor", action="store_true")
+
     goals = sub.add_parser("goals", help="list goals")
     goals.add_argument("session_id", nargs="?")
 
     dispatch_runs = sub.add_parser("dispatch-runs", help="list dispatch runs")
     dispatch_runs.add_argument("session_id", nargs="?")
 
-    dispatch_index = sub.add_parser("dispatch-index", help="list dispatch scheduling index entries")
-    dispatch_index.add_argument("session_id", nargs="?")
     dispatch_requests = sub.add_parser("dispatch-requests", help="list dispatch requests")
     dispatch_requests.add_argument("session_id", nargs="?")
 
@@ -260,11 +267,14 @@ def run(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "create-session":
+            parent_session_ids = args.parent_session_ids
+            if parent_session_ids is None and args.created_by:
+                parent_session_ids = [store.account_home_session(args.created_by)]
             print_json(
                 store.create_session(
                     args.session_id,
                     unit_id=args.unit_id,
-                    parent_session_ids=args.parent_session_ids,
+                    parent_session_ids=parent_session_ids,
                 )
             )
         elif args.command == "activate-session":
@@ -272,11 +282,12 @@ def run(argv: list[str] | None = None) -> int:
         elif args.command == "deactivate-session":
             print_json(store.set_session_active(args.session_id, active=False))
         elif args.command == "start-goal":
+            parent_session_ids = args.parent_session_ids or [store.account_home_session(args.created_by)]
             print_json(
                 store.start_goal_session(
                     args.session_id,
                     unit_id=args.unit_id,
-                    parent_session_ids=args.parent_session_ids or ["root"],
+                    parent_session_ids=parent_session_ids,
                     label=args.label,
                     body=args.body,
                     created_by=args.created_by,
@@ -335,11 +346,22 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.children(args.session_id))
         elif args.command == "messages":
             print_json(tail_items(store.messages(args.session_id), args.limit))
+        elif args.command == "session-log":
+            print_json(
+                store.session_log(
+                    args.session_id,
+                    from_seq=args.from_seq,
+                    to_seq=args.to_seq,
+                    limit=args.limit,
+                    role=args.role,
+                    after_cursor=args.after_cursor,
+                )
+            )
         elif args.command == "goals":
             print_json(store.goals(args.session_id))
         elif args.command == "dispatch-runs":
             print_json(store.dispatch_runs(args.session_id))
-        elif args.command in {"dispatch-index", "dispatch-requests"}:
+        elif args.command == "dispatch-requests":
             print_json(store.dispatch_requests(args.session_id))
         elif args.command == "agent-threads":
             print_json(store.agent_threads(args.session_id))

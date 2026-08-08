@@ -1,57 +1,86 @@
 from __future__ import annotations
 
 import json
-import re
+from pathlib import Path
 from typing import Any
 
 from envelope import render_message_bundle, xml_text
 
 
 class PromptMixin:
-    def _extract_goal_manager_status(self, output: str) -> str:
-        marker = "AIZE_GOAL_STATUS:"
-        if marker in output:
-            after_marker = output.split(marker, 1)[1]
-            status = after_marker.splitlines()[0].strip().lower()
-            status = status.split("<", 1)[0].strip()
-            if status in {"completed", "incomplete", "ready"}:
-                return status
-        xml_match = re.search(
-            r"<AIZE_GOAL_STATUS>\s*([^<\s]+)\s*</AIZE_GOAL_STATUS>",
-            output,
-            flags=re.IGNORECASE,
-        )
-        if xml_match:
-            status = xml_match.group(1).strip().lower()
-            if status in {"completed", "incomplete", "ready"}:
-                return status
-        return "incomplete"
+    def _agent_cli_prefix(self) -> str:
+        src_root = Path(__file__).resolve().parent
+        return f"PYTHONPATH={src_root} python3 -m cli --root {self.root}"
 
-    def _extract_goal_manager_reason(self, output: str) -> str:
-        marker = "AIZE_GOAL_REASON:"
-        if marker in output:
-            after_marker = output.split(marker, 1)[1]
-            reason = after_marker.splitlines()[0].strip()
-            reason = reason.split("</", 1)[0].strip()
-            if reason:
-                return reason
-        xml_match = re.search(
-            r"<AIZE_GOAL_REASON>\s*(.*?)\s*</AIZE_GOAL_REASON>",
-            output,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if xml_match:
-            reason = " ".join(xml_match.group(1).split())
-            if reason:
-                return reason[:240]
-        for line in output.splitlines():
-            normalized = line.strip()
-            if not normalized or normalized.startswith("<"):
-                continue
-            if normalized.startswith("AIZE_GOAL_STATUS:"):
-                continue
-            return normalized[:240]
-        return "GoalManager did not provide a reason."
+    def _summarize_messages_for_prompt(
+        self,
+        messages: list[dict[str, Any]] | None,
+        *,
+        limit: int = 8,
+        body_limit: int = 700,
+    ) -> list[dict[str, Any]]:
+        summarized: list[dict[str, Any]] = []
+        for message in list(messages or [])[-limit:]:
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            summary_payload: dict[str, Any] = {}
+            for key in (
+                "body",
+                "text",
+                "user_input",
+                "worker_request",
+                "worker_role",
+                "worker_followup",
+                "implicit_worker_request",
+                "schedule_update",
+                "next_run_at",
+                "run_id",
+                "reply_to",
+            ):
+                if key not in payload:
+                    continue
+                value = payload[key]
+                if isinstance(value, str) and len(value) > body_limit:
+                    value = f"{value[:body_limit]}...[truncated; use CLI history access for full payload]"
+                summary_payload[key] = value
+            summarized.append(
+                {
+                    "message_id": message.get("message_id", ""),
+                    "from": message.get("from", ""),
+                    "to": message.get("to", ""),
+                    "created_at": message.get("created_at", ""),
+                    "payload": summary_payload,
+                }
+            )
+        return summarized
+
+    def _render_history_access_block(
+        self,
+        session: dict[str, Any],
+        *,
+        role: str,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+    ) -> list[str]:
+        session_id = str(session["session_id"])
+        cli = self._agent_cli_prefix()
+        log_range = ""
+        if from_seq is not None:
+            log_range += f" --from {int(from_seq)}"
+        if to_seq is not None:
+            log_range += f" --to {int(to_seq)}"
+        return [
+            "  <history-access>",
+            "    Full Session history is intentionally not embedded in this prompt.",
+            "    Pull only the needed history with these CLI commands when more context is required.",
+            f"    <session-log-window>{xml_text(cli)} session-log {xml_text(session_id)}{xml_text(log_range)} --limit 0</session-log-window>",
+            f"    <session-log-after-cursor>{xml_text(cli)} session-log {xml_text(session_id)} --role {xml_text(role)} --after-cursor --limit 0</session-log-after-cursor>",
+            f"    <messages-tail>{xml_text(cli)} messages {xml_text(session_id)} --limit 20</messages-tail>",
+            f"    <messages-all>{xml_text(cli)} messages {xml_text(session_id)} --limit 0</messages-all>",
+            f"    <dispatch-runs>{xml_text(cli)} dispatch-runs {xml_text(session_id)}</dispatch-runs>",
+            "  </history-access>",
+        ]
 
     def _render_goal_manager_prompt(
         self,
@@ -64,9 +93,12 @@ class PromptMixin:
         dispatch_messages: list[dict[str, Any]] | None = None,
         dispatch_signals: list[dict[str, Any]] | None = None,
         run_messages: list[dict[str, Any]] | None = None,
+        log_window: dict[str, Any] | None = None,
         worker_output: str = "",
         recovery_context: str = "",
     ) -> str:
+        from_seq = (log_window or {}).get("from_log_seq")
+        to_seq = (log_window or {}).get("to_log_seq")
         prompt = [
             f'<aize-agent-input role="GoalManager" phase="{xml_text(phase)}">',
             "  <session>",
@@ -83,18 +115,19 @@ class PromptMixin:
             "  <session-goal>",
             f"    <body>{xml_text(goal.get('body') or '')}</body>",
             "  </session-goal>",
+            *self._render_history_access_block(session, role="GoalManager", from_seq=from_seq, to_seq=to_seq),
             "  <session-messages>",
-            render_message_bundle(session_messages or []),
+            render_message_bundle(self._summarize_messages_for_prompt(session_messages, limit=5)),
             "  </session-messages>",
             "  <dispatch-feed>",
-            render_message_bundle(dispatch_messages or []),
+            render_message_bundle(self._summarize_messages_for_prompt(dispatch_messages, limit=10)),
             "  </dispatch-feed>",
             "  <system-signals>",
             xml_text(json.dumps(dispatch_signals or [], ensure_ascii=False, sort_keys=True)),
             "  </system-signals>",
             "  <python-message-api>",
             "    Use Python functions from agent_api for AIze message passing.",
-            "    Available functions: send_user_console_message(body), send_session_message(body), send_worker_request(body), set_next_unit_run_at(next_run_at, note='').",
+            "    Available functions: send_user_console_message(body), send_session_message(body), send_worker_request(body), set_goal_completion_state(completion_state, reason), set_next_unit_run_at(next_run_at, note='').",
             "    send_worker_request(body) records a Worker request as a Session Message; Session dispatch connects it to WorkerAgent.",
             "    For a scheduled Unit, call set_next_unit_run_at(...) with a future UTC timestamp before completing the SessionGoal when the Unit has no future next_run_at.",
             "    GoalManager is the only role that may send user-facing console replies and request WorkerAgent work.",
@@ -103,8 +136,9 @@ class PromptMixin:
             "  <role-policy>",
             "    GoalManager verifies the SessionGoal state, checks whether work can proceed, and decides completion.",
             "    GoalManager should delegate implementation and concrete task work by writing Worker requests to Session.",
-            "    If the goal is incomplete, write AIZE_GOAL_REASON as an actionable WorkerAgent instruction.",
-            "    Runtime treats an incomplete GoalManager result without an explicit Worker request as an implicit WorkerAgent request.",
+            "    Always call set_goal_completion_state('complete' or 'incomplete', reason) before exiting.",
+            "    If incomplete, make its reason an actionable WorkerAgent instruction.",
+            "    Runtime treats an incomplete decision without an explicit Worker request as an implicit WorkerAgent request.",
             "    GoalManager should not perform implementation work itself unless it is only a minimal verification needed to make the completion decision.",
             "  </role-policy>",
         ]
@@ -112,7 +146,7 @@ class PromptMixin:
             prompt.extend(
                 [
                     "  <dispatch-messages-this-run>",
-                    render_message_bundle(run_messages or []),
+                    render_message_bundle(self._summarize_messages_for_prompt(run_messages, limit=5)),
                     "  </dispatch-messages-this-run>",
                 ]
             )
@@ -123,7 +157,7 @@ class PromptMixin:
         prompt.extend(
             [
                 "  <instruction>Decide whether the SessionGoal can proceed or is completed.</instruction>",
-                "  <output-format>Return an aize-output XML block and include AIZE_GOAL_STATUS: completed or incomplete plus AIZE_GOAL_REASON: one concise actionable reason/instruction.</output-format>",
+                "  <output-format>Use the Python API for all state changes. stdout is only a concise diagnostic summary.</output-format>",
                 "</aize-agent-input>",
             ]
         )
@@ -138,8 +172,11 @@ class PromptMixin:
         session_messages: list[dict[str, Any]] | None = None,
         dispatch_messages: list[dict[str, Any]] | None = None,
         dispatch_signals: list[dict[str, Any]] | None = None,
+        log_window: dict[str, Any] | None = None,
         recovery_context: str = "",
     ) -> str:
+        from_seq = (log_window or {}).get("from_log_seq")
+        to_seq = (log_window or {}).get("to_log_seq")
         prompt = [
             '<aize-agent-input role="WorkerAgent" phase="work">',
             "  <session>",
@@ -153,11 +190,12 @@ class PromptMixin:
             "  <session-goal>",
             f"    <body>{xml_text(goal.get('body') or '')}</body>",
             "  </session-goal>",
+            *self._render_history_access_block(session, role="WorkerAgent", from_seq=from_seq, to_seq=to_seq),
             "  <session-messages>",
-            render_message_bundle(session_messages or []),
+            render_message_bundle(self._summarize_messages_for_prompt(session_messages, limit=5)),
             "  </session-messages>",
             "  <dispatch-feed>",
-            render_message_bundle(dispatch_messages or []),
+            render_message_bundle(self._summarize_messages_for_prompt(dispatch_messages, limit=10)),
             "  </dispatch-feed>",
             "  <system-signals>",
             xml_text(json.dumps(dispatch_signals or [], ensure_ascii=False, sort_keys=True)),
