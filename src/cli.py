@@ -228,7 +228,7 @@ def run(argv: list[str] | None = None) -> int:
         elif args.command == "agents":
             print_json(store.agent_profiles())
         elif args.command == "agent-pool":
-            print_json(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs()))
+            print_json(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs(include_output=False)))
         elif args.command == "set-dispatch-lots":
             print_json(store.set_dispatch_lot_size(args.size))
         elif args.command == "set-agent":

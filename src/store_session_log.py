@@ -9,16 +9,98 @@ from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE, normalize_endpoint
 class SessionLogMixin:
     def _ensure_session_log_defaults(self, state: dict[str, Any]) -> bool:
         changed = False
-        session_logs = state.setdefault("session_logs", {})
         for session_id, session in state.setdefault("sessions", {}).items():
-            if session_id not in session_logs:
-                session_logs[session_id] = []
-                changed = True
             if self._ensure_role_cursors(session):
                 changed = True
             if self._sync_session_current_state(state, session_id):
                 changed = True
 
+        return changed
+
+    def _session_log_entries(self, state: dict[str, Any], session_id: str) -> list[dict[str, Any]]:
+        session_logs = state.setdefault("session_logs", {})
+        full_ids = state.setdefault("_session_log_full_ids", [])
+        if session_id not in full_ids:
+            pending = session_logs.get(session_id, [])
+            persisted = self.storage.read_session_log(session_id)
+            by_seq = {
+                int(entry.get("seq") or 0): entry
+                for entry in [*persisted, *pending]
+                if isinstance(entry, dict)
+            }
+            session_logs[session_id] = [by_seq[seq] for seq in sorted(by_seq)]
+            full_ids.append(session_id)
+        return session_logs[session_id]
+
+    def _all_session_log_ids(self, state: dict[str, Any]) -> list[str]:
+        return sorted(set(self.storage.session_log_ids()) | set(state.setdefault("session_logs", {})))
+
+    @staticmethod
+    def _clear_session_log_cache(state: dict[str, Any]) -> None:
+        state["session_logs"] = {}
+        state.pop("_session_log_full_ids", None)
+
+    def _reconcile_state_from_session_logs(self, state: dict[str, Any]) -> bool:
+        changed = False
+        for session_id in self._all_session_log_ids(state):
+            session = state.setdefault("sessions", {}).get(session_id)
+            if not session:
+                continue
+            entries = self._session_log_entries(state, session_id)
+            latest_seq = int(entries[-1].get("seq") or 0) if entries else 0
+            self._ensure_role_cursors(session)
+            for role, cursor in list(session.setdefault("role_cursors", {}).items()):
+                normalized = min(max(0, int(cursor or 0)), latest_seq)
+                if normalized != cursor:
+                    session["role_cursors"][role] = normalized
+                    changed = True
+            goal = self._current_goal_for_session(state, session_id)
+            for entry in entries:
+                kind = str(entry.get("kind") or "")
+                event = entry.get("event")
+                created_at = str(entry.get("created_at") or "")
+                if kind == "SessionActiveChanged" and isinstance(event, dict):
+                    active = bool(event.get("active"))
+                    if session.get("active") is not active:
+                        session["active"] = active
+                        changed = True
+                elif kind == "GoalStateChanged" and isinstance(event, dict) and goal:
+                    completion_state = str(event.get("completion_state") or "")
+                    if completion_state not in {"complete", "incomplete"}:
+                        continue
+                    reason = str(event.get("reason") or "")
+                    if goal.get("completion_state") != completion_state:
+                        goal["completion_state"] = completion_state
+                        changed = True
+                    if goal.get("completion_reason") != reason:
+                        goal["completion_reason"] = reason
+                        changed = True
+                    goal["completion_reason_updated_at"] = created_at
+                    if completion_state == "complete":
+                        goal["completed_at"] = created_at
+                        goal.pop("last_incomplete_at", None)
+                    else:
+                        goal["last_incomplete_at"] = created_at
+                        goal.pop("completed_at", None)
+                elif kind == "Message" and goal:
+                    message = self._message_for_log_entry(state, entry)
+                    payload = message.get("payload") if isinstance(message, dict) else None
+                    if not isinstance(payload, dict) or payload.get("user_input") is not True:
+                        continue
+                    if goal.get("completion_state") == "complete":
+                        goal["completion_state"] = "incomplete"
+                        goal["completion_reason"] = (
+                            f"UserInput message {message.get('message_id')} requires Session processing."
+                        )
+                        goal["completion_reason_updated_at"] = created_at
+                        goal["last_incomplete_at"] = created_at
+                        goal.pop("completed_at", None)
+                        changed = True
+                if created_at and str(session.get("updated_at") or "") < created_at:
+                    session["updated_at"] = created_at
+                    changed = True
+            if self._sync_session_current_state(state, session_id):
+                changed = True
         return changed
 
     def _ensure_role_cursors(self, session: dict[str, Any]) -> bool:
@@ -64,7 +146,8 @@ class SessionLogMixin:
             return entries[-1] if entries else {}
         if event_key and any(str(entry.get("event_key") or "") == event_key for entry in entries):
             return entries[-1] if entries else {}
-        next_seq = int(entries[-1].get("seq") or 0) + 1 if entries else 1
+        persisted_seq = self.storage.latest_session_log_seq(session_id)
+        next_seq = max(persisted_seq, int(entries[-1].get("seq") or 0) if entries else 0) + 1
         entry = {
             "log_id": new_id("log"),
             "seq": next_seq,
@@ -82,13 +165,14 @@ class SessionLogMixin:
         return entry
 
     def _log_message_for_session(self, state: dict[str, Any], message: dict[str, Any], session_id: str) -> None:
-        self._append_session_log_entry(
+        entry = self._append_session_log_entry(
             state,
             session_id,
             kind="Message",
             created_at=str(message.get("created_at") or utc_now()),
             message_id=str(message.get("message_id") or ""),
         )
+        entry["message"] = message
 
     def _log_goal_state_transition(
         self,
@@ -192,15 +276,21 @@ class SessionLogMixin:
         session = state.setdefault("sessions", {}).get(session_id, {})
         self._ensure_role_cursors(session)
         cursor = int(session.setdefault("role_cursors", {}).get(role) or 0)
-        return [
-            dict(entry)
-            for entry in state.setdefault("session_logs", {}).setdefault(session_id, [])
-            if int(entry.get("seq") or 0) > cursor
-        ]
+        if session_id in state.setdefault("_session_log_full_ids", []):
+            entries = state.setdefault("session_logs", {}).get(session_id, [])
+        else:
+            entries = self.storage.read_session_log(session_id, from_seq=cursor + 1)
+            entries.extend(
+                entry
+                for entry in state.setdefault("session_logs", {}).get(session_id, [])
+                if int(entry.get("seq") or 0) > cursor
+            )
+        return [dict(entry) for entry in entries if int(entry.get("seq") or 0) > cursor]
 
     def _latest_session_log_seq(self, state: dict[str, Any], *, session_id: str) -> int:
-        entries = state.setdefault("session_logs", {}).setdefault(session_id, [])
-        return int(entries[-1].get("seq") or 0) if entries else 0
+        entries = state.setdefault("session_logs", {}).get(session_id, [])
+        pending_seq = int(entries[-1].get("seq") or 0) if entries else 0
+        return max(self.storage.latest_session_log_seq(session_id), pending_seq)
 
     def _set_role_cursor(self, state: dict[str, Any], *, session_id: str, role: str, seq: int) -> None:
         session = state.setdefault("sessions", {}).get(session_id)
@@ -213,6 +303,9 @@ class SessionLogMixin:
         message_id = str(entry.get("message_id") or "")
         if not message_id:
             return None
+        embedded = entry.get("message")
+        if isinstance(embedded, dict):
+            return embedded
         for message in state.setdefault("messages", []):
             if str(message.get("message_id") or "") == message_id:
                 return message
@@ -228,7 +321,12 @@ class SessionLogMixin:
         role: str | None = None,
     ) -> list[dict[str, Any]]:
         signals: list[dict[str, Any]] = []
-        for entry in state.setdefault("session_logs", {}).setdefault(session_id, []):
+        if session_id in state.setdefault("_session_log_full_ids", []):
+            entries = state.setdefault("session_logs", {}).get(session_id, [])
+        else:
+            entries = self.storage.read_session_log(session_id, from_seq=from_seq, to_seq=to_seq)
+            entries.extend(state.setdefault("session_logs", {}).get(session_id, []))
+        for entry in entries:
             seq = int(entry.get("seq") or 0)
             if seq < from_seq or seq > to_seq or entry.get("kind") != "SystemSignal":
                 continue

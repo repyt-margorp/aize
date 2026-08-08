@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
 import fcntl
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +25,7 @@ from store_defs import (
 from store_auth import AuthMixin
 from store_dispatch import DispatchMixin
 from store_dispatch_requests import DispatchRequestMixin
+from store_files import SplitStateStorage
 from store_message import MessageMixin
 from store_prompts import PromptMixin
 from store_query import QueryMixin
@@ -46,7 +45,9 @@ class Store(
 ):
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.state_path = root / "state.json"
+        self.storage = SplitStateStorage(root)
+        self.state_path = self.storage.manifest_path
+        self.legacy_state_path = self.storage.legacy_state_path
 
     @contextmanager
     def _state_lock(self):
@@ -62,9 +63,26 @@ class Store(
     def init(self) -> dict[str, Any]:
         with self._state_lock():
             if self.state_path.exists():
+                self.storage.ensure_current_format()
+                self.storage.recover_all_session_logs()
                 state = self.load()
-                if self.ensure_defaults(state):
+                changed = self.ensure_defaults(state)
+                if self._reconcile_state_from_session_logs(state):
+                    changed = True
+                if changed:
                     self.save(state)
+                self._clear_session_log_cache(state)
+                return state
+            if self.legacy_state_path.exists():
+                self.storage.migrate_legacy_state_json()
+                self.storage.recover_all_session_logs()
+                state = self.load()
+                changed = self.ensure_defaults(state)
+                if self._reconcile_state_from_session_logs(state):
+                    changed = True
+                if changed:
+                    self.save(state)
+                self._clear_session_log_cache(state)
                 return state
             now = utc_now()
             state = {
@@ -85,14 +103,13 @@ class Store(
                 "session_logs": {},
             }
             self.ensure_defaults(state, now=now)
-            self.save(state)
+            self.storage.initialize(state)
             return state
 
     def load(self) -> dict[str, Any]:
         if not self.state_path.exists():
             raise StoreError(f"state not initialized: {self.state_path}")
-        with self.state_path.open("r", encoding="utf-8") as fh:
-            state = json.load(fh)
+        state = self.storage.load()
         if not isinstance(state, dict):
             raise StoreError("state root must be an object")
         if state.get("version") != STATE_VERSION:
@@ -425,8 +442,4 @@ class Store(
 
     def save(self, state: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_name(f"{self.state_path.name}.{os.getpid()}.{new_id('tmp')}.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2, sort_keys=True, ensure_ascii=False)
-            fh.write("\n")
-        tmp.replace(self.state_path)
+        self.storage.save(state)

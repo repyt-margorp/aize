@@ -28,9 +28,11 @@ py-modules = [
   "store_auth",
   "store_defs",
   "store_dispatch",
-  "store_dispatch_queue",
+  "store_dispatch_requests",
+  "store_files",
   "store_message",
   "store_prompts",
   "store_query",
   "store_session",
+  "store_session_log",
 ]

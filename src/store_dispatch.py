@@ -197,6 +197,11 @@ class DispatchMixin:
             "current_phase": role,
             "from_log_seq": request_entry.get("from_log_seq"),
             "to_log_seq": request_entry.get("to_log_seq"),
+            "attention_reasons": [
+                dict(item)
+                for item in request_entry.get("attention_reasons", [])
+                if isinstance(item, dict)
+            ],
         }
         if dispatch_lot_id is not None:
             run["dispatch_lot_id"] = int(dispatch_lot_id)
@@ -710,7 +715,7 @@ class DispatchMixin:
         to_seq = request_entry.get("to_log_seq")
         if from_seq is not None and to_seq is not None:
             messages: list[dict[str, Any]] = []
-            for entry in state.setdefault("session_logs", {}).setdefault(session_id, []):
+            for entry in self._session_log_entries(state, session_id):
                 seq = int(entry.get("seq") or 0)
                 if seq < int(from_seq) or seq > int(to_seq):
                     continue

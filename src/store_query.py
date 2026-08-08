@@ -23,7 +23,7 @@ class QueryMixin:
     def status(self) -> dict[str, Any]:
         state = self.load()
         self._enqueue_dispatchable_goals(state)
-        messages = state["messages"]
+        message_count = self.storage.session_log_stats()["message_count"]
         active_sessions = [session for session in state["sessions"].values() if session.get("active") is True]
         inactive_sessions = [session for session in state["sessions"].values() if session.get("active") is not True]
         current_goals = self._current_goals(state)
@@ -64,7 +64,7 @@ class QueryMixin:
             "dispatch_lot_size": max(1, int(state.setdefault("runtime_settings", {}).get("dispatch_lot_size") or 1)),
             "agent_profile_count": len(state["agent_profiles"]),
             "agent_thread_count": len(state["agent_threads"]),
-            "message_count": len(messages),
+            "message_count": message_count,
             "endpoint_cursor_count": len(state.get("endpoint_cursors", {})),
         }
 
@@ -75,11 +75,18 @@ class QueryMixin:
             goals = [goal for goal in goals if goal.get("session_id") == session_id]
         return sorted(goals, key=lambda item: (item["created_at"], item["goal_id"]))
 
-    def dispatch_runs(self, session_id: str | None = None) -> list[dict[str, Any]]:
+    def dispatch_runs(
+        self,
+        session_id: str | None = None,
+        *,
+        include_output: bool = True,
+    ) -> list[dict[str, Any]]:
         state = self.load()
         runs = list(state["dispatch_runs"].values())
         if session_id:
             runs = [run for run in runs if run.get("session_id") == session_id]
+        if include_output:
+            runs = self.storage.hydrate_dispatch_runs(runs)
         return sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))
 
     def dispatch_requests(self, session_id: str | None = None) -> list[dict[str, Any]]:
@@ -108,6 +115,7 @@ class QueryMixin:
         threads = list(state["agent_threads"].values())
         if session_id:
             threads = [thread for thread in threads if thread.get("session_id") == session_id]
+        threads = self.storage.hydrate_agent_threads(threads)
         return sorted(threads, key=lambda item: (item["session_id"], item["role"]))
 
     def session(self, session_id: str) -> dict[str, Any]:
@@ -155,7 +163,7 @@ class QueryMixin:
 
     def messages(self, session_id: str | None = None) -> list[dict[str, Any]]:
         state = self.load()
-        messages = state["messages"]
+        messages = self._all_messages(state)
         if session_id:
             messages = self._session_messages(state, session_id)
         return list(messages)
@@ -182,7 +190,7 @@ class QueryMixin:
             from_seq = max(int(from_seq or 0), cursor + 1)
 
         entries = []
-        for entry in state.setdefault("session_logs", {}).setdefault(session_id, []):
+        for entry in self._session_log_entries(state, session_id):
             seq = int(entry.get("seq") or 0)
             if from_seq is not None and seq < int(from_seq):
                 continue

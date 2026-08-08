@@ -35,6 +35,7 @@ class DispatchRequestMixin:
         trigger_message_id: str | None = None,
         from_log_seq: int | None = None,
         to_log_seq: int | None = None,
+        attention_reasons: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         goal_id = str(goal.get("goal_id") or "")
         session_id = str(goal.get("session_id") or "")
@@ -85,6 +86,9 @@ class DispatchRequestMixin:
                     if to_log_seq is not None and entry.get("to_log_seq") != to_log_seq:
                         entry["to_log_seq"] = to_log_seq
                         changed = True
+                    if attention_reasons is not None and entry.get("attention_reasons") != attention_reasons:
+                        entry["attention_reasons"] = [dict(item) for item in attention_reasons]
+                        changed = True
                 if changed:
                     entry["updated_at"] = queued_at or utc_now()
                 return entry
@@ -106,6 +110,8 @@ class DispatchRequestMixin:
             entry["from_log_seq"] = from_log_seq
         if to_log_seq is not None:
             entry["to_log_seq"] = to_log_seq
+        if attention_reasons is not None:
+            entry["attention_reasons"] = [dict(item) for item in attention_reasons]
         requests.append(entry)
         return entry
 
@@ -139,7 +145,7 @@ class DispatchRequestMixin:
                     continue
                 if any(
                     entry.get("goal_id") == goal_id
-                    and entry.get("status") in {"queued", "acquired"}
+                    and entry.get("status") == "acquired"
                     and entry.get("role", GOAL_MANAGER_ROLE) == role
                     for entry in state.setdefault("dispatch_requests", [])
                 ):
@@ -150,8 +156,60 @@ class DispatchRequestMixin:
                     session_id=session_id,
                     role=role,
                 )
-                if request:
-                    self._enqueue_dispatch(state, goal, role=role, **request)
+                self._refresh_queued_role_request(
+                    state,
+                    goal=goal,
+                    role=role,
+                    request=request,
+                )
+
+    def _refresh_queued_role_request(
+        self,
+        state: dict[str, Any],
+        *,
+        goal: dict[str, Any],
+        role: str,
+        request: dict[str, Any] | None,
+    ) -> None:
+        goal_id = str(goal.get("goal_id") or "")
+        queued = [
+            entry
+            for entry in state.setdefault("dispatch_requests", [])
+            if entry.get("goal_id") == goal_id
+            and entry.get("status") == "queued"
+            and entry.get("role", GOAL_MANAGER_ROLE) == role
+        ]
+        if request is None:
+            for entry in queued:
+                entry["status"] = "stale"
+                entry["stale_at"] = utc_now()
+            return
+        if not queued:
+            self._enqueue_dispatch(state, goal, role=role, **request)
+            return
+
+        primary = sorted(queued, key=lambda entry: str(entry.get("queued_at") or ""))[0]
+        for key in (
+            "priority",
+            "reason",
+            "available_after",
+            "trigger_message_id",
+            "from_log_seq",
+            "to_log_seq",
+            "attention_reasons",
+        ):
+            if key in request:
+                value = request[key]
+                primary[key] = [dict(item) for item in value] if key == "attention_reasons" else value
+            else:
+                primary.pop(key, None)
+        primary["refreshed_at"] = utc_now()
+        for entry in queued:
+            if entry is primary:
+                continue
+            entry["status"] = "superseded"
+            entry["superseded_at"] = primary["refreshed_at"]
+            entry["superseded_by_request_id"] = primary["request_id"]
 
     def _dispatch_request_from_session_log(
         self,
@@ -188,6 +246,20 @@ class DispatchRequestMixin:
             "reason": reason,
             "from_log_seq": first_seq,
             "to_log_seq": to_seq,
+            "attention_reasons": [
+                {
+                    "seq": int(entry.get("seq") or 0),
+                    "kind": str(entry.get("kind") or ""),
+                    "priority": int(entry_priority),
+                    "reason": entry_reason,
+                    "message_id": str(entry_message.get("message_id") or "") if entry_message else "",
+                    "log_id": str(entry.get("log_id") or ""),
+                }
+                for entry, entry_message, entry_priority, entry_reason in sorted(
+                    relevant,
+                    key=lambda item: int(item[0].get("seq") or 0),
+                )
+            ],
         }
         if trigger_entry.get("kind") == "SystemSignal":
             event = trigger_entry.get("event")

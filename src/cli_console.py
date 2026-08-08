@@ -214,7 +214,9 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 elif command == "agent-threads":
                     print_agent_threads(store.agent_threads(current_session_id))
                 elif command == "agent-pool":
-                    print_agent_pool(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs()))
+                    print_agent_pool(
+                        agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs(include_output=False))
+                    )
                 elif command == "dispatch-runs":
                     print_dispatch_runs(store.dispatch_runs(current_session_id))
                 elif command == "dispatch-requests":
@@ -251,7 +253,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                         store.session_graph(),
                         goals=store.goals(),
                         queue=store.dispatch_requests(),
-                        runs=store.dispatch_runs(),
+                        runs=store.dispatch_runs(include_output=False),
                     )
                 else:
                     raise StoreError(f"unknown console command: {command}")

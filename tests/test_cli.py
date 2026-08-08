@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -628,10 +628,10 @@ class CliTests(unittest.TestCase):
 
             from store import Store
 
-            state = Store(state_root).load()
+            store = Store(state_root)
             signals = [
                 entry.get("event")
-                for entry in state["session_logs"][session_id]
+                for entry in store.session_log(session_id, limit=0)
                 if entry.get("kind") == "SystemSignal"
             ]
             self.assertTrue(any(signal.get("signal_type") == "GoalCompletionRejected" for signal in signals))
@@ -1354,10 +1354,9 @@ class CliTests(unittest.TestCase):
                 sender="root",
                 body="new user input while worker is running",
             )
-            state = store.load()
             worker_message = next(
                 item
-                for item in state["messages"]
+                for item in store.messages("running-session")
                 if item.get("payload", {}).get("forwarded_from") == message["message_id"]
             )
             self.assertIsNone(store.dispatch_once(session_id="running-session"))
@@ -1462,6 +1461,65 @@ class CliTests(unittest.TestCase):
             self.assertEqual(worker_entries[0]["trigger_message_id"], second["message_id"])
             self.assertLessEqual(int(worker_entries[0]["from_log_seq"]), int(worker_entries[0]["to_log_seq"]))
 
+    def test_queued_dispatch_request_refreshes_to_latest_session_log_before_acquire(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("refresh-session", parent_session_ids=["root"])
+            store.update_goal(
+                "refresh-session",
+                body="review all accumulated feedback",
+                created_by="root",
+            )
+            state = store.load()
+            state["sessions"]["refresh-session"]["role_cursors"]["GoalManager"] = store._latest_session_log_seq(
+                state,
+                session_id="refresh-session",
+            )
+            store.save(state)
+
+            first = store.append_user_input(
+                "refresh-session",
+                sender="root",
+                body="first feedback",
+            )
+            state = store.load()
+            store._enqueue_dispatchable_goals(state)
+            initial = next(
+                entry
+                for entry in state["dispatch_requests"]
+                if entry.get("status") == "queued" and entry.get("role") == "GoalManager"
+            )
+            initial_request_id = initial["request_id"]
+            initial_queued_at = initial["queued_at"]
+            initial_to_seq = int(initial["to_log_seq"])
+            store.save(state)
+
+            second = store.append_user_input(
+                "refresh-session",
+                sender="root",
+                body="second feedback before dispatch",
+            )
+            state = store.load()
+            selected = store._next_dispatch_requests_entry(state, session_id="refresh-session")
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(selected["request_id"], initial_request_id)
+            self.assertEqual(selected["queued_at"], initial_queued_at)
+            self.assertGreater(int(selected["to_log_seq"]), initial_to_seq)
+            self.assertEqual(selected["to_log_seq"], store._latest_session_log_seq(state, session_id="refresh-session"))
+            self.assertEqual(selected["trigger_message_id"], second["message_id"])
+            attention_message_ids = {
+                reason.get("message_id")
+                for reason in selected["attention_reasons"]
+                if reason.get("message_id")
+            }
+            self.assertIn(first["message_id"], attention_message_ids)
+            self.assertIn(second["message_id"], attention_message_ids)
+
     def test_messages_defaults_to_tail_ten_and_accepts_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
@@ -1509,7 +1567,9 @@ class CliTests(unittest.TestCase):
             self.assertIn("GoalStateChanged", kinds)
             message_entries = [entry for entry in full_log if entry["kind"] == "Message"]
             self.assertTrue(any(message_body(entry["message"]) == "first message" for entry in message_entries))
-            state = json.loads((state_root / "state.json").read_text(encoding="utf-8"))
+            from store import Store
+
+            state = Store(state_root).load()
             self.assertNotIn("message_index", state)
             self.assertFalse(any("state_transitions" in goal for goal in state["goals"].values()))
 
@@ -1804,11 +1864,308 @@ class CliTests(unittest.TestCase):
             self.assertEqual(run_cli(state_root, "user-input", "time", "root", "hello").returncode, 0)
             self.assertEqual(run_cli(state_root, "status").returncode, 0)
 
-            before = (state_root / "state.json").read_text(encoding="utf-8")
+            before = (state_root / "manifest.json").read_text(encoding="utf-8")
             self.assertEqual(run_cli(state_root, "status").returncode, 0)
             self.assertEqual(run_cli(state_root, "dispatch-requests", "time").returncode, 0)
-            after = (state_root / "state.json").read_text(encoding="utf-8")
+            after = (state_root / "manifest.json").read_text(encoding="utf-8")
             self.assertEqual(after, before)
+
+    def test_split_state_externalizes_agent_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            state = store.load()
+            state["agent_threads"]["root:GoalManager"] = {
+                "thread_id": "root:GoalManager",
+                "session_id": "root",
+                "role": "GoalManager",
+                "created_at": "2026-08-08T00:00:00Z",
+                "updated_at": "2026-08-08T00:00:00Z",
+                "turns": [{"created_at": "2026-08-08T00:00:00Z", "prompt": "large prompt", "result": "large result"}],
+            }
+            state["dispatch_runs"]["run-storage"] = {
+                "run_id": "run-storage",
+                "session_id": "root",
+                "goal_id": "goal-storage",
+                "created_at": "2026-08-08T00:00:00Z",
+                "steps": [{"phase": "GoalManagerReview", "output": "large output"}],
+            }
+            store.save(state)
+
+            persisted = store.load()
+            turn = persisted["agent_threads"]["root:GoalManager"]["turns"][0]
+            step = persisted["dispatch_runs"]["run-storage"]["steps"][0]
+            self.assertNotIn("prompt", turn)
+            self.assertNotIn("result", turn)
+            self.assertNotIn("output", step)
+            self.assertTrue((state_root / turn["prompt_path"]).is_file())
+            self.assertTrue((state_root / step["output_path"]).is_file())
+            self.assertEqual(store.agent_threads("root")[0]["turns"][0]["prompt"], "large prompt")
+            self.assertEqual(store.dispatch_runs("root")[0]["steps"][0]["output"], "large output")
+            self.assertTrue((state_root / "manifest.json").is_file())
+            self.assertFalse((state_root / "state.json").exists())
+
+    def test_concurrent_session_producers_receive_one_gap_free_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("concurrent-log", parent_session_ids=["root"])
+
+            def send(index: int) -> str:
+                message = Store(state_root).append_message(
+                    "concurrent-log",
+                    sender="root",
+                    recipient="kernel",
+                    body=f"parallel-{index}",
+                )
+                return str(message["message_id"])
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                message_ids = list(executor.map(send, range(40)))
+
+            entries = store.session_log("concurrent-log", limit=0)
+            self.assertEqual([entry["seq"] for entry in entries], list(range(1, 41)))
+            self.assertEqual(len({entry["log_id"] for entry in entries}), 40)
+            self.assertEqual(
+                {entry["message"]["message_id"] for entry in entries},
+                set(message_ids),
+            )
+
+    def test_session_append_does_not_rewrite_another_session_or_create_generations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("isolated-a", parent_session_ids=["root"])
+            store.create_session("isolated-b", parent_session_ids=["root"])
+            store.append_message("isolated-b", sender="root", recipient="kernel", body="stable")
+            b_segment = store.storage._segment_paths("isolated-b")[0]
+            b_before = (b_segment.stat().st_mtime_ns, b_segment.read_bytes())
+            manifest_before = (state_root / "manifest.json").read_bytes()
+
+            store.append_message("isolated-a", sender="root", recipient="kernel", body="changed")
+
+            self.assertEqual((b_segment.stat().st_mtime_ns, b_segment.read_bytes()), b_before)
+            self.assertEqual((state_root / "manifest.json").read_bytes(), manifest_before)
+            self.assertFalse((state_root / "store" / "generations").exists())
+
+    def test_torn_session_log_tail_is_removed_during_startup_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("torn-tail", parent_session_ids=["root"])
+            for index in range(3):
+                store.append_message("torn-tail", sender="root", recipient="kernel", body=f"valid-{index}")
+            segment = store.storage._segment_paths("torn-tail")[0]
+            valid_size = segment.stat().st_size
+            interrupted = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_APPEND); "
+                        "os.write(fd,b'AIZELOG2\\x00\\x00\\x00'); os.fsync(fd); os._exit(91)"
+                    ),
+                    str(segment),
+                ],
+                check=False,
+            )
+            self.assertEqual(interrupted.returncode, 91)
+            self.assertGreater(segment.stat().st_size, valid_size)
+
+            Store(state_root).init()
+
+            self.assertEqual(segment.stat().st_size, valid_size)
+            entries = Store(state_root).session_log("torn-tail", limit=0)
+            self.assertEqual([entry["seq"] for entry in entries], [1, 2, 3])
+
+    def test_session_append_uses_index_without_rescanning_existing_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from unittest.mock import patch
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("indexed-append", parent_session_ids=["root"])
+            store.append_message("indexed-append", sender="root", recipient="kernel", body="first")
+
+            with patch.object(store.storage, "_scan_segment", side_effect=AssertionError("history was rescanned")):
+                store.append_message("indexed-append", sender="root", recipient="kernel", body="second")
+
+            self.assertEqual(
+                [message_body(message) for message in store.messages("indexed-append")],
+                ["first", "second"],
+            )
+
+    def test_one_store_transaction_group_commits_multiple_session_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from unittest.mock import patch
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("group-commit", parent_session_ids=["root"])
+            store.update_goal("group-commit", body="wait for user", created_by="root")
+            state = store.load()
+            goal = store._current_goal_for_session(state, "group-commit")
+            assert goal is not None
+            store._set_goal_completion_state(
+                state,
+                goal,
+                "complete",
+                reason="ready for another request",
+                actor="GoalManager",
+            )
+            store.save(state)
+            before = store.storage.latest_session_log_seq("group-commit")
+
+            with patch("store_files.os.fdatasync", wraps=os.fdatasync) as sync:
+                store.append_user_input("group-commit", sender="root", body="continue")
+
+            after_entries = store.session_log("group-commit", from_seq=before + 1, limit=0)
+            self.assertEqual([entry["kind"] for entry in after_entries], ["Message", "GoalStateChanged"])
+            self.assertEqual(sync.call_count, 1)
+
+    def test_startup_reconciles_committed_user_input_when_metadata_update_was_lost(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("log-authority", parent_session_ids=["root"])
+            store.update_goal("log-authority", body="wait", created_by="root")
+            state = store.load()
+            goal = store._current_goal_for_session(state, "log-authority")
+            assert goal is not None
+            store._set_goal_completion_state(
+                state,
+                goal,
+                "complete",
+                reason="temporarily complete",
+                actor="GoalManager",
+            )
+            store.save(state)
+
+            seq = store.storage.latest_session_log_seq("log-authority") + 1
+            message = store._message(
+                from_endpoint="account:root",
+                to_endpoint="session:log-authority",
+                payload={"body": "committed before metadata", "user_input": True},
+            )
+            store.storage.append_session_log_entries(
+                "log-authority",
+                [
+                    {
+                        "log_id": "log-interrupted-commit",
+                        "seq": seq,
+                        "session_id": "log-authority",
+                        "kind": "Message",
+                        "created_at": message["created_at"],
+                        "message_id": message["message_id"],
+                        "message": message,
+                    }
+                ],
+            )
+            self.assertEqual(store.goals("log-authority")[0]["completion_state"], "complete")
+
+            Store(state_root).init()
+
+            recovered_goal = Store(state_root).goals("log-authority")[0]
+            self.assertEqual(recovered_goal["completion_state"], "incomplete")
+            self.assertIn(message["message_id"], recovered_goal["completion_reason"])
+
+    def test_generation_storage_is_migrated_to_session_logs_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("legacy-generation", parent_session_ids=["root"])
+            store.append_message("legacy-generation", sender="root", recipient="kernel", body="preserve me")
+            legacy_state = store.load()
+            legacy_state["messages"] = store.messages()
+            legacy_state["session_logs"] = {
+                session_id: store.session_log(session_id, limit=0)
+                for session_id in store.storage.session_log_ids()
+            }
+            created_at = legacy_state["created_at"]
+            shutil.rmtree(state_root / "store")
+            (state_root / "manifest.json").unlink()
+
+            generation_root = state_root / "state-data" / "generations" / "gen-test"
+            collections_root = generation_root / "collections"
+            collections_root.mkdir(parents=True)
+            collection_names = sorted(key for key in legacy_state if key not in {"version", "created_at"})
+            for name in collection_names:
+                (collections_root / f"{name}.json").write_text(
+                    json.dumps(legacy_state[name], ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            (generation_root / "snapshot.json").write_text(
+                json.dumps({"collections": collection_names}),
+                encoding="utf-8",
+            )
+            (state_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "storage_version": 1,
+                        "state_version": 1,
+                        "created_at": created_at,
+                        "generation": "gen-test",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            migrated = Store(state_root)
+            migrated.init()
+
+            self.assertEqual(
+                [message_body(message) for message in migrated.messages("legacy-generation")],
+                ["preserve me"],
+            )
+            self.assertEqual(json.loads((state_root / "manifest.json").read_text())["storage_version"], 2)
+            self.assertTrue((state_root / "manifest.v1.json").is_file())
+            self.assertFalse((state_root / "store" / "generations").exists())
+
+    def test_legacy_state_json_is_migrated_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            original = store.init()
+            (state_root / "manifest.json").unlink()
+            import shutil
+
+            shutil.rmtree(state_root / "store")
+            (state_root / "state.json").write_text(
+                json.dumps(original, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            migrated = Store(state_root).init()
+            self.assertEqual(migrated["version"], original["version"])
+            self.assertTrue((state_root / "manifest.json").is_file())
+            self.assertTrue((state_root / "state.v1.json").is_file())
+            self.assertFalse((state_root / "state.json").exists())
 
     def test_goal_manager_incomplete_creates_implicit_worker_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

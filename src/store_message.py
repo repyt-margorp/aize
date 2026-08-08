@@ -47,25 +47,46 @@ class MessageMixin:
             payload=dict(payload),
             created_at=created_at,
         )
-        state.setdefault("messages", []).append(message)
         self._log_message_for_session(state, message, session_id)
         state["sessions"][session_id]["updated_at"] = str(message["created_at"])
         return message
 
     def _session_messages(self, state: dict[str, Any], session_id: str) -> list[dict[str, Any]]:
-        message_ids = {
-            str(entry.get("message_id") or "")
-            for entry in state.setdefault("session_logs", {}).setdefault(session_id, [])
-            if entry.get("kind") == "Message"
-        }
-        return [
-            dict(message)
-            for message in state.setdefault("messages", [])
-            if str(message.get("message_id") or "") in message_ids
-        ]
+        messages: list[dict[str, Any]] = []
+        for entry in self._session_log_entries(state, session_id):
+            if entry.get("kind") != "Message":
+                continue
+            message = self._message_for_log_entry(state, entry)
+            if message:
+                messages.append(dict(message))
+        return messages
+
+    def _all_messages(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        indexed_messages: list[tuple[str, str, int, dict[str, Any]]] = []
+        seen: set[str] = set()
+        for session_id in self._all_session_log_ids(state):
+            for entry in self._session_log_entries(state, session_id):
+                if entry.get("kind") != "Message":
+                    continue
+                message = self._message_for_log_entry(state, entry)
+                if not message:
+                    continue
+                message_id = str(message.get("message_id") or "")
+                if message_id in seen:
+                    continue
+                seen.add(message_id)
+                indexed_messages.append(
+                    (
+                        str(message.get("created_at") or ""),
+                        session_id,
+                        int(entry.get("seq") or 0),
+                        dict(message),
+                    )
+                )
+        return [item[3] for item in sorted(indexed_messages, key=lambda item: item[:3])]
 
     def _messages_after_cursor(self, state: dict[str, Any], endpoint: str) -> list[dict[str, Any]]:
-        messages = state.get("messages", [])
+        messages = self._all_messages(state)
         cursor_id = str(state.setdefault("endpoint_cursors", {}).get(endpoint) or "")
         start_index = -1
         if cursor_id:
@@ -106,26 +127,27 @@ class MessageMixin:
         body: str,
         files: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        state = self.load()
-        if session_id not in state["sessions"]:
-            raise StoreError(f"unknown session: {session_id}")
-        normalized_files = self._normalize_message_files(files)
-        payload: dict[str, Any] = {"body": body}
-        if normalized_files:
-            payload["files"] = normalized_files
-        from_endpoint = normalize_endpoint(sender, session_id=session_id)
-        to_endpoint = normalize_endpoint(recipient, session_id=session_id)
-        if from_endpoint.startswith("agent:") or to_endpoint.startswith("agent:"):
-            raise StoreError("generic messages may not use agent endpoints")
-        message = self._append_session_message_locked(
-            state,
-            session_id=session_id,
-            from_endpoint=from_endpoint,
-            to_endpoint=to_endpoint,
-            payload=payload,
-        )
-        self.save(state)
-        return message
+        with self._state_lock():
+            state = self.load()
+            if session_id not in state["sessions"]:
+                raise StoreError(f"unknown session: {session_id}")
+            normalized_files = self._normalize_message_files(files)
+            payload: dict[str, Any] = {"body": body}
+            if normalized_files:
+                payload["files"] = normalized_files
+            from_endpoint = normalize_endpoint(sender, session_id=session_id)
+            to_endpoint = normalize_endpoint(recipient, session_id=session_id)
+            if from_endpoint.startswith("agent:") or to_endpoint.startswith("agent:"):
+                raise StoreError("generic messages may not use agent endpoints")
+            message = self._append_session_message_locked(
+                state,
+                session_id=session_id,
+                from_endpoint=from_endpoint,
+                to_endpoint=to_endpoint,
+                payload=payload,
+            )
+            self.save(state)
+            return message
 
     def append_file_message(
         self,
