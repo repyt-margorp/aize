@@ -10,7 +10,7 @@ The dispatch index is only a scheduling index. A pending item records:
 - `goal_id`
 - `role`
 - priority and lease state
-- optional `trigger_message_id`
+- contiguous `from_log_seq` and `observed_to_seq`
 
 Triggered work items are not coalesced across different Session Messages. This preserves the Session log order as the source of truth while still letting the scheduler pick the next role to run.
 

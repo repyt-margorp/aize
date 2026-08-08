@@ -18,7 +18,7 @@ derive dispatch work from committed log records.
 - GoalManager and WorkerAgent dispatch only consume committed records.
 - A torn final record after process or machine interruption is detected and
   discarded without losing earlier valid records.
-- Dispatch requests and runtime indexes are derived state. SessionLog remains
+- Dispatch readiness and runtime indexes are derived state. SessionLog remains
   authoritative and can reconstruct pending role work.
 - Hot-path Message writes do not copy unrelated Sessions, runs, or logs.
 - The AIze Store coordinates CLI, Daemon, and Agent API processes through one
@@ -44,7 +44,7 @@ derive dispatch work from committed log records.
     log.index.json
   runtime/
     endpoint_cursors.json
-    dispatch_requests.json
+    dispatch_readiness.json
     agent_threads.json
     dispatch_runs.json
   artifacts/<sha256-prefix>/<sha256>.txt

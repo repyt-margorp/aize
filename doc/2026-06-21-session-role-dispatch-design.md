@@ -59,7 +59,7 @@ Implemented:
 - GoalManager/Worker prompts receive Session MessageLog context.
 - Completion authority remains with GoalManager dispatch commit.
 - Dispatch index entries are role-specific work items.
-- Dispatch index entries are lightweight pointers into the Session MessageLog, usually via `trigger_message_id`.
+- Role readiness entries point to one contiguous unread SessionLog range.
 - Agent prompts receive both the full `session-messages` log and the role-specific `dispatch-feed`.
 - `GoalManager` runs `GoalManagerReview`.
 - `WorkerAgent` runs `WorkerWork`.

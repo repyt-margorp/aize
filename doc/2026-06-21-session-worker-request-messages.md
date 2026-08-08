@@ -13,7 +13,7 @@ GoalManager no longer sends work directly to `agent:WorkerAgent`.
 
 When the Session stores that Message, the store creates a role-specific `WorkerAgent` dispatch index entry. Worker dispatch then reads the Session MessageLog plus the triggered Worker request Message.
 
-The dispatch index does not carry the work body as separate state. It stores a `trigger_message_id` pointer back into the Session MessageLog. Worker and GoalManager prompts receive:
+The dispatch index does not carry the work body as separate state. A Role readiness entry points to one contiguous unread SessionLog range. Worker and GoalManager prompts receive:
 
 - `session-messages`: the ordered Session-related log.
 - `dispatch-feed`: the triggering Session Message or Messages for this role dispatch.

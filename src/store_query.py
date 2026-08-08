@@ -22,7 +22,7 @@ class QueryMixin:
 
     def status(self) -> dict[str, Any]:
         state = self.load()
-        self._enqueue_dispatchable_goals(state)
+        self._refresh_dispatch_readiness(state)
         message_count = self.storage.session_log_stats()["message_count"]
         active_sessions = [session for session in state["sessions"].values() if session.get("active") is True]
         inactive_sessions = [session for session in state["sessions"].values() if session.get("active") is not True]
@@ -37,11 +37,11 @@ class QueryMixin:
         acquired_dispatch_leases = [
             run for run in state["dispatch_runs"].values() if run.get("lease_state") == "acquired"
         ]
-        queued_dispatch_request_entries = [
-            entry for entry in state.get("dispatch_requests", []) if entry.get("status") == "queued"
+        ready_dispatch_entries = [
+            entry for entry in state.get("dispatch_readiness", []) if entry.get("status") == "ready"
         ]
-        acquired_dispatch_request_entries = [
-            entry for entry in state.get("dispatch_requests", []) if entry.get("status") == "acquired"
+        acquired_dispatch_readiness = [
+            entry for entry in state.get("dispatch_readiness", []) if entry.get("status") == "acquired"
         ]
         return {
             "version": state["version"],
@@ -58,9 +58,9 @@ class QueryMixin:
             "active_incomplete_goal_count": len(active_incomplete_goals),
             "dispatch_run_count": len(state["dispatch_runs"]),
             "acquired_dispatch_lease_count": len(acquired_dispatch_leases),
-            "dispatch_request_count": len(state.get("dispatch_requests", [])),
-            "queued_dispatch_request_count": len(queued_dispatch_request_entries),
-            "acquired_dispatch_request_count": len(acquired_dispatch_request_entries),
+            "dispatch_readiness_count": len(state.get("dispatch_readiness", [])),
+            "ready_dispatch_count": len(ready_dispatch_entries),
+            "acquired_dispatch_readiness_count": len(acquired_dispatch_readiness),
             "dispatch_lot_size": max(1, int(state.setdefault("runtime_settings", {}).get("dispatch_lot_size") or 1)),
             "agent_profile_count": len(state["agent_profiles"]),
             "agent_thread_count": len(state["agent_threads"]),
@@ -89,10 +89,10 @@ class QueryMixin:
             runs = self.storage.hydrate_dispatch_runs(runs)
         return sorted(runs, key=lambda item: (item["created_at"], item["run_id"]))
 
-    def dispatch_requests(self, session_id: str | None = None) -> list[dict[str, Any]]:
+    def dispatch_readiness(self, session_id: str | None = None) -> list[dict[str, Any]]:
         state = self.load()
-        self._enqueue_dispatchable_goals(state)
-        indexed_entries = list(enumerate(state.get("dispatch_requests", [])))
+        self._refresh_dispatch_readiness(state)
+        indexed_entries = list(enumerate(state.get("dispatch_readiness", [])))
         if session_id:
             indexed_entries = [
                 (index, entry)
@@ -103,8 +103,9 @@ class QueryMixin:
             indexed_entries,
             key=lambda item: (
                 str(item[1].get("status") or ""),
-                -int(item[1].get("priority") or 0),
-                str(item[1].get("queued_at") or ""),
+                str(item[1].get("first_ready_at") or ""),
+                str(item[1].get("session_id") or ""),
+                str(item[1].get("role") or ""),
                 item[0],
             ),
         )

@@ -16,7 +16,7 @@
 
 ## Design notes
 
-The message itself is an immutable packet. Running state remains in scheduler-specific structures such as `dispatch_runs`. Dispatch scheduling entries are lightweight indexes into Session MessageLog, usually by `trigger_message_id`; they do not carry the work body as separate state. Endpoint receive progress lives in `endpoint_cursors`. Session timeline membership lives in `message_index`.
+The message itself is an immutable packet. Running state remains in scheduler-specific structures such as `dispatch_runs`. Role readiness entries are lightweight indexes over contiguous unread SessionLog ranges; they do not carry the work body as separate state. Endpoint receive progress lives in `endpoint_cursors`. Session timeline membership lives in `message_index`.
 
 This follows the MINIX-inspired split more closely:
 

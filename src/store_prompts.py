@@ -98,7 +98,7 @@ class PromptMixin:
         recovery_context: str = "",
     ) -> str:
         from_seq = (log_window or {}).get("from_log_seq")
-        to_seq = (log_window or {}).get("to_log_seq")
+        to_seq = (log_window or {}).get("observed_to_seq")
         prompt = [
             f'<aize-agent-input role="GoalManager" phase="{xml_text(phase)}">',
             "  <session>",
@@ -122,9 +122,9 @@ class PromptMixin:
             "  <dispatch-feed>",
             render_message_bundle(self._summarize_messages_for_prompt(dispatch_messages, limit=10)),
             "  </dispatch-feed>",
-            "  <dispatch-attention>",
-            xml_text(json.dumps((log_window or {}).get("attention_reasons") or [], ensure_ascii=False, sort_keys=True)),
-            "  </dispatch-attention>",
+            "  <dispatch-wake-reasons>",
+            xml_text(json.dumps((log_window or {}).get("wake_reasons") or [], ensure_ascii=False, sort_keys=True)),
+            "  </dispatch-wake-reasons>",
             "  <system-signals>",
             xml_text(json.dumps(dispatch_signals or [], ensure_ascii=False, sort_keys=True)),
             "  </system-signals>",
@@ -180,7 +180,7 @@ class PromptMixin:
         recovery_context: str = "",
     ) -> str:
         from_seq = (log_window or {}).get("from_log_seq")
-        to_seq = (log_window or {}).get("to_log_seq")
+        to_seq = (log_window or {}).get("observed_to_seq")
         prompt = [
             '<aize-agent-input role="WorkerAgent" phase="work">',
             "  <session>",
@@ -201,9 +201,9 @@ class PromptMixin:
             "  <dispatch-feed>",
             render_message_bundle(self._summarize_messages_for_prompt(dispatch_messages, limit=10)),
             "  </dispatch-feed>",
-            "  <dispatch-attention>",
-            xml_text(json.dumps((log_window or {}).get("attention_reasons") or [], ensure_ascii=False, sort_keys=True)),
-            "  </dispatch-attention>",
+            "  <dispatch-wake-reasons>",
+            xml_text(json.dumps((log_window or {}).get("wake_reasons") or [], ensure_ascii=False, sort_keys=True)),
+            "  </dispatch-wake-reasons>",
             "  <system-signals>",
             xml_text(json.dumps(dispatch_signals or [], ensure_ascii=False, sort_keys=True)),
             "  </system-signals>",

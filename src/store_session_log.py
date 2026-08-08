@@ -369,15 +369,15 @@ class SessionLogMixin:
                 run["interrupted_reason"] = "runtime recovered stale acquired run for non-dispatchable goal"
                 run.pop("current_phase", None)
 
-            for request in state.setdefault("dispatch_requests", []):
-                if request.get("status") != "acquired":
+            for readiness in state.setdefault("dispatch_readiness", []):
+                if readiness.get("status") != "acquired":
                     continue
-                if str(request.get("goal_id") or "") in current_active_incomplete_goals:
+                if str(readiness.get("goal_id") or "") in current_active_incomplete_goals:
                     continue
-                request["status"] = "stale"
-                request["stale_at"] = timestamp
-                request["stale_reason"] = "runtime recovered stale acquired request for non-dispatchable goal"
-                request.pop("acquired_at", None)
+                readiness["status"] = "stale"
+                readiness["stale_at"] = timestamp
+                readiness["stale_reason"] = "runtime recovered stale acquired readiness for non-dispatchable goal"
+                readiness.pop("acquired_at", None)
 
             for goal in current_active_incomplete_goals.values():
                 if goal.get("completion_state") != "incomplete" or goal.get("archived_at"):
@@ -396,12 +396,12 @@ class SessionLogMixin:
                     run["lease_state"] = "interrupted"
                     run["interrupted_at"] = timestamp
                     run.pop("current_phase", None)
-                for request in state.setdefault("dispatch_requests", []):
-                    if str(request.get("session_id") or "") != session_id or request.get("status") != "acquired":
+                for readiness in state.setdefault("dispatch_readiness", []):
+                    if str(readiness.get("session_id") or "") != session_id or readiness.get("status") != "acquired":
                         continue
-                    request["status"] = "queued"
-                    request["recovered_at"] = timestamp
-                    request.pop("acquired_at", None)
+                    readiness["status"] = "ready"
+                    readiness["recovered_at"] = timestamp
+                    readiness.pop("acquired_at", None)
                 target_roles = [GOAL_MANAGER_ROLE]
                 for role in interrupted_roles:
                     if role not in target_roles:

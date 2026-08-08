@@ -9,7 +9,7 @@ Dispatch now follows role-specific work items:
 - If `GoalManager` records a Worker request on the Session, a `WorkerAgent` queue item is created.
 - `WorkerAgent` reports only to `Session`.
 - A `WorkerAgent` Session report queues a later `GoalManager` review.
-- Each triggered work item points at a Session Message with `trigger_message_id`.
+- Each Role readiness entry points at the complete unread SessionLog window.
 - The agent prompt includes the whole Session MessageLog plus a smaller `dispatch-feed` for the triggering Messages.
 
 The old `GoalManagerPrecheck -> WorkerAgent -> GoalManagerCompletion` single-run pipeline was removed.

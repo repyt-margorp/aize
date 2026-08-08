@@ -77,6 +77,7 @@ class Session:
     title: str = ""
     active: bool = True
     singleton: bool = False
+    scheduling_policy: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +88,7 @@ class Session:
             "updated_at": self.updated_at,
             "active": self.active,
             "singleton": self.singleton,
+            "scheduling_policy": dict(self.scheduling_policy or {"class": "normal", "base_priority": 0}),
         }
 
 

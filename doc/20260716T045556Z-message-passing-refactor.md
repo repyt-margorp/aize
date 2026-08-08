@@ -13,7 +13,7 @@ This refactor removes three conflicting control paths from AIze:
 - `messages` stores message envelopes only: `from`, `to`, `payload`, and `created_at`.
 - A `SessionLog` entry with `kind=Message` associates an envelope with exactly one Session and gives it an ordered sequence.
 - Goal state transitions are `SessionLog` entries with `kind=GoalStateChanged`; `Goal` retains only its current completion state and current reason.
-- `role_cursors` consume SessionLog sequence numbers. `dispatch_requests` are derived leases over those log ranges.
+- `role_cursors` consume SessionLog sequence numbers. Role readiness entries are derived leases over those log ranges.
 - GoalManager uses `agent_api.set_goal_completion_state(state, reason)`. WorkerAgent cannot call it.
 - stdout/stderr remain Run diagnostics only. They have no scheduling or state-transition meaning.
 

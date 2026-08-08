@@ -24,7 +24,7 @@ from store_defs import (
 )
 from store_auth import AuthMixin
 from store_dispatch import DispatchMixin
-from store_dispatch_requests import DispatchRequestMixin
+from store_dispatch_readiness import DispatchReadinessMixin
 from store_files import SplitStateStorage
 from store_message import MessageMixin
 from store_prompts import PromptMixin
@@ -38,7 +38,7 @@ class Store(
     SessionLogMixin,
     SessionGoalMixin,
     MessageMixin,
-    DispatchRequestMixin,
+    DispatchReadinessMixin,
     PromptMixin,
     DispatchMixin,
     QueryMixin,
@@ -69,6 +69,8 @@ class Store(
                 changed = self.ensure_defaults(state)
                 if self._reconcile_state_from_session_logs(state):
                     changed = True
+                if self._refresh_dispatch_readiness(state):
+                    changed = True
                 if changed:
                     self.save(state)
                 self._clear_session_log_cache(state)
@@ -79,6 +81,8 @@ class Store(
                 state = self.load()
                 changed = self.ensure_defaults(state)
                 if self._reconcile_state_from_session_logs(state):
+                    changed = True
+                if self._refresh_dispatch_readiness(state):
                     changed = True
                 if changed:
                     self.save(state)
@@ -96,7 +100,7 @@ class Store(
                 "agent_profiles": {},
                 "agent_threads": {},
                 "dispatch_runs": {},
-                "dispatch_requests": [],
+                "dispatch_readiness": [],
                 "runtime_settings": {},
                 "messages": [],
                 "endpoint_cursors": {},
@@ -122,7 +126,7 @@ class Store(
         state.setdefault("agent_profiles", {})
         state.setdefault("agent_threads", {})
         state.setdefault("dispatch_runs", {})
-        self._ensure_dispatch_requests_state(state)
+        self._ensure_dispatch_readiness_state(state)
         state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
         state.setdefault("endpoint_cursors", {})
@@ -141,7 +145,7 @@ class Store(
         agent_profiles = state.setdefault("agent_profiles", {})
         agent_threads = state.setdefault("agent_threads", {})
         state.setdefault("dispatch_runs", {})
-        if self._ensure_dispatch_requests_state(state):
+        if self._ensure_dispatch_readiness_state(state):
             changed = True
         runtime_settings = state.setdefault("runtime_settings", {})
         state.setdefault("messages", [])
@@ -396,9 +400,9 @@ class Store(
         for goal in state.setdefault("goals", {}).values():
             if goal.get("session_id") == previous_id:
                 goal["session_id"] = session_id
-        for request in state.setdefault("dispatch_requests", []):
-            if request.get("session_id") == previous_id:
-                request["session_id"] = session_id
+        for readiness in state.setdefault("dispatch_readiness", []):
+            if readiness.get("session_id") == previous_id:
+                readiness["session_id"] = session_id
         for run in state.setdefault("dispatch_runs", {}).values():
             if run.get("session_id") == previous_id:
                 run["session_id"] = session_id

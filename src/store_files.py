@@ -32,7 +32,7 @@ ITEM_COLLECTION_KEYS = {
 }
 VALUE_COLLECTIONS = {
     "session_edges": [],
-    "dispatch_requests": [],
+    "dispatch_readiness": [],
     "runtime_settings": {},
     "endpoint_cursors": {},
 }
@@ -511,7 +511,7 @@ class SplitStateStorage:
         return base / name
 
     def _value_collection_path(self, name: str) -> Path:
-        base = self.runtime_root if name in {"dispatch_requests", "endpoint_cursors"} else self.metadata_root
+        base = self.runtime_root if name in {"dispatch_readiness", "endpoint_cursors"} else self.metadata_root
         return base / f"{name}.json"
 
     def _externalize_field(self, record: dict[str, Any], field: str, path_field: str) -> None:

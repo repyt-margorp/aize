@@ -675,19 +675,18 @@ class CliTests(unittest.TestCase):
                 "lease_acquired_at": utc_now(),
                 "steps": [],
             }
-            state["dispatch_requests"].append(
+            state["dispatch_readiness"].append(
                 {
-                    "request_id": "dr-worker-acquired",
+                    "readiness_id": "ready-worker-acquired",
                     "session_id": "recover-session",
                     "goal_id": goal["goal_id"],
                     "role": "WorkerAgent",
-                    "priority": 150,
-                    "reason": "interrupted worker",
                     "status": "acquired",
-                    "queued_at": utc_now(),
+                    "first_ready_at": utc_now(),
                     "acquired_at": utc_now(),
                     "from_log_seq": 1,
-                    "to_log_seq": store._latest_session_log_seq(state, session_id="recover-session"),
+                    "observed_to_seq": store._latest_session_log_seq(state, session_id="recover-session"),
+                    "wake_reasons": [],
                 }
             )
             store.save(state)
@@ -701,12 +700,14 @@ class CliTests(unittest.TestCase):
 
             state = store.load()
             self.assertEqual(state["dispatch_runs"]["run-worker-acquired"]["lease_state"], "interrupted")
-            recovered_request = next(
-                request for request in state["dispatch_requests"] if request["request_id"] == "dr-worker-acquired"
+            recovered_readiness = next(
+                readiness
+                for readiness in state["dispatch_readiness"]
+                if readiness["readiness_id"] == "ready-worker-acquired"
             )
-            self.assertEqual(recovered_request["status"], "queued")
-            requests = store.dispatch_requests("recover-session")
-            self.assertTrue(any(request.get("role") == "GoalManager" for request in requests))
+            self.assertEqual(recovered_readiness["status"], "ready")
+            readiness = store.dispatch_readiness("recover-session")
+            self.assertTrue(any(entry.get("role") == "GoalManager" for entry in readiness))
 
     def test_runtime_recovery_closes_stale_acquired_runs_for_completed_goals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -731,19 +732,18 @@ class CliTests(unittest.TestCase):
                 "lease_acquired_at": utc_now(),
                 "steps": [],
             }
-            state["dispatch_requests"].append(
+            state["dispatch_readiness"].append(
                 {
-                    "request_id": "dr-stale-acquired",
+                    "readiness_id": "ready-stale-acquired",
                     "session_id": "done-session",
                     "goal_id": goal["goal_id"],
                     "role": "WorkerAgent",
-                    "priority": 150,
-                    "reason": "stale worker",
                     "status": "acquired",
-                    "queued_at": utc_now(),
+                    "first_ready_at": utc_now(),
                     "acquired_at": utc_now(),
                     "from_log_seq": 1,
-                    "to_log_seq": store._latest_session_log_seq(state, session_id="done-session"),
+                    "observed_to_seq": store._latest_session_log_seq(state, session_id="done-session"),
+                    "wake_reasons": [],
                 }
             )
             store.save(state)
@@ -753,7 +753,7 @@ class CliTests(unittest.TestCase):
 
             state = store.load()
             self.assertEqual(state["dispatch_runs"]["run-stale-acquired"]["lease_state"], "interrupted")
-            self.assertEqual(state["dispatch_requests"][0]["status"], "stale")
+            self.assertEqual(state["dispatch_readiness"][0]["status"], "stale")
             status = store.status()
             self.assertEqual(status["active_incomplete_goal_count"], 0)
             self.assertEqual(status["acquired_dispatch_lease_count"], 0)
@@ -1110,9 +1110,9 @@ class CliTests(unittest.TestCase):
             self.assertEqual(followup.returncode, 0, followup.stderr)
             goals = json.loads(run_cli(state_root, "goals", "build-cli").stdout)
             self.assertEqual(goals[0]["completion_state"], "incomplete")
-            queue = json.loads(run_cli(state_root, "dispatch-requests", "build-cli").stdout)
-            self.assertEqual(queue[0]["status"], "queued")
-            self.assertEqual(queue[0]["priority"], 100)
+            queue = json.loads(run_cli(state_root, "dispatch-readiness", "build-cli").stdout)
+            self.assertEqual(queue[0]["status"], "ready")
+            self.assertIn("UserInput", {reason["kind"] for reason in queue[0]["wake_reasons"]})
 
             redispatched = run_cli(state_root, "dispatch-once")
             self.assertEqual(redispatched.returncode, 0, redispatched.stderr)
@@ -1292,13 +1292,12 @@ class CliTests(unittest.TestCase):
             self.assertEqual(worker_messages[0]["payload"]["forwarded_from"], message["message_id"])
             self.assertEqual(worker_messages[0]["payload"]["run_id"], "run-active-worker")
             self.assertEqual(worker_messages[0]["payload"]["body"], "new user input while worker is running")
-            queue = store.dispatch_requests("running-session")
+            readiness = store.dispatch_readiness("running-session")
             worker_entries = [
                 entry
-                for entry in queue
-                if entry.get("status") == "queued"
+                for entry in readiness
+                if entry.get("status") == "ready"
                 and entry.get("role") == "WorkerAgent"
-                and entry.get("trigger_message_id") == worker_messages[0]["message_id"]
             ]
             self.assertEqual(worker_entries, [])
 
@@ -1306,15 +1305,18 @@ class CliTests(unittest.TestCase):
             state["dispatch_runs"]["run-active-worker"]["lease_state"] = "released"
             state["dispatch_runs"]["run-active-worker"].pop("current_phase", None)
             store.save(state)
-            queue = store.dispatch_requests("running-session")
+            readiness = store.dispatch_readiness("running-session")
             worker_entries = [
                 entry
-                for entry in queue
-                if entry.get("status") == "queued"
+                for entry in readiness
+                if entry.get("status") == "ready"
                 and entry.get("role") == "WorkerAgent"
-                and entry.get("trigger_message_id") == worker_messages[0]["message_id"]
             ]
             self.assertEqual(len(worker_entries), 1)
+            self.assertIn(
+                worker_messages[0]["message_id"],
+                {reason.get("message_id") for reason in worker_entries[0]["wake_reasons"]},
+            )
 
     def test_active_worker_followup_waits_for_worker_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1370,7 +1372,10 @@ class CliTests(unittest.TestCase):
             self.assertIsNotNone(dispatched)
             assert dispatched is not None
             self.assertEqual(dispatched["run"]["role"], "WorkerAgent")
-            self.assertEqual(dispatched["run"]["trigger_message_id"], worker_message["message_id"])
+            self.assertIn(
+                worker_message["message_id"],
+                {reason.get("message_id") for reason in dispatched["run"]["wake_reasons"]},
+            )
 
     def test_worker_session_report_enqueues_goal_manager_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1401,19 +1406,21 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(message["to"], "session:worker-report-session")
 
-            queue = store.dispatch_requests("worker-report-session")
+            readiness = store.dispatch_readiness("worker-report-session")
             live_entries = [
                 entry
-                for entry in queue
-                if entry.get("status") == "queued"
+                for entry in readiness
+                if entry.get("status") == "ready"
                 and entry.get("role") == "GoalManager"
-                and entry.get("trigger_message_id") == message["message_id"]
             ]
             self.assertEqual(len(live_entries), 1)
-            self.assertIn("WorkerAgent Session report", live_entries[0]["reason"])
+            self.assertIn(
+                message["message_id"],
+                {reason.get("message_id") for reason in live_entries[0]["wake_reasons"]},
+            )
             self.assertEqual(live_entries[0]["goal_id"], goal["goal_id"])
 
-    def test_triggered_dispatch_entries_are_not_coalesced_across_messages(self) -> None:
+    def test_worker_wake_reasons_are_coalesced_into_one_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             from store import Store
 
@@ -1451,17 +1458,21 @@ class CliTests(unittest.TestCase):
                 worker_request=True,
             )
 
-            queue = store.dispatch_requests("trigger-session")
+            readiness = store.dispatch_readiness("trigger-session")
             worker_entries = [
                 entry
-                for entry in queue
-                if entry.get("status") == "queued" and entry.get("role") == "WorkerAgent"
+                for entry in readiness
+                if entry.get("status") == "ready" and entry.get("role") == "WorkerAgent"
             ]
             self.assertEqual(len(worker_entries), 1)
-            self.assertEqual(worker_entries[0]["trigger_message_id"], second["message_id"])
-            self.assertLessEqual(int(worker_entries[0]["from_log_seq"]), int(worker_entries[0]["to_log_seq"]))
+            wake_message_ids = {reason.get("message_id") for reason in worker_entries[0]["wake_reasons"]}
+            self.assertEqual(wake_message_ids, {first["message_id"], second["message_id"]})
+            self.assertLessEqual(
+                int(worker_entries[0]["from_log_seq"]),
+                int(worker_entries[0]["observed_to_seq"]),
+            )
 
-    def test_queued_dispatch_request_refreshes_to_latest_session_log_before_acquire(self) -> None:
+    def test_ready_window_refreshes_to_latest_session_log_before_acquire(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             from store import Store
 
@@ -1487,15 +1498,15 @@ class CliTests(unittest.TestCase):
                 body="first feedback",
             )
             state = store.load()
-            store._enqueue_dispatchable_goals(state)
+            store._refresh_dispatch_readiness(state)
             initial = next(
                 entry
-                for entry in state["dispatch_requests"]
-                if entry.get("status") == "queued" and entry.get("role") == "GoalManager"
+                for entry in state["dispatch_readiness"]
+                if entry.get("status") == "ready" and entry.get("role") == "GoalManager"
             )
-            initial_request_id = initial["request_id"]
-            initial_queued_at = initial["queued_at"]
-            initial_to_seq = int(initial["to_log_seq"])
+            initial_readiness_id = initial["readiness_id"]
+            initial_ready_at = initial["first_ready_at"]
+            initial_to_seq = int(initial["observed_to_seq"])
             store.save(state)
 
             second = store.append_user_input(
@@ -1504,21 +1515,114 @@ class CliTests(unittest.TestCase):
                 body="second feedback before dispatch",
             )
             state = store.load()
-            selected = store._next_dispatch_requests_entry(state, session_id="refresh-session")
+            selected = store._next_dispatch_readiness_entry(state, session_id="refresh-session")
             self.assertIsNotNone(selected)
             assert selected is not None
-            self.assertEqual(selected["request_id"], initial_request_id)
-            self.assertEqual(selected["queued_at"], initial_queued_at)
-            self.assertGreater(int(selected["to_log_seq"]), initial_to_seq)
-            self.assertEqual(selected["to_log_seq"], store._latest_session_log_seq(state, session_id="refresh-session"))
-            self.assertEqual(selected["trigger_message_id"], second["message_id"])
-            attention_message_ids = {
+            self.assertEqual(selected["readiness_id"], initial_readiness_id)
+            self.assertEqual(selected["first_ready_at"], initial_ready_at)
+            self.assertGreater(int(selected["observed_to_seq"]), initial_to_seq)
+            self.assertEqual(
+                selected["observed_to_seq"],
+                store._latest_session_log_seq(state, session_id="refresh-session"),
+            )
+            wake_message_ids = {
                 reason.get("message_id")
-                for reason in selected["attention_reasons"]
+                for reason in selected["wake_reasons"]
                 if reason.get("message_id")
             }
-            self.assertIn(first["message_id"], attention_message_ids)
-            self.assertIn(second["message_id"], attention_message_ids)
+            self.assertIn(first["message_id"], wake_message_ids)
+            self.assertIn(second["message_id"], wake_message_ids)
+
+    def test_log_appended_after_acquire_remains_for_next_role_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("snapshot-session", parent_session_ids=["root"])
+            store.update_goal("snapshot-session", body="process feedback", created_by="root")
+            state = store.load()
+            state["sessions"]["snapshot-session"]["role_cursors"]["GoalManager"] = (
+                store._latest_session_log_seq(state, session_id="snapshot-session")
+            )
+            store.save(state)
+            first = store.append_user_input("snapshot-session", sender="root", body="first")
+
+            with store._state_lock():
+                lease = store._acquire_dispatch_lease_locked(session_id="snapshot-session")
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            observed_to_seq = int(lease["run"]["observed_to_seq"])
+            second = store.append_user_input("snapshot-session", sender="root", body="second during run")
+
+            state = store.load()
+            store._set_role_cursor(
+                state,
+                session_id="snapshot-session",
+                role="GoalManager",
+                seq=observed_to_seq,
+            )
+            state["dispatch_runs"][lease["run"]["run_id"]]["lease_state"] = "released"
+            readiness = store._readiness_entry_by_id(state, lease["readiness_id"])
+            assert readiness is not None
+            readiness["status"] = "resolved"
+            store.save(state)
+
+            state = store.load()
+            store._refresh_dispatch_readiness(state)
+            next_entry = next(
+                entry
+                for entry in state["dispatch_readiness"]
+                if entry.get("status") == "ready" and entry.get("role") == "GoalManager"
+            )
+            self.assertGreater(int(next_entry["from_log_seq"]), observed_to_seq)
+            self.assertNotIn(
+                first["message_id"],
+                {reason.get("message_id") for reason in next_entry["wake_reasons"]},
+            )
+            self.assertIn(
+                second["message_id"],
+                {reason.get("message_id") for reason in next_entry["wake_reasons"]},
+            )
+
+    def test_startup_rebuilds_readiness_from_session_log_and_role_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("rebuild-session", parent_session_ids=["root"])
+            store.update_goal("rebuild-session", body="rebuild readiness", created_by="root")
+            state = store.load()
+            state["dispatch_readiness"] = []
+            store.save(state)
+
+            Store(state_root).init()
+
+            rebuilt = [
+                entry
+                for entry in Store(state_root).load()["dispatch_readiness"]
+                if entry["session_id"] == "rebuild-session"
+            ]
+            self.assertEqual(len(rebuilt), 1)
+            self.assertEqual(rebuilt[0]["role"], "GoalManager")
+
+    def test_session_scheduling_policy_can_be_set_from_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            self.assertEqual(run_cli(state_root, "create-session", "policy-session", "--parent", "root").returncode, 0)
+
+            result = run_cli(state_root, "set-session-policy", "policy-session", "high", "7")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"base_priority": 7, "class": "high"})
+            from store import Store
+
+            session = Store(state_root).session("policy-session")
+            self.assertEqual(session["scheduling_policy"], {"base_priority": 7, "class": "high"})
 
     def test_messages_defaults_to_tail_ten_and_accepts_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1847,10 +1951,10 @@ class CliTests(unittest.TestCase):
                     for entry in log
                 )
             )
-            requests = json.loads(run_cli_with_env(state_root, env, "dispatch-requests", "stdout-only").stdout)
+            requests = json.loads(run_cli_with_env(state_root, env, "dispatch-readiness", "stdout-only").stdout)
             self.assertTrue(
                 any(
-                    request.get("status") == "queued" and request.get("role") == "GoalManager"
+                    request.get("status") == "ready" and request.get("role") == "GoalManager"
                     for request in requests
                 )
             )
@@ -1866,7 +1970,7 @@ class CliTests(unittest.TestCase):
 
             before = (state_root / "manifest.json").read_text(encoding="utf-8")
             self.assertEqual(run_cli(state_root, "status").returncode, 0)
-            self.assertEqual(run_cli(state_root, "dispatch-requests", "time").returncode, 0)
+            self.assertEqual(run_cli(state_root, "dispatch-readiness", "time").returncode, 0)
             after = (state_root / "manifest.json").read_text(encoding="utf-8")
             self.assertEqual(after, before)
 
@@ -2216,16 +2320,15 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["run"]["completion_state"], "incomplete")
             self.assertTrue(payload["message"]["payload"]["implicit_worker_request"])
 
-            queue = json.loads(run_cli_with_env(state_root, env, "dispatch-requests", "retry-session").stdout)
+            queue = json.loads(run_cli_with_env(state_root, env, "dispatch-readiness", "retry-session").stdout)
             worker_entries = [
                 entry
                 for entry in queue
-                if entry.get("status") == "queued" and entry.get("role") == "WorkerAgent"
+                if entry.get("status") == "ready" and entry.get("role") == "WorkerAgent"
             ]
             self.assertEqual(len(worker_entries), 1)
-            self.assertEqual(worker_entries[0]["priority"], 150)
             self.assertNotIn("available_after", worker_entries[0])
-            self.assertIn("requires WorkerAgent work", worker_entries[0]["reason"])
+            self.assertIn("WorkerRequest", {reason["kind"] for reason in worker_entries[0]["wake_reasons"]})
 
             goals = json.loads(run_cli_with_env(state_root, env, "goals", "retry-session").stdout)
             self.assertIn("waiting for more work", goals[0]["completion_reason"])
@@ -2368,11 +2471,11 @@ class CliTests(unittest.TestCase):
                 )
             )
             requests = json.loads(
-                run_cli_with_env(state_root, env, "dispatch-requests", "missing-worker-report").stdout
+                run_cli_with_env(state_root, env, "dispatch-readiness", "missing-worker-report").stdout
             )
             self.assertTrue(
                 any(
-                    request.get("status") == "queued" and request.get("role") == "GoalManager"
+                    request.get("status") == "ready" and request.get("role") == "GoalManager"
                     for request in requests
                 )
             )
@@ -2897,8 +3000,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("session: time", result.stdout)
             self.assertNotIn("dispatch queued in background", result.stdout)
-            requests = json.loads(run_cli(state_root, "dispatch-requests", "time").stdout)
-            self.assertTrue(any(request["status"] == "queued" for request in requests))
+            requests = json.loads(run_cli(state_root, "dispatch-readiness", "time").stdout)
+            self.assertTrue(any(request["status"] == "ready" for request in requests))
 
     def test_console_update_goal_uses_body_without_title(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

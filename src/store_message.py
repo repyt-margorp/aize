@@ -5,7 +5,6 @@ from typing import Any
 from model import Message, new_id, utc_now
 from store_defs import (
     AGENT_ROLES,
-    DISPATCH_PRIORITY_USER_INPUT,
     GOAL_MANAGER_ROLE,
     ROLE_MESSAGE_RECIPIENTS,
     SESSION_RECIPIENT,
@@ -292,10 +291,8 @@ class MessageMixin:
             session_id=session_id,
             reason=f"UserInput message {message['message_id']} requires Session processing.",
             actor=sender,
-            priority=DISPATCH_PRIORITY_USER_INPUT,
             created_at=now,
-            trigger_message_id=message["message_id"],
-            enqueue_on_incomplete=False,
+            defer_goal_manager=bool(active_worker_run),
         )
         message["payload"]["reprocess_goal_id"] = target_goal["goal_id"]
         message["payload"]["reprocess_recorded_at"] = now

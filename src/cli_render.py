@@ -97,7 +97,7 @@ def current_goal_by_session(goals: list[dict[str, Any]]) -> dict[str, dict[str, 
 
 
 def dispatch_state_by_goal(
-    queue: list[dict[str, Any]] | None = None,
+    readiness: list[dict[str, Any]] | None = None,
     runs: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     states: dict[str, str] = {}
@@ -107,12 +107,12 @@ def dispatch_state_by_goal(
         goal_id = str(run.get("goal_id") or "")
         if goal_id:
             states[goal_id] = "running"
-    for entry in queue or []:
-        if entry.get("status") != "queued":
+    for entry in readiness or []:
+        if entry.get("status") != "ready":
             continue
         goal_id = str(entry.get("goal_id") or "")
         if goal_id and states.get(goal_id) != "running":
-            states[goal_id] = "queued"
+            states[goal_id] = "ready"
     return states
 
 
@@ -174,14 +174,14 @@ def print_sessions(
     sessions: list[dict[str, Any]],
     *,
     goals: list[dict[str, Any]] | None = None,
-    queue: list[dict[str, Any]] | None = None,
+    readiness: list[dict[str, Any]] | None = None,
     runs: list[dict[str, Any]] | None = None,
 ) -> None:
     if not sessions:
         print("No sessions.")
         return
     current_goals = current_goal_by_session(goals or [])
-    dispatch_states = dispatch_state_by_goal(queue, runs)
+    dispatch_states = dispatch_state_by_goal(readiness, runs)
     agent_allocations = agent_allocations_by_session(runs)
     print(f"Sessions ({len(sessions)})")
     for session in sessions:
@@ -302,22 +302,26 @@ def print_dispatch_runs(runs: list[dict[str, Any]]) -> None:
         phases = [str(step.get("phase")) for step in run.get("steps", []) if isinstance(step, dict)]
         if phases:
             print(f"  steps: {', '.join(phases)}")
+        if run.get("scheduling_score") is not None:
+            print(f"  scheduling: score={run.get('scheduling_score')} {run.get('scheduling_reason') or ''}".rstrip())
 
 
-def print_dispatch_requests(entries: list[dict[str, Any]]) -> None:
+def print_dispatch_readiness(entries: list[dict[str, Any]]) -> None:
     if not entries:
-        print("Dispatch requests: empty")
+        print("Dispatch readiness: empty")
         return
-    print(f"Dispatch requests ({len(entries)})")
+    print(f"Dispatch readiness ({len(entries)})")
     for entry in entries:
         print(
-            f"- {entry.get('request_id')} [{entry.get('status')}] "
+            f"- {entry.get('readiness_id')} [{entry.get('status')}] "
             f"session={entry.get('session_id')} goal={entry.get('goal_id')} "
-            f"role={entry.get('role') or GOAL_MANAGER_ROLE} priority={entry.get('priority')}"
+            f"role={entry.get('role') or GOAL_MANAGER_ROLE} "
+            f"range={entry.get('from_log_seq')}..{entry.get('observed_to_seq')}"
         )
-        reason = short_text(entry.get("reason"), limit=120)
-        if reason:
-            print(f"  reason: {reason}")
+        print(f"  first_ready_at: {entry.get('first_ready_at')}")
+        wake_kinds = [str(reason.get("kind") or "") for reason in entry.get("wake_reasons", []) if isinstance(reason, dict)]
+        if wake_kinds:
+            print(f"  wake_reasons: {', '.join(wake_kinds)}")
         if entry.get("available_after"):
             print(f"  available_after: {entry.get('available_after')}")
 
@@ -326,10 +330,10 @@ def print_graph(
     graph: dict[str, Any],
     *,
     goals: list[dict[str, Any]] | None = None,
-    queue: list[dict[str, Any]] | None = None,
+    readiness: list[dict[str, Any]] | None = None,
     runs: list[dict[str, Any]] | None = None,
 ) -> None:
-    print_sessions(list(graph.get("sessions") or []), goals=goals, queue=queue, runs=runs)
+    print_sessions(list(graph.get("sessions") or []), goals=goals, readiness=readiness, runs=runs)
     edges = list(graph.get("edges") or [])
     if not edges:
         print("Edges: none")

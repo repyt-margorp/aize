@@ -7,13 +7,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from dispatch_policy import SCHEDULING_CLASS_SCORES
 from model import Goal, Session, Unit, new_id, utc_now
 from schedule_resolvers import ScheduleResolverError, resolve_next_run_at
 from store_defs import (
     AGENT_ROLES,
     DEFAULT_SESSION_CAPABILITIES,
-    DISPATCH_PRIORITY_GOAL,
-    DISPATCH_PRIORITY_USER_INPUT,
     GOAL_MANAGER_ROLE,
     ROOT_SESSION_ID,
     ROOT_USERNAME,
@@ -110,6 +109,14 @@ class SessionGoalMixin:
             self._ensure_session_unit_workspace_link(session, state.get("units", {}).get(unit_id) if unit_id else None)
             if session.get("capabilities") != DEFAULT_SESSION_CAPABILITIES:
                 session["capabilities"] = json.loads(json.dumps(DEFAULT_SESSION_CAPABILITIES, ensure_ascii=False))
+                changed = True
+            scheduling_policy = session.get("scheduling_policy")
+            normalized_policy = {
+                "class": str(scheduling_policy.get("class") or "normal") if isinstance(scheduling_policy, dict) else "normal",
+                "base_priority": int(scheduling_policy.get("base_priority") or 0) if isinstance(scheduling_policy, dict) else 0,
+            }
+            if scheduling_policy != normalized_policy:
+                session["scheduling_policy"] = normalized_policy
                 changed = True
         return changed
 
@@ -304,8 +311,6 @@ class SessionGoalMixin:
                     "incomplete",
                     reason=f"Scheduled Unit initial prompt {message['message_id']} requires Session processing.",
                     actor=unit_created_by,
-                    priority=DISPATCH_PRIORITY_USER_INPUT,
-                    trigger_message_id=message["message_id"],
                 )
                 message["payload"]["reprocess_goal_id"] = goal["goal_id"]
                 message["payload"]["reprocess_recorded_at"] = now_text
@@ -386,8 +391,6 @@ class SessionGoalMixin:
                     "incomplete",
                     reason=f"Startup Unit initial prompt {message['message_id']} requires Session processing.",
                     actor=unit_created_by,
-                    priority=DISPATCH_PRIORITY_USER_INPUT,
-                    trigger_message_id=message["message_id"],
                 )
                 message["payload"]["reprocess_goal_id"] = goal["goal_id"]
                 message["payload"]["reprocess_recorded_at"] = now_text
@@ -423,6 +426,28 @@ class SessionGoalMixin:
         profile["updated_at"] = utc_now()
         self.save(state)
         return dict(profile)
+
+    def set_session_scheduling_policy(
+        self,
+        session_id: str,
+        *,
+        scheduling_class: str,
+        base_priority: int,
+    ) -> dict[str, Any]:
+        normalized_class = str(scheduling_class or "").strip().lower()
+        if normalized_class not in SCHEDULING_CLASS_SCORES:
+            supported = ", ".join(sorted(SCHEDULING_CLASS_SCORES))
+            raise StoreError(f"unsupported scheduling class: {scheduling_class}; expected one of {supported}")
+        with self._state_lock():
+            state = self.load()
+            session = state["sessions"].get(session_id)
+            if not session:
+                raise StoreError(f"unknown session: {session_id}")
+            policy = {"class": normalized_class, "base_priority": int(base_priority)}
+            session["scheduling_policy"] = policy
+            session["updated_at"] = utc_now()
+            self.save(state)
+            return dict(policy)
 
     def agent_profiles(self) -> list[dict[str, Any]]:
         state = self.load()
@@ -614,7 +639,6 @@ class SessionGoalMixin:
             "incomplete",
             reason="Goal session created.",
             actor="system",
-            priority=DISPATCH_PRIORITY_GOAL,
         )
         return {"session": dict(state["sessions"][session_id]), "goal": goal_dict}
 
@@ -688,8 +712,6 @@ class SessionGoalMixin:
             "incomplete",
             reason=f"Singleton Unit {unit_id} activated by {activation_trigger} trigger.",
             actor="system",
-            priority=DISPATCH_PRIORITY_GOAL,
-            enqueue_on_incomplete=True,
         )
         return {"session": dict(session), "goal": goal, "startup_signal" if activation_trigger == "startup" else "activation_signal": dict(signal)}
 
@@ -988,7 +1010,6 @@ class SessionGoalMixin:
             "incomplete",
             reason=reason,
             actor="system",
-            priority=DISPATCH_PRIORITY_GOAL,
         )
         self.save(state)
         return goal_dict
@@ -1002,11 +1023,8 @@ class SessionGoalMixin:
         reason: str,
         actor: str,
         run_id: str | None = None,
-        priority: int = DISPATCH_PRIORITY_GOAL,
-        enqueue_on_incomplete: bool = False,
-        available_after: str | None = None,
-        trigger_message_id: str | None = None,
         occurred_at: str | None = None,
+        defer_goal_manager: bool = False,
     ) -> dict[str, Any]:
         if completion_state not in {"complete", "incomplete"}:
             raise StoreError(f"unsupported goal completion state: {completion_state}")
@@ -1017,20 +1035,10 @@ class SessionGoalMixin:
         goal["completion_reason_updated_at"] = now
         if completion_state == "complete":
             goal["completed_at"] = now
-            self._resolve_dispatch_request_entries(state, str(goal.get("goal_id") or ""), resolved_at=now)
+            self._resolve_dispatch_readiness(state, str(goal.get("goal_id") or ""), resolved_at=now)
         else:
             goal.pop("completed_at", None)
             goal["last_incomplete_at"] = now
-            if enqueue_on_incomplete:
-                self._enqueue_dispatch(
-                    state,
-                    goal,
-                    priority=priority,
-                    reason=reason,
-                    queued_at=now,
-                    available_after=available_after,
-                    trigger_message_id=trigger_message_id,
-                )
         session = state["sessions"].get(str(goal.get("session_id") or ""))
         if session:
             session["updated_at"] = now
@@ -1044,6 +1052,8 @@ class SessionGoalMixin:
         }
         if run_id:
             transition["run_id"] = run_id
+        if defer_goal_manager:
+            transition["defer_goal_manager_until_worker_report"] = True
         self._log_goal_state_transition(state, goal, transition)
         return transition
 
@@ -1122,10 +1132,8 @@ class SessionGoalMixin:
         session_id: str,
         actor: str,
         reason: str,
-        priority: int,
         created_at: str,
-        trigger_message_id: str | None = None,
-        enqueue_on_incomplete: bool = True,
+        defer_goal_manager: bool = False,
     ) -> dict[str, Any]:
         target_goal = self._current_goal_for_session(state, session_id)
         if not target_goal:
@@ -1143,9 +1151,7 @@ class SessionGoalMixin:
             "incomplete",
             reason=reason,
             actor=actor,
-            priority=priority,
-            trigger_message_id=trigger_message_id,
-            enqueue_on_incomplete=enqueue_on_incomplete,
+            defer_goal_manager=defer_goal_manager,
         )
         return target_goal
 

@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     set_dispatch_lots = sub.add_parser("set-dispatch-lots", help="set daemon dispatch lot target size")
     set_dispatch_lots.add_argument("size", type=int)
 
+    set_session_policy = sub.add_parser("set-session-policy", help="set Session scheduling class and base priority")
+    set_session_policy.add_argument("session_id")
+    set_session_policy.add_argument(
+        "scheduling_class",
+        choices=["idle", "background", "normal", "high", "critical"],
+    )
+    set_session_policy.add_argument("base_priority", type=int)
+
     set_agent = sub.add_parser("set-agent", help="assign a provider to an agent role")
     set_agent.add_argument("role")
     set_agent.add_argument("provider")
@@ -167,8 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_runs = sub.add_parser("dispatch-runs", help="list dispatch runs")
     dispatch_runs.add_argument("session_id", nargs="?")
 
-    dispatch_requests = sub.add_parser("dispatch-requests", help="list dispatch requests")
-    dispatch_requests.add_argument("session_id", nargs="?")
+    dispatch_readiness = sub.add_parser("dispatch-readiness", help="list role dispatch readiness")
+    dispatch_readiness.add_argument("session_id", nargs="?")
 
     agent_threads = sub.add_parser("agent-threads", help="list durable session agent threads")
     agent_threads.add_argument("session_id", nargs="?")
@@ -231,6 +239,14 @@ def run(argv: list[str] | None = None) -> int:
             print_json(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs(include_output=False)))
         elif args.command == "set-dispatch-lots":
             print_json(store.set_dispatch_lot_size(args.size))
+        elif args.command == "set-session-policy":
+            print_json(
+                store.set_session_scheduling_policy(
+                    args.session_id,
+                    scheduling_class=args.scheduling_class,
+                    base_priority=args.base_priority,
+                )
+            )
         elif args.command == "set-agent":
             print_json(store.set_agent_provider(args.role, provider=args.provider))
         elif args.command == "auth":
@@ -410,8 +426,8 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.goals(args.session_id))
         elif args.command == "dispatch-runs":
             print_json(store.dispatch_runs(args.session_id))
-        elif args.command == "dispatch-requests":
-            print_json(store.dispatch_requests(args.session_id))
+        elif args.command == "dispatch-readiness":
+            print_json(store.dispatch_readiness(args.session_id))
         elif args.command == "agent-threads":
             print_json(store.agent_threads(args.session_id))
         elif args.command == "dispatch-once":

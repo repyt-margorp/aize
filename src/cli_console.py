@@ -14,7 +14,7 @@ from cli_render import (
     print_agent_threads,
     print_created_goal_session,
     print_created_session,
-    print_dispatch_requests,
+    print_dispatch_readiness,
     print_dispatch_result,
     print_dispatch_runs,
     print_goals,
@@ -115,7 +115,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 if command in {"exit", "quit"}:
                     return 0
                 if command == "help":
-                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-requests, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
+                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-readiness, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
                 elif command == "units":
                     print_units(store.units())
                 elif command == "create-unit":
@@ -211,6 +211,19 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                             )
                         ]
                     )
+                elif command == "set-policy":
+                    if len(args) != 2:
+                        raise StoreError("usage: set-policy CLASS BASE_PRIORITY")
+                    try:
+                        base_priority = int(args[1])
+                    except ValueError as exc:
+                        raise StoreError("BASE_PRIORITY must be an integer") from exc
+                    policy = store.set_session_scheduling_policy(
+                        current_session_id,
+                        scheduling_class=args[0],
+                        base_priority=base_priority,
+                    )
+                    print(f"scheduling policy: class={policy['class']} base_priority={policy['base_priority']}")
                 elif command == "agent-threads":
                     print_agent_threads(store.agent_threads(current_session_id))
                 elif command == "agent-pool":
@@ -219,8 +232,8 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     )
                 elif command == "dispatch-runs":
                     print_dispatch_runs(store.dispatch_runs(current_session_id))
-                elif command == "dispatch-requests":
-                    print_dispatch_requests(store.dispatch_requests(current_session_id))
+                elif command == "dispatch-readiness":
+                    print_dispatch_readiness(store.dispatch_readiness(current_session_id))
                 elif command == "dispatch":
                     print_dispatch_result(store.dispatch_once())
                 elif command in {"goal", "start-goal"}:
@@ -252,7 +265,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_graph(
                         store.session_graph(),
                         goals=store.goals(),
-                        queue=store.dispatch_requests(),
+                        readiness=store.dispatch_readiness(),
                         runs=store.dispatch_runs(include_output=False),
                     )
                 else:
