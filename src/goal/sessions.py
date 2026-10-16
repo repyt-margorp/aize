@@ -8,10 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from goal.policy import SCHEDULING_CLASS_SCORES
-from goal.model import Goal
+from goal.model import Goal, Unit
 from kernel.model import (
     Session,
-    Unit,
     new_id,
     utc_now,
 )

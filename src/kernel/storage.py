@@ -21,28 +21,21 @@ FRAME_HEADER = struct.Struct(">8sQI")
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_SEGMENT_BYTES = 64 * 1024 * 1024
 
-ITEM_COLLECTION_KEYS = {
-    "accounts": "username",
-    "units": "unit_id",
-    "sessions": "session_id",
-    "goals": "goal_id",
-    "agent_profiles": "role",
-    "agent_threads": "thread_id",
-    "dispatch_runs": "run_id",
-}
-VALUE_COLLECTIONS = {
-    "session_edges": [],
-    "dispatch_readiness": [],
-    "runtime_settings": {},
-    "endpoint_cursors": {},
-}
-
 
 class SplitStateStorage:
     """Durable item metadata plus framed append-only logs per Session."""
 
-    def __init__(self, root: Path, *, data_name: str = "store") -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        item_collections: dict[str, str] | None = None,
+        value_collections: dict[str, Any] | None = None,
+        data_name: str = "store",
+    ) -> None:
         self.root = root
+        self.item_collections = dict(item_collections or {})
+        self.value_collections = {name: copy.deepcopy(default) for name, default in (value_collections or {}).items()}
         self.manifest_path = root / "manifest.json"
         self.legacy_state_path = root / "state.json"
         self.data_root = root / data_name
@@ -99,9 +92,9 @@ class SplitStateStorage:
             "version": manifest["state_version"],
             "created_at": manifest["created_at"],
         }
-        for name, identity_key in ITEM_COLLECTION_KEYS.items():
+        for name, identity_key in self.item_collections.items():
             state[name] = self._load_item_collection(name, identity_key)
-        for name, default in VALUE_COLLECTIONS.items():
+        for name, default in self.value_collections.items():
             path = self._value_collection_path(name)
             state[name] = self._read_json(path) if path.exists() else copy.deepcopy(default)
         # Session messages are embedded in SessionLog. These are operation-local caches.
@@ -118,12 +111,12 @@ class SplitStateStorage:
             if isinstance(entries, list):
                 self.append_session_log_entries(str(session_id), entries)
 
-        for name, identity_key in ITEM_COLLECTION_KEYS.items():
+        for name, identity_key in self.item_collections.items():
             value = state.get(name, {})
             if not isinstance(value, dict):
                 raise StoreError(f"state collection {name} must be an object")
             self._save_item_collection(name, identity_key, value)
-        for name, default in VALUE_COLLECTIONS.items():
+        for name, default in self.value_collections.items():
             self._write_json_atomic_if_changed(
                 self._value_collection_path(name),
                 state.get(name, copy.deepcopy(default)),
@@ -551,7 +544,12 @@ class SplitStateStorage:
         backup_manifest: dict[str, Any] | None = None,
     ) -> None:
         staging_name = f"store.migrating-{new_id('state')}"
-        staging = SplitStateStorage(self.root, data_name=staging_name)
+        staging = SplitStateStorage(
+            self.root,
+            item_collections=self.item_collections,
+            value_collections=self.value_collections,
+            data_name=staging_name,
+        )
         staging._prepare_data_directories()
         for session_id, entries in state.get("session_logs", {}).items():
             if isinstance(entries, list) and entries:

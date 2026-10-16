@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel.model import Session, Unit, new_id, utc_now
+from kernel.model import Session, new_id, utc_now
+from goal.model import Unit
 from kernel.lock import StateLockMixin
 from kernel.auth import AuthMixin
 from kernel.session_log import SessionLogStorageMixin
@@ -35,6 +36,23 @@ from goal.readiness import DispatchReadinessMixin
 from goal.dispatch import DispatchMixin
 
 
+STATE_ITEM_COLLECTIONS = {
+    "accounts": "username",
+    "units": "unit_id",
+    "sessions": "session_id",
+    "goals": "goal_id",
+    "agent_profiles": "role",
+    "agent_threads": "thread_id",
+    "dispatch_runs": "run_id",
+}
+STATE_VALUE_COLLECTIONS = {
+    "session_edges": [],
+    "dispatch_readiness": [],
+    "runtime_settings": {},
+    "endpoint_cursors": {},
+}
+
+
 class Store(
     StateLockMixin,
     AuthMixin,
@@ -50,7 +68,11 @@ class Store(
 ):
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.storage = SplitStateStorage(root)
+        self.storage = SplitStateStorage(
+            root,
+            item_collections=STATE_ITEM_COLLECTIONS,
+            value_collections=STATE_VALUE_COLLECTIONS,
+        )
         self.state_path = self.storage.manifest_path
         self.legacy_state_path = self.storage.legacy_state_path
 
