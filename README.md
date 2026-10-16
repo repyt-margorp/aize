@@ -24,8 +24,10 @@ Official display name is `AIze`. Lowercase identifiers such as the `aize`
 console command, `.aize-state`, `<aize-message>`, and `remote-aize` are stable
 CLI/protocol names rather than brand spelling.
 
-The previous runtime source is preserved under `2026-06-20-old-aize/` for
-reference. The active CLI runtime lives directly under `src/`.
+The previous runtime source is preserved under `archive/2026-06-20-old-aize/`
+for reference. The active CLI runtime is organized as layered packages under
+`src/`: `kernel/` (message-passing core), `goal/` (Goal orchestration), and
+`cli/` (CLI surface), per `doc/2026-10-17-runtime-layer-boundaries.md`.
 
 ## Quick Start
 

@@ -5,8 +5,11 @@ import hmac
 import secrets
 from typing import Any
 
-from model import Account, utc_now
-from store_defs import PASSWORD_HASH_ITERATIONS, StoreError
+from kernel.model import Account, utc_now
+from kernel.defs import StoreError
+
+
+PASSWORD_HASH_ITERATIONS = 210_000
 
 
 class AuthMixin:

@@ -1,43 +1,48 @@
 from __future__ import annotations
 
-import fcntl
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from model import Session, Unit, new_id, utc_now
+from kernel.model import Session, Unit, new_id, utc_now
+from kernel.lock import StateLockMixin
+from kernel.auth import AuthMixin
+from kernel.session_log import SessionLogStorageMixin
+from kernel.messages import MessageCoreMixin
+from kernel.storage import SplitStateStorage
 
-
-from store_defs import (
-    DEFAULT_AGENT_PROVIDER,
+from kernel.defs import (
     DEFAULT_ROOT_PASSWORD,
-    GOAL_MANAGER_ROLE,
     ROOT_SESSION_ID,
     ROOT_UNIT_ID,
     ROOT_USERNAME,
     STATE_VERSION,
-    WORKER_AGENT_ROLE,
     StoreError,
     account_home_unit_id,
     account_home_session_id,
     session_endpoint,
 )
-from store_auth import AuthMixin
-from store_dispatch import DispatchMixin
-from store_dispatch_readiness import DispatchReadinessMixin
-from store_files import SplitStateStorage
-from store_message import MessageMixin
-from store_prompts import PromptMixin
-from store_query import QueryMixin
-from store_session import SessionGoalMixin
-from store_session_log import SessionLogMixin
+from goal.defs import (
+    DEFAULT_AGENT_PROVIDER,
+    GOAL_MANAGER_ROLE,
+    WORKER_AGENT_ROLE,
+)
+from goal.log import GoalLogMixin
+from goal.messages import GoalMessageMixin
+from goal.sessions import SessionGoalMixin
+from goal.query import QueryMixin
+from goal.prompts import PromptMixin
+from goal.readiness import DispatchReadinessMixin
+from goal.dispatch import DispatchMixin
 
 
 class Store(
+    StateLockMixin,
     AuthMixin,
-    SessionLogMixin,
+    SessionLogStorageMixin,
+    GoalLogMixin,
+    GoalMessageMixin,
+    MessageCoreMixin,
     SessionGoalMixin,
-    MessageMixin,
     DispatchReadinessMixin,
     PromptMixin,
     DispatchMixin,
@@ -48,17 +53,6 @@ class Store(
         self.storage = SplitStateStorage(root)
         self.state_path = self.storage.manifest_path
         self.legacy_state_path = self.storage.legacy_state_path
-
-    @contextmanager
-    def _state_lock(self):
-        self.root.mkdir(parents=True, exist_ok=True)
-        lock_path = self.root / "state.lock"
-        with lock_path.open("a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def init(self) -> dict[str, Any]:
         with self._state_lock():

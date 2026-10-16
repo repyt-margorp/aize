@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Collection
 
-from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
+from goal.defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
 
 
 DEFAULT_SCHEDULING_CLASS = "normal"

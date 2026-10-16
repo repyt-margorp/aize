@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from store_defs import AGENT_EXECUTION_TIMEOUT_SECONDS
+from goal.defs import AGENT_EXECUTION_TIMEOUT_SECONDS
 
 
 class AgentError(RuntimeError):

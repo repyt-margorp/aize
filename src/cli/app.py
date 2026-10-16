@@ -5,17 +5,17 @@ import json
 import sys
 from pathlib import Path
 
-from cli_console import run_console
-from cli_render import (
+from cli.console import run_console
+from cli.render import (
     DEFAULT_MESSAGE_LIMIT,
     agent_pool_snapshot,
     print_json,
     tail_items,
 )
-from cli_workers import run_daemon, run_dispatch_loop, run_dispatch_worker
-from model import utc_now
-from store import Store
-from store_defs import StoreError
+from cli.workers import run_daemon, run_dispatch_loop, run_dispatch_worker
+from kernel.model import utc_now
+from goal.store import Store
+from kernel.defs import StoreError
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="AIze")

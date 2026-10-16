@@ -5,16 +5,18 @@ import os
 from pathlib import Path
 from typing import Any
 
-from agents import AgentError, AgentRunner
-from model import new_id, utc_now
-from store_defs import (
+from goal.agents import AgentError, AgentRunner
+from kernel.model import new_id, utc_now
+from goal.defs import (
     DEFAULT_AGENT_PROVIDER,
     GOAL_MANAGER_ROLE,
+    WORKER_AGENT_ROLE,
+    normalize_endpoint,
+)
+from kernel.defs import (
     ROOT_USERNAME,
     SESSION_RECIPIENT,
-    WORKER_AGENT_ROLE,
     StoreError,
-    normalize_endpoint,
     node_endpoint,
 )
 
@@ -741,7 +743,7 @@ class DispatchMixin:
             session_id=session_id,
             from_seq=int(from_seq),
             to_seq=int(observed_to_seq),
-            role=role,
+            target_filter=role,
         )
 
     def _append_implicit_worker_request_for_incomplete_goal(

@@ -5,9 +5,9 @@ from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from io import StringIO
 
-from cli_render import print_dispatch_readiness
-from dispatch_policy import select_role_dispatch_readiness
-from dispatch_projection import DispatchLogItem, derive_role_dispatch_readiness
+from cli.render import print_dispatch_readiness
+from goal.policy import select_role_dispatch_readiness
+from goal.projections import DispatchLogItem, derive_role_dispatch_readiness
 
 
 class DispatchProjectionTests(unittest.TestCase):

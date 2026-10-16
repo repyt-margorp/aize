@@ -7,19 +7,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from dispatch_policy import SCHEDULING_CLASS_SCORES
-from model import Goal, Session, Unit, new_id, utc_now
-from schedule_resolvers import ScheduleResolverError, resolve_next_run_at
-from store_defs import (
+from goal.policy import SCHEDULING_CLASS_SCORES
+from goal.model import Goal
+from kernel.model import (
+    Session,
+    Unit,
+    new_id,
+    utc_now,
+)
+from goal.schedules import ScheduleResolverError, resolve_next_run_at
+from goal.defs import (
     AGENT_ROLES,
     DEFAULT_SESSION_CAPABILITIES,
     GOAL_MANAGER_ROLE,
+    WORKER_AGENT_ROLE,
+    normalize_endpoint,
+)
+from kernel.defs import (
     ROOT_SESSION_ID,
     ROOT_USERNAME,
-    WORKER_AGENT_ROLE,
     StoreError,
     account_endpoint,
-    normalize_endpoint,
     session_endpoint,
 )
 

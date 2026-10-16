@@ -5,8 +5,8 @@ import sys
 import time
 from typing import Any
 
-from store import Store
-from store_defs import StoreError
+from goal.store import Store
+from kernel.defs import StoreError
 
 
 def run_dispatch_loop(

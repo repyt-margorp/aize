@@ -3,12 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from store_defs import (
-    GOAL_MANAGER_ROLE,
-    SESSION_RECIPIENT,
-    WORKER_AGENT_ROLE,
-    normalize_endpoint,
-)
+from goal.defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE, normalize_endpoint
+from kernel.defs import SESSION_RECIPIENT
 
 
 @dataclass(frozen=True)

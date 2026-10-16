@@ -4,13 +4,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from store import Store
-from store_defs import (
-    AGENT_ROLES,
-    SESSION_RECIPIENT,
-    USER_CONSOLE_RECIPIENT,
-    StoreError,
-)
+from goal.store import Store
+from goal.defs import AGENT_ROLES
+from kernel.defs import SESSION_RECIPIENT, USER_CONSOLE_RECIPIENT, StoreError
 
 
 def runtime_context() -> dict[str, str]:

@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from cli_render import (
+from cli.render import (
     DEFAULT_MESSAGE_LIMIT,
     agent_pool_snapshot,
     console_body,
@@ -25,9 +25,9 @@ from cli_render import (
     print_units,
     tail_items,
 )
-from model import new_id
-from store import Store
-from store_defs import StoreError, payload_body
+from kernel.model import new_id
+from goal.store import Store
+from kernel.defs import StoreError, payload_body
 
 def start_console_message_poller(
     store: Store,

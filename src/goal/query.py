@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 
-from model import utc_now
-from store_defs import StoreError
+from kernel.model import utc_now
+from kernel.defs import StoreError
 
 
 class QueryMixin:

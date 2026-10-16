@@ -3,14 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from dispatch_policy import select_role_dispatch_readiness
-from dispatch_projection import DispatchLogItem, derive_role_dispatch_readiness
-from model import new_id, utc_now
-from store_defs import (
-    DISPATCH_LEASE_RECOVERY_SECONDS,
-    GOAL_MANAGER_ROLE,
-    WORKER_AGENT_ROLE,
-)
+from goal.policy import select_role_dispatch_readiness
+from goal.projections import DispatchLogItem, derive_role_dispatch_readiness
+from kernel.model import new_id, utc_now
+from goal.defs import DISPATCH_LEASE_RECOVERY_SECONDS, GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
 
 
 class DispatchReadinessMixin:

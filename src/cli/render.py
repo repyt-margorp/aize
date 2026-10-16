@@ -4,7 +4,8 @@ import json
 import re
 from typing import Any
 
-from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE, StoreError, payload_body, payload_files
+from goal.defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
+from kernel.defs import StoreError, payload_body, payload_files
 
 DEFAULT_MESSAGE_LIMIT = 10
 

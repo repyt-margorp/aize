@@ -75,7 +75,7 @@ def wait_for_goal_state(state_root: Path, session_id: str, expected_state: str, 
 
 class CliTests(unittest.TestCase):
     def test_schedule_resolver_combines_unit_and_runtime_parameters(self) -> None:
-        from schedule_resolvers import resolve_next_run_at
+        from goal.schedules import resolve_next_run_at
 
         next_run_at = resolve_next_run_at(
             "next_interval_boundary",
@@ -115,8 +115,8 @@ class CliTests(unittest.TestCase):
             self.assertTrue(unit["activation_triggers"]["scheduled"])
 
     def test_agent_allocation_counts_follow_current_dispatch_phase(self) -> None:
-        from cli_render import agent_allocations_by_session, agent_pool_snapshot
-        from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
+        from cli.render import agent_allocations_by_session, agent_pool_snapshot
+        from goal.defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
 
         runs = [
             {
@@ -150,7 +150,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual([run["current_phase"] for run in pool["active_runs"]], ["GoalManager", "WorkerAgent"])
 
     def test_console_body_prefers_agent_output_before_embedded_prompt(self) -> None:
-        from cli_render import console_body
+        from cli.render import console_body
 
         output = (
             "<aize-output>\n"
@@ -375,7 +375,7 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(not_due.stdout), [])
 
-            from store import Store
+            from goal.store import Store
             store = Store(state_root)
             scheduled_session_id = payload[0]["session"]["session_id"]
             update = store.set_next_unit_run_at_from_session(
@@ -627,7 +627,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(rejected["goal"]["completion_state"], "incomplete")
             self.assertEqual(rejected["run"]["goal_manager_status"], "schedule_next_run_required")
 
-            from store import Store
+            from goal.store import Store
 
             store = Store(state_root)
             signals = [
@@ -656,8 +656,8 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_recovery_signal_targets_interrupted_roles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from model import utc_now
-            from store import Store
+            from kernel.model import utc_now
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -713,8 +713,8 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_recovery_does_not_retry_orphaned_acquired_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from model import utc_now
-            from store import Store
+            from kernel.model import utc_now
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -763,8 +763,8 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_recovery_closes_stale_acquired_runs_for_completed_goals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from model import utc_now
-            from store import Store
+            from kernel.model import utc_now
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -950,7 +950,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("dispatch lot size must be positive", rejected.stderr)
 
     def test_dispatch_lot_refill_respects_dynamic_target_without_pinning_sessions(self) -> None:
-        from cli_workers import _collect_completed_lots, _submit_available_lots
+        from cli.workers import _collect_completed_lots, _submit_available_lots
 
         class FakeExecutor:
             def __init__(self) -> None:
@@ -1043,7 +1043,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("cycle", cycle.stderr)
 
     def test_active_incomplete_session_graph_filters_by_state_and_recent_activity(self) -> None:
-        from store import Store
+        from goal.store import Store
 
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state"
@@ -1094,7 +1094,7 @@ class CliTests(unittest.TestCase):
     def test_session_goal_dag_exposes_goal_ancestry_and_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             from agent_api import get_session_goal_dag
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1170,7 +1170,7 @@ class CliTests(unittest.TestCase):
 
     def test_child_goal_completion_wakes_each_parent_goal_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1407,8 +1407,8 @@ class CliTests(unittest.TestCase):
                 send_worker_request,
                 set_goal_completion_state,
             )
-            from store import Store
-            from store_defs import StoreError
+            from goal.store import Store
+            from kernel.defs import StoreError
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1497,8 +1497,8 @@ class CliTests(unittest.TestCase):
 
     def test_user_input_fans_out_to_active_worker_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
-            from model import utc_now
+            from goal.store import Store
+            from kernel.model import utc_now
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1565,8 +1565,9 @@ class CliTests(unittest.TestCase):
 
     def test_active_worker_followup_waits_for_worker_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
-            from model import Goal, utc_now
+            from goal.store import Store
+            from goal.model import Goal
+            from kernel.model import utc_now
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1624,7 +1625,7 @@ class CliTests(unittest.TestCase):
 
     def test_worker_session_report_enqueues_goal_manager_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1667,7 +1668,7 @@ class CliTests(unittest.TestCase):
 
     def test_worker_wake_reasons_are_coalesced_into_one_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1719,7 +1720,7 @@ class CliTests(unittest.TestCase):
 
     def test_ready_window_refreshes_to_latest_session_log_before_acquire(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1780,7 +1781,7 @@ class CliTests(unittest.TestCase):
 
     def test_log_appended_after_acquire_remains_for_next_role_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1833,7 +1834,7 @@ class CliTests(unittest.TestCase):
 
     def test_startup_rebuilds_readiness_from_session_log_and_role_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1856,8 +1857,8 @@ class CliTests(unittest.TestCase):
 
     def test_liveness_recovery_replaces_orphaned_acquired_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from model import utc_now
-            from store import Store
+            from kernel.model import utc_now
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1917,7 +1918,7 @@ class CliTests(unittest.TestCase):
 
     def test_liveness_recovery_wakes_goal_manager_when_no_role_has_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -1958,10 +1959,10 @@ class CliTests(unittest.TestCase):
     def test_external_agent_timeout_is_a_recoverable_agent_error(self) -> None:
         from unittest.mock import patch
 
-        from agents import AgentError, AgentRunner
+        from goal.agents import AgentError, AgentRunner
 
-        with patch("agents.shutil.which", return_value="/usr/bin/codex"), patch(
-            "agents.subprocess.run",
+        with patch("goal.agents.shutil.which", return_value="/usr/bin/codex"), patch(
+            "goal.agents.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd=["codex"], timeout=600),
         ):
             with self.assertRaisesRegex(AgentError, "600-second execution limit"):
@@ -1981,7 +1982,7 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), {"base_priority": 7, "class": "high"})
-            from store import Store
+            from goal.store import Store
 
             session = Store(state_root).session("policy-session")
             self.assertEqual(session["scheduling_policy"], {"base_priority": 7, "class": "high"})
@@ -2033,7 +2034,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("GoalStateChanged", kinds)
             message_entries = [entry for entry in full_log if entry["kind"] == "Message"]
             self.assertTrue(any(message_body(entry["message"]) == "first message" for entry in message_entries))
-            from store import Store
+            from goal.store import Store
 
             state = Store(state_root).load()
             self.assertNotIn("message_index", state)
@@ -2338,7 +2339,7 @@ class CliTests(unittest.TestCase):
 
     def test_split_state_externalizes_agent_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2376,7 +2377,7 @@ class CliTests(unittest.TestCase):
 
     def test_concurrent_session_producers_receive_one_gap_free_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2405,7 +2406,7 @@ class CliTests(unittest.TestCase):
 
     def test_session_append_does_not_rewrite_another_session_or_create_generations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2425,7 +2426,7 @@ class CliTests(unittest.TestCase):
 
     def test_torn_session_log_tail_is_removed_during_startup_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2460,7 +2461,7 @@ class CliTests(unittest.TestCase):
     def test_session_append_uses_index_without_rescanning_existing_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             from unittest.mock import patch
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2479,7 +2480,7 @@ class CliTests(unittest.TestCase):
     def test_one_store_transaction_group_commits_multiple_session_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             from unittest.mock import patch
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2499,7 +2500,7 @@ class CliTests(unittest.TestCase):
             store.save(state)
             before = store.storage.latest_session_log_seq("group-commit")
 
-            with patch("store_files.os.fdatasync", wraps=os.fdatasync) as sync:
+            with patch("kernel.storage.os.fdatasync", wraps=os.fdatasync) as sync:
                 store.append_user_input("group-commit", sender="root", body="continue")
 
             after_entries = store.session_log("group-commit", from_seq=before + 1, limit=0)
@@ -2508,7 +2509,7 @@ class CliTests(unittest.TestCase):
 
     def test_startup_reconciles_committed_user_input_when_metadata_update_was_lost(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2558,7 +2559,7 @@ class CliTests(unittest.TestCase):
     def test_generation_storage_is_migrated_to_session_logs_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             import shutil
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2613,7 +2614,7 @@ class CliTests(unittest.TestCase):
 
     def test_legacy_state_json_is_migrated_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from store import Store
+            from goal.store import Store
 
             state_root = Path(tmp) / "state"
             store = Store(state_root)
@@ -2979,7 +2980,7 @@ class CliTests(unittest.TestCase):
 
     def test_codex_external_execution_uses_full_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from agents import AgentRunner
+            from goal.agents import AgentRunner
 
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()

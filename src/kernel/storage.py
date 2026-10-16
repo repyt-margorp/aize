@@ -11,8 +11,8 @@ import zlib
 from pathlib import Path
 from typing import Any, Iterable
 
-from model import new_id
-from store_defs import STATE_VERSION, StoreError, safe_id_part
+from kernel.model import new_id
+from kernel.defs import STATE_VERSION, StoreError, safe_id_part
 
 
 STORAGE_VERSION = 2

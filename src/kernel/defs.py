@@ -8,45 +8,8 @@ ROOT_UNIT_ID = "root"
 ROOT_SESSION_ID = "root"
 ROOT_USERNAME = "root"
 DEFAULT_ROOT_PASSWORD = "root"
-PASSWORD_HASH_ITERATIONS = 210_000
-GOAL_MANAGER_ROLE = "GoalManager"
-WORKER_AGENT_ROLE = "WorkerAgent"
 SESSION_RECIPIENT = "Session"
 USER_CONSOLE_RECIPIENT = "UserConsole"
-AGENT_ROLES = {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE}
-ROLE_MESSAGE_RECIPIENTS = {
-    GOAL_MANAGER_ROLE: {SESSION_RECIPIENT, USER_CONSOLE_RECIPIENT},
-    WORKER_AGENT_ROLE: {SESSION_RECIPIENT},
-}
-DEFAULT_AGENT_PROVIDER = "codex"
-AGENT_EXECUTION_TIMEOUT_SECONDS = 600
-DISPATCH_LEASE_RECOVERY_SECONDS = AGENT_EXECUTION_TIMEOUT_SECONDS + 60
-DEFAULT_SESSION_CAPABILITIES = {
-    "Session": [
-        "accept_user_input_message",
-        "store_session_messages",
-        "provide_messages_to_agents_on_dispatch",
-    ],
-    GOAL_MANAGER_ROLE: [
-        "read_session_goal",
-        "read_session_goal_dag",
-        "read_session_messages",
-        "evaluate_session_goal_completion",
-        "write_goal_completion_state",
-        "write_goal_completion_reason_message",
-        "send_session_message",
-        "send_user_console_message_to_reply_endpoint",
-        "send_worker_request",
-    ],
-    WORKER_AGENT_ROLE: [
-        "read_session_goal",
-        "read_session_goal_dag",
-        "read_session_messages",
-        "work_toward_session_goal",
-        "send_session_message",
-        "attach_message_files",
-    ],
-}
 
 
 class StoreError(RuntimeError):
@@ -75,10 +38,6 @@ def account_endpoint(username: str) -> str:
     return f"account:{username}"
 
 
-def agent_endpoint(role: str) -> str:
-    return f"agent:{role}"
-
-
 def console_endpoint(endpoint_id: str) -> str:
     return f"console:{endpoint_id}"
 
@@ -99,8 +58,6 @@ def normalize_endpoint(value: str, *, session_id: str | None = None) -> str:
         return session_endpoint(session_id)
     if raw == USER_CONSOLE_RECIPIENT:
         return USER_CONSOLE_RECIPIENT
-    if raw in AGENT_ROLES:
-        return agent_endpoint(raw)
     if raw == "remote-aize":
         return node_endpoint("remote-aize")
     return account_endpoint(raw)

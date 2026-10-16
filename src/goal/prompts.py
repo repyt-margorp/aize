@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from envelope import render_message_bundle, xml_text
+from kernel.envelope import render_message_bundle, xml_text
 
 
 class PromptMixin:
