@@ -127,6 +127,8 @@ def _goal_manager_wake_reason(
         return _reason(item, "GoalIncomplete", "SessionGoal became incomplete outside GoalManager.")
     if entry.get("kind") == "SystemSignal":
         return _system_signal_reason(item, role=GOAL_MANAGER_ROLE)
+    if entry.get("kind") == "ChildGoalCompleted":
+        return _reason(item, "ChildGoalCompleted", "A child SessionGoal completed and requires parent review.")
 
     message = item.message
     payload = message.get("payload") if message else None

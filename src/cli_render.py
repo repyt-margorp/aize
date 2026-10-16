@@ -176,6 +176,7 @@ def print_sessions(
     goals: list[dict[str, Any]] | None = None,
     readiness: list[dict[str, Any]] | None = None,
     runs: list[dict[str, Any]] | None = None,
+    show_identifiers: bool = False,
 ) -> None:
     if not sessions:
         print("No sessions.")
@@ -205,7 +206,11 @@ def print_sessions(
                 dispatch_note = f" {dispatch_state}"
             elif session.get("active") is True and goal_state == "incomplete":
                 dispatch_note = " dispatchable"
-        print(f"- {session_id} [{state_text}]{allocation_text} unit={unit}{singleton}{dispatch_note}")
+        identity = session_id
+        if show_identifiers:
+            title = short_text(session.get("title"), limit=80) or session_id
+            identity = f"SID={session_id} title={title}"
+        print(f"- {identity} [{state_text}]{allocation_text} unit={unit}{singleton}{dispatch_note}")
 
 
 def print_session(session: dict[str, Any]) -> None:
@@ -333,7 +338,18 @@ def print_graph(
     readiness: list[dict[str, Any]] | None = None,
     runs: list[dict[str, Any]] | None = None,
 ) -> None:
-    print_sessions(list(graph.get("sessions") or []), goals=goals, readiness=readiness, runs=runs)
+    graph_filter = graph.get("filter") if isinstance(graph.get("filter"), dict) else None
+    if graph_filter:
+        hours = float(graph_filter.get("updated_within_hours") or 0)
+        formatted_hours = str(int(hours)) if hours.is_integer() else str(hours)
+        print(f"Graph: Active + Incomplete, updated within {formatted_hours}h")
+    print_sessions(
+        list(graph.get("sessions") or []),
+        goals=goals,
+        readiness=readiness,
+        runs=runs,
+        show_identifiers=True,
+    )
     edges = list(graph.get("edges") or [])
     if not edges:
         print("Edges: none")

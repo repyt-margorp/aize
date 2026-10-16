@@ -79,6 +79,7 @@ class PromptMixin:
             f"    <messages-tail>{xml_text(cli)} messages {xml_text(session_id)} --limit 20</messages-tail>",
             f"    <messages-all>{xml_text(cli)} messages {xml_text(session_id)} --limit 0</messages-all>",
             f"    <dispatch-runs>{xml_text(cli)} dispatch-runs {xml_text(session_id)}</dispatch-runs>",
+            f"    <session-goal-dag>{xml_text(cli)} session-goal-dag {xml_text(session_id)}</session-goal-dag>",
             "  </history-access>",
         ]
 
@@ -130,7 +131,8 @@ class PromptMixin:
             "  </system-signals>",
             "  <python-message-api>",
             "    Use Python functions from agent_api for AIze message passing.",
-            "    Available functions: send_user_console_message(body), send_session_message(body), send_worker_request(body), set_goal_completion_state(completion_state, reason, schedule_parameters=None), schedule_next_unit_run(parameters=None).",
+            "    Available functions: get_session_goal_dag(include_descendants=True), send_user_console_message(body), send_session_message(body), send_worker_request(body), set_goal_completion_state(completion_state, reason, schedule_parameters=None), schedule_next_unit_run(parameters=None).",
+            "    Use get_session_goal_dag() to inspect ancestor Goals, descendant Goals, and the parent-child edges connecting them before making decisions that depend on Subgoals.",
             "    send_worker_request(body) records a Worker request as a Session Message; Session dispatch connects it to WorkerAgent.",
             "    For a scheduled Unit, pass call-time schedule_parameters when declaring completion. AIze combines them with the Unit's fixed schedule parameters and persisted Session timing context.",
             "    Resolvers that use completed_at must run through set_goal_completion_state('complete', ..., schedule_parameters=...).",
@@ -209,7 +211,8 @@ class PromptMixin:
             "  </system-signals>",
             "  <python-message-api>",
             "    Use Python functions from agent_api for AIze message passing.",
-            "    Available functions: send_session_message(body).",
+            "    Available functions: get_session_goal_dag(include_descendants=True), send_session_message(body).",
+            "    Use get_session_goal_dag() when the work depends on ancestor Goals or related Subgoal Sessions.",
             "    WorkerAgent must report execution progress and results to Session only.",
             "    WorkerAgent may not message GoalManager directly, decide SessionGoal completion, or send user-facing console replies.",
             "    Do not use stdout as a user-facing response channel; stdout is execution log only.",

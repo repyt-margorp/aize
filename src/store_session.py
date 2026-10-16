@@ -1055,7 +1055,30 @@ class SessionGoalMixin:
         if defer_goal_manager:
             transition["defer_goal_manager_until_worker_report"] = True
         self._log_goal_state_transition(state, goal, transition)
+        if completion_state == "complete" and previous_state != "complete":
+            self._log_child_goal_completed_for_parents(state, goal, transition)
+            self._reopen_completed_parent_goals_for_child(state, goal, transition)
         return transition
+
+    def _reopen_completed_parent_goals_for_child(
+        self,
+        state: dict[str, Any],
+        child_goal: dict[str, Any],
+        transition: dict[str, Any],
+    ) -> None:
+        child_session_id = str(child_goal.get("session_id") or "")
+        for parent_session_id in self._parent_session_ids(state, child_session_id):
+            parent_goal = self._current_goal_for_session(state, parent_session_id)
+            if not parent_goal or parent_goal.get("completion_state") != "complete":
+                continue
+            self._set_goal_completion_state(
+                state,
+                parent_goal,
+                "incomplete",
+                reason=f"Child SessionGoal {child_session_id} completed and requires parent review.",
+                actor="system",
+                occurred_at=str(transition.get("created_at") or utc_now()),
+            )
 
     def set_goal_completion_state_from_runtime(
         self,

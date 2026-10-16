@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -669,6 +670,7 @@ class CliTests(unittest.TestCase):
                 "goal_id": goal["goal_id"],
                 "session_id": "recover-session",
                 "role": "WorkerAgent",
+                "readiness_id": "ready-worker-acquired",
                 "lease_state": "acquired",
                 "current_phase": "WorkerAgent",
                 "created_at": utc_now(),
@@ -708,6 +710,56 @@ class CliTests(unittest.TestCase):
             self.assertEqual(recovered_readiness["status"], "ready")
             readiness = store.dispatch_readiness("recover-session")
             self.assertTrue(any(entry.get("role") == "GoalManager" for entry in readiness))
+
+    def test_runtime_recovery_does_not_retry_orphaned_acquired_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from model import utc_now
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("orphan-on-restart", parent_session_ids=["root"])
+            goal = store.update_goal("orphan-on-restart", body="recover safely", created_by="root")
+            state = store.load()
+            state["dispatch_readiness"] = [
+                {
+                    "readiness_id": "ready-without-run",
+                    "session_id": "orphan-on-restart",
+                    "goal_id": goal["goal_id"],
+                    "role": "WorkerAgent",
+                    "status": "acquired",
+                    "first_ready_at": utc_now(),
+                    "acquired_at": utc_now(),
+                    "from_log_seq": 1,
+                    "observed_to_seq": store._latest_session_log_seq(state, session_id="orphan-on-restart"),
+                    "wake_reasons": [],
+                }
+            ]
+            store.save(state)
+
+            store.record_runtime_recovery_signals("system restarted")
+
+            state = store.load()
+            orphan = next(
+                entry
+                for entry in state["dispatch_readiness"]
+                if entry.get("readiness_id") == "ready-without-run"
+            )
+            self.assertEqual(orphan["status"], "stale")
+            readiness = store.dispatch_readiness("orphan-on-restart")
+            self.assertFalse(
+                any(
+                    entry.get("status") == "ready" and entry.get("role") == "WorkerAgent"
+                    for entry in readiness
+                )
+            )
+            self.assertTrue(
+                any(
+                    entry.get("status") == "ready" and entry.get("role") == "GoalManager"
+                    for entry in readiness
+                )
+            )
 
     def test_runtime_recovery_closes_stale_acquired_runs_for_completed_goals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -989,6 +1041,199 @@ class CliTests(unittest.TestCase):
             cycle = run_cli(state_root, "link-session", "task", "root")
             self.assertEqual(cycle.returncode, 2)
             self.assertIn("cycle", cycle.stderr)
+
+    def test_active_incomplete_session_graph_filters_by_state_and_recent_activity(self) -> None:
+        from store import Store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state"
+            self.assertEqual(run_cli(state_root, "init").returncode, 0)
+            store = Store(state_root)
+            now = datetime(2026, 8, 11, 3, 0, tzinfo=UTC)
+            recent = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+            stale = (now - timedelta(hours=30)).isoformat().replace("+00:00", "Z")
+
+            store.create_session("recent-parent")
+            store.create_session("recent-child", parent_session_ids=["recent-parent"])
+            store.create_session("stale", parent_session_ids=["recent-parent"])
+            store.create_session("complete", parent_session_ids=["recent-parent"])
+            store.create_session("inactive", parent_session_ids=["recent-parent"])
+            for session_id in ("recent-parent", "recent-child", "stale", "complete", "inactive"):
+                store.update_goal(session_id, body=f"goal for {session_id}", created_by="root")
+
+            state = store.load()
+            for session_id in ("recent-parent", "recent-child", "complete", "inactive"):
+                state["sessions"][session_id]["updated_at"] = recent
+            state["sessions"]["stale"]["updated_at"] = stale
+            state["sessions"]["inactive"]["active"] = False
+            complete_goal = next(
+                goal for goal in state["goals"].values() if goal["session_id"] == "complete"
+            )
+            complete_goal["completion_state"] = "complete"
+            store.save(state)
+
+            graph_24 = store.active_incomplete_session_graph(updated_within_hours=24, now=now)
+            self.assertEqual(
+                [session["session_id"] for session in graph_24["sessions"]],
+                ["recent-child", "recent-parent"],
+            )
+            self.assertEqual(
+                [
+                    (edge["parent_session_id"], edge["child_session_id"])
+                    for edge in graph_24["edges"]
+                ],
+                [("recent-parent", "recent-child")],
+            )
+
+            graph_48 = store.active_incomplete_session_graph(updated_within_hours=48, now=now)
+            self.assertEqual(
+                [session["session_id"] for session in graph_48["sessions"]],
+                ["recent-child", "recent-parent", "stale"],
+            )
+
+    def test_session_goal_dag_exposes_goal_ancestry_and_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from agent_api import get_session_goal_dag
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.start_goal_session(
+                "parent-task",
+                parent_session_ids=["root"],
+                label="Parent task",
+                body="Deliver the parent objective.",
+                created_by="root",
+            )
+            store.start_goal_session(
+                "supporting-task",
+                parent_session_ids=["parent-task"],
+                label="Supporting task",
+                body="Prepare supporting work.",
+                created_by="root",
+            )
+            store.start_goal_session(
+                "shared-subgoal",
+                parent_session_ids=["parent-task", "supporting-task"],
+                label="Shared subgoal",
+                body="Complete the shared subgoal.",
+                created_by="root",
+            )
+
+            dag_result = run_cli(state_root, "session-goal-dag", "shared-subgoal")
+            self.assertEqual(dag_result.returncode, 0, dag_result.stderr)
+            dag = json.loads(dag_result.stdout)
+            nodes = {node["session_id"]: node for node in dag["nodes"]}
+            self.assertEqual(nodes["parent-task"]["relation_to_focus"], "ancestor")
+            self.assertEqual(nodes["parent-task"]["goal"]["body"], "Deliver the parent objective.")
+            self.assertEqual(nodes["supporting-task"]["goal"]["body"], "Prepare supporting work.")
+            self.assertEqual(nodes["shared-subgoal"]["relation_to_focus"], "focus")
+            self.assertEqual(nodes["shared-subgoal"]["goal"]["body"], "Complete the shared subgoal.")
+            self.assertIn(
+                ("parent-task", "shared-subgoal"),
+                {(edge["parent_session_id"], edge["child_session_id"]) for edge in dag["edges"]},
+            )
+            self.assertIn(
+                ("supporting-task", "shared-subgoal"),
+                {(edge["parent_session_id"], edge["child_session_id"]) for edge in dag["edges"]},
+            )
+            edge_relationships = {
+                (edge["parent_session_id"], edge["child_session_id"]): edge["relationship"]
+                for edge in dag["edges"]
+            }
+            self.assertEqual(edge_relationships[("parent-task", "shared-subgoal")], "subgoal")
+            self.assertEqual(edge_relationships[("root", "parent-task")], "context")
+
+            previous_env = {
+                key: os.environ.get(key)
+                for key in ("AIZE_STATE_ROOT", "AIZE_SESSION_ID", "AIZE_AGENT_ROLE", "AIZE_RUN_ID")
+            }
+            try:
+                os.environ["AIZE_STATE_ROOT"] = str(state_root)
+                os.environ["AIZE_SESSION_ID"] = "shared-subgoal"
+                os.environ["AIZE_AGENT_ROLE"] = "WorkerAgent"
+                os.environ["AIZE_RUN_ID"] = "run-read-only"
+                api_dag = get_session_goal_dag(include_descendants=False)
+                self.assertEqual(api_dag["focus_session_id"], "shared-subgoal")
+                self.assertFalse(api_dag["include_descendants"])
+                self.assertEqual(
+                    {node["session_id"] for node in api_dag["nodes"]},
+                    {"root", "parent-task", "supporting-task", "shared-subgoal"},
+                )
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_child_goal_completion_wakes_each_parent_goal_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            parent = store.start_goal_session(
+                "parent-goal",
+                parent_session_ids=["root"],
+                label="Parent",
+                body="Complete the overall objective.",
+                created_by="root",
+            )
+            child = store.start_goal_session(
+                "child-goal",
+                parent_session_ids=["parent-goal"],
+                label="Child",
+                body="Complete the required subgoal.",
+                created_by="root",
+            )
+
+            state = store.load()
+            parent_goal = state["goals"][parent["goal"]["goal_id"]]
+            child_goal = state["goals"][child["goal"]["goal_id"]]
+            store._set_goal_completion_state(
+                state,
+                parent_goal,
+                "complete",
+                reason="Waiting state was prematurely considered complete.",
+                actor="GoalManager",
+            )
+            store._set_role_cursor(
+                state,
+                session_id="parent-goal",
+                role="GoalManager",
+                seq=store._latest_session_log_seq(state, session_id="parent-goal"),
+            )
+            store._set_goal_completion_state(
+                state,
+                child_goal,
+                "complete",
+                reason="Subgoal work finished.",
+                actor="GoalManager",
+                run_id="run-child",
+            )
+            store.save(state)
+
+            refreshed_parent_goal = store.goals("parent-goal")[0]
+            self.assertEqual(refreshed_parent_goal["completion_state"], "incomplete")
+            parent_log = store.session_log("parent-goal", limit=0)
+            child_events = [entry for entry in parent_log if entry.get("kind") == "ChildGoalCompleted"]
+            self.assertEqual(len(child_events), 1)
+            self.assertEqual(child_events[0]["event"]["child_session_id"], "child-goal")
+            self.assertEqual(child_events[0]["event"]["child_goal_body"], "Complete the required subgoal.")
+
+            readiness = store.dispatch_readiness("parent-goal")
+            goal_manager_ready = next(
+                entry
+                for entry in readiness
+                if entry.get("status") == "ready" and entry.get("role") == "GoalManager"
+            )
+            self.assertIn(
+                "ChildGoalCompleted",
+                {reason["kind"] for reason in goal_manager_ready["wake_reasons"]},
+            )
 
     def test_create_session_requires_existing_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1608,6 +1853,123 @@ class CliTests(unittest.TestCase):
             ]
             self.assertEqual(len(rebuilt), 1)
             self.assertEqual(rebuilt[0]["role"], "GoalManager")
+
+    def test_liveness_recovery_replaces_orphaned_acquired_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from model import utc_now
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("orphaned-readiness", parent_session_ids=["root"])
+            goal = store.update_goal(
+                "orphaned-readiness",
+                body="Continue until the SessionGoal is complete.",
+                created_by="root",
+            )
+            state = store.load()
+            store._refresh_dispatch_readiness(state)
+            readiness = next(
+                entry
+                for entry in state["dispatch_readiness"]
+                if entry["session_id"] == "orphaned-readiness" and entry["role"] == "GoalManager"
+            )
+            readiness["status"] = "acquired"
+            readiness["acquired_at"] = utc_now()
+            state["dispatch_runs"]["run-already-released"] = {
+                "run_id": "run-already-released",
+                "goal_id": goal["goal_id"],
+                "session_id": "orphaned-readiness",
+                "role": "GoalManager",
+                "readiness_id": readiness["readiness_id"],
+                "lease_state": "released",
+                "created_at": utc_now(),
+                "lease_acquired_at": utc_now(),
+                "lease_released_at": utc_now(),
+            }
+            store.save(state)
+
+            audit = store.dispatch_liveness()
+            self.assertEqual(audit["orphaned_acquired_readiness_count"], 1)
+            self.assertEqual(audit["gap_count"], 1)
+
+            with store._state_lock():
+                state = store.load()
+                self.assertTrue(store._reconcile_dispatch_liveness(state))
+                store.save(state)
+
+            repaired = store.dispatch_readiness("orphaned-readiness")
+            self.assertFalse(any(entry.get("status") == "acquired" for entry in repaired))
+            self.assertTrue(
+                any(
+                    entry.get("status") == "ready" and entry.get("role") == "GoalManager"
+                    for entry in repaired
+                )
+            )
+            signals = [
+                entry.get("event", {})
+                for entry in store.session_log("orphaned-readiness", limit=0)
+                if entry.get("kind") == "SystemSignal"
+            ]
+            self.assertIn("DispatchLivenessRecovered", {signal.get("signal_type") for signal in signals})
+            self.assertEqual(store.dispatch_liveness()["gap_count"], 0)
+
+    def test_liveness_recovery_wakes_goal_manager_when_no_role_has_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from store import Store
+
+            state_root = Path(tmp) / "state"
+            store = Store(state_root)
+            store.init()
+            store.create_session("lost-work", parent_session_ids=["root"])
+            store.update_goal("lost-work", body="Never lose this work.", created_by="root")
+            state = store.load()
+            latest_seq = store._latest_session_log_seq(state, session_id="lost-work")
+            store._set_role_cursor(state, session_id="lost-work", role="GoalManager", seq=latest_seq)
+            store._set_role_cursor(state, session_id="lost-work", role="WorkerAgent", seq=latest_seq)
+            state["dispatch_readiness"] = []
+            store.save(state)
+
+            self.assertEqual(store.dispatch_liveness()["gap_count"], 1)
+
+            with store._state_lock():
+                state = store.load()
+                self.assertTrue(store._reconcile_dispatch_liveness(state))
+                store.save(state)
+
+            readiness = store.dispatch_readiness("lost-work")
+            goal_manager = next(
+                entry
+                for entry in readiness
+                if entry.get("status") == "ready" and entry.get("role") == "GoalManager"
+            )
+            self.assertIn("SystemSignal", {reason["kind"] for reason in goal_manager["wake_reasons"]})
+            signals = [
+                entry.get("event", {})
+                for entry in store.session_log("lost-work", limit=0)
+                if entry.get("kind") == "SystemSignal"
+            ]
+            self.assertIn("SessionLivenessRecovery", {signal.get("signal_type") for signal in signals})
+            status = store.status()
+            self.assertEqual(status["dispatch_liveness_gap_count"], 0)
+            self.assertEqual(status["orphaned_acquired_readiness_count"], 0)
+
+    def test_external_agent_timeout_is_a_recoverable_agent_error(self) -> None:
+        from unittest.mock import patch
+
+        from agents import AgentError, AgentRunner
+
+        with patch("agents.shutil.which", return_value="/usr/bin/codex"), patch(
+            "agents.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["codex"], timeout=600),
+        ):
+            with self.assertRaisesRegex(AgentError, "600-second execution limit"):
+                AgentRunner(external_enabled=True).run(
+                    "codex",
+                    role="WorkerAgent",
+                    prompt="work",
+                )
 
     def test_session_scheduling_policy_can_be_set_from_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2886,6 +3248,7 @@ class CliTests(unittest.TestCase):
                     "agent-pool",
                     "dispatch-runs",
                     "graph",
+                    "graph 48",
                     "exit",
                     "",
                 ]
@@ -2918,8 +3281,13 @@ class CliTests(unittest.TestCase):
             self.assertIn("Agent pool", result.stdout)
             self.assertIn("- GoalManager provider=codex status=active allocated=0", result.stdout)
             self.assertIn("- WorkerAgent provider=codex status=active allocated=0", result.stdout)
-            self.assertIn("child-session [Active, Incomplete] G:0,W:0 unit=none", result.stdout)
-            self.assertIn("notes-session [Active, NoGoal] G:0,W:0 unit=none", result.stdout)
+            self.assertIn(
+                "SID=child-session title=BuildChild [Active, Incomplete] G:0,W:0 unit=none",
+                result.stdout,
+            )
+            self.assertIn("Graph: Active + Incomplete, updated within 24h", result.stdout)
+            self.assertIn("Graph: Active + Incomplete, updated within 48h", result.stdout)
+            self.assertNotIn("SID=notes-session", result.stdout)
 
     def test_console_login_starts_in_account_home_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2929,7 +3297,6 @@ class CliTests(unittest.TestCase):
                 [
                     "current",
                     "session home-child",
-                    "graph",
                     "exit",
                     "",
                 ]
@@ -2947,8 +3314,6 @@ class CliTests(unittest.TestCase):
             self.assertIn("current session: account-root", result.stdout)
             self.assertIn("Session account-root", result.stdout)
             self.assertIn("session: home-child unit=none", result.stdout)
-            self.assertIn("root -> account-root", result.stdout)
-            self.assertIn("account-root -> home-child", result.stdout)
 
     def test_console_send_queues_current_session_without_starting_a_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

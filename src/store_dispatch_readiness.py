@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from dispatch_policy import select_role_dispatch_readiness
 from dispatch_projection import DispatchLogItem, derive_role_dispatch_readiness
 from model import new_id, utc_now
-from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE
+from store_defs import (
+    DISPATCH_LEASE_RECOVERY_SECONDS,
+    GOAL_MANAGER_ROLE,
+    WORKER_AGENT_ROLE,
+)
 
 
 class DispatchReadinessMixin:
@@ -50,6 +55,128 @@ class DispatchReadinessMixin:
                 )
                 self._reconcile_ready_entry(state, goal=goal, role=role, fields=fields)
         return previous != state["dispatch_readiness"]
+
+    def _reconcile_dispatch_liveness(self, state: dict[str, Any]) -> bool:
+        """Enforce that every Active/Incomplete Session has ready or running work."""
+        changed = False
+        now = utc_now()
+        acquired_runs = {
+            str(run.get("run_id") or ""): run
+            for run in state.setdefault("dispatch_runs", {}).values()
+            if run.get("lease_state") == "acquired"
+        }
+        acquired_run_by_readiness = {
+            str(run.get("readiness_id") or ""): run
+            for run in acquired_runs.values()
+            if str(run.get("readiness_id") or "")
+        }
+        repaired_by_session: dict[str, dict[str, list[str]]] = {}
+
+        for run_id, run in acquired_runs.items():
+            if not self._dispatch_lease_expired(run, now=now):
+                continue
+            session_id = str(run.get("session_id") or "")
+            run["lease_state"] = "interrupted"
+            run["interrupted_at"] = now
+            run["interrupted_reason"] = "dispatch lease exceeded the Agent execution limit"
+            run.pop("current_phase", None)
+            repaired_by_session.setdefault(session_id, {"readiness_ids": [], "run_ids": []})["run_ids"].append(run_id)
+            changed = True
+
+        for readiness in state.setdefault("dispatch_readiness", []):
+            if readiness.get("status") != "acquired":
+                continue
+            readiness_id = str(readiness.get("readiness_id") or "")
+            matching_run = acquired_run_by_readiness.get(readiness_id)
+            if matching_run and matching_run.get("lease_state") == "acquired":
+                continue
+            session_id = str(readiness.get("session_id") or "")
+            readiness["status"] = "stale"
+            readiness["stale_at"] = now
+            readiness["stale_reason"] = "acquired readiness has no live acquired dispatch run"
+            readiness.pop("acquired_at", None)
+            repaired_by_session.setdefault(session_id, {"readiness_ids": [], "run_ids": []})[
+                "readiness_ids"
+            ].append(readiness_id)
+            changed = True
+
+        for session_id, repair in repaired_by_session.items():
+            if session_id not in state.setdefault("sessions", {}):
+                continue
+            self._log_system_signal(
+                state,
+                session_id,
+                signal_type="DispatchLivenessRecovered",
+                body="AIze recovered dispatch ownership that no longer had a live Agent run. GoalManager must reassess the SessionGoal.",
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor="dispatcher",
+                data=repair,
+                created_at=now,
+            )
+            changed = True
+
+        if self._refresh_dispatch_readiness(state):
+            changed = True
+
+        live_goal_ids = {
+            str(entry.get("goal_id") or "")
+            for entry in state.setdefault("dispatch_readiness", [])
+            if entry.get("status") in {"ready", "acquired"}
+        }
+        live_goal_ids.update(
+            str(run.get("goal_id") or "")
+            for run in state.setdefault("dispatch_runs", {}).values()
+            if run.get("lease_state") == "acquired"
+        )
+        liveness_signals_added = False
+        for goal in self._current_goals(state):
+            goal_id = str(goal.get("goal_id") or "")
+            session_id = str(goal.get("session_id") or "")
+            session = state.setdefault("sessions", {}).get(session_id)
+            if (
+                not goal_id
+                or goal.get("archived_at")
+                or goal.get("completion_state") != "incomplete"
+                or not session
+                or session.get("active") is not True
+                or goal_id in live_goal_ids
+            ):
+                continue
+            self._log_system_signal(
+                state,
+                session_id,
+                signal_type="SessionLivenessRecovery",
+                body=(
+                    "This Session is Active and its SessionGoal is incomplete, but no GoalManager or "
+                    "WorkerAgent is ready or running. GoalManager must choose the next action."
+                ),
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor="dispatcher",
+                data={"goal_id": goal_id},
+                created_at=now,
+            )
+            live_goal_ids.add(goal_id)
+            liveness_signals_added = True
+            changed = True
+        if liveness_signals_added and self._refresh_dispatch_readiness(state):
+            changed = True
+        return changed
+
+    @staticmethod
+    def _dispatch_lease_expired(run: dict[str, Any], *, now: str) -> bool:
+        acquired_at = str(run.get("lease_acquired_at") or run.get("created_at") or "")
+        if not acquired_at:
+            return True
+        try:
+            acquired = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
+            current = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if acquired.tzinfo is None:
+            acquired = acquired.replace(tzinfo=UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return current >= acquired + timedelta(seconds=DISPATCH_LEASE_RECOVERY_SECONDS)
 
     def _deduplicate_ready_entries(self, state: dict[str, Any]) -> None:
         retained: list[dict[str, Any]] = []

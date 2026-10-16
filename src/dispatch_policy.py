@@ -22,6 +22,7 @@ SCHEDULING_CLASS_SCORES = {
 }
 AGING_INTERVAL_SECONDS = 60
 AGING_SCORE_LIMIT = 100
+STARVATION_WAIT_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,27 @@ def select_role_dispatch_readiness(
 
     if not candidates:
         return SchedulingDecision(None, tuple(stale_indexes))
+    starved = [
+        item
+        for item in candidates
+        if _waiting_seconds(item[1].get("first_ready_at"), now=current_time) >= STARVATION_WAIT_SECONDS
+    ]
+    if starved:
+        selected = min(
+            starved,
+            key=lambda item: (
+                str(item[1].get("first_ready_at") or ""),
+                str(item[1].get("session_id") or ""),
+                str(item[1].get("role") or ""),
+                item[0],
+            ),
+        )
+        return SchedulingDecision(
+            selected[0],
+            tuple(stale_indexes),
+            selected[2],
+            f"{selected[3]}; starvation_override=true",
+        )
     selected = min(
         candidates,
         key=lambda item: (

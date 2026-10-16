@@ -170,6 +170,51 @@ class DispatchSelectionTests(unittest.TestCase):
 
         self.assertIsNone(decision.readiness_index)
 
+    def test_ten_minute_wait_prevents_priority_starvation(self) -> None:
+        readiness = [
+            {
+                "readiness_id": "starved",
+                "session_id": "background-work",
+                "goal_id": "goal-background",
+                "role": "GoalManager",
+                "status": "ready",
+                "first_ready_at": "2026-08-08T00:00:00Z",
+            },
+            {
+                "readiness_id": "new-critical",
+                "session_id": "critical-work",
+                "goal_id": "goal-critical",
+                "role": "GoalManager",
+                "status": "ready",
+                "first_ready_at": "2026-08-08T00:10:30Z",
+            },
+        ]
+        goals = {
+            "goal-background": {"completion_state": "incomplete"},
+            "goal-critical": {"completion_state": "incomplete"},
+        }
+        sessions = {
+            "background-work": {
+                "active": True,
+                "scheduling_policy": {"class": "idle", "base_priority": -10_000},
+            },
+            "critical-work": {
+                "active": True,
+                "scheduling_policy": {"class": "critical", "base_priority": 10_000},
+            },
+        }
+
+        decision = select_role_dispatch_readiness(
+            readiness,
+            goals=goals,
+            sessions=sessions,
+            acquired_roles=set(),
+            now=datetime(2026, 8, 8, 0, 11, tzinfo=UTC),
+        )
+
+        self.assertEqual(decision.readiness_index, 0)
+        self.assertIn("starvation_override=true", decision.scheduling_reason)
+
 
 class DispatchReadinessRenderingTests(unittest.TestCase):
     def test_cli_render_shows_window_and_wake_reasons_without_priority(self) -> None:

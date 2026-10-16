@@ -134,8 +134,11 @@ class DispatchMixin:
         state = self.load()
         if session_id and session_id not in state["sessions"]:
             raise StoreError(f"unknown session: {session_id}")
+        liveness_changed = self._reconcile_dispatch_liveness(state)
         readiness_entry = self._next_dispatch_readiness_entry(state, session_id=session_id)
         if not readiness_entry:
+            if liveness_changed:
+                self.save(state)
             return None
 
         goal = state["goals"][str(readiness_entry.get("goal_id") or "")]

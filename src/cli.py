@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("accounts", help="list accounts without password hashes")
     sub.add_parser("agents", help="list agent role provider assignments")
     sub.add_parser("agent-pool", help="show active agent pool allocations")
+    sub.add_parser("dispatch-liveness", help="audit Active/Incomplete Session dispatch coverage")
 
     set_dispatch_lots = sub.add_parser("set-dispatch-lots", help="set daemon dispatch lot target size")
     set_dispatch_lots.add_argument("size", type=int)
@@ -157,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
     children = sub.add_parser("children", help="show child session edges")
     children.add_argument("session_id")
 
+    session_goal_dag = sub.add_parser(
+        "session-goal-dag",
+        help="show a Session's ancestor and descendant Goal context",
+    )
+    session_goal_dag.add_argument("session_id")
+    session_goal_dag.add_argument("--ancestors-only", action="store_true")
+
     messages = sub.add_parser("messages", help="list messages")
     messages.add_argument("session_id", nargs="?")
     messages.add_argument("-n", "--limit", type=int, default=DEFAULT_MESSAGE_LIMIT, help="number of trailing messages to show, 0 for all")
@@ -237,6 +245,8 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.agent_profiles())
         elif args.command == "agent-pool":
             print_json(agent_pool_snapshot(store.agent_profiles(), store.dispatch_runs(include_output=False)))
+        elif args.command == "dispatch-liveness":
+            print_json(store.dispatch_liveness())
         elif args.command == "set-dispatch-lots":
             print_json(store.set_dispatch_lot_size(args.size))
         elif args.command == "set-session-policy":
@@ -409,6 +419,13 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.parents(args.session_id))
         elif args.command == "children":
             print_json(store.children(args.session_id))
+        elif args.command == "session-goal-dag":
+            print_json(
+                store.session_goal_dag(
+                    args.session_id,
+                    include_descendants=not args.ancestors_only,
+                )
+            )
         elif args.command == "messages":
             print_json(tail_items(store.messages(args.session_id), args.limit))
         elif args.command == "session-log":

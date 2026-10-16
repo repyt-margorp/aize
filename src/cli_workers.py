@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import sys
 import time
 from typing import Any
 
@@ -225,7 +226,11 @@ def _collect_completed_lots(
     for lot_id, future in list(active_lots.items()):
         if not future.done():
             continue
-        result = future.result()
+        try:
+            result = future.result()
+        except Exception as exc:
+            print(f"AIze dispatch Lot {lot_id} failed unexpectedly: {exc}", file=sys.stderr, flush=True)
+            result = None
         if result is not None:
             dispatched.append(result)
         completed.append(lot_id)

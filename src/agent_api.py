@@ -67,6 +67,17 @@ def send_worker_request(body: str) -> dict[str, Any]:
     return send_message(SESSION_RECIPIENT, body, worker_request=True)
 
 
+def get_session_goal_dag(*, include_descendants: bool = True) -> dict[str, Any]:
+    """Read the current Session's ancestor/descendant Goal context without writing a Message."""
+    context = runtime_context()
+    if context["agent_role"] not in AGENT_ROLES:
+        raise StoreError(f"AIZE_AGENT_ROLE is not allowed to read Session context: {context['agent_role']}")
+    return Store(Path(context["state_root"])).session_goal_dag(
+        context["session_id"],
+        include_descendants=include_descendants,
+    )
+
+
 def set_goal_completion_state(
     completion_state: str,
     reason: str,

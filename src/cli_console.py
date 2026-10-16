@@ -19,6 +19,7 @@ from cli_render import (
     print_dispatch_runs,
     print_goals,
     print_graph,
+    print_json,
     print_messages,
     print_session,
     print_units,
@@ -115,7 +116,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 if command in {"exit", "quit"}:
                     return 0
                 if command == "help":
-                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-readiness, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph, exit")
+                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, goal-dag, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-readiness, dispatch-liveness, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph [HOURS], exit")
                 elif command == "units":
                     print_units(store.units())
                 elif command == "create-unit":
@@ -199,6 +200,10 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_messages(tail_items(store.messages(current_session_id), limit))
                 elif command == "goals":
                     print_goals(store.goals(current_session_id))
+                elif command == "goal-dag":
+                    if args:
+                        raise StoreError("usage: goal-dag")
+                    print_json(store.session_goal_dag(current_session_id))
                 elif command == "update-goal":
                     if len(args) < 1:
                         raise StoreError("usage: update-goal BODY")
@@ -234,6 +239,10 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_dispatch_runs(store.dispatch_runs(current_session_id))
                 elif command == "dispatch-readiness":
                     print_dispatch_readiness(store.dispatch_readiness(current_session_id))
+                elif command == "dispatch-liveness":
+                    if args:
+                        raise StoreError("usage: dispatch-liveness")
+                    print_json(store.dispatch_liveness())
                 elif command == "dispatch":
                     print_dispatch_result(store.dispatch_once())
                 elif command in {"goal", "start-goal"}:
@@ -262,8 +271,16 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                         )
                     )
                 elif command == "graph":
+                    if len(args) > 1:
+                        raise StoreError("usage: graph [HOURS]")
+                    hours = 24.0
+                    if args:
+                        try:
+                            hours = float(args[0])
+                        except ValueError as exc:
+                            raise StoreError("usage: graph [HOURS]") from exc
                     print_graph(
-                        store.session_graph(),
+                        store.active_incomplete_session_graph(updated_within_hours=hours),
                         goals=store.goals(),
                         readiness=store.dispatch_readiness(),
                         runs=store.dispatch_runs(include_output=False),

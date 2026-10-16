@@ -7,6 +7,17 @@ from store_defs import GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE, normalize_endpoint
 
 
 class SessionLogMixin:
+    @staticmethod
+    def _parent_session_ids(state: dict[str, Any], child_session_id: str) -> list[str]:
+        return sorted(
+            {
+                str(edge.get("parent_session_id") or "")
+                for edge in state.setdefault("session_edges", [])
+                if str(edge.get("child_session_id") or "") == child_session_id
+                and str(edge.get("parent_session_id") or "")
+            }
+        )
+
     def _ensure_session_log_defaults(self, state: dict[str, Any]) -> bool:
         changed = False
         for session_id, session in state.setdefault("sessions", {}).items():
@@ -192,6 +203,40 @@ class SessionLogMixin:
             event_key=self._goal_state_event_key(goal, transition),
         )
         self._sync_session_current_state(state, session_id)
+
+    def _log_child_goal_completed_for_parents(
+        self,
+        state: dict[str, Any],
+        goal: dict[str, Any],
+        transition: dict[str, Any],
+    ) -> None:
+        child_session_id = str(goal.get("session_id") or "")
+        goal_id = str(goal.get("goal_id") or "")
+        completed_at = str(transition.get("created_at") or utc_now())
+        if not child_session_id or not goal_id:
+            return
+        for parent_session_id in self._parent_session_ids(state, child_session_id):
+            parent_session = state.setdefault("sessions", {}).get(parent_session_id)
+            if not parent_session:
+                continue
+            self._append_session_log_entry(
+                state,
+                parent_session_id,
+                kind="ChildGoalCompleted",
+                created_at=completed_at,
+                event={
+                    "child_session_id": child_session_id,
+                    "child_goal_id": goal_id,
+                    "child_goal_body": str(goal.get("body") or ""),
+                    "completion_state": "complete",
+                    "completion_reason": str(transition.get("reason") or ""),
+                    "actor": str(transition.get("actor") or ""),
+                    "run_id": str(transition.get("run_id") or ""),
+                    "created_at": completed_at,
+                },
+                event_key=f"child-goal-completed:{parent_session_id}:{goal_id}:{completed_at}",
+            )
+            parent_session["updated_at"] = completed_at
 
     def _log_session_active_change(
         self,
@@ -387,20 +432,32 @@ class SessionLogMixin:
                 if not session or session.get("active") is not True:
                     continue
                 interrupted_roles: list[str] = []
+                interrupted_readiness_ids: set[str] = set()
                 for run in state.get("dispatch_runs", {}).values():
                     if str(run.get("session_id") or "") != session_id or run.get("lease_state") != "acquired":
                         continue
                     role = str(run.get("role") or run.get("current_phase") or "")
                     if role in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE} and role not in interrupted_roles:
                         interrupted_roles.append(role)
+                    readiness_id = str(run.get("readiness_id") or "")
+                    if readiness_id:
+                        interrupted_readiness_ids.add(readiness_id)
                     run["lease_state"] = "interrupted"
                     run["interrupted_at"] = timestamp
                     run.pop("current_phase", None)
                 for readiness in state.setdefault("dispatch_readiness", []):
                     if str(readiness.get("session_id") or "") != session_id or readiness.get("status") != "acquired":
                         continue
-                    readiness["status"] = "ready"
-                    readiness["recovered_at"] = timestamp
+                    readiness_id = str(readiness.get("readiness_id") or "")
+                    if readiness_id in interrupted_readiness_ids:
+                        readiness["status"] = "ready"
+                        readiness["recovered_at"] = timestamp
+                    else:
+                        readiness["status"] = "stale"
+                        readiness["stale_at"] = timestamp
+                        readiness["stale_reason"] = (
+                            "runtime recovered acquired readiness without a matching acquired run"
+                        )
                     readiness.pop("acquired_at", None)
                 target_roles = [GOAL_MANAGER_ROLE]
                 for role in interrupted_roles:

@@ -6,6 +6,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from store_defs import AGENT_EXECUTION_TIMEOUT_SECONDS
+
 
 class AgentError(RuntimeError):
     pass
@@ -121,15 +123,22 @@ class AgentRunner:
             ]
         else:
             command = [executable, "-p", resumed_prompt]
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd is not None else None,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=600,
-            env={**os.environ, **(runtime_env or {})},
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd) if cwd is not None else None,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=AGENT_EXECUTION_TIMEOUT_SECONDS,
+                env={**os.environ, **(runtime_env or {})},
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AgentError(
+                f"{provider} exceeded the {AGENT_EXECUTION_TIMEOUT_SECONDS}-second execution limit"
+            ) from exc
+        except OSError as exc:
+            raise AgentError(f"{provider} could not be executed: {exc}") from exc
         output = completed.stdout.strip()
         error = completed.stderr.strip()
         if completed.returncode != 0:

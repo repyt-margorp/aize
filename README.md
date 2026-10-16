@@ -85,6 +85,24 @@ does not need a Unit. A Session can also have multiple parents by passing
 PYTHONPATH=src python3 -m cli --root .aize-state create-session task --parent root --parent notes
 ```
 
+Between Goal-bearing Sessions, DAG edges represent Goal decomposition: a child
+SessionGoal is a Subgoal contributing to each direct parent SessionGoal.
+NoGoal system/account roots remain context anchors rather than artificial
+Goals. Inspect the relevant ancestor and descendant Goals, their completion
+states, and the connecting edges with:
+
+```bash
+./aize session-goal-dag task
+```
+
+Dispatched Agents can read the same context without writing a Message through
+`agent_api.get_session_goal_dag()`. When a child SessionGoal becomes complete,
+AIze records a `ChildGoalCompleted` entry in every direct parent's SessionLog.
+This makes an active, incomplete parent GoalManager ready for review. A parent
+Goal that was already complete is first returned to incomplete so the new
+Subgoal result cannot be silently ignored. No Goal is synthesized for a
+NoGoal root or account Session.
+
 Each Session receives a workspace under the runtime state root:
 
 ```text
@@ -231,6 +249,19 @@ role-specific context.
 Dispatch occupancy is recorded as a dispatch-run lease history (`lease_state`,
 `lease_acquired_at`, `lease_released_at`) rather than as a durable Goal or
 Session progress flag.
+
+AIze enforces a dispatch liveness invariant: every Active Session with an
+Incomplete Goal must have at least one GoalManager or WorkerAgent role ready or
+running. Before every dispatch selection, the runtime removes orphaned or
+expired ownership and wakes GoalManager if no role owns the work. Inspect the
+invariant directly with:
+
+```bash
+./aize dispatch-liveness
+```
+
+`gap_count`, `orphaned_acquired_readiness_count`, and
+`expired_acquired_dispatch_lease_count` should all be zero.
 
 By default both agent roles use the `codex` provider:
 

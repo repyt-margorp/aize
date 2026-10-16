@@ -19,6 +19,8 @@ ROLE_MESSAGE_RECIPIENTS = {
     WORKER_AGENT_ROLE: {SESSION_RECIPIENT},
 }
 DEFAULT_AGENT_PROVIDER = "codex"
+AGENT_EXECUTION_TIMEOUT_SECONDS = 600
+DISPATCH_LEASE_RECOVERY_SECONDS = AGENT_EXECUTION_TIMEOUT_SECONDS + 60
 DEFAULT_SESSION_CAPABILITIES = {
     "Session": [
         "accept_user_input_message",
@@ -27,6 +29,7 @@ DEFAULT_SESSION_CAPABILITIES = {
     ],
     GOAL_MANAGER_ROLE: [
         "read_session_goal",
+        "read_session_goal_dag",
         "read_session_messages",
         "evaluate_session_goal_completion",
         "write_goal_completion_state",
@@ -37,6 +40,7 @@ DEFAULT_SESSION_CAPABILITIES = {
     ],
     WORKER_AGENT_ROLE: [
         "read_session_goal",
+        "read_session_goal_dag",
         "read_session_messages",
         "work_toward_session_goal",
         "send_session_message",

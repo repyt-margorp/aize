@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import Any
 
+from model import utc_now
 from store_defs import StoreError
 
 
@@ -23,6 +26,7 @@ class QueryMixin:
     def status(self) -> dict[str, Any]:
         state = self.load()
         self._refresh_dispatch_readiness(state)
+        liveness = self._dispatch_liveness_snapshot(state)
         message_count = self.storage.session_log_stats()["message_count"]
         active_sessions = [session for session in state["sessions"].values() if session.get("active") is True]
         inactive_sessions = [session for session in state["sessions"].values() if session.get("active") is not True]
@@ -61,11 +65,91 @@ class QueryMixin:
             "dispatch_readiness_count": len(state.get("dispatch_readiness", [])),
             "ready_dispatch_count": len(ready_dispatch_entries),
             "acquired_dispatch_readiness_count": len(acquired_dispatch_readiness),
+            "dispatch_liveness_gap_count": liveness["gap_count"],
+            "orphaned_acquired_readiness_count": liveness["orphaned_acquired_readiness_count"],
+            "expired_acquired_dispatch_lease_count": liveness["expired_acquired_dispatch_lease_count"],
             "dispatch_lot_size": max(1, int(state.setdefault("runtime_settings", {}).get("dispatch_lot_size") or 1)),
             "agent_profile_count": len(state["agent_profiles"]),
             "agent_thread_count": len(state["agent_threads"]),
             "message_count": message_count,
             "endpoint_cursor_count": len(state.get("endpoint_cursors", {})),
+        }
+
+    def dispatch_liveness(self) -> dict[str, Any]:
+        state = self.load()
+        self._refresh_dispatch_readiness(state)
+        return self._dispatch_liveness_snapshot(state)
+
+    def _dispatch_liveness_snapshot(self, state: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        acquired_runs = [
+            run
+            for run in state.setdefault("dispatch_runs", {}).values()
+            if run.get("lease_state") == "acquired"
+        ]
+        live_runs = [run for run in acquired_runs if not self._dispatch_lease_expired(run, now=now)]
+        live_run_by_readiness = {
+            str(run.get("readiness_id") or ""): run
+            for run in live_runs
+            if str(run.get("readiness_id") or "")
+        }
+        orphaned_readiness = [
+            entry
+            for entry in state.setdefault("dispatch_readiness", [])
+            if entry.get("status") == "acquired"
+            and str(entry.get("readiness_id") or "") not in live_run_by_readiness
+        ]
+        ready_roles_by_goal: dict[str, set[str]] = {}
+        for entry in state.setdefault("dispatch_readiness", []):
+            status = str(entry.get("status") or "")
+            if status != "ready":
+                continue
+            ready_roles_by_goal.setdefault(str(entry.get("goal_id") or ""), set()).add(
+                str(entry.get("role") or "")
+            )
+        running_roles_by_goal: dict[str, set[str]] = {}
+        for run in live_runs:
+            running_roles_by_goal.setdefault(str(run.get("goal_id") or ""), set()).add(
+                str(run.get("role") or run.get("current_phase") or "")
+            )
+
+        sessions: list[dict[str, Any]] = []
+        for goal in self._current_goals(state):
+            session_id = str(goal.get("session_id") or "")
+            session = state.setdefault("sessions", {}).get(session_id)
+            if (
+                goal.get("archived_at")
+                or goal.get("completion_state") != "incomplete"
+                or not session
+                or session.get("active") is not True
+            ):
+                continue
+            goal_id = str(goal.get("goal_id") or "")
+            ready_roles = sorted(role for role in ready_roles_by_goal.get(goal_id, set()) if role)
+            running_roles = sorted(role for role in running_roles_by_goal.get(goal_id, set()) if role)
+            sessions.append(
+                {
+                    "session_id": session_id,
+                    "goal_id": goal_id,
+                    "ready_roles": ready_roles,
+                    "running_roles": running_roles,
+                    "covered": bool(ready_roles or running_roles),
+                }
+            )
+        sessions.sort(key=lambda item: str(item["session_id"]))
+        return {
+            "active_incomplete_session_count": len(sessions),
+            "covered_count": sum(1 for item in sessions if item["covered"]),
+            "gap_count": sum(1 for item in sessions if not item["covered"]),
+            "orphaned_acquired_readiness_count": len(orphaned_readiness),
+            "orphaned_acquired_readiness_ids": sorted(
+                str(entry.get("readiness_id") or "") for entry in orphaned_readiness
+            ),
+            "expired_acquired_dispatch_lease_count": len(acquired_runs) - len(live_runs),
+            "expired_acquired_dispatch_run_ids": sorted(
+                str(run.get("run_id") or "") for run in acquired_runs if run not in live_runs
+            ),
+            "sessions": sessions,
         }
 
     def goals(self, session_id: str | None = None) -> list[dict[str, Any]]:
@@ -143,6 +227,177 @@ class QueryMixin:
                 key=lambda item: (item["parent_session_id"], item["child_session_id"]),
             ),
         }
+
+    def active_incomplete_session_graph(
+        self,
+        *,
+        updated_within_hours: float = 24,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        hours = float(updated_within_hours)
+        if not isfinite(hours) or hours <= 0:
+            raise StoreError("graph hours must be positive")
+
+        state = self.load()
+        current_goals = {
+            str(goal.get("session_id") or ""): goal
+            for goal in self._current_goals(state)
+        }
+        try:
+            cutoff = (now or datetime.now(UTC)) - timedelta(hours=hours)
+        except OverflowError as exc:
+            raise StoreError("graph hours are too large") from exc
+        sessions: list[dict[str, Any]] = []
+        selected_ids: set[str] = set()
+        for session in state["sessions"].values():
+            session_id = str(session.get("session_id") or "")
+            goal = current_goals.get(session_id)
+            if session.get("active") is not True or not goal:
+                continue
+            if goal.get("completion_state") != "incomplete":
+                continue
+            try:
+                updated_at = self._parse_utc(str(session.get("updated_at") or ""))
+            except (StoreError, TypeError, ValueError):
+                continue
+            if updated_at < cutoff:
+                continue
+            selected_ids.add(session_id)
+            sessions.append(dict(session))
+
+        return {
+            "sessions": sorted(sessions, key=lambda item: str(item.get("session_id") or "")),
+            "edges": sorted(
+                (
+                    dict(edge)
+                    for edge in state["session_edges"]
+                    if edge.get("parent_session_id") in selected_ids
+                    and edge.get("child_session_id") in selected_ids
+                ),
+                key=lambda item: (item["parent_session_id"], item["child_session_id"]),
+            ),
+            "filter": {
+                "active": True,
+                "completion_state": "incomplete",
+                "updated_within_hours": hours,
+                "cutoff": cutoff.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            },
+        }
+
+    def session_goal_dag(
+        self,
+        session_id: str,
+        *,
+        include_descendants: bool = True,
+    ) -> dict[str, Any]:
+        """Return the Goal-bearing DAG context relevant to one Session."""
+        state = self.load()
+        if session_id not in state["sessions"]:
+            raise StoreError(f"unknown session: {session_id}")
+
+        edges = state["session_edges"]
+        parents_by_child: dict[str, list[str]] = {}
+        children_by_parent: dict[str, list[str]] = {}
+        for edge in edges:
+            parent_id = str(edge.get("parent_session_id") or "")
+            child_id = str(edge.get("child_session_id") or "")
+            if not parent_id or not child_id:
+                continue
+            parents_by_child.setdefault(child_id, []).append(parent_id)
+            children_by_parent.setdefault(parent_id, []).append(child_id)
+
+        ancestor_distances = self._session_graph_distances(parents_by_child, session_id)
+        descendant_distances = (
+            self._session_graph_distances(children_by_parent, session_id)
+            if include_descendants
+            else {session_id: 0}
+        )
+        selected_ids = set(ancestor_distances) | set(descendant_distances)
+        current_goals = {
+            str(goal.get("session_id") or ""): goal
+            for goal in self._current_goals(state)
+        }
+
+        nodes: list[dict[str, Any]] = []
+        for selected_id in selected_ids:
+            session = state["sessions"].get(selected_id)
+            if not session:
+                continue
+            if selected_id == session_id:
+                relation = "focus"
+                distance = 0
+            elif selected_id in ancestor_distances:
+                relation = "ancestor"
+                distance = ancestor_distances[selected_id]
+            else:
+                relation = "descendant"
+                distance = descendant_distances[selected_id]
+            goal = current_goals.get(selected_id)
+            nodes.append(
+                {
+                    "session_id": selected_id,
+                    "title": str(session.get("title") or ""),
+                    "active": session.get("active") is True,
+                    "unit_id": session.get("unit_id"),
+                    "relation_to_focus": relation,
+                    "distance": distance,
+                    "goal": (
+                        {
+                            "goal_id": str(goal.get("goal_id") or ""),
+                            "body": str(goal.get("body") or ""),
+                            "completion_state": str(goal.get("completion_state") or ""),
+                            "completion_reason": str(goal.get("completion_reason") or ""),
+                        }
+                        if goal
+                        else None
+                    ),
+                }
+            )
+
+        relation_order = {"ancestor": 0, "focus": 1, "descendant": 2}
+        nodes.sort(
+            key=lambda item: (
+                relation_order[str(item["relation_to_focus"])],
+                -int(item["distance"]) if item["relation_to_focus"] == "ancestor" else int(item["distance"]),
+                str(item["session_id"]),
+            )
+        )
+        selected_edges: list[dict[str, Any]] = []
+        for edge in edges:
+            parent_id = str(edge.get("parent_session_id") or "")
+            child_id = str(edge.get("child_session_id") or "")
+            if parent_id not in selected_ids or child_id not in selected_ids:
+                continue
+            edge_context = dict(edge)
+            edge_context["relationship"] = (
+                "subgoal"
+                if parent_id in current_goals and child_id in current_goals
+                else "context"
+            )
+            selected_edges.append(edge_context)
+        selected_edges.sort(
+            key=lambda item: (str(item.get("parent_session_id") or ""), str(item.get("child_session_id") or "")),
+        )
+        return {
+            "focus_session_id": session_id,
+            "include_descendants": include_descendants,
+            "nodes": nodes,
+            "edges": selected_edges,
+        }
+
+    @staticmethod
+    def _session_graph_distances(adjacency: dict[str, list[str]], start: str) -> dict[str, int]:
+        distances = {start: 0}
+        pending = [start]
+        while pending:
+            current = pending.pop(0)
+            next_distance = distances[current] + 1
+            for adjacent in adjacency.get(current, []):
+                if adjacent in distances and distances[adjacent] <= next_distance:
+                    continue
+                distances[adjacent] = next_distance
+                pending.append(adjacent)
+        return distances
 
     def parents(self, session_id: str) -> list[dict[str, Any]]:
         state = self.load()
