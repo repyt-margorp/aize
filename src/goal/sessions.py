@@ -15,6 +15,7 @@ from kernel.model import (
     utc_now,
 )
 from goal.schedules import ScheduleResolverError, resolve_next_run_at
+from kernel.lock import state_transaction
 from goal.defs import (
     AGENT_ROLES,
     DEFAULT_SESSION_CAPABILITIES,
@@ -127,6 +128,7 @@ class SessionGoalMixin:
                 changed = True
         return changed
 
+    @state_transaction
     def create_unit(
         self,
         unit_id: str,
@@ -247,6 +249,7 @@ class SessionGoalMixin:
             raise StoreError(f"owner account has no home session: {owner_account}")
         return home_session_id, owner_account
 
+    @state_transaction
     def run_scheduled_units(
         self,
         *,
@@ -335,6 +338,7 @@ class SessionGoalMixin:
         self.save(state)
         return started
 
+    @state_transaction
     def run_startup_units(
         self,
         *,
@@ -410,6 +414,7 @@ class SessionGoalMixin:
         self.save(state)
         return started
 
+    @state_transaction
     def set_agent_provider(self, role: str, *, provider: str) -> dict[str, Any]:
         normalized_role = self._normalize_agent_role(role)
         if normalized_role not in AGENT_ROLES:
@@ -460,6 +465,7 @@ class SessionGoalMixin:
         state = self.load()
         return sorted(state["agent_profiles"].values(), key=lambda item: item["role"])
 
+    @state_transaction
     def set_session_active(self, session_id: str, *, active: bool) -> dict[str, Any]:
         state = self.load()
         session = state["sessions"].get(session_id)
@@ -491,6 +497,7 @@ class SessionGoalMixin:
         }
         return aliases.get(normalized, aliases.get(normalized.lower(), normalized))
 
+    @state_transaction
     def create_session(
         self,
         session_id: str,
@@ -539,6 +546,7 @@ class SessionGoalMixin:
         self.save(state)
         return dict(sessions[session_id])
 
+    @state_transaction
     def start_goal_session(
         self,
         session_id: str,
@@ -977,6 +985,7 @@ class SessionGoalMixin:
             index += 1
         return candidate
 
+    @state_transaction
     def update_goal(
         self,
         session_id: str,
@@ -1185,6 +1194,7 @@ class SessionGoalMixin:
         )
         return target_goal
 
+    @state_transaction
     def link_sessions(self, parent_session_id: str, child_session_id: str) -> dict[str, Any]:
         state = self.load()
         edge = self._link_sessions_in_state(state, parent_session_id, child_session_id)

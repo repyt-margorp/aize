@@ -6,6 +6,7 @@ import secrets
 from typing import Any
 
 from kernel.model import Account, utc_now
+from kernel.lock import state_transaction
 from kernel.defs import StoreError
 
 
@@ -49,6 +50,7 @@ class AuthMixin:
             "home_session_id": account.get("home_session_id"),
         }
 
+    @state_transaction
     def create_account(self, username: str, *, password: str, roles: list[str] | None = None) -> dict[str, Any]:
         normalized_username = str(username or "").strip()
         if not normalized_username:

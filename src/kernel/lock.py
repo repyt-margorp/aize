@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 from contextlib import contextmanager
+from typing import Any, Callable
 
 
 class StateLockMixin:
@@ -15,3 +17,12 @@ class StateLockMixin:
                 yield
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def state_transaction(method: Callable) -> Callable:
+    @functools.wraps(method)
+    def transaction(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._state_lock():
+            return method(self, *args, **kwargs)
+
+    return transaction

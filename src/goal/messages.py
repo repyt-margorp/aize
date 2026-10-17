@@ -10,6 +10,7 @@ from kernel.defs import (
     console_endpoint,
     session_endpoint,
 )
+from kernel.lock import state_transaction
 from kernel.model import utc_now
 from goal.defs import (
     AGENT_ROLES,
@@ -175,6 +176,7 @@ class GoalMessageMixin:
         active_runs.sort(key=lambda item: str(item.get("lease_acquired_at") or item.get("created_at") or ""))
         return dict(active_runs[-1])
 
+    @state_transaction
     def receive_message(self, recipient: str, *, session_id: str | None = None) -> dict[str, Any] | None:
         state = self.load()
         normalized_recipient = str(recipient or "").strip()
