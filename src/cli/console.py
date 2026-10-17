@@ -117,7 +117,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 if command in {"exit", "quit"}:
                     return 0
                 if command == "help":
-                    print("commands: session SESSION, unit-session SESSION UNIT, sessions, use SESSION, current, activate, deactivate, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, goal-dag, update-goal BODY, agent-threads, agent-pool, dispatch-runs, dispatch-readiness, dispatch-liveness, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], dispatch, graph [HOURS], exit")
+                    print("commands: units, create-unit UNIT, sessions, session SESSION, session-goal-dag SESSION, unit-session SESSION UNIT, use SESSION, current, activate, deactivate, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, goal-dag, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], agent-threads, agent-pool, dispatch-runs, dispatch-readiness, dispatch-liveness, dispatch, graph [HOURS], exit")
                 elif command == "units":
                     print_units(store.units())
                 elif command == "create-unit":
