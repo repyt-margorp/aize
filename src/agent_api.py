@@ -25,6 +25,7 @@ def send_message(
     recipient_endpoint_id: str | None = None,
     files: list[dict[str, Any]] | None = None,
     worker_request: bool = False,
+    wake_event: str | None = None,
 ) -> dict[str, Any]:
     context = runtime_context()
     sender = context["agent_role"]
@@ -40,6 +41,7 @@ def send_message(
         recipient_endpoint_id=recipient_endpoint_id,
         files=files,
         worker_request=worker_request,
+        wake_event=wake_event,
     )
 
 
@@ -55,8 +57,8 @@ def send_user_console_message(
     )
 
 
-def send_session_message(body: str) -> dict[str, Any]:
-    return send_message(SESSION_RECIPIENT, body)
+def send_session_message(body: str, *, wake_event: str | None = None) -> dict[str, Any]:
+    return send_message(SESSION_RECIPIENT, body, wake_event=wake_event)
 
 
 def send_worker_request(body: str) -> dict[str, Any]:
@@ -88,6 +90,18 @@ def set_goal_completion_state(
         actor=context["agent_role"],
         run_id=context["run_id"] or None,
         schedule_parameters=schedule_parameters,
+    )
+
+
+def set_goal_waiting(wait: dict[str, Any], *, note: str = "") -> dict[str, Any]:
+    """Record the current Session's bounded Waiting decision without creating Worker work."""
+    context = runtime_context()
+    return Store(Path(context["state_root"])).set_goal_waiting_from_runtime(
+        context["session_id"],
+        wait=wait,
+        actor=context["agent_role"],
+        run_id=context["run_id"] or None,
+        reason=note,
     )
 
 

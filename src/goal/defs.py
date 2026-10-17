@@ -29,6 +29,7 @@ DEFAULT_SESSION_CAPABILITIES = {
         "read_session_messages",
         "evaluate_session_goal_completion",
         "write_goal_completion_state",
+        "declare_session_goal_waiting",
         "write_goal_completion_reason_message",
         "send_session_message",
         "send_user_console_message_to_reply_endpoint",

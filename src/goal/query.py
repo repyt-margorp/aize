@@ -127,19 +127,22 @@ class QueryMixin:
             goal_id = str(goal.get("goal_id") or "")
             ready_roles = sorted(role for role in ready_roles_by_goal.get(goal_id, set()) if role)
             running_roles = sorted(role for role in running_roles_by_goal.get(goal_id, set()) if role)
+            waiting = goal.get("waiting") is not None
             sessions.append(
                 {
                     "session_id": session_id,
                     "goal_id": goal_id,
                     "ready_roles": ready_roles,
                     "running_roles": running_roles,
-                    "covered": bool(ready_roles or running_roles),
+                    "waiting": waiting,
+                    "covered": bool(ready_roles or running_roles) or waiting,
                 }
             )
         sessions.sort(key=lambda item: str(item["session_id"]))
         return {
             "active_incomplete_session_count": len(sessions),
             "covered_count": sum(1 for item in sessions if item["covered"]),
+            "waiting_count": sum(1 for item in sessions if item["waiting"]),
             "gap_count": sum(1 for item in sessions if not item["covered"]),
             "orphaned_acquired_readiness_count": len(orphaned_readiness),
             "orphaned_acquired_readiness_ids": sorted(

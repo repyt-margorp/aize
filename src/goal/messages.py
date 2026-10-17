@@ -38,6 +38,7 @@ class GoalMessageMixin:
         recipient_endpoint_id: str | None = None,
         files: list[dict[str, Any]] | None = None,
         worker_request: bool = False,
+        wake_event: str | None = None,
     ) -> dict[str, Any]:
         with self._state_lock():
             state = self.load()
@@ -62,6 +63,11 @@ class GoalMessageMixin:
                     raise StoreError("worker requests must be GoalManager Messages to Session")
                 payload["worker_request"] = True
                 payload["worker_role"] = WORKER_AGENT_ROLE
+            if wake_event:
+                normalized_wake_event = str(wake_event).strip()
+                if not normalized_wake_event:
+                    raise StoreError("wake_event must be a non-empty name")
+                payload["wake_events"] = [normalized_wake_event]
             if provider:
                 payload["provider"] = str(provider)
             if run_id:

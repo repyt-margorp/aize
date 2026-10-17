@@ -336,7 +336,34 @@ class DispatchMixin:
             str(goal.get("goal_id") or ""),
         ) or self._has_worker_request_for_run(state, session_id=session["session_id"], run_id=run["run_id"])
         implicit_worker_message = None
-        if decision["completion_state"] == "complete":
+        if decision["completion_state"] == "waiting":
+            wait_reason = str(decision.get("reason") or "")
+            goal["waiting"] = {
+                **dict(decision.get("wait") or {}),
+                "reason": wait_reason,
+                "declared_at": completed_at,
+                "declared_run_id": run["run_id"],
+            }
+            transition = None
+            self._log_goal_state_transition(
+                state,
+                goal,
+                {
+                    "completion_state": "waiting",
+                    "reason": wait_reason,
+                    "actor": GOAL_MANAGER_ROLE,
+                    "run_id": run["run_id"],
+                    "created_at": completed_at,
+                },
+            )
+            self._resolve_goal_manager_readiness_for_goal(
+                state,
+                str(goal.get("goal_id") or ""),
+                resolved_at=completed_at,
+            )
+            run["completion_state"] = "incomplete"
+            run["goal_manager_status"] = "waiting"
+        elif decision["completion_state"] == "complete":
             schedule_reason = self._prepare_scheduled_unit_completion(
                 state,
                 session=session,
@@ -418,7 +445,7 @@ class DispatchMixin:
         )
         if readiness_entry and (
             run.get("completion_state") == "complete"
-            or run.get("goal_manager_status") == "schedule_next_run_required"
+            or run.get("goal_manager_status") in {"schedule_next_run_required", "waiting"}
         ):
             readiness_entry["status"] = "resolved"
             readiness_entry["resolved_at"] = completed_at

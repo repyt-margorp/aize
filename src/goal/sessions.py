@@ -1163,6 +1163,87 @@ class SessionGoalMixin:
             self.save(state)
             return dict(declaration)
 
+    def set_goal_waiting_from_runtime(
+        self,
+        session_id: str,
+        *,
+        wait: dict[str, Any],
+        actor: str,
+        run_id: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
+            raise StoreError("only GoalManager may declare a SessionGoal waiting")
+        if not run_id:
+            raise StoreError("GoalManager waiting decision requires an active dispatch run")
+        with self._state_lock():
+            state = self.load()
+            run = state.setdefault("dispatch_runs", {}).get(run_id)
+            if not run:
+                raise StoreError(f"unknown dispatch run: {run_id}")
+            if (
+                str(run.get("session_id") or "") != session_id
+                or str(run.get("role") or "") != GOAL_MANAGER_ROLE
+                or run.get("lease_state") != "acquired"
+            ):
+                raise StoreError("GoalManager waiting decision requires its acquired dispatch lease")
+            goal = self._current_goal_for_session(state, session_id)
+            if not goal or str(goal.get("goal_id") or "") != str(run.get("goal_id") or ""):
+                raise StoreError("dispatch run no longer owns the current SessionGoal")
+            if isinstance(run.get("declared_outcome"), dict):
+                raise StoreError("GoalManager dispatch run already declared its completion outcome")
+            spec = self._normalize_goal_waiting_spec_locked(
+                state,
+                session_id=session_id,
+                spec=wait if isinstance(wait, dict) else {},
+            )
+            declaration = {
+                "completion_state": "waiting",
+                "reason": str(reason or "").strip() or "GoalManager recorded a waiting decision.",
+                "wait": spec,
+                "declared_at": utc_now(),
+            }
+            run["declared_outcome"] = declaration
+            self.save(state)
+            return dict(declaration)
+
+    def _normalize_goal_waiting_spec_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        kind = str(spec.get("kind") or "").strip().lower()
+        if kind not in {"deadline", "event", "child"}:
+            raise StoreError("waiting spec requires kind deadline, event, or child")
+        normalized: dict[str, Any] = {"kind": kind}
+        if kind == "deadline":
+            wait_until = str(spec.get("wait_until") or "").strip()
+            if not wait_until:
+                raise StoreError("deadline waiting requires wait_until")
+            try:
+                deadline = self._parse_utc(wait_until)
+            except StoreError as exc:
+                raise StoreError(f"deadline waiting requires a valid UTC wait_until: {exc}") from exc
+            if deadline <= self._parse_utc(utc_now()):
+                raise StoreError("deadline waiting requires wait_until in the future")
+            normalized["wait_until"] = wait_until
+        if kind == "event":
+            event_name = str(spec.get("event_name") or "").strip()
+            if not event_name:
+                raise StoreError("event waiting requires event_name")
+            normalized["event_name"] = event_name
+        if kind == "child":
+            child_session_id = str(spec.get("child_session_id") or "").strip()
+            if not child_session_id:
+                raise StoreError("child waiting requires child_session_id")
+            if child_session_id not in state.setdefault("sessions", {}):
+                raise StoreError(f"child waiting references an unknown Session: {child_session_id}")
+            normalized["child_session_id"] = child_session_id
+        normalized["wake_log_seq"] = self._latest_session_log_seq(state, session_id=session_id)
+        return normalized
+
     def _current_goal_for_session(self, state: dict[str, Any], session_id: str) -> dict[str, Any] | None:
         session_goals = sorted(
             [
@@ -1209,6 +1290,20 @@ class SessionGoalMixin:
                 created_at=created_at,
             ).to_dict()
             state["goals"][target_goal["goal_id"]] = target_goal
+        if isinstance(target_goal.get("waiting"), dict):
+            target_goal.pop("waiting", None)
+            self._log_system_signal(
+                state,
+                session_id,
+                signal_type="GoalWaitingCancelled",
+                body=(
+                    f"New UserInput cancelled the SessionGoal's bounded waiting: {reason}"
+                ),
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor=actor,
+                data={"goal_id": str(target_goal.get("goal_id") or "")},
+                created_at=created_at,
+            )
         self._set_goal_completion_state(
             state,
             target_goal,

@@ -24,6 +24,7 @@ class DispatchReadinessMixin:
             entry["resolved_at"] = resolved_at
 
     def _refresh_dispatch_readiness(self, state: dict[str, Any]) -> bool:
+        waiting_changed = self._expire_goal_waiting(state)
         previous = [dict(entry) for entry in state.setdefault("dispatch_readiness", [])]
         state["dispatch_readiness"] = [
             entry
@@ -33,7 +34,7 @@ class DispatchReadinessMixin:
         self._deduplicate_ready_entries(state)
 
         for goal in self._current_goals(state):
-            if goal.get("archived_at") or goal.get("completion_state") != "incomplete":
+            if goal.get("archived_at") or goal.get("completion_state") != "incomplete" or goal.get("waiting"):
                 continue
             session_id = str(goal.get("session_id") or "")
             session = state.get("sessions", {}).get(session_id)
@@ -50,10 +51,73 @@ class DispatchReadinessMixin:
                     role=role,
                 )
                 self._reconcile_ready_entry(state, goal=goal, role=role, fields=fields)
-        return previous != state["dispatch_readiness"]
+        return previous != state["dispatch_readiness"] or waiting_changed
+
+    def _expire_goal_waiting(self, state: dict[str, Any]) -> bool:
+        superseded = False
+        now = utc_now()
+        for goal in self._current_goals(state):
+            waiting = goal.get("waiting")
+            if not isinstance(waiting, dict) or not waiting.get("kind"):
+                continue
+            session_id = str(goal.get("session_id") or "")
+            session = state.get("sessions", {}).get(session_id)
+            if not session or session.get("active") is not True:
+                continue
+            reason = self._goal_waiting_wake_reason(state, goal, waiting, now=now)
+            if not reason:
+                continue
+            goal.pop("waiting", None)
+            self._log_system_signal(
+                state,
+                session_id,
+                signal_type="GoalWaitingWake",
+                body=reason,
+                target_roles=[GOAL_MANAGER_ROLE],
+                actor="scheduler",
+                data={"goal_id": str(goal.get("goal_id") or ""), "wait_kind": waiting["kind"]},
+                created_at=now,
+            )
+            superseded = True
+        return superseded
+
+    def _goal_waiting_wake_reason(self, state: dict[str, Any], goal: dict[str, Any], waiting: dict[str, Any], *, now: str) -> str | None:
+        session_id = str(goal.get("session_id") or "")
+        kind = str(waiting.get("kind") or "")
+        wait_log_seq = int(waiting.get("wake_log_seq") or 0)
+        if kind == "deadline":
+            try:
+                deadline_passed = self._parse_utc(str(waiting.get("wait_until") or "")) <= self._parse_utc(now)
+            except StoreError:
+                deadline_passed = True
+            if deadline_passed:
+                return "bounded waiting deadline reached; GoalManager must review the SessionGoal again."
+        if kind == "event":
+            event_name = str(waiting.get("event_name") or "")
+            for entry in self._session_log_after_cursor(state, session_id=session_id, cursor=wait_log_seq):
+                if entry.get("kind") != "Message":
+                    continue
+                message = self._message_for_log_entry(state, entry)
+                payload = message.get("payload") if isinstance(message, dict) else None
+                events = payload.get("wake_events") if isinstance(payload, dict) else None
+                if isinstance(events, str):
+                    events = [events]
+                if isinstance(events, list) and event_name in events:
+                    return f"bounded waiting event {event_name} fired."
+        if kind == "child":
+            child_session_id = str(waiting.get("child_session_id") or "")
+            for entry in self._session_log_after_cursor(state, session_id=session_id, cursor=wait_log_seq):
+                if entry.get("kind") != "ChildGoalCompleted":
+                    continue
+                event = entry.get("event")
+                if not isinstance(event, dict):
+                    continue
+                if not child_session_id or str(event.get("child_session_id") or "") == child_session_id:
+                    return f"bounded waiting child SessionGoal {child_session_id or '(any child)'} completed."
+        return None
 
     def _reconcile_dispatch_liveness(self, state: dict[str, Any]) -> bool:
-        """Enforce that every Active/Incomplete Session has ready or running work."""
+        """Enforce that every Active/Incomplete Session has ready, running, or bounded-waiting work."""
         changed = False
         now = utc_now()
         acquired_runs = {
@@ -136,6 +200,7 @@ class DispatchReadinessMixin:
                 or not session
                 or session.get("active") is not True
                 or goal_id in live_goal_ids
+                or goal.get("waiting")
             ):
                 continue
             self._log_system_signal(
