@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create_unit.add_argument("--schedule-fixed-parameters", default="{}")
     create_unit.add_argument("--owner-account", default="root")
+    create_unit.add_argument("--spawn-group", action="append", dest="spawn_groups")
     create_unit.add_argument("--manual", action="store_true", default=None, dest="manual")
     create_unit.add_argument("--no-manual", action="store_false", dest="manual")
     create_unit.add_argument("--startup", action="store_true", default=False)
@@ -100,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_session.add_argument("session_id")
     create_session.add_argument("--unit", dest="unit_id")
     create_session.add_argument("--parent", action="append", dest="parent_session_ids")
-    create_session.add_argument("--created-by", dest="created_by")
+    create_session.add_argument("--created-by", dest="created_by", default="root")
 
     activate_session = sub.add_parser("activate-session", help="set a session active")
     activate_session.add_argument("session_id")
@@ -110,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     activate_unit = sub.add_parser("activate-unit", help="resume a paused Unit")
     activate_unit.add_argument("unit_id")
+
+    set_unit_spawn_groups = sub.add_parser("set-unit-spawn-groups", help="restrict which user groups may start a Unit's Sessions")
+    set_unit_spawn_groups.add_argument("unit_id")
+    set_unit_spawn_groups.add_argument("--group", action="append", dest="groups")
+    set_unit_spawn_groups.add_argument("--clear", action="store_true")
+
+    sub.add_parser("groups", help="list each group with its user members")
 
     deactivate_unit = sub.add_parser("deactivate-unit", help="pause a Unit so it cannot start Sessions")
     deactivate_unit.add_argument("unit_id")
@@ -356,6 +364,7 @@ def run(argv: list[str] | None = None) -> int:
                     args.session_id,
                     unit_id=args.unit_id,
                     parent_session_ids=parent_session_ids,
+                    created_by=args.created_by,
                 )
             )
         elif args.command == "activate-session":
@@ -364,6 +373,11 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.set_session_active(args.session_id, active=False))
         elif args.command == "activate-unit":
             print_json(store.set_unit_active(args.unit_id, active=True))
+        elif args.command == "set-unit-spawn-groups":
+            spawn_groups = [] if args.clear else list(args.groups or [])
+            print_json(store.set_unit_spawn_groups(args.unit_id, groups=spawn_groups))
+        elif args.command == "groups":
+            print_json(store.group_members())
         elif args.command == "deactivate-unit":
             print_json(store.set_unit_active(args.unit_id, active=False))
         elif args.command == "start-goal":

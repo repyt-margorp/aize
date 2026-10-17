@@ -141,6 +141,7 @@ class SessionGoalMixin:
         initial_prompt: str = "",
         schedule: dict[str, Any] | None = None,
         activation_triggers: dict[str, bool] | None = None,
+        spawn_groups: list[str] | None = None,
         owner_account: str = ROOT_USERNAME,
     ) -> Unit:
         state = self.load()
@@ -171,9 +172,46 @@ class SessionGoalMixin:
             owner_account=normalized_owner_account,
         )
         units[unit_id] = unit.to_dict()
+        units[unit_id]["spawn_groups"] = self._normalize_spawn_groups(spawn_groups)
         self._ensure_unit_workspace(units[unit_id])
         self.save(state)
         return unit
+
+    @staticmethod
+    def _normalize_spawn_groups(spawn_groups: list[str] | None) -> list[str]:
+        normalized: list[str] = []
+        for value in spawn_groups or []:
+            group = str(value).strip()
+            if group and group not in normalized:
+                normalized.append(group)
+        return normalized
+
+    @staticmethod
+    def _unit_spawn_groups(unit: dict[str, Any] | None) -> list[str]:
+        if not isinstance(unit, dict):
+            return []
+        return list(unit.get("spawn_groups") or [])
+
+    def _check_unit_spawn_membership(self, state: dict[str, Any], unit: dict[str, Any] | None, username: str) -> None:
+        required = self._unit_spawn_groups(unit)
+        if not required:
+            return
+        members = state.setdefault("users", {}).get(str(username)) if username else None
+        memberships = set(members.get("groups") or []) if isinstance(members, dict) else set()
+        if memberships.isdisjoint(required):
+            raise StoreError(
+                f"user {username} is not a member of the required spawn groups: {', '.join(required)}"
+            )
+
+    @state_transaction
+    def set_unit_spawn_groups(self, unit_id: str, *, groups: list[str]) -> dict[str, Any]:
+        state = self.load()
+        unit = state["units"].get(unit_id)
+        if not unit:
+            raise StoreError(f"unknown unit: {unit_id}")
+        unit["spawn_groups"] = self._normalize_spawn_groups(groups)
+        self.save(state)
+        return dict(unit)
 
     def configure_unit_schedule(
         self,
@@ -286,17 +324,28 @@ class SessionGoalMixin:
             scheduled_for = str(unit.get("schedule", {}).get("next_run_at") or "")
             label = str(unit.get("display_name") or unit_id).strip()
             goal_body = str(unit.get("goal_text") or label).strip()
-            payload = self._start_goal_session_in_state(
-                state,
-                session_id=session_id,
-                unit_id=unit_id,
-                parent_session_ids=[unit_parent_session_id],
-                label=label,
-                body=goal_body,
-                created_by=unit_created_by,
-                created_at=now_text,
-                activation_trigger="scheduled",
-            )
+            try:
+                payload = self._start_goal_session_in_state(
+                    state,
+                    session_id=session_id,
+                    unit_id=unit_id,
+                    parent_session_ids=[unit_parent_session_id],
+                    label=label,
+                    body=goal_body,
+                    created_by=unit_created_by,
+                    created_at=now_text,
+                    activation_trigger="scheduled",
+                )
+            except StoreError as exc:
+                started.append(
+                    {
+                        "skipped": {
+                            "unit_id": unit_id,
+                            "reason": str(exc),
+                        }
+                    }
+                )
+                continue
             state["sessions"][session_id]["schedule_timing"] = {
                 "scheduled_for": scheduled_for,
             }
@@ -371,17 +420,28 @@ class SessionGoalMixin:
             session_id = self._triggered_session_id(state, unit_id=unit_id, trigger="startup", now_text=now_text)
             label = str(unit.get("display_name") or unit_id).strip()
             goal_body = str(unit.get("goal_text") or label).strip()
-            payload = self._start_goal_session_in_state(
-                state,
-                session_id=session_id,
-                unit_id=unit_id,
-                parent_session_ids=[unit_parent_session_id],
-                label=label,
-                body=goal_body,
-                created_by=unit_created_by,
-                created_at=now_text,
-                activation_trigger="startup",
-            )
+            try:
+                payload = self._start_goal_session_in_state(
+                    state,
+                    session_id=session_id,
+                    unit_id=unit_id,
+                    parent_session_ids=[unit_parent_session_id],
+                    label=label,
+                    body=goal_body,
+                    created_by=unit_created_by,
+                    created_at=now_text,
+                    activation_trigger="startup",
+                )
+            except StoreError as exc:
+                started.append(
+                    {
+                        "skipped": {
+                            "unit_id": unit_id,
+                            "reason": str(exc),
+                        }
+                    }
+                )
+                continue
             initial_prompt = str(unit.get("initial_prompt") or "").strip()
             if initial_prompt:
                 message = self._append_session_message_locked(
@@ -523,6 +583,7 @@ class SessionGoalMixin:
         *,
         unit_id: str | None = None,
         parent_session_ids: list[str] | None = None,
+        created_by: str = ROOT_USERNAME,
     ) -> dict[str, Any]:
         state = self.load()
         normalized_unit_id = str(unit_id or "").strip() or None
@@ -532,6 +593,10 @@ class SessionGoalMixin:
             raise StoreError(f"unit does not allow manual activation: {normalized_unit_id}")
         if normalized_unit_id and self._unit_paused(state["units"].get(normalized_unit_id)):
             raise StoreError(f"unit is paused: {normalized_unit_id}")
+        if normalized_unit_id:
+            self._check_unit_spawn_membership(state, state["units"].get(normalized_unit_id), created_by)
+            if created_by not in state["users"]:
+                raise StoreError(f"unknown user: {created_by}")
         sessions = state["sessions"]
         if session_id in sessions:
             raise StoreError(f"session already exists: {session_id}")
@@ -623,6 +688,8 @@ class SessionGoalMixin:
             raise StoreError(f"unit does not allow {activation_trigger} activation: {normalized_unit_id}")
         if normalized_unit_id and self._unit_paused(state["units"].get(normalized_unit_id)):
             raise StoreError(f"unit is paused: {normalized_unit_id}")
+        if normalized_unit_id:
+            self._check_unit_spawn_membership(state, state["units"].get(normalized_unit_id), created_by)
         if session_id in state["sessions"]:
             raise StoreError(f"session already exists: {session_id}")
         unit = state["units"].get(normalized_unit_id) if normalized_unit_id else None

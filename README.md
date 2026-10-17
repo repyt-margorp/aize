@@ -154,6 +154,14 @@ Pause a Unit so it cannot start Sessions at all and its Sessions dispatch nothin
 ./aize activate-unit pc-aize-email-report
 ```
 
+Restrict which user groups may start a Unit's Sessions (empty list = open):
+
+```bash
+./aize create-unit manager-tracker --spawn-group managers --goal-text "..."
+./aize set-unit-spawn-groups manager-tracker --group managers
+./aize groups
+```
+
 Update an existing Unit without recreating it:
 
 ```bash

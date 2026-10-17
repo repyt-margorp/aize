@@ -59,7 +59,15 @@ user-management vocabulary:
 ## Later phases
 
 2. Groups carry real semantics: membership checks at spawn eligibility and
-   per-group dispatch priority for service identities.
+   per-group dispatch priority for service identities. — **Implemented
+   2026-10-17 (phase 2)**: `unit.spawn_groups` restricts which user groups may
+   start a Unit's Sessions across every activation path (manual
+   `create-session`/`start-goal`, `run-scheduled-units`, `run-startup-units`);
+   scheduler runs isolate a gated Unit as a skip record instead of failing the
+   batch, `set-unit-spawn-groups` edits the list, and `groups` lists each
+   group with its members. Per-group dispatch priority for service identities
+   stays reserved for phase 3.
+
 3. Service identities: non-login `svc-*` users, per-role priority lists,
    `(session, group)` thread keys, `agent:` endpoint names become
    `user:{svc-name}`, `AIZE_AGENT_ROLE` retires behind an alias window.

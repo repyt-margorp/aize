@@ -104,3 +104,16 @@ class AuthMixin:
             [self._public_user(user) for user in state["users"].values()],
             key=lambda item: item["username"],
         )
+
+    def group_members(self) -> list[dict[str, Any]]:
+        state = self.load()
+        memberships: dict[str, list[str]] = {}
+        for user in sorted(state["users"].values(), key=lambda item: item["username"]):
+            for group in user.get("groups") or []:
+                members = memberships.setdefault(str(group).strip(), [])
+                if user["username"] not in members:
+                    members.append(user["username"])
+        return [
+            {"group": group, "members": sorted(members)}
+            for group, members in sorted(memberships.items())
+        ]
