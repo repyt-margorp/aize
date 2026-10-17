@@ -80,9 +80,11 @@ def print_units(units: list[dict[str, Any]]) -> None:
         owner = f" owner={unit.get('owner_account')}" if unit.get("owner_account") else ""
         triggers = unit.get("activation_triggers") if isinstance(unit.get("activation_triggers"), dict) else {}
         trigger_text = ",".join(key for key in ("manual", "scheduled", "startup") if triggers.get(key)) or "none"
+        schedule = unit.get("schedule") if isinstance(unit.get("schedule"), dict) else {}
+        schedule_text = f" schedule={'on' if schedule.get('enabled') is True else 'off'}"
         print(
             f"- {unit.get('unit_id')} policy={unit.get('instance_policy')} "
-            f"triggers={trigger_text} status={unit.get('status')}{singleton}"
+            f"triggers={trigger_text}{schedule_text} status={unit.get('status')}{singleton}"
             f"{owner}"
         )
 

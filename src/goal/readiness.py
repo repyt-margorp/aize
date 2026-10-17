@@ -199,6 +199,7 @@ class DispatchReadinessMixin:
                 or goal.get("completion_state") != "incomplete"
                 or not session
                 or session.get("active") is not True
+                or self._unit_paused(state.setdefault("units", {}).get(str(session.get("unit_id") or "")))
                 or goal_id in live_goal_ids
                 or goal.get("waiting")
             ):

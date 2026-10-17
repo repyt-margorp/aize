@@ -122,6 +122,7 @@ class QueryMixin:
                 or goal.get("completion_state") != "incomplete"
                 or not session
                 or session.get("active") is not True
+                or self._unit_paused(state.setdefault("units", {}).get(str(session.get("unit_id") or "")))
             ):
                 continue
             goal_id = str(goal.get("goal_id") or "")

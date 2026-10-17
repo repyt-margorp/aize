@@ -108,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
     deactivate_session = sub.add_parser("deactivate-session", help="set a session inactive")
     deactivate_session.add_argument("session_id")
 
+    activate_unit = sub.add_parser("activate-unit", help="resume a paused Unit")
+    activate_unit.add_argument("unit_id")
+
+    deactivate_unit = sub.add_parser("deactivate-unit", help="pause a Unit so it cannot start Sessions")
+    deactivate_unit.add_argument("unit_id")
+
     start_goal = sub.add_parser("start-goal", help="create a child session and active goal")
     start_goal.add_argument("session_id")
     start_goal.add_argument("--unit", dest="unit_id")
@@ -356,6 +362,10 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.set_session_active(args.session_id, active=True))
         elif args.command == "deactivate-session":
             print_json(store.set_session_active(args.session_id, active=False))
+        elif args.command == "activate-unit":
+            print_json(store.set_unit_active(args.unit_id, active=True))
+        elif args.command == "deactivate-unit":
+            print_json(store.set_unit_active(args.unit_id, active=False))
         elif args.command == "start-goal":
             parent_session_ids = args.parent_session_ids or [store.account_home_session(args.created_by)]
             print_json(

@@ -144,6 +144,13 @@ PYTHONPATH=src python3 -m cli --root .aize-state create-unit monitor \
 PYTHONPATH=src python3 -m cli --root .aize-state run-scheduled-units
 ```
 
+Pause a Unit so it cannot start Sessions at all and its Sessions dispatch nothing:
+
+```bash
+./aize deactivate-unit pc-aize-email-report
+./aize activate-unit pc-aize-email-report
+```
+
 Update an existing Unit without recreating it:
 
 ```bash

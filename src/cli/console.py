@@ -117,7 +117,7 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                 if command in {"exit", "quit"}:
                     return 0
                 if command == "help":
-                    print("commands: units, create-unit UNIT, sessions, session SESSION, session-goal-dag SESSION, unit-session SESSION UNIT, use SESSION, current, activate, deactivate, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, goal-dag, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], agent-threads, agent-pool, dispatch-runs, dispatch-readiness, dispatch-liveness, dispatch, graph [HOURS], exit")
+                    print("commands: units, create-unit UNIT, sessions, session SESSION, session-goal-dag SESSION, unit-session SESSION UNIT, use SESSION, current, activate, deactivate, activate-unit UNIT, deactivate-unit UNIT, set-policy CLASS BASE_PRIORITY, send BODY, send-file RECIPIENT PATH [BODY], messages [N], goals, update-goal BODY, goal-dag, goal SESSION LABEL [BODY], unit-goal SESSION UNIT LABEL [BODY], agent-threads, agent-pool, dispatch-runs, dispatch-readiness, dispatch-liveness, dispatch, graph [HOURS], exit")
                 elif command == "units":
                     print_units(store.units())
                 elif command == "create-unit":
@@ -151,6 +151,14 @@ def run_console(store: Store, *, username: str | None, password: str | None) -> 
                     print_session(store.set_session_active(current_session_id, active=True))
                 elif command == "deactivate":
                     print_session(store.set_session_active(current_session_id, active=False))
+                elif command == "activate-unit":
+                    if len(args) != 1:
+                        raise StoreError("usage: activate-unit UNIT")
+                    print_units([store.set_unit_active(args[0], active=True)])
+                elif command == "deactivate-unit":
+                    if len(args) != 1:
+                        raise StoreError("usage: deactivate-unit UNIT")
+                    print_units([store.set_unit_active(args[0], active=False)])
                 elif command == "use":
                     if len(args) != 1:
                         raise StoreError("usage: use SESSION")

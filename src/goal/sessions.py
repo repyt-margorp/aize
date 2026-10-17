@@ -25,6 +25,7 @@ from goal.defs import (
 )
 from kernel.defs import (
     ROOT_SESSION_ID,
+    ROOT_UNIT_ID,
     ROOT_USERNAME,
     StoreError,
     account_endpoint,
@@ -466,6 +467,24 @@ class SessionGoalMixin:
         return sorted(state["agent_profiles"].values(), key=lambda item: item["role"])
 
     @state_transaction
+    def set_unit_active(self, unit_id: str, *, active: bool) -> dict[str, Any]:
+        state = self.load()
+        unit = state["units"].get(unit_id)
+        if not unit:
+            raise StoreError(f"unknown unit: {unit_id}")
+        if unit_id == ROOT_UNIT_ID and active is False:
+            raise StoreError("the system root Unit cannot be paused")
+        unit["status"] = "active" if active else "paused"
+        self.save(state)
+        return dict(unit)
+
+    @staticmethod
+    def _unit_paused(unit: dict[str, Any] | None) -> bool:
+        if not isinstance(unit, dict):
+            return False
+        return str(unit.get("status") or "active") != "active"
+
+    @state_transaction
     def set_session_active(self, session_id: str, *, active: bool) -> dict[str, Any]:
         state = self.load()
         session = state["sessions"].get(session_id)
@@ -511,6 +530,8 @@ class SessionGoalMixin:
             raise StoreError(f"unknown unit: {normalized_unit_id}")
         if normalized_unit_id and not self._unit_activation_trigger_enabled(state["units"][normalized_unit_id], "manual"):
             raise StoreError(f"unit does not allow manual activation: {normalized_unit_id}")
+        if normalized_unit_id and self._unit_paused(state["units"].get(normalized_unit_id)):
+            raise StoreError(f"unit is paused: {normalized_unit_id}")
         sessions = state["sessions"]
         if session_id in sessions:
             raise StoreError(f"session already exists: {session_id}")
@@ -600,6 +621,8 @@ class SessionGoalMixin:
             raise StoreError(f"unknown unit: {normalized_unit_id}")
         if normalized_unit_id and not self._unit_activation_trigger_enabled(state["units"][normalized_unit_id], activation_trigger):
             raise StoreError(f"unit does not allow {activation_trigger} activation: {normalized_unit_id}")
+        if normalized_unit_id and self._unit_paused(state["units"].get(normalized_unit_id)):
+            raise StoreError(f"unit is paused: {normalized_unit_id}")
         if session_id in state["sessions"]:
             raise StoreError(f"session already exists: {session_id}")
         unit = state["units"].get(normalized_unit_id) if normalized_unit_id else None
