@@ -201,6 +201,7 @@ class DispatchMixin:
             "steps": [],
             "session_message_ids": [message["message_id"] for message in session_messages],
             "current_phase": role,
+            "observed_goal_body": str(goal.get("body") or ""),
             "from_log_seq": readiness_entry.get("from_log_seq"),
             "observed_to_seq": readiness_entry.get("observed_to_seq"),
             "wake_reasons": [
@@ -241,6 +242,16 @@ class DispatchMixin:
             return self._recover_missing_lease_run_locked(state, lease)
         goal = state["goals"][lease["goal"]["goal_id"]]
         session = state["sessions"][lease["session"]["session_id"]]
+        fence_reason = self._stale_dispatch_fence_locked(state, run, role=GOAL_MANAGER_ROLE)
+        if fence_reason:
+            return self._discard_stale_dispatch_result_locked(
+                state,
+                run,
+                lease=lease,
+                role=GOAL_MANAGER_ROLE,
+                fence_reason=fence_reason,
+                result=result,
+            )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
         thread = self._ensure_agent_thread(state, session_id=session["session_id"], role=GOAL_MANAGER_ROLE)
         self._record_agent_turn(thread, prompt=result["prompt"], result=result["agent_result"].output)
@@ -505,6 +516,16 @@ class DispatchMixin:
             return self._recover_missing_lease_run_locked(state, lease)
         goal = state["goals"][lease["goal"]["goal_id"]]
         session = state["sessions"][lease["session"]["session_id"]]
+        fence_reason = self._stale_dispatch_fence_locked(state, run, role=WORKER_AGENT_ROLE)
+        if fence_reason:
+            return self._discard_stale_dispatch_result_locked(
+                state,
+                run,
+                lease=lease,
+                role=WORKER_AGENT_ROLE,
+                fence_reason=fence_reason,
+                result=result,
+            )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
         thread = self._ensure_agent_thread(state, session_id=session["session_id"], role=WORKER_AGENT_ROLE)
         self._record_agent_turn(thread, prompt=result["prompt"], result=result["agent_result"].output)
@@ -590,6 +611,17 @@ class DispatchMixin:
             return self._recover_missing_lease_run_locked(state, lease)
         goal = state["goals"][lease["goal"]["goal_id"]]
         session = state["sessions"][lease["session"]["session_id"]]
+        error_role = str(run.get("role") or GOAL_MANAGER_ROLE)
+        fence_reason = self._stale_dispatch_fence_locked(state, run, role=error_role)
+        if fence_reason:
+            return self._discard_stale_dispatch_result_locked(
+                state,
+                run,
+                lease=lease,
+                role=error_role,
+                fence_reason=fence_reason,
+                result=None,
+            )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
         failed_at = utc_now()
         transition = self._set_goal_completion_state(
@@ -745,6 +777,127 @@ class DispatchMixin:
             to_seq=int(observed_to_seq),
             target_filter=role,
         )
+
+    def _stale_dispatch_fence_locked(self, state: dict[str, Any], run: dict[str, Any], *, role: str) -> str:
+        if str(run.get("role") or "") != role:
+            return f"dispatch run belongs to another role: {run.get('role')}"
+        if str(run.get("lease_state") or "") != "acquired":
+            return f"dispatch run is no longer acquired: lease_state={run.get('lease_state')}"
+        goal = state.get("goals", {}).get(str(run.get("goal_id") or ""))
+        if not goal:
+            return "dispatch run references a missing SessionGoal"
+        if "observed_goal_body" in run and str(goal.get("body") or "") != str(run.get("observed_goal_body")):
+            return "the observed SessionGoal was updated during the dispatch run"
+        conflict = self._new_requirement_conflicts_after_window(
+            state,
+            session_id=str(run.get("session_id") or ""),
+            run_id=str(run.get("run_id") or ""),
+            observed_to_seq=run.get("observed_to_seq"),
+        )
+        if conflict:
+            return conflict
+        return ""
+
+    def _new_requirement_conflicts_after_window(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        run_id: str,
+        observed_to_seq: int | None,
+    ) -> str:
+        if observed_to_seq is None:
+            return ""
+        observed_to_seq = int(observed_to_seq)
+        latest_seq = self._latest_session_log_seq(state, session_id=session_id)
+        if latest_seq <= observed_to_seq:
+            return ""
+        for entry in self._session_log_after_cursor(state, session_id=session_id, cursor=observed_to_seq):
+            kind = str(entry.get("kind") or "")
+            event = entry.get("event")
+            event_run_id = str(event.get("run_id") or "") if isinstance(event, dict) else ""
+            if kind == "GoalBodyUpdated":
+                if event_run_id == run_id:
+                    continue
+                return "a SessionGoal body revision arrived after the run's observation window"
+            if kind == "Message":
+                message = self._message_for_log_entry(state, entry)
+                payload = message.get("payload") if isinstance(message, dict) else None
+                if isinstance(payload, dict) and str(payload.get("run_id") or "") == run_id:
+                    continue
+                return "a newer Session message arrived after the run's observation window"
+            if kind == "GoalStateChanged":
+                if event_run_id == run_id:
+                    continue
+                return "a newer SessionGoal state change arrived after the run's observation window"
+            if kind == "ChildGoalCompleted":
+                return "a child SessionGoal completed after the run's observation window"
+        return ""
+
+    def _discard_stale_dispatch_result_locked(
+        self,
+        state: dict[str, Any],
+        run: dict[str, Any],
+        *,
+        lease: dict[str, Any],
+        role: str,
+        fence_reason: str,
+        result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        recorded_at = utc_now()
+        agent_result = result.get("agent_result") if isinstance(result, dict) else None
+        output_body = str(agent_result.output) if agent_result is not None else ""
+        run.setdefault("stale_results", []).append(
+            {
+                "created_at": recorded_at,
+                "role": role,
+                "fence_reason": fence_reason,
+                "output": output_body,
+                "output_chars": len(output_body),
+            }
+        )
+        run["stale_result_at"] = recorded_at
+        run["stale_result_fenced"] = True
+        if str(run.get("lease_state") or "") == "acquired":
+            run["lease_state"] = "released"
+            run["lease_released_at"] = recorded_at
+            run.pop("current_phase", None)
+            readiness_entry = self._readiness_entry_by_id(state, str(run.get("readiness_id") or ""))
+            if readiness_entry and readiness_entry.get("status") == "acquired":
+                readiness_entry["status"] = "stale"
+                readiness_entry["stale_at"] = recorded_at
+                readiness_entry["stale_reason"] = f"dispatch result discarded: {fence_reason}"
+                readiness_entry.pop("acquired_at", None)
+            self._set_role_cursor(
+                state,
+                session_id=str(run.get("session_id") or ""),
+                role=role,
+                seq=int(run.get("observed_to_seq") or 0),
+            )
+        self._log_system_signal(
+            state,
+            str(run.get("session_id") or ""),
+            signal_type="StaleDispatchResultDiscarded",
+            body=(
+                f"Dispatch run {run.get('run_id')} returned after it lost its dispatch ownership or its observed "
+                f"requirement changed: {fence_reason}. The returned output was kept as run evidence without "
+                "advancing the SessionGoal."
+            ),
+            target_roles=[GOAL_MANAGER_ROLE],
+            actor="dispatcher",
+            run_id=str(run.get("run_id") or ""),
+            data={"role": role, "stale_output_chars": len(output_body), "fence_reason": fence_reason},
+            created_at=recorded_at,
+        )
+        self.save(state)
+        return {
+            "goal": dict(state.get("goals", {}).get(lease["goal"]["goal_id"], lease["goal"])),
+            "session": dict(state.get("sessions", {}).get(lease["session"]["session_id"], lease["session"])),
+            "unit": dict(lease["unit"]) if lease.get("unit") else None,
+            "run": dict(run),
+            "state_transition": None,
+            "message": None,
+        }
 
     def _append_implicit_worker_request_for_incomplete_goal(
         self,

@@ -1005,9 +1005,19 @@ class SessionGoalMixin:
         goal_dict = self._current_goal_for_session(state, session_id)
         reason = "SessionGoal updated."
         if goal_dict:
+            previous_body = str(goal_dict.get("body") or "")
             goal_dict["body"] = normalized_body
             goal_dict["created_by"] = created_by
             goal_dict["updated_at"] = now
+            self._log_goal_body_update(
+                state,
+                session_id,
+                goal_id=str(goal_dict.get("goal_id") or ""),
+                previous_body=previous_body,
+                body=normalized_body,
+                actor=created_by,
+                created_at=now,
+            )
         else:
             goal = Goal(
                 goal_id=new_id("goal"),
@@ -1128,6 +1138,21 @@ class SessionGoalMixin:
                 raise StoreError("dispatch run no longer owns the current SessionGoal")
             if isinstance(run.get("declared_outcome"), dict):
                 raise StoreError("GoalManager dispatch run already declared its completion outcome")
+            if "observed_goal_body" in run and str(goal.get("body") or "") != str(run.get("observed_goal_body")):
+                raise StoreError(
+                    "the observed SessionGoal changed during the dispatch run; complete a fresh review before declaring"
+                )
+            conflict = self._new_requirement_conflicts_after_window(
+                state,
+                session_id=session_id,
+                run_id=run_id,
+                observed_to_seq=run.get("observed_to_seq"),
+            )
+            if conflict:
+                raise StoreError(
+                    "the observed Session requirement changed during the dispatch run: "
+                    f"{conflict}; complete a fresh review before declaring"
+                )
             declaration = {
                 "completion_state": completion_state,
                 "reason": str(reason or "").strip() or "GoalManager recorded a completion decision.",

@@ -124,6 +124,33 @@ class GoalLogMixin:
         )
         self._sync_session_current_state(state, session_id)
 
+    def _log_goal_body_update(
+        self,
+        state: dict[str, Any],
+        session_id: str,
+        *,
+        goal_id: str,
+        previous_body: str,
+        body: str,
+        actor: str,
+        created_at: str,
+    ) -> None:
+        self._append_session_log_entry(
+            state,
+            session_id,
+            kind="GoalBodyUpdated",
+            created_at=created_at,
+            event={
+                "goal_id": goal_id,
+                "previous_body": previous_body,
+                "body": body,
+                "actor": normalize_endpoint(actor, session_id=session_id),
+                "created_at": created_at,
+            },
+            event_key=f"goal-body:{goal_id}:{created_at}:{new_id('revision')}",
+        )
+        self._sync_session_current_state(state, session_id)
+
     def _log_child_goal_completed_for_parents(
         self,
         state: dict[str, Any],
