@@ -1,7 +1,11 @@
 # Runtime Layer Boundaries
 
 Date: 2026-10-17
-Status: design note; no code changes yet.
+Status: implemented and verified. The migration program below was executed on
+this date: package re-home with an unchanged behavior suite, a static
+layer-boundary audit, and the L2 repairs list (transaction locks, completion
+fencing, provider thread contract, bounded waiting). See "Implementation
+record" under the Migration sequence.
 
 ## Problem
 
@@ -20,11 +24,13 @@ one layer instead of touching the core.
 
 ## Layer definitions
 
-| Layer | Responsibility | Current modules | Change policy |
+Final module layout after the 2026-10-17 implementation:
+
+| Layer | Responsibility | Modules | Change policy |
 | --- | --- | --- | --- |
-| L1 Kernel | Sessions as receiver processes, Message passing, payload files, SessionLog, endpoint cursors, durable store, auth, agent-facing message API of `agent_api.py`, envelopes | `model.py` (message/id parts), `store_defs.py`, `store.py`, `store_files.py`, `store_message.py`, `store_session_log.py`, `store_auth.py`, `agent_api.py`, `envelope.py` | Frozen semantics. Re-homing only. |
-| L2 Goal orchestration | Goals, goal lifecycle and completion, role readiness projection, dispatch policy/liveness, schedules/resolvers, provider execution and remote handoff | `store_session.py`, `store_dispatch.py`, `store_dispatch_readiness.py`, `store_query.py`, `dispatch_policy.py`, `dispatch_projection.py`, `store_prompts.py`, `schedule_resolvers.py`, `agents.py` | Refactor target for F1/F2 and stability work. |
-| L3 CLI | Command parsing, console, rendering, daemon loop and Lots | `cli.py`, `cli_console.py`, `cli_render.py`, `cli_workers.py` | Thin adapters. Goal-free commands depend only on L1. |
+| L1 Kernel | Sessions as receiver processes, Message passing, payload files, SessionLog segments, endpoint cursors, durable storage engine plus the fcntl state lock, auth | `src/kernel/{defs,model,storage,lock,auth,messages,session_log,envelope}.py`; top-level `src/agent_api.py` remains the stable external message API surface for agent subprocesses | Frozen semantics; storage schemas are supplied by the composition root. |
+| L2 Goal orchestration | Goal lifecycle and completion, bounded waiting, role readiness projection, dispatch policy/liveness, schedules/resolvers, prompts, provider execution and remote handoff, the concrete `Store` facade composition | `src/goal/{defs,model,sessions,dispatch,readiness,policy,projections,prompts,schedules,agents,query,log,messages,store}.py` | Refactor target for F1/F2 and stability work. |
+| L3 CLI | Command parsing, console, rendering, daemon loop and Lots | `src/cli/{app,console,render,workers}.py` | Thin adapters. Goal-free commands depend only on L1. |
 
 ## Dependency direction
 
@@ -34,12 +40,15 @@ before any behavior change.
 
 ## L1 contract (explicit, code unchanged)
 
-1. **Transaction ownership.** `store.py:_state_lock` (fcntl `state.lock`) is
-   the single writer lock. Callers must hold it across each entire
-   load → change → save transaction. Locking only the save is insufficient.
-2. **Delete-on-save.** `store_files.py:_save_item_collection` removes records
+1. **Transaction ownership.** `kernel/lock.py:StateLockMixin._state_lock`
+   (fcntl `state.lock`) is the single writer lock. Callers must hold it across
+   each entire load → change → save transaction. Locking only the save is
+   insufficient.
+2. **Delete-on-save.** `kernel/storage.py:_save_item_collection` removes records
    absent from the saved snapshot. This is correct only when the save is the
-   latest snapshot taken inside a locked transaction.
+   latest snapshot taken inside a locked transaction. The collection-identity
+   maps live with the composition root (`goal/store.py:STATE_ITEM_COLLECTIONS`,
+   `STATE_VALUE_COLLECTIONS`), so the storage engine itself is goal-free.
 3. **Append-only sidecars.** SessionLog segments and message payload files are
    outside delete-on-save; they only ever append.
 4. **Goal-free core.** L1 semantics stay independent of Goals, roles, and
@@ -167,3 +176,45 @@ for any future external mirrors.
 3. Implement the L2 repairs list; land each with its permanent regression test.
 4. Only then consider higher-level runtime features on top of the unchanged
    L1 core.
+
+## Implementation record (2026-10-17)
+
+1. **Re-home.** All modules moved under `src/kernel/`, `src/goal/`, `src/cli/`;
+   the external subprocess contract keeps `import agent_api` at the `src/`
+   top level. `python3 -m cli` continues to work via the package `__main__`.
+   The full behavior suite passed unchanged at every step (77 tests).
+2. **Import audit.** `scripts/check_layer_imports.py` enforces
+   `cli → goal → kernel` import directions and a goal-vocabulary ban inside
+   `kernel/` modules; the exit code blocks commits on violation.
+3. **P1 transaction coverage.** Every public mutating store operation now runs
+   inside the fcntl state transaction (`@state_transaction` on the unlocked
+   paths: `create_unit`, `run_scheduled_units`, `run_startup_units`,
+   `set_agent_provider`, `set_session_active`, `create_session`,
+   `start_goal_session`, `update_goal`, `link_sessions`, `receive_message`,
+   `create_account`). Tests: `tests/test_store_transactions.py` instrumented
+   save-vs-lock coverage plus concurrent write races.
+4. **P1 completion fencing.** Dispatch runs record their observed goal body
+   and log window at acquire. Declaration and final commit re-validate lease
+   ownership and the observed window; stale results are retained as run
+   evidence (`stale_results`, `StaleDispatchResultDiscarded` signal) without
+   completing or advancing the SessionGoal, and replaced requirement
+   work wakes a fresh review. Goal body updates are logged as dated
+   `GoalBodyUpdated` SessionLog events. Tests: `tests/test_dispatch_fencing.py`.
+5. **P2 provider thread contract.** `AgentResult` may carry
+   `provider_thread_id`; the durable agent thread persists a per-provider
+   `provider_threads` map and the next run receives the persisted ids after a
+   process restart. Tests: `tests/test_provider_threads.py` including the
+   restart assertion.
+6. **P2 bounded waiting.** GoalManager may declare `set_goal_waiting` with a
+   `deadline`, `event`, or `child` spec through its acquired run. The waiting
+   decision leaves the SessionGoal incomplete while it suppresses implicit
+   Worker requests and liveness recovery; wake clears the decision via a
+   `GoalWaitingWake` signal derived from the log (deadline passage, a
+   Session Message carrying `wake_events`, or a `ChildGoalCompleted` event),
+   and new UserInput cancels the wait (`GoalWaitingCancelled`).
+   `dispatch-liveness` reports `waiting_count` and treats a waiting Session as
+   covered. Tests: `tests/test_goal_waiting.py`.
+
+Kernel untouched claim per the probes: the two crash-mode repairs and the
+F1/F2 regressions are covered by tests that pass with kernel modules only
+moved, not modified.

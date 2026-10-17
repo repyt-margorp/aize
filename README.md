@@ -202,6 +202,14 @@ PYTHONPATH=src python3 -m cli --root .aize-state deactivate-session task
 PYTHONPATH=src python3 -m cli --root .aize-state activate-session task
 ```
 
+The CLI runtime lives as the layered packages `src/kernel/` (message-passing
+core with durable storage, the fcntl state transaction, SessionLog, and auth),
+`src/goal/` (Goal orchestration: sessions, dispatch, readiness, schedules,
+providers), and `src/cli/` (commands, console, daemon). The import direction
+`cli → goal → kernel` is enforced by `scripts/check_layer_imports.py`; the
+design note with the L1 contract and the implementation record is
+`doc/2026-10-17-runtime-layer-boundaries.md`.
+
 ## Login Console
 
 Start the login console:
@@ -254,16 +262,38 @@ Session progress flag.
 
 AIze enforces a dispatch liveness invariant: every Active Session with an
 Incomplete Goal must have at least one GoalManager or WorkerAgent role ready or
-running. Before every dispatch selection, the runtime removes orphaned or
-expired ownership and wakes GoalManager if no role owns the work. Inspect the
-invariant directly with:
+running, or a bounded Waiting decision on the current SessionGoal. Before every
+dispatch selection, the runtime removes orphaned or expired ownership and wakes
+GoalManager if no role owns the work. Inspect the invariant directly with:
 
 ```bash
 ./aize dispatch-liveness
 ```
 
 `gap_count`, `orphaned_acquired_readiness_count`, and
-`expired_acquired_dispatch_lease_count` should all be zero.
+`expired_acquired_dispatch_lease_count` should all be zero; `waiting_count`
+reports Active/Incomplete Sessions currently holding a bounded Waiting
+decision.
+
+A GoalManager may declare a bounded Waiting decision instead of an incomplete
+implementation request with `agent_api.set_goal_waiting(...)`. The decision
+requires an acquired dispatch run and one spec:
+
+```text
+{'kind': 'deadline', 'wait_until': <UTC ISO>}
+{'kind': 'event', 'event_name': <name>}
+{'kind': 'child', 'child_session_id': <session>}
+```
+
+While waiting, the SessionGoal stays incomplete, no implicit Worker work is
+created, and liveness recovery wakes nothing. The GoalManager is woken again
+with a `GoalWaitingWake` signal when the deadline passes, when a Session
+Message arrives whose payload carries `wake_events` containing the event name
+(`agent_api.send_session_message(body, wake_event="<name>")`), or when the
+named child SessionGoal completes. New UserInput cancels the wait with a
+`GoalWaitingCancelled` signal. Dispatch commits from earlier runs are fenced:
+if a run's observed requirement changed or the run lost its lease, the returned
+output is kept as run evidence without completing the SessionGoal.
 
 By default both agent roles use the `codex` provider:
 
