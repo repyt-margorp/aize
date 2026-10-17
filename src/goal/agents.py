@@ -18,6 +18,7 @@ class AgentResult:
     provider: str
     output: str
     resume_token: str | None = None
+    provider_thread_id: str | None = None
 
 
 class AgentRunner:
@@ -38,6 +39,7 @@ class AgentRunner:
         role: str,
         prompt: str,
         resume_token: str | None = None,
+        provider_thread: dict[str, str] | None = None,
         runtime_env: dict[str, str] | None = None,
         cwd: str | Path | None = None,
     ) -> AgentResult:

@@ -72,6 +72,7 @@ class DispatchMixin:
                     role=GOAL_MANAGER_ROLE,
                     prompt=prompt,
                     resume_token=lease["resume_token"],
+                    provider_thread=lease["agent_thread"].get("provider_threads"),
                     cwd=self._session_workspace_abs_path(session),
                     runtime_env=self._agent_runtime_env(
                         session_id=str(session["session_id"]),
@@ -104,6 +105,7 @@ class DispatchMixin:
                     role=WORKER_AGENT_ROLE,
                     prompt=prompt,
                     resume_token=lease["resume_token"],
+                    provider_thread=lease["agent_thread"].get("provider_threads"),
                     cwd=self._session_workspace_abs_path(session),
                     runtime_env=self._agent_runtime_env(
                         session_id=str(session["session_id"]),
@@ -231,6 +233,7 @@ class DispatchMixin:
             "dispatch_signals": [dict(signal) for signal in dispatch_signals],
             "role": role,
             "agent_profile": dict(agent_profile),
+            "agent_thread": dict(agent_thread),
             "resume_token": str(agent_thread["resume_token"]),
             "recovery_context": recovery_context or "",
         }
@@ -254,7 +257,13 @@ class DispatchMixin:
             )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
         thread = self._ensure_agent_thread(state, session_id=session["session_id"], role=GOAL_MANAGER_ROLE)
-        self._record_agent_turn(thread, prompt=result["prompt"], result=result["agent_result"].output)
+        self._record_agent_turn(
+            thread,
+            prompt=result["prompt"],
+            result=result["agent_result"].output,
+            provider=result["agent_result"].provider,
+            provider_thread_id=result["agent_result"].provider_thread_id,
+        )
         self._append_dispatch_step_message(
             state,
             run,
@@ -528,7 +537,13 @@ class DispatchMixin:
             )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
         thread = self._ensure_agent_thread(state, session_id=session["session_id"], role=WORKER_AGENT_ROLE)
-        self._record_agent_turn(thread, prompt=result["prompt"], result=result["agent_result"].output)
+        self._record_agent_turn(
+            thread,
+            prompt=result["prompt"],
+            result=result["agent_result"].output,
+            provider=result["agent_result"].provider,
+            provider_thread_id=result["agent_result"].provider_thread_id,
+        )
         self._append_dispatch_step_message(
             state,
             run,
@@ -993,7 +1008,15 @@ class DispatchMixin:
             }
         return threads[thread_key]
 
-    def _record_agent_turn(self, thread: dict[str, Any], *, prompt: str, result: str) -> None:
+    def _record_agent_turn(
+        self,
+        thread: dict[str, Any],
+        *,
+        prompt: str,
+        result: str,
+        provider: str | None = None,
+        provider_thread_id: str | None = None,
+    ) -> None:
         now = utc_now()
         thread["updated_at"] = now
         thread.setdefault("turns", []).append(
@@ -1003,6 +1026,8 @@ class DispatchMixin:
                 "result": result,
             }
         )
+        if provider and provider_thread_id:
+            thread.setdefault("provider_threads", {})[provider] = provider_thread_id
 
     def _agent_runtime_env(
         self,
