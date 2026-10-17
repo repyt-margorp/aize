@@ -60,7 +60,7 @@ PYTHONPATH=src python3 -m cli --root .aize-state send root user kernel "hello"
 PYTHONPATH=src python3 -m cli --root .aize-state send-file root user kernel ./README.md --body "readme snapshot"
 PYTHONPATH=src python3 -m cli --root .aize-state recv kernel
 PYTHONPATH=src python3 -m cli --root .aize-state status
-PYTHONPATH=src python3 -m cli --root .aize-state accounts
+PYTHONPATH=src python3 -m cli --root .aize-state users
 PYTHONPATH=src python3 -m cli --root .aize-state agents
 PYTHONPATH=src python3 -m cli --root .aize-state auth root root
 PYTHONPATH=src python3 -m cli --root .aize-state sessions
@@ -78,8 +78,11 @@ aize --root .aize-state status
 ```
 
 `init` always creates the default `root` Unit and the singleton `root` Session.
-It also creates the default local `root` account with password `root`.
-Additional sessions default to the system `root` Session as parent. A Session
+It also creates the default local `root` user (with password `root`) in the
+`root` and `admin` groups. Users are identities; membership is expressed as a
+`groups` list on the user record (see
+`doc/2026-10-17-user-group-terminology.md`). Additional sessions default to the
+system `root` Session as parent. A Session
 does not need a Unit. A Session can also have multiple parents by passing
 `--parent` more than once:
 

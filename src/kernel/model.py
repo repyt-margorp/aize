@@ -15,11 +15,11 @@ def new_id(prefix: str) -> str:
 
 
 @dataclass(frozen=True)
-class Account:
+class User:
     username: str
     password_hash: str
     salt: str
-    roles: list[str]
+    groups: list[str]
     created_at: str
     status: str = "active"
 
@@ -28,7 +28,7 @@ class Account:
             "username": self.username,
             "password_hash": self.password_hash,
             "salt": self.salt,
-            "roles": list(self.roles),
+            "groups": list(self.groups),
             "created_at": self.created_at,
             "status": self.status,
         }

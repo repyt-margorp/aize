@@ -114,8 +114,8 @@ class GoalMessageMixin:
         sessions = state["sessions"]
         if session_id not in sessions:
             raise StoreError(f"unknown session: {session_id}")
-        if sender not in state["accounts"]:
-            raise StoreError(f"unknown account: {sender}")
+        if sender not in state["users"]:
+            raise StoreError(f"unknown user: {sender}")
         normalized_reply_to = str(reply_to or "").strip()
         now = utc_now()
         active_worker_run = self._active_worker_run_for_session(state, session_id=session_id)

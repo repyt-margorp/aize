@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="show system status counts")
     sub.add_parser("units", help="list units")
     sub.add_parser("sessions", help="list sessions")
-    sub.add_parser("accounts", help="list accounts without password hashes")
+    sub.add_parser("users", aliases=["accounts"], help="list users without login material")
     sub.add_parser("agents", help="list agent role provider assignments")
     sub.add_parser("agent-pool", help="show active agent pool allocations")
     sub.add_parser("dispatch-liveness", help="audit Active/Incomplete Session dispatch coverage")
@@ -54,10 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("username")
     auth.add_argument("password")
 
-    create_account = sub.add_parser("create-account", help="create an account")
-    create_account.add_argument("username")
-    create_account.add_argument("password")
-    create_account.add_argument("--role", action="append", dest="roles")
+    create_user = sub.add_parser("create-user", aliases=["create-account"], help="create a user")
+    create_user.add_argument("username")
+    create_user.add_argument("password")
+    create_user.add_argument("--group", "--role", action="append", dest="groups")
 
     create_unit = sub.add_parser("create-unit", help="create a unit")
     create_unit.add_argument("unit_id")
@@ -245,8 +245,8 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.units())
         elif args.command == "sessions":
             print_json(store.sessions())
-        elif args.command == "accounts":
-            print_json(store.accounts())
+        elif args.command in {"users", "accounts"}:
+            print_json(store.users())
         elif args.command == "agents":
             print_json(store.agent_profiles())
         elif args.command == "agent-pool":
@@ -267,8 +267,8 @@ def run(argv: list[str] | None = None) -> int:
             print_json(store.set_agent_provider(args.role, provider=args.provider))
         elif args.command == "auth":
             print_json(store.authenticate(args.username, password=args.password))
-        elif args.command == "create-account":
-            print_json(store.create_account(args.username, password=args.password, roles=args.roles))
+        elif args.command in {"create-user", "create-account"}:
+            print_json(store.create_user(args.username, password=args.password, groups=args.groups))
         elif args.command == "create-unit":
             schedule = {}
             if (
@@ -350,7 +350,7 @@ def run(argv: list[str] | None = None) -> int:
         elif args.command == "create-session":
             parent_session_ids = args.parent_session_ids
             if parent_session_ids is None and args.created_by:
-                parent_session_ids = [store.account_home_session(args.created_by)]
+                parent_session_ids = [store.user_home_session(args.created_by)]
             print_json(
                 store.create_session(
                     args.session_id,
@@ -367,7 +367,7 @@ def run(argv: list[str] | None = None) -> int:
         elif args.command == "deactivate-unit":
             print_json(store.set_unit_active(args.unit_id, active=False))
         elif args.command == "start-goal":
-            parent_session_ids = args.parent_session_ids or [store.account_home_session(args.created_by)]
+            parent_session_ids = args.parent_session_ids or [store.user_home_session(args.created_by)]
             print_json(
                 store.start_goal_session(
                     args.session_id,

@@ -47,7 +47,7 @@ class TransactionGuardTests(unittest.TestCase):
     def test_every_mutation_save_holds_the_state_transaction(self) -> None:
         store, patchers = self._guarded_store()
         with patchers[0], patchers[1]:
-            store.create_account("alice", password="alice-password")
+            store.create_user("alice", password="alice-password")
             store.create_unit(
                 "unit-a",
                 display_name="Unit A",

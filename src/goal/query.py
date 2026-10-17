@@ -55,7 +55,7 @@ class QueryMixin:
             "active_session_count": len(active_sessions),
             "inactive_session_count": len(inactive_sessions),
             "session_edge_count": len(state["session_edges"]),
-            "account_count": len(state["accounts"]),
+            "user_count": len(state["users"]),
             "goal_count": len(current_goals),
             "incomplete_goal_count": len(incomplete_goals),
             "complete_goal_count": len(complete_goals),

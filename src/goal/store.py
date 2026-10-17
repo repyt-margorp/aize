@@ -37,7 +37,7 @@ from goal.dispatch import DispatchMixin
 
 
 STATE_ITEM_COLLECTIONS = {
-    "accounts": "username",
+    "users": "username",
     "units": "unit_id",
     "sessions": "session_id",
     "goals": "goal_id",
@@ -51,6 +51,7 @@ STATE_VALUE_COLLECTIONS = {
     "runtime_settings": {},
     "endpoint_cursors": {},
 }
+STATE_COLLECTION_DIR_NAMES = {"users": "accounts"}
 
 
 class Store(
@@ -72,6 +73,7 @@ class Store(
             root,
             item_collections=STATE_ITEM_COLLECTIONS,
             value_collections=STATE_VALUE_COLLECTIONS,
+            collection_dir_names=STATE_COLLECTION_DIR_NAMES,
         )
         self.state_path = self.storage.manifest_path
         self.legacy_state_path = self.storage.legacy_state_path
@@ -111,7 +113,7 @@ class Store(
                 "units": {},
                 "sessions": {},
                 "session_edges": [],
-                "accounts": {},
+                "users": {},
                 "goals": {},
                 "agent_profiles": {},
                 "agent_threads": {},
@@ -137,7 +139,7 @@ class Store(
         state.setdefault("units", {})
         state.setdefault("sessions", {})
         state.setdefault("session_edges", [])
-        state.setdefault("accounts", {})
+        state.setdefault("users", {})
         state.setdefault("goals", {})
         state.setdefault("agent_profiles", {})
         state.setdefault("agent_threads", {})
@@ -156,7 +158,7 @@ class Store(
         units = state.setdefault("units", {})
         sessions = state.setdefault("sessions", {})
         state.setdefault("session_edges", [])
-        accounts = state.setdefault("accounts", {})
+        users = state.setdefault("users", {})
         state.setdefault("goals", {})
         agent_profiles = state.setdefault("agent_profiles", {})
         agent_threads = state.setdefault("agent_threads", {})
@@ -232,15 +234,16 @@ class Store(
             if root_session.get("singleton") is not True:
                 root_session["singleton"] = True
                 changed = True
-        if ROOT_USERNAME not in accounts:
-            accounts[ROOT_USERNAME] = self._build_account(
+        if ROOT_USERNAME not in users:
+            users[ROOT_USERNAME] = self._build_user(
                 ROOT_USERNAME,
                 DEFAULT_ROOT_PASSWORD,
-                roles=["root", "admin"],
+                groups=["root", "admin"],
                 created_at=timestamp,
             ).to_dict()
             changed = True
-        if self._ensure_account_home_sessions(state, now=timestamp):
+        self._ensure_user_record_fields(users)
+        if self._ensure_user_home_sessions(state, now=timestamp):
             changed = True
         if self._ensure_unit_session_owner_parents(state):
             changed = True
@@ -273,24 +276,33 @@ class Store(
             changed = True
         return changed
 
+    def _ensure_user_record_fields(self, users: dict[str, Any]) -> bool:
+        changed = False
+        for user in users.values():
+            if "groups" not in user:
+                user["groups"] = list(user.get("roles") or [])
+                changed = True
+            user.pop("roles", None)
+        return changed
+
     def _ensure_unit_session_owner_parents(self, state: dict[str, Any]) -> bool:
         changed = False
         units = state.setdefault("units", {})
         sessions = state.setdefault("sessions", {})
-        accounts = state.setdefault("accounts", {})
+        users = state.setdefault("users", {})
         edges = state.setdefault("session_edges", [])
         for session_id, session in sessions.items():
             unit_id = str(session.get("unit_id") or "").strip()
             unit = units.get(unit_id)
             owner_account = str(unit.get("owner_account") or "").strip() if unit else ""
-            account = accounts.get(owner_account)
-            if not account:
+            owner_user = users.get(owner_account)
+            if not owner_user:
                 continue
-            home_session_id = str(account.get("home_session_id") or "").strip()
+            home_session_id = str(owner_user.get("home_session_id") or "").strip()
             if not home_session_id or home_session_id == session_id:
                 continue
             if home_session_id not in sessions:
-                raise StoreError(f"owner account has no home session: {owner_account}")
+                raise StoreError(f"owner user has no home session: {owner_account}")
             if not any(
                 edge.get("parent_session_id") == home_session_id
                 and edge.get("child_session_id") == session_id
@@ -311,24 +323,24 @@ class Store(
                 changed = True
         return changed
 
-    def _ensure_account_home_sessions(self, state: dict[str, Any], *, now: str | None = None) -> bool:
+    def _ensure_user_home_sessions(self, state: dict[str, Any], *, now: str | None = None) -> bool:
         timestamp = now or utc_now()
         changed = False
         units = state.setdefault("units", {})
         sessions = state.setdefault("sessions", {})
-        accounts = state.setdefault("accounts", {})
+        users = state.setdefault("users", {})
         state.setdefault("session_edges", [])
-        for username, account in sorted(accounts.items()):
+        for username, user in sorted(users.items()):
             home_session_id = account_home_session_id(username)
-            previous_home_session_id = str(account.get("home_session_id") or "").strip()
+            previous_home_session_id = str(user.get("home_session_id") or "").strip()
             if previous_home_session_id and previous_home_session_id != home_session_id:
                 if self._rename_session_id(state, previous_home_session_id, home_session_id):
                     changed = True
             if previous_home_session_id != home_session_id:
-                account["home_session_id"] = home_session_id
+                user["home_session_id"] = home_session_id
                 changed = True
             home_unit_id = account_home_unit_id(username)
-            previous_home_unit_id = str(account.get("home_unit_id") or "").strip()
+            previous_home_unit_id = str(user.get("home_unit_id") or "").strip()
             if previous_home_unit_id and previous_home_unit_id != home_unit_id:
                 previous_home_unit = units.pop(previous_home_unit_id, None)
                 if previous_home_unit is not None:
@@ -338,7 +350,7 @@ class Store(
                     units[home_unit_id] = previous_home_unit
                     changed = True
             if previous_home_unit_id != home_unit_id:
-                account["home_unit_id"] = home_unit_id
+                user["home_unit_id"] = home_unit_id
                 changed = True
             if home_session_id == ROOT_SESSION_ID:
                 raise StoreError("account home session cannot be the system root session")

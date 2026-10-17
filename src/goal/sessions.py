@@ -155,7 +155,7 @@ class SessionGoalMixin:
         if unit_id in units:
             raise StoreError(f"unit already exists: {unit_id}")
         normalized_owner_account = str(owner_account or "").strip()
-        if normalized_owner_account and normalized_owner_account not in state["accounts"]:
+        if normalized_owner_account and normalized_owner_account not in state["users"]:
             raise StoreError(f"unknown owner account: {normalized_owner_account}")
         unit = Unit(
             unit_id=unit_id,
@@ -242,12 +242,12 @@ class SessionGoalMixin:
         fallback_created_by: str,
     ) -> tuple[str, str]:
         owner_account = str(unit.get("owner_account") or "").strip()
-        account = state.get("accounts", {}).get(owner_account)
-        if not account:
+        owner_user = state.get("users", {}).get(owner_account)
+        if not owner_user:
             return fallback_parent_session_id, fallback_created_by
-        home_session_id = str(account.get("home_session_id") or "").strip()
+        home_session_id = str(owner_user.get("home_session_id") or "").strip()
         if home_session_id not in state.get("sessions", {}):
-            raise StoreError(f"owner account has no home session: {owner_account}")
+            raise StoreError(f"owner user has no home session: {owner_account}")
         return home_session_id, owner_account
 
     @state_transaction
@@ -261,7 +261,7 @@ class SessionGoalMixin:
         state = self.load()
         if parent_session_id not in state["sessions"]:
             raise StoreError(f"unknown parent session: {parent_session_id}")
-        if created_by not in state["accounts"]:
+        if created_by not in state["users"]:
             raise StoreError(f"unknown account: {created_by}")
         now_text = now or utc_now()
         now_dt = self._parse_utc(now_text)
@@ -350,7 +350,7 @@ class SessionGoalMixin:
         state = self.load()
         if parent_session_id not in state["sessions"]:
             raise StoreError(f"unknown parent session: {parent_session_id}")
-        if created_by not in state["accounts"]:
+        if created_by not in state["users"]:
             raise StoreError(f"unknown account: {created_by}")
         now_text = now or utc_now()
         started: list[dict[str, Any]] = []
@@ -583,7 +583,7 @@ class SessionGoalMixin:
             raise StoreError("session label is required")
         goal_body = str(body or "").strip() or session_title
         state = self.load()
-        if created_by not in state["accounts"]:
+        if created_by not in state["users"]:
             raise StoreError(f"unknown account: {created_by}")
         payload = self._start_goal_session_in_state(
             state,
@@ -1022,7 +1022,7 @@ class SessionGoalMixin:
         state = self.load()
         if session_id not in state["sessions"]:
             raise StoreError(f"unknown session: {session_id}")
-        if created_by not in state["accounts"]:
+        if created_by not in state["users"]:
             raise StoreError(f"unknown account: {created_by}")
         now = utc_now()
         goal_dict = self._current_goal_for_session(state, session_id)

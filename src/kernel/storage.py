@@ -31,11 +31,13 @@ class SplitStateStorage:
         *,
         item_collections: dict[str, str] | None = None,
         value_collections: dict[str, Any] | None = None,
+        collection_dir_names: dict[str, str] | None = None,
         data_name: str = "store",
     ) -> None:
         self.root = root
         self.item_collections = dict(item_collections or {})
         self.value_collections = {name: copy.deepcopy(default) for name, default in (value_collections or {}).items()}
+        self.collection_dir_names = dict(collection_dir_names or {})
         self.manifest_path = root / "manifest.json"
         self.legacy_state_path = root / "state.json"
         self.data_root = root / data_name
@@ -501,7 +503,7 @@ class SplitStateStorage:
 
     def _item_collection_root(self, name: str) -> Path:
         base = self.runtime_root if name in {"agent_threads", "dispatch_runs"} else self.metadata_root
-        return base / name
+        return base / self.collection_dir_names.get(name, name)
 
     def _value_collection_path(self, name: str) -> Path:
         base = self.runtime_root if name in {"dispatch_readiness", "endpoint_cursors"} else self.metadata_root

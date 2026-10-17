@@ -5,7 +5,7 @@ import hmac
 import secrets
 from typing import Any
 
-from kernel.model import Account, utc_now
+from kernel.model import User, utc_now
 from kernel.lock import state_transaction
 from kernel.defs import StoreError
 
@@ -14,20 +14,20 @@ PASSWORD_HASH_ITERATIONS = 210_000
 
 
 class AuthMixin:
-    def _build_account(
+    def _build_user(
         self,
         username: str,
         password: str,
         *,
-        roles: list[str],
+        groups: list[str],
         created_at: str,
-    ) -> Account:
+    ) -> User:
         salt = secrets.token_hex(16)
-        return Account(
+        return User(
             username=username,
             password_hash=self._hash_password(password, salt),
             salt=salt,
-            roles=roles,
+            groups=groups,
             created_at=created_at,
         )
 
@@ -40,67 +40,67 @@ class AuthMixin:
         )
         return digest.hex()
 
-    def _public_account(self, account: dict[str, Any]) -> dict[str, Any]:
+    def _public_user(self, user: dict[str, Any]) -> dict[str, Any]:
         return {
-            "username": account["username"],
-            "roles": list(account.get("roles", [])),
-            "created_at": account["created_at"],
-            "status": account.get("status", "active"),
-            "home_unit_id": account.get("home_unit_id"),
-            "home_session_id": account.get("home_session_id"),
+            "username": user["username"],
+            "groups": list(user.get("groups", [])),
+            "created_at": user["created_at"],
+            "status": user.get("status", "active"),
+            "home_unit_id": user.get("home_unit_id"),
+            "home_session_id": user.get("home_session_id"),
         }
 
     @state_transaction
-    def create_account(self, username: str, *, password: str, roles: list[str] | None = None) -> dict[str, Any]:
+    def create_user(self, username: str, *, password: str, groups: list[str] | None = None) -> dict[str, Any]:
         normalized_username = str(username or "").strip()
         if not normalized_username:
             raise StoreError("username is required")
         if not password:
             raise StoreError("password is required")
         state = self.load()
-        accounts = state["accounts"]
-        if normalized_username in accounts:
-            raise StoreError(f"account already exists: {normalized_username}")
+        users = state["users"]
+        if normalized_username in users:
+            raise StoreError(f"user already exists: {normalized_username}")
         now = utc_now()
-        account = self._build_account(
+        user = self._build_user(
             normalized_username,
             password,
-            roles=roles or ["user"],
+            groups=groups or ["user"],
             created_at=now,
         )
-        accounts[normalized_username] = account.to_dict()
-        self._ensure_account_home_sessions(state, now=now)
+        users[normalized_username] = user.to_dict()
+        self._ensure_user_home_sessions(state, now=now)
         self.save(state)
-        return self._public_account(accounts[normalized_username])
+        return self._public_user(users[normalized_username])
 
     def authenticate(self, username: str, *, password: str) -> dict[str, Any]:
         state = self.load()
-        account = state["accounts"].get(username)
-        if not account:
+        user = state["users"].get(username)
+        if not user:
             raise StoreError("authentication failed")
-        if account.get("status") != "active":
+        if user.get("status") != "active":
             raise StoreError("authentication failed")
-        expected = str(account.get("password_hash") or "")
-        actual = self._hash_password(password, str(account.get("salt") or ""))
+        expected = str(user.get("password_hash") or "")
+        actual = self._hash_password(password, str(user.get("salt") or ""))
         if not hmac.compare_digest(expected, actual):
             raise StoreError("authentication failed")
-        return self._public_account(account)
+        return self._public_user(user)
 
-    def account_home_session(self, username: str) -> str:
+    def user_home_session(self, username: str) -> str:
         state = self.load()
-        account = state["accounts"].get(username)
-        if not account:
-            raise StoreError(f"unknown account: {username}")
-        home_session_id = str(account.get("home_session_id") or "").strip()
+        user = state["users"].get(username)
+        if not user:
+            raise StoreError(f"unknown user: {username}")
+        home_session_id = str(user.get("home_session_id") or "").strip()
         if not home_session_id:
-            raise StoreError(f"account has no home session: {username}")
+            raise StoreError(f"user has no home session: {username}")
         if home_session_id not in state["sessions"]:
-            raise StoreError(f"unknown account home session: {home_session_id}")
+            raise StoreError(f"unknown user home session: {home_session_id}")
         return home_session_id
 
-    def accounts(self) -> list[dict[str, Any]]:
+    def users(self) -> list[dict[str, Any]]:
         state = self.load()
         return sorted(
-            [self._public_account(account) for account in state["accounts"].values()],
+            [self._public_user(user) for user in state["users"].values()],
             key=lambda item: item["username"],
         )

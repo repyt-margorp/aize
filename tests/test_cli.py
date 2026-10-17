@@ -173,8 +173,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(initial_state["units"]["root"]["instance_policy"], "singleton")
             self.assertEqual(initial_state["units"]["root"]["singleton_session_id"], "root")
             self.assertTrue(initial_state["sessions"]["root"]["singleton"])
-            self.assertIn("root", initial_state["accounts"])
-            self.assertNotEqual(initial_state["accounts"]["root"]["password_hash"], "root")
+            self.assertIn("root", initial_state["users"])
+            self.assertNotEqual(initial_state["users"]["root"]["password_hash"], "root")
             self.assertEqual(initial_state["agent_profiles"]["GoalManager"]["provider"], "codex")
             self.assertEqual(initial_state["agent_profiles"]["WorkerAgent"]["provider"], "codex")
 
@@ -212,7 +212,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(status["active_session_count"], 3)
             self.assertEqual(status["inactive_session_count"], 0)
             self.assertEqual(status["session_edge_count"], 2)
-            self.assertEqual(status["account_count"], 1)
+            self.assertEqual(status["user_count"], 1)
             self.assertEqual(status["message_count"], 2)
             self.assertEqual(status["endpoint_cursor_count"], 0)
 
@@ -234,14 +234,14 @@ class CliTests(unittest.TestCase):
             self.assertIn("entrance", [unit["unit_id"] for unit in units])
             self.assertIn("root", [unit["unit_id"] for unit in units])
 
-            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            root_account = json.loads(run_cli(state_root, "users").stdout)[0]
             children = json.loads(run_cli(state_root, "children", root_account["home_session_id"]).stdout)
             child_session_ids = [child["child_session_id"] for child in children]
             self.assertIn("entrance-main", child_session_ids)
 
-            accounts = json.loads(run_cli(state_root, "accounts").stdout)
+            accounts = json.loads(run_cli(state_root, "users").stdout)
             self.assertEqual(accounts[0]["username"], "root")
-            self.assertEqual(accounts[0]["roles"], ["root", "admin"])
+            self.assertEqual(accounts[0]["groups"], ["root", "admin"])
             self.assertEqual(accounts[0]["home_session_id"], "account-root")
             self.assertEqual(accounts[0]["home_unit_id"], accounts[0]["home_session_id"])
             self.assertNotIn("password_hash", accounts[0])
@@ -262,7 +262,7 @@ class CliTests(unittest.TestCase):
             state_root = Path(tmp) / "state"
 
             self.assertEqual(run_cli(state_root, "init").returncode, 0)
-            created = run_cli(state_root, "create-account", "alice", "secret")
+            created = run_cli(state_root, "create-user", "alice", "secret")
             self.assertEqual(created.returncode, 0, created.stderr)
             account = json.loads(created.stdout)
             home_session_id = account["home_session_id"]
@@ -343,7 +343,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload[0]["goal"]["body"], "Inspect system state and report findings.")
             self.assertEqual(payload[0]["initial_message"]["payload"]["body"], "Run diagnostics now.")
             self.assertTrue(payload[0]["initial_message"]["payload"]["user_input"])
-            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            root_account = json.loads(run_cli(state_root, "users").stdout)[0]
             parents = json.loads(run_cli(state_root, "parents", payload[0]["session"]["session_id"]).stdout)
             self.assertEqual(
                 [parent["parent_session_id"] for parent in parents],
@@ -1028,7 +1028,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(graph["edges"]), 4)
 
             parents = json.loads(run_cli(state_root, "parents", "task").stdout)
-            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            root_account = json.loads(run_cli(state_root, "users").stdout)[0]
             self.assertEqual(
                 [parent["parent_session_id"] for parent in parents],
                 [root_account["home_session_id"], "dev"],
@@ -1312,7 +1312,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(user_message["to"], "session:build-cli")
             self.assertTrue(user_message["payload"]["user_input"])
 
-            root_account = json.loads(run_cli(state_root, "accounts").stdout)[0]
+            root_account = json.loads(run_cli(state_root, "users").stdout)[0]
             children = json.loads(run_cli(state_root, "children", root_account["home_session_id"]).stdout)
             self.assertIn("build-cli", [child["child_session_id"] for child in children])
 
