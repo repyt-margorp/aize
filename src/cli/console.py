@@ -22,6 +22,7 @@ from cli.render import (
     print_json,
     print_messages,
     print_session,
+    print_sessions,
     print_units,
     tail_items,
 )
