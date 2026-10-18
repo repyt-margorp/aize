@@ -20,16 +20,20 @@ from goal.defs import (
     AGENT_ROLES,
     DEFAULT_SESSION_CAPABILITIES,
     GOAL_MANAGER_ROLE,
+    PROVIDER_SERVICE_ACCOUNTS,
+    SLOT_GROUPS,
     WORKER_AGENT_ROLE,
+    normalize_agent_role,
     normalize_endpoint,
+    slot_group_name,
 )
 from kernel.defs import (
     ROOT_SESSION_ID,
     ROOT_UNIT_ID,
     ROOT_USERNAME,
     StoreError,
-    account_endpoint,
     session_endpoint,
+    user_endpoint,
 )
 
 UNIT_ACTIVATION_TRIGGERS = ("manual", "scheduled", "startup")
@@ -355,7 +359,7 @@ class SessionGoalMixin:
                 message = self._append_session_message_locked(
                     state,
                     session_id=session_id,
-                    from_endpoint=account_endpoint(unit_created_by),
+                    from_endpoint=user_endpoint(unit_created_by),
                     to_endpoint=session_endpoint(session_id),
                     payload={
                         "body": initial_prompt,
@@ -447,7 +451,7 @@ class SessionGoalMixin:
                 message = self._append_session_message_locked(
                     state,
                     session_id=payload["session"]["session_id"],
-                    from_endpoint=account_endpoint(unit_created_by),
+                    from_endpoint=user_endpoint(unit_created_by),
                     to_endpoint=session_endpoint(payload["session"]["session_id"]),
                     payload={
                         "body": initial_prompt,
@@ -483,9 +487,13 @@ class SessionGoalMixin:
         normalized_provider = provider.strip().lower()
         if normalized_provider not in {"local", "codex", "claude", "remote-aize"}:
             raise StoreError(f"unsupported agent provider: {provider}")
-        if normalized_role == GOAL_MANAGER_ROLE and normalized_provider == "remote-aize":
-            raise StoreError("GoalManager provider must be local to this PC")
         state = self.load()
+        if normalized_provider == "local":
+            accounts: list[str] = []
+        else:
+            account = self._ensure_provider_service_account(state, provider=normalized_provider)
+            self._check_account_slot_eligibility(account, normalized_role, provider=normalized_provider)
+            accounts = [str(account["username"])]
         profile = state["agent_profiles"].setdefault(
             normalized_role,
             {
@@ -494,11 +502,76 @@ class SessionGoalMixin:
             },
         )
         profile["provider"] = normalized_provider
+        profile["accounts"] = accounts
         profile["default_assignment"] = False
         profile["status"] = "active"
         profile["updated_at"] = utc_now()
         self.save(state)
         return dict(profile)
+
+    @state_transaction
+    def set_agent_accounts(self, role: str, *, accounts: list[str]) -> dict[str, Any]:
+        normalized_role = self._normalize_agent_role(role)
+        if normalized_role not in AGENT_ROLES:
+            raise StoreError(f"unsupported agent role: {role}")
+        slot_group = SLOT_GROUPS[normalized_role]
+        state = self.load()
+        normalized_accounts: list[str] = []
+        for value in accounts or []:
+            username = str(value or "").strip()
+            if not username or username in normalized_accounts:
+                continue
+            user = state["users"].get(username)
+            if not user:
+                raise StoreError(f"unknown service account: {username}")
+            if str(user.get("status") or "") != "service":
+                raise StoreError(f"account is not a non-login service user: {username}")
+            if slot_group not in [str(group) for group in user.get("groups") or []]:
+                raise StoreError(
+                    f"service account {username} is not eligible for {normalized_role}: "
+                    f"missing group {slot_group}"
+                )
+            normalized_accounts.append(username)
+        profile = state["agent_profiles"].setdefault(
+            normalized_role,
+            {
+                "role": normalized_role,
+                "created_at": utc_now(),
+            },
+        )
+        profile["accounts"] = normalized_accounts
+        profile["default_assignment"] = False
+        profile["updated_at"] = utc_now()
+        self.save(state)
+        return dict(profile)
+
+    def _ensure_provider_service_account(self, state: dict[str, Any], *, provider: str) -> dict[str, Any]:
+        spec = PROVIDER_SERVICE_ACCOUNTS.get(str(provider or "").strip().lower())
+        if not spec:
+            raise StoreError(f"provider has no service account: {provider}")
+        account_name = str(spec["account"])
+        user = state["users"].get(account_name)
+        if not user:
+            user = {
+                "username": account_name,
+                "password_hash": "",
+                "salt": "",
+                "groups": list(spec["groups"]),
+                "created_at": utc_now(),
+                "status": "service",
+                "provider": str(provider).strip().lower(),
+            }
+            state["users"][account_name] = user
+        return dict(user)
+
+    def _check_account_slot_eligibility(self, account: dict[str, Any], role: str, *, provider: str) -> None:
+        slot_group = slot_group_name(role)
+        groups = [str(group) for group in account.get("groups") or []]
+        if slot_group and slot_group not in groups:
+            raise StoreError(
+                f"provider {provider} cannot serve {role}: "
+                f"account {account.get('username')} is not {slot_group}-capable"
+            )
 
     def set_session_scheduling_policy(
         self,
@@ -566,15 +639,19 @@ class SessionGoalMixin:
         return dict(session)
 
     def _normalize_agent_role(self, role: str) -> str:
-        normalized = role.strip()
-        aliases = {
-            "goalmanager": GOAL_MANAGER_ROLE,
-            "GoalManager": GOAL_MANAGER_ROLE,
-            "workeragent": WORKER_AGENT_ROLE,
-            "WorkerAgent": WORKER_AGENT_ROLE,
-            "worker": WORKER_AGENT_ROLE,
-        }
-        return aliases.get(normalized, aliases.get(normalized.lower(), normalized))
+        return normalize_agent_role(role)
+
+    def _runtime_actor_allowed(self, state: dict[str, Any], *, actor: str, run_id: str | None, role: str) -> bool:
+        """A runtime decision is authorized by the leased slot, and its
+        provenance is bound to the service identity the lease appointed."""
+        if self._normalize_agent_role(actor) == role:
+            return True
+        if not run_id:
+            return False
+        run = state.setdefault("dispatch_runs", {}).get(str(run_id))
+        if not isinstance(run, dict):
+            return False
+        return bool(run.get("agent_user")) and str(run.get("agent_user")) == str(actor or "").strip()
 
     @state_transaction
     def create_session(
@@ -964,7 +1041,7 @@ class SessionGoalMixin:
         session = state["sessions"].get(session_id)
         if not session:
             raise StoreError(f"unknown session: {session_id}")
-        if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
+        if not self._runtime_actor_allowed(state, actor=actor, run_id=run_id, role=GOAL_MANAGER_ROLE):
             raise StoreError("only GoalManager may set a Scheduled Unit next run time")
         unit_id = str(session.get("unit_id") or "")
         if not unit_id:
@@ -1206,8 +1283,6 @@ class SessionGoalMixin:
         run_id: str | None,
         schedule_parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
-            raise StoreError("only GoalManager may set a SessionGoal completion state")
         if completion_state not in {"complete", "incomplete"}:
             raise StoreError(f"unsupported goal completion state: {completion_state}")
         if not run_id:
@@ -1217,6 +1292,8 @@ class SessionGoalMixin:
             run = state.setdefault("dispatch_runs", {}).get(run_id)
             if not run:
                 raise StoreError(f"unknown dispatch run: {run_id}")
+            if not self._runtime_actor_allowed(state, actor=actor, run_id=run_id, role=GOAL_MANAGER_ROLE):
+                raise StoreError("only GoalManager may set a SessionGoal completion state")
             if (
                 str(run.get("session_id") or "") != session_id
                 or str(run.get("role") or "") != GOAL_MANAGER_ROLE
@@ -1247,6 +1324,7 @@ class SessionGoalMixin:
                 "completion_state": completion_state,
                 "reason": str(reason or "").strip() or "GoalManager recorded a completion decision.",
                 "schedule_parameters": dict(schedule_parameters or {}),
+                "declared_by": str(actor or "").strip() or GOAL_MANAGER_ROLE,
                 "declared_at": utc_now(),
             }
             run["declared_outcome"] = declaration
@@ -1262,8 +1340,6 @@ class SessionGoalMixin:
         run_id: str,
         reason: str = "",
     ) -> dict[str, Any]:
-        if self._normalize_agent_role(actor) != GOAL_MANAGER_ROLE:
-            raise StoreError("only GoalManager may declare a SessionGoal waiting")
         if not run_id:
             raise StoreError("GoalManager waiting decision requires an active dispatch run")
         with self._state_lock():
@@ -1271,6 +1347,8 @@ class SessionGoalMixin:
             run = state.setdefault("dispatch_runs", {}).get(run_id)
             if not run:
                 raise StoreError(f"unknown dispatch run: {run_id}")
+            if not self._runtime_actor_allowed(state, actor=actor, run_id=run_id, role=GOAL_MANAGER_ROLE):
+                raise StoreError("only GoalManager may declare a SessionGoal waiting")
             if (
                 str(run.get("session_id") or "") != session_id
                 or str(run.get("role") or "") != GOAL_MANAGER_ROLE
@@ -1291,6 +1369,7 @@ class SessionGoalMixin:
                 "completion_state": "waiting",
                 "reason": str(reason or "").strip() or "GoalManager recorded a waiting decision.",
                 "wait": spec,
+                "declared_by": str(actor or "").strip() or GOAL_MANAGER_ROLE,
                 "declared_at": utc_now(),
             }
             run["declared_outcome"] = declaration

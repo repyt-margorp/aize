@@ -162,6 +162,22 @@ Restrict which user groups may start a Unit's Sessions (empty list = open):
 ./aize groups
 ```
 
+Slots are filled by non-login service users. The runtime auto-registers one
+`svc-*` account per provider entity, and groups carry the slot eligibility
+(`manage` for GoalManager, `work` for WorkerAgent):
+
+```bash
+./aize users                          # svc-* users have status=service, no login
+./aize set-agent GoalManager codex         # appoints svc-codex to the manage slot
+./aize set-agent-priority manage svc-claude svc-codex
+```
+
+Dispatch appoints the first eligible account in the slot's priority list whose
+provider is available (an unavailable provider falls through). An appointed
+service identity sends Messages as `user:svc-codex` and the run records
+`agent_user`/`agent_group` provenance; the legacy `account:` endpoint family
+and `AIZE_AGENT_ROLE` environment variable stay accepted as aliases.
+
 Update an existing Unit without recreating it:
 
 ```bash

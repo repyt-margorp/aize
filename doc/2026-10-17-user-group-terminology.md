@@ -68,9 +68,52 @@ user-management vocabulary:
    group with its members. Per-group dispatch priority for service identities
    stays reserved for phase 3.
 
-3. Service identities: non-login `svc-*` users, per-role priority lists,
-   `(session, group)` thread keys, `agent:` endpoint names become
-   `user:{svc-name}`, `AIZE_AGENT_ROLE` retires behind an alias window.
+3. Service identities — **implemented 2026-10-18 (phase 3)**, per the
+   "Agent service identities" section of
+   `doc/2026-10-17-runtime-layer-boundaries.md`, reconciled with this note:
+   - **Non-login `svc-*` users.** Service accounts are user records with
+     `status: "service"` (never authenticate), no password material, and a
+     `provider` execution profile. The runtime auto-registers one account per
+     provider entity (`svc-codex`, `svc-claude`, `svc-remote-aize`). The
+     `svc-` namespace is reserved: login users cannot take `svc-*` names and
+     service users must. Service users get no home Unit/Session.
+   - **Groups carry appointment eligibility.** Job classes gain group names:
+     `manage` (GoalManager slot) and `work` (WorkerAgent slot). Role tokens
+     GoalManager/WorkerAgent stay as durable protocol names (capability
+     stamping, SessionLog targets, prompts); the group names are the
+     appointment vocabulary, and remote providers are never manage-capable.
+   - **Per-role priority lists.** `agent_profiles[role]` carries an ordered
+     `accounts` list edited by `set-agent` (single provider → its account) and
+     by the new `set-agent-priority`. Dispatch appoints the first eligible
+     account (exists, active-or-service, slot group member) whose provider is
+     available; an unavailable provider falls through the list. An empty list
+     keeps the protocol identity with the profile's provider, so pre-phase-3
+     behavior is reproduced exactly.
+   - **Run lease = credentials of the moment.** A dispatched run records
+     `agent_user` / `agent_group` / `agent_provider`; the appointed identity
+     sends Messages as `user:{svc-name}` (`agent:{role}` stays accepted as the
+     legacy alias, and `account:{name}` dual-reads as `user:{name}`); provenance
+     of completion/waiting/schedule decisions binds actor to the leased
+     identity (`declared_by`, runtime run binding).
+   - **Thread keys.** Agent threads key per `(session, role, account)` —
+     `session:Role` without an appointed account (legacy shape), else
+     `session:Role:svc-name`; a legacy role-keyed thread is adopted by the
+     appointed account of the provider that already owns its provider threads,
+     so no provider continuation context is lost (F3 fix).
+   - **Env contract alias window.** `AIZE_AGENT_GROUP` (`manage`/`work`) and
+     `AIZE_AGENT_USER` are canonical; `AIZE_AGENT_ROLE` stays accepted and is
+     still exported for compatibility.
+
+   Implementation notes beyond the boundaries-doc commitments: dispatch
+   readiness derivations match agent senders through a provenance vocabulary
+   (Message payload `agent_role`/`agent_user`), falling back to the legacy
+   `agent:{role}` endpoint comparison for dual-read; the implicit WorkerAgent
+   request and run-message stamps carry the leased identity. Verification:
+   `tests/test_service_identities.py` (19 probes: auto-registration, non-login
+   gate, namespace reservation, profile priority lists, availability
+   fall-through, appointment, thread adoption keys, `user:` endpoints, run
+   binding, legacy alias window), full suite 123/123 OK with
+   `scripts/check_layer_imports.py` clean.
 
 Rules that outlive the phases (from
 `doc/2026-10-17-runtime-layer-boundaries.md`): the L1 lock contract stays the

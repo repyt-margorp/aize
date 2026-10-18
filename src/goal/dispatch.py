@@ -5,19 +5,22 @@ import os
 from pathlib import Path
 from typing import Any
 
-from goal.agents import AgentError, AgentRunner
+from goal.agents import AgentError, AgentRunner, provider_is_available
 from kernel.model import new_id, utc_now
 from goal.defs import (
     DEFAULT_AGENT_PROVIDER,
     GOAL_MANAGER_ROLE,
     WORKER_AGENT_ROLE,
+    agent_sender_endpoint,
     normalize_endpoint,
+    slot_group_name,
 )
 from kernel.defs import (
     ROOT_USERNAME,
     SESSION_RECIPIENT,
     StoreError,
     node_endpoint,
+    user_endpoint,
 )
 
 
@@ -47,6 +50,9 @@ class DispatchMixin:
             session_messages = lease["session_messages"]
             role = lease["role"]
             agent_profile = lease["agent_profile"]
+            provider = str(lease.get("provider") or agent_profile.get("provider") or "local")
+            agent_user = str(lease.get("agent_user") or "")
+            agent_group = str(lease.get("agent_group") or "")
 
             if role == GOAL_MANAGER_ROLE:
                 with self._state_lock():
@@ -68,7 +74,7 @@ class DispatchMixin:
                     recovery_context=lease.get("recovery_context") or "",
                 )
                 agent_result = runner.run(
-                    str(agent_profile.get("provider") or "local"),
+                    provider,
                     role=GOAL_MANAGER_ROLE,
                     prompt=prompt,
                     resume_token=lease["resume_token"],
@@ -80,6 +86,8 @@ class DispatchMixin:
                         run_id=run_id,
                         session=session,
                         unit=unit,
+                        agent_user=agent_user,
+                        agent_group=agent_group,
                     ),
                 )
                 result = {
@@ -101,7 +109,7 @@ class DispatchMixin:
                     recovery_context=lease.get("recovery_context") or "",
                 )
                 agent_result = runner.run(
-                    str(agent_profile.get("provider") or "local"),
+                    provider,
                     role=WORKER_AGENT_ROLE,
                     prompt=prompt,
                     resume_token=lease["resume_token"],
@@ -113,6 +121,8 @@ class DispatchMixin:
                         run_id=run_id,
                         session=session,
                         unit=unit,
+                        agent_user=agent_user,
+                        agent_group=agent_group,
                     ),
                 )
                 result = {
@@ -174,7 +184,16 @@ class DispatchMixin:
         if role not in {GOAL_MANAGER_ROLE, WORKER_AGENT_ROLE}:
             raise StoreError(f"unsupported dispatch role: {role}")
         agent_profile = state["agent_profiles"].get(role, {"provider": DEFAULT_AGENT_PROVIDER})
-        agent_thread = self._ensure_agent_thread(state, session_id=actual_session_id, role=role)
+        appointed = self._select_dispatch_account(state, role=role, profile=agent_profile)
+        provider = str((appointed or {}).get("provider") or agent_profile.get("provider") or DEFAULT_AGENT_PROVIDER)
+        agent_user = str((appointed or {}).get("username") or "")
+        agent_thread = self._ensure_agent_thread(
+            state,
+            session_id=actual_session_id,
+            role=role,
+            account=agent_user,
+            provider=provider,
+        )
         session_messages = self._session_messages_for_dispatch(state, session_id=actual_session_id)
         dispatch_messages = self._dispatch_messages_for_readiness_locked(
             state,
@@ -203,6 +222,9 @@ class DispatchMixin:
             "steps": [],
             "session_message_ids": [message["message_id"] for message in session_messages],
             "current_phase": role,
+            "agent_group": slot_group_name(role),
+            "agent_user": agent_user,
+            "agent_provider": provider,
             "observed_goal_body": str(goal.get("body") or ""),
             "from_log_seq": readiness_entry.get("from_log_seq"),
             "observed_to_seq": readiness_entry.get("observed_to_seq"),
@@ -233,6 +255,9 @@ class DispatchMixin:
             "dispatch_signals": [dict(signal) for signal in dispatch_signals],
             "role": role,
             "agent_profile": dict(agent_profile),
+            "provider": provider,
+            "agent_user": agent_user,
+            "agent_group": slot_group_name(role),
             "agent_thread": dict(agent_thread),
             "resume_token": str(agent_thread["resume_token"]),
             "recovery_context": recovery_context or "",
@@ -256,7 +281,13 @@ class DispatchMixin:
                 result=result,
             )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
-        thread = self._ensure_agent_thread(state, session_id=session["session_id"], role=GOAL_MANAGER_ROLE)
+        thread = self._ensure_agent_thread(
+            state,
+            session_id=session["session_id"],
+            role=GOAL_MANAGER_ROLE,
+            account=str(run.get("agent_user") or ""),
+            provider=str(run.get("agent_provider") or ""),
+        )
         self._record_agent_turn(
             thread,
             prompt=result["prompt"],
@@ -563,7 +594,13 @@ class DispatchMixin:
                 result=result,
             )
         readiness_entry = self._readiness_entry_by_id(state, lease["readiness_id"])
-        thread = self._ensure_agent_thread(state, session_id=session["session_id"], role=WORKER_AGENT_ROLE)
+        thread = self._ensure_agent_thread(
+            state,
+            session_id=session["session_id"],
+            role=WORKER_AGENT_ROLE,
+            account=str(run.get("agent_user") or ""),
+            provider=str(run.get("agent_provider") or ""),
+        )
         self._record_agent_turn(
             thread,
             prompt=result["prompt"],
@@ -594,6 +631,7 @@ class DispatchMixin:
             state,
             session_id=session["session_id"],
             run_id=run["run_id"],
+            run=run,
             role=WORKER_AGENT_ROLE,
         )
         protocol_signal = None
@@ -955,12 +993,14 @@ class DispatchMixin:
         return self._append_session_message_locked(
             state,
             session_id=session["session_id"],
-            from_endpoint=normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session["session_id"]),
+            from_endpoint=agent_sender_endpoint(GOAL_MANAGER_ROLE, str(run.get("agent_user") or "")),
             to_endpoint=normalize_endpoint(SESSION_RECIPIENT, session_id=session["session_id"]),
             payload={
                 "body": body,
                 "worker_request": True,
                 "worker_role": WORKER_AGENT_ROLE,
+                "agent_role": GOAL_MANAGER_ROLE,
+                "agent_user": str(run.get("agent_user") or ""),
                 "run_id": run["run_id"],
                 "implicit_worker_request": True,
             },
@@ -1019,20 +1059,88 @@ class DispatchMixin:
         declaration = run.get("declared_outcome")
         return dict(declaration) if isinstance(declaration, dict) else None
 
-    def _ensure_agent_thread(self, state: dict[str, Any], *, session_id: str, role: str) -> dict[str, Any]:
-        thread_key = f"{session_id}:{role}"
+    def _select_dispatch_account(self, state: dict[str, Any], *, role: str, profile: dict[str, Any]) -> dict[str, Any] | None:
+        """Appoint the service identity that acts in this run: the first
+        eligible account in the slot's priority list whose provider is
+        available; an unavailable provider falls through to the next entry."""
+        requested = [str(name).strip() for name in (profile.get("accounts") or []) if str(name).strip()]
+        if not requested:
+            return None
+        slot_group = slot_group_name(role)
+        fallback: dict[str, Any] | None = None
+        for name in requested:
+            user = state.setdefault("users", {}).get(name)
+            if not isinstance(user, dict):
+                continue
+            if str(user.get("status") or "") not in {"active", "service"}:
+                continue
+            if slot_group and slot_group not in [str(group) for group in user.get("groups") or []]:
+                continue
+            provider = str(user.get("provider") or profile.get("provider") or DEFAULT_AGENT_PROVIDER)
+            if fallback is None:
+                fallback = {"username": str(user.get("username")), "provider": provider}
+            if provider_is_available(provider):
+                return {"username": str(user.get("username")), "provider": provider}
+        return fallback
+
+    def _ensure_agent_thread(
+        self,
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        role: str,
+        account: str | None = None,
+        provider: str | None = None,
+    ) -> dict[str, Any]:
         threads = state["agent_threads"]
-        if thread_key not in threads:
-            now = utc_now()
-            threads[thread_key] = {
-                "thread_id": thread_key,
-                "session_id": session_id,
-                "role": role,
-                "resume_token": f"thread-{new_id('agent')}",
-                "created_at": now,
-                "updated_at": now,
-                "turns": [],
-            }
+        now = utc_now()
+        legacy_key = f"{session_id}:{role}"
+        account_name = str(account or "").strip()
+        if not account_name:
+            if legacy_key not in threads:
+                threads[legacy_key] = {
+                    "thread_id": legacy_key,
+                    "session_id": session_id,
+                    "role": role,
+                    "group": slot_group_name(role),
+                    "resume_token": f"thread-{new_id('agent')}",
+                    "created_at": now,
+                    "updated_at": now,
+                    "turns": [],
+                }
+            return threads[legacy_key]
+        thread_key = f"{session_id}:{role}:{account_name}"
+        if thread_key in threads:
+            return threads[thread_key]
+        # A legacy role-keyed thread may be adopted by the auto-registered
+        # account of the provider that already owns its provider threads, so
+        # continuation context is never lost while identity binding tightens.
+        legacy_thread = threads.get(legacy_key)
+        if isinstance(legacy_thread, dict) and not str(legacy_thread.get("account") or "").strip():
+            provider_threads = legacy_thread.get("provider_threads")
+            foreign_providers = [
+                str(key)
+                for key in (provider_threads or {})
+                if str(key) != str(provider or "")
+            ]
+            if not foreign_providers:
+                threads.pop(legacy_key)
+                legacy_thread["thread_id"] = thread_key
+                legacy_thread["account"] = account_name
+                legacy_thread["group"] = slot_group_name(role)
+                threads[thread_key] = legacy_thread
+                return threads[thread_key]
+        threads[thread_key] = {
+            "thread_id": thread_key,
+            "session_id": session_id,
+            "role": role,
+            "group": slot_group_name(role),
+            "account": account_name,
+            "resume_token": f"thread-{new_id('agent')}",
+            "created_at": now,
+            "updated_at": now,
+            "turns": [],
+        }
         return threads[thread_key]
 
     def _record_agent_turn(
@@ -1064,6 +1172,8 @@ class DispatchMixin:
         run_id: str,
         session: dict[str, Any],
         unit: dict[str, Any] | None,
+        agent_user: str = "",
+        agent_group: str = "",
     ) -> dict[str, str]:
         workspace_path = self._session_workspace_abs_path(session)
         src_path = str(Path(__file__).resolve().parent)
@@ -1073,6 +1183,8 @@ class DispatchMixin:
             "AIZE_SESSION_ID": session_id,
             "AIZE_SESSION_WORKSPACE": str(workspace_path),
             "AIZE_AGENT_ROLE": role,
+            "AIZE_AGENT_GROUP": agent_group or slot_group_name(role),
+            "AIZE_AGENT_USER": agent_user,
             "AIZE_RUN_ID": run_id,
             "PYTHONPATH": f"{src_path}:{existing_pythonpath}" if existing_pythonpath else src_path,
         }
@@ -1111,9 +1223,11 @@ class DispatchMixin:
         *,
         session_id: str,
         run_id: str,
+        run: dict[str, Any] | None = None,
         role: str,
     ) -> list[dict[str, Any]]:
-        sender = normalize_endpoint(role, session_id=session_id)
+        bound_run = run or state.setdefault("dispatch_runs", {}).get(str(run_id)) or {}
+        sender = agent_sender_endpoint(role, str(bound_run.get("agent_user") or ""))
         recipient = normalize_endpoint(SESSION_RECIPIENT, session_id=session_id)
         reports: list[dict[str, Any]] = []
         for message in self._session_messages(state, session_id):
@@ -1141,6 +1255,7 @@ class DispatchMixin:
             state,
             session_id=session_id,
             run_id=str(run.get("run_id") or ""),
+            run=run,
             role=role,
         )
         if role == GOAL_MANAGER_ROLE:

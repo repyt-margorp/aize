@@ -5,6 +5,8 @@ from typing import Any
 from kernel.model import Message, new_id, utc_now
 from kernel.defs import (
     StoreError,
+    canonical_endpoint,
+    legacy_endpoint_alias,
     normalize_endpoint,
     session_endpoint,
 )
@@ -81,7 +83,9 @@ class MessageCoreMixin:
 
     def _messages_after_cursor(self, state: dict[str, Any], endpoint: str) -> list[dict[str, Any]]:
         messages = self._all_messages(state)
-        cursor_id = str(state.setdefault("endpoint_cursors", {}).get(endpoint) or "")
+        endpoint = canonical_endpoint(endpoint)
+        cursors = state.setdefault("endpoint_cursors", {})
+        cursor_id = str(cursors.get(endpoint) or cursors.get(legacy_endpoint_alias(endpoint)) or "")
         start_index = -1
         if cursor_id:
             for index, message in enumerate(messages):
@@ -91,12 +95,13 @@ class MessageCoreMixin:
         return [
             dict(message)
             for message in messages[start_index + 1 :]
-            if str(message.get("to") or "") == endpoint
+            if canonical_endpoint(str(message.get("to") or "")) == endpoint
         ]
 
     def _advance_endpoint_cursor(self, state: dict[str, Any], endpoint: str, messages: list[dict[str, Any]]) -> None:
+        endpoint = canonical_endpoint(endpoint)
         for message in reversed(messages):
-            if str(message.get("to") or "") == endpoint:
+            if canonical_endpoint(str(message.get("to") or "")) == endpoint:
                 state.setdefault("endpoint_cursors", {})[endpoint] = str(message.get("message_id") or "")
                 return
 
@@ -133,6 +138,9 @@ class MessageCoreMixin:
             to_endpoint = self._resolve_message_endpoint(recipient, session_id=session_id)
             if from_endpoint.startswith("agent:") or to_endpoint.startswith("agent:"):
                 raise StoreError("generic messages may not use agent endpoints")
+            for endpoint in (from_endpoint, to_endpoint):
+                if endpoint.startswith("user:") and self._is_service_identity(state, endpoint.split(":", 1)[1]):
+                    raise StoreError("generic messages may not use service identities as endpoints")
             message = self._append_session_message_locked(
                 state,
                 session_id=session_id,
@@ -176,4 +184,8 @@ class MessageCoreMixin:
                 raise StoreError("message file payload must be an object")
             normalized_files.append(dict(file_payload))
         return normalized_files
+
+    def _is_service_identity(self, state: dict[str, Any], username: str) -> bool:
+        user = state.setdefault("users", {}).get(str(username))
+        return isinstance(user, dict) and str(user.get("status") or "") == "service"
 

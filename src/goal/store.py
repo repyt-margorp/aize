@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from kernel.model import Session, new_id, utc_now
+from kernel.model import Session, User, new_id, utc_now
 from goal.model import Unit
 from kernel.lock import StateLockMixin
 from kernel.auth import AuthMixin
@@ -25,6 +25,7 @@ from kernel.defs import (
 from goal.defs import (
     DEFAULT_AGENT_PROVIDER,
     GOAL_MANAGER_ROLE,
+    PROVIDER_SERVICE_ACCOUNTS,
     WORKER_AGENT_ROLE,
 )
 from goal.log import GoalLogMixin
@@ -243,6 +244,8 @@ class Store(
             ).to_dict()
             changed = True
         self._ensure_user_record_fields(users)
+        if self._ensure_service_accounts(users, now=timestamp):
+            changed = True
         if self._ensure_user_home_sessions(state, now=timestamp):
             changed = True
         if self._ensure_unit_session_owner_parents(state):
@@ -264,12 +267,15 @@ class Store(
                 agent_profiles[role] = {
                     "role": role,
                     "provider": DEFAULT_AGENT_PROVIDER,
+                    "accounts": [self._default_profile_account(DEFAULT_AGENT_PROVIDER)],
                     "status": "active",
                     "created_at": timestamp,
                     "default_assignment": True,
                 }
                 changed = True
                 continue
+        if self._ensure_agent_profile_accounts(agent_profiles):
+            changed = True
         if self._ensure_session_metadata(state):
             changed = True
         if self._ensure_session_log_defaults(state):
@@ -283,6 +289,42 @@ class Store(
                 user["groups"] = list(user.get("roles") or [])
                 changed = True
             user.pop("roles", None)
+            if "provider" not in user:
+                user["provider"] = ""
+                changed = True
+        return changed
+
+    def _ensure_service_accounts(self, users: dict[str, Any], *, now: str) -> bool:
+        changed = False
+        for provider, spec in sorted(PROVIDER_SERVICE_ACCOUNTS.items()):
+            account = str(spec["account"])
+            if account in users:
+                continue
+            users[account] = User(
+                username=account,
+                password_hash="",
+                salt="",
+                groups=list(spec["groups"]),
+                created_at=now,
+                status="service",
+                provider=provider,
+            ).to_dict()
+            changed = True
+        return changed
+
+    @staticmethod
+    def _default_profile_account(provider: str) -> str | None:
+        spec = PROVIDER_SERVICE_ACCOUNTS.get(str(provider or "").strip().lower())
+        return str(spec["account"]) if spec else None
+
+    def _ensure_agent_profile_accounts(self, agent_profiles: dict[str, Any]) -> bool:
+        changed = False
+        for profile in agent_profiles.values():
+            if "accounts" in profile:
+                continue
+            account = self._default_profile_account(str(profile.get("provider") or ""))
+            profile["accounts"] = [account] if account else []
+            changed = True
         return changed
 
     def _ensure_unit_session_owner_parents(self, state: dict[str, Any]) -> bool:
@@ -331,6 +373,8 @@ class Store(
         users = state.setdefault("users", {})
         state.setdefault("session_edges", [])
         for username, user in sorted(users.items()):
+            if str(user.get("status") or "") == "service":
+                continue
             home_session_id = account_home_session_id(username)
             previous_home_session_id = str(user.get("home_session_id") or "").strip()
             if previous_home_session_id and previous_home_session_id != home_session_id:

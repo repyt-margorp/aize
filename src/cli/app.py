@@ -46,9 +46,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_session_policy.add_argument("base_priority", type=int)
 
-    set_agent = sub.add_parser("set-agent", help="assign a provider to an agent role")
+    set_agent = sub.add_parser("set-agent", help="assign a provider to an agent slot")
     set_agent.add_argument("role")
     set_agent.add_argument("provider")
+
+    set_agent_priority = sub.add_parser(
+        "set-agent-priority",
+        help="replace a slot's service-account priority list (order = appointment priority)",
+    )
+    set_agent_priority.add_argument("role")
+    set_agent_priority.add_argument("accounts", nargs="*")
+    set_agent_priority.add_argument("--clear", action="store_true", help="empty the list")
 
     auth = sub.add_parser("auth", help="authenticate an account")
     auth.add_argument("username")
@@ -56,8 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     create_user = sub.add_parser("create-user", aliases=["create-account"], help="create a user")
     create_user.add_argument("username")
-    create_user.add_argument("password")
+    create_user.add_argument("password", nargs="?", help="required for login users; service users take none")
     create_user.add_argument("--group", "--role", action="append", dest="groups")
+    create_user.add_argument("--service", action="store_true", help="create a non-login svc-* service user")
+    create_user.add_argument("--provider", default="", help="provider entity the service user executes")
 
     create_unit = sub.add_parser("create-unit", help="create a unit")
     create_unit.add_argument("unit_id")
@@ -273,10 +283,22 @@ def run(argv: list[str] | None = None) -> int:
             )
         elif args.command == "set-agent":
             print_json(store.set_agent_provider(args.role, provider=args.provider))
+        elif args.command == "set-agent-priority":
+            accounts = [] if args.clear else args.accounts
+            print_json(store.set_agent_accounts(args.role, accounts=accounts))
         elif args.command == "auth":
             print_json(store.authenticate(args.username, password=args.password))
         elif args.command in {"create-user", "create-account"}:
-            print_json(store.create_user(args.username, password=args.password, groups=args.groups))
+            if args.service:
+                if args.password:
+                    raise StoreError("service users do not take a password")
+                print_json(
+                    store.create_service_user(args.username, groups=args.groups, provider=args.provider)
+                )
+            else:
+                if not args.password:
+                    raise StoreError("password is required (or pass --service for a non-login svc-* user)")
+                print_json(store.create_user(args.username, password=args.password, groups=args.groups))
         elif args.command == "create-unit":
             schedule = {}
             if (

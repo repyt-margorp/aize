@@ -21,6 +21,8 @@ class AuthMixin:
         *,
         groups: list[str],
         created_at: str,
+        status: str = "active",
+        provider: str = "",
     ) -> User:
         salt = secrets.token_hex(16)
         return User(
@@ -29,6 +31,8 @@ class AuthMixin:
             salt=salt,
             groups=groups,
             created_at=created_at,
+            status=status,
+            provider=provider,
         )
 
     def _hash_password(self, password: str, salt: str) -> str:
@@ -46,6 +50,7 @@ class AuthMixin:
             "groups": list(user.get("groups", [])),
             "created_at": user["created_at"],
             "status": user.get("status", "active"),
+            "provider": str(user.get("provider") or ""),
             "home_unit_id": user.get("home_unit_id"),
             "home_session_id": user.get("home_session_id"),
         }
@@ -55,6 +60,8 @@ class AuthMixin:
         normalized_username = str(username or "").strip()
         if not normalized_username:
             raise StoreError("username is required")
+        if normalized_username.startswith("svc-"):
+            raise StoreError("usernames starting with svc- are reserved for service users")
         if not password:
             raise StoreError("password is required")
         state = self.load()
@@ -70,6 +77,36 @@ class AuthMixin:
         )
         users[normalized_username] = user.to_dict()
         self._ensure_user_home_sessions(state, now=now)
+        self.save(state)
+        return self._public_user(users[normalized_username])
+
+    @state_transaction
+    def create_service_user(
+        self,
+        username: str,
+        *,
+        groups: list[str] | None = None,
+        provider: str = "",
+    ) -> dict[str, Any]:
+        normalized_username = str(username or "").strip()
+        if not normalized_username:
+            raise StoreError("username is required")
+        if not normalized_username.startswith("svc-"):
+            raise StoreError("service usernames must start with svc-")
+        state = self.load()
+        users = state["users"]
+        if normalized_username in users:
+            raise StoreError(f"user already exists: {normalized_username}")
+        user = User(
+            username=normalized_username,
+            password_hash="",
+            salt="",
+            groups=[str(group).strip() for group in (groups or []) if str(group).strip()],
+            created_at=utc_now(),
+            status="service",
+            provider=str(provider or "").strip().lower(),
+        )
+        users[normalized_username] = user.to_dict()
         self.save(state)
         return self._public_user(users[normalized_username])
 

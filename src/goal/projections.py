@@ -136,9 +136,8 @@ def _goal_manager_wake_reason(
         return _reason(item, "UserInput", "New UserInput requires GoalManager review.")
     if payload.get("schedule_update") is True:
         return _reason(item, "ScheduleUpdate", "A Unit schedule update requires GoalManager review.")
-    if (
-        str(message.get("from") or "") == normalize_endpoint(WORKER_AGENT_ROLE, session_id=session_id)
-        and str(message.get("to") or "") == normalize_endpoint(SESSION_RECIPIENT, session_id=session_id)
+    if str(message.get("to") or "") == normalize_endpoint(SESSION_RECIPIENT, session_id=session_id) and _agent_sender_matches(
+        message, payload, role=WORKER_AGENT_ROLE, session_id=session_id
     ):
         return _reason(item, "WorkerReport", "A WorkerAgent Session report requires GoalManager review.")
     return None
@@ -155,11 +154,27 @@ def _worker_wake_reason(item: DispatchLogItem, *, session_id: str) -> WakeReason
         return None
     if str(message.get("to") or "") != normalize_endpoint(SESSION_RECIPIENT, session_id=session_id):
         return None
-    if str(message.get("from") or "") == normalize_endpoint(GOAL_MANAGER_ROLE, session_id=session_id):
+    if _agent_sender_matches(message, payload, role=GOAL_MANAGER_ROLE, session_id=session_id):
         return _reason(item, "WorkerRequest", "GoalManager requested WorkerAgent work.")
     if payload.get("worker_followup") is True:
         return _reason(item, "WorkerFollowup", "New UserInput must reach the active WorkerAgent.")
     return None
+
+
+def _agent_sender_matches(
+    message: dict[str, Any] | None,
+    payload: dict[str, Any] | None,
+    *,
+    role: str,
+    session_id: str,
+) -> bool:
+    """Slot identity of a Message sender: provenance vocabulary first (payload
+    agent_role), the legacy role endpoint as the dual-read fallback."""
+    if isinstance(payload, dict) and payload.get("agent_role") == role:
+        return True
+    if message is None:
+        return False
+    return str(message.get("from") or "") == normalize_endpoint(role, session_id=session_id)
 
 
 def _system_signal_reason(item: DispatchLogItem, *, role: str) -> WakeReason | None:

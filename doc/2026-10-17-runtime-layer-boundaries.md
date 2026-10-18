@@ -83,7 +83,7 @@ semantics. The repair stays in L2 by serializing every store mutation.
   stays innocent; if any probe can only be fixed inside L1 modules, the L1
   design is revisited explicitly.
 
-## Agent service identities (decided 2026-10-17)
+## Agent service identities (decided 2026-10-17; implemented 2026-10-18)
 
 Hired agent entities become non-login service accounts (the `www-data`
 pattern): a real durable identity with permissions, without any login path.
@@ -119,6 +119,12 @@ Open points only when the first consumer arrives:
   human usernames in the same account store.
 - Whether the pool also allows concurrent WorkerAgent runs per session; the
   account model does not by itself add parallelism.
+
+(Implemented as the `svc-` reserved namespace with non-login `status:
+"service"` users, and no concurrent pool change; see phase 3's implementation
+record in `doc/2026-10-17-user-group-terminology.md`. The (session, account)
+thread contract is realized as `(session, role, account)` keys so the two slots
+of one session stay separate.)
 
 ## Planned L2 repairs (after boundaries are in place)
 

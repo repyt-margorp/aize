@@ -184,8 +184,8 @@ class CliTests(unittest.TestCase):
             sent = run_cli(state_root, "send", "root", "user", "kernel", "hello")
             self.assertEqual(sent.returncode, 0, sent.stderr)
             message = json.loads(sent.stdout)
-            self.assertEqual(message["from"], "account:user")
-            self.assertEqual(message["to"], "account:kernel")
+            self.assertEqual(message["from"], "user:user")
+            self.assertEqual(message["to"], "user:kernel")
             self.assertEqual(message["payload"]["body"], "hello")
 
             payload_file = state_root.parent / "payload.txt"
@@ -212,14 +212,14 @@ class CliTests(unittest.TestCase):
             self.assertEqual(status["active_session_count"], 3)
             self.assertEqual(status["inactive_session_count"], 0)
             self.assertEqual(status["session_edge_count"], 2)
-            self.assertEqual(status["user_count"], 1)
+            self.assertEqual(status["user_count"], 4)
             self.assertEqual(status["message_count"], 2)
             self.assertEqual(status["endpoint_cursor_count"], 0)
 
             received = run_cli(state_root, "recv", "kernel")
             self.assertEqual(received.returncode, 0, received.stderr)
             delivered = json.loads(received.stdout)
-            self.assertEqual(delivered["to"], "account:kernel")
+            self.assertEqual(delivered["to"], "user:kernel")
 
             status = json.loads(run_cli(state_root, "status").stdout)
             self.assertEqual(status["message_count"], 2)
@@ -1308,7 +1308,7 @@ class CliTests(unittest.TestCase):
             user_input = run_cli(state_root, "user-input", "build-cli", "root", "please build via session message")
             self.assertEqual(user_input.returncode, 0, user_input.stderr)
             user_message = json.loads(user_input.stdout)
-            self.assertEqual(user_message["from"], "account:root")
+            self.assertEqual(user_message["from"], "user:root")
             self.assertEqual(user_message["to"], "session:build-cli")
             self.assertTrue(user_message["payload"]["user_input"])
 
@@ -3099,7 +3099,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(run_cli(state_root, "init").returncode, 0)
             rejected = run_cli(state_root, "set-agent", "GoalManager", "remote-aize")
             self.assertEqual(rejected.returncode, 2)
-            self.assertIn("GoalManager provider must be local", rejected.stderr)
+            self.assertIn("cannot serve GoalManager", rejected.stderr)
 
             accepted = run_cli(state_root, "set-agent", "WorkerAgent", "remote-aize")
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
@@ -3270,7 +3270,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("session: notes-session unit=none", result.stdout)
             self.assertIn("session: child-session unit=none", result.stdout)
             self.assertIn("hello from console", result.stdout)
-            self.assertIn("account:root -> session:root", result.stdout)
+            self.assertIn("user:root -> session:root", result.stdout)
             self.assertNotIn("dispatch queued in background", result.stdout)
             self.assertIn("goal: child body [incomplete]", result.stdout)
             self.assertIn("No messages.", result.stdout)

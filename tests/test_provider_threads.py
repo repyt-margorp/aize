@@ -56,7 +56,7 @@ class ProviderThreadContractTests(unittest.TestCase):
         thread = next(
             entry
             for entry in store.storage.hydrate_agent_threads(list(state["agent_threads"].values()))
-            if entry.get("thread_id") == "thread-session:GoalManager"
+            if entry.get("thread_id") == "thread-session:GoalManager:svc-codex"
         )
         self.assertEqual(thread["provider_threads"].get(provider), "provider-thread-77")
         self.assertEqual(thread["turns"][-1]["result"], "provider output 0")

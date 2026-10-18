@@ -22,6 +22,7 @@ class User:
     groups: list[str]
     created_at: str
     status: str = "active"
+    provider: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -31,6 +32,7 @@ class User:
             "groups": list(self.groups),
             "created_at": self.created_at,
             "status": self.status,
+            "provider": self.provider,
         }
 
 

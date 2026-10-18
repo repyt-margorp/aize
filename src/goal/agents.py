@@ -13,6 +13,29 @@ class AgentError(RuntimeError):
     pass
 
 
+def external_agents_enabled() -> bool:
+    return os.environ.get("AIZE_ENABLE_EXTERNAL_AGENTS", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def provider_is_available(provider: str) -> bool:
+    """Whether a provider entity can plausibly execute right now. Used only to
+    order service-account appointments; an unavailable provider falls through to
+    the next entry in the slot's priority list."""
+    normalized = str(provider or "").strip().lower()
+    if normalized in {"", "local", "remote-aize"}:
+        return True
+    if not external_agents_enabled():
+        # Disabled external execution still produces protocol output, so the
+        # configured provider is not treated as down.
+        return True
+    return shutil.which(normalized) is not None
+
+
 @dataclass(frozen=True)
 class AgentResult:
     provider: str
@@ -24,12 +47,7 @@ class AgentResult:
 class AgentRunner:
     def __init__(self, *, external_enabled: bool | None = None) -> None:
         if external_enabled is None:
-            external_enabled = os.environ.get("AIZE_ENABLE_EXTERNAL_AGENTS", "true").strip().lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
-            }
+            external_enabled = external_agents_enabled()
         self.external_enabled = external_enabled
 
     def run(
